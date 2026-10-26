@@ -1,26 +1,31 @@
 //! The file-name index: every file and folder under one root, kept as flat lists.
 
 use hashbrown::{DefaultHashBuilder, HashTable};
+use rayon::prelude::*;
 use std::hash::BuildHasher;
 use std::path::PathBuf;
 
 pub type EntryId = u32;
 
 /// The number of a distinct name. Every `README.md` on the disk shares one.
-type NameId = u32;
+pub(crate) type NameId = u32;
 
 pub(crate) const NO_PARENT: EntryId = EntryId::MAX;
 
-/// The `entry_` lists are read by entry number: entry 7's folder is `entry_parent[7]`.
+/// The `entry_` lists are read by entry number: entry 7's parent folder is `entry_parent[7]`.
+/// A folder is always numbered before anything inside it.
 /// Plain number lists keep memory low and can later be saved to disk as they are.
 pub struct Index {
     /// Every distinct name once, back to back.
-    names: String,
+    pub(crate) names: String,
     /// Where each distinct name starts in `names`, plus one final end position.
-    name_starts: Vec<u32>,
-    entry_name: Vec<NameId>,
-    entry_parent: Vec<EntryId>,
-    entry_is_dir: Vec<bool>,
+    pub(crate) name_starts: Vec<u32>,
+    pub(crate) name_letters: Vec<u64>,
+    pub(crate) entry_name: Vec<NameId>,
+    pub(crate) entry_parent: Vec<EntryId>,
+    /// Every folder's entry number, smallest first. Most entries are files, so this is
+    /// smaller than a yes/no per entry.
+    pub(crate) folders: Vec<EntryId>,
 }
 
 impl Index {
@@ -40,8 +45,12 @@ impl Index {
         self.name_text(self.entry_name[entry as usize])
     }
 
+    pub fn folder_count(&self) -> usize {
+        self.folders.len()
+    }
+
     pub fn is_dir(&self, entry: EntryId) -> bool {
-        self.entry_is_dir[entry as usize]
+        self.folders.binary_search(&entry).is_ok()
     }
 
     pub fn path(&self, entry: EntryId) -> PathBuf {
@@ -57,16 +66,33 @@ impl Index {
     pub fn heap_bytes(&self) -> usize {
         self.names.capacity()
             + self.name_starts.capacity() * size_of::<u32>()
+            + self.name_letters.capacity() * size_of::<u64>()
             + self.entry_name.capacity() * size_of::<NameId>()
             + self.entry_parent.capacity() * size_of::<EntryId>()
-            + self.entry_is_dir.capacity() * size_of::<bool>()
+            + self.folders.capacity() * size_of::<EntryId>()
     }
 
-    fn name_text(&self, name: NameId) -> &str {
+    pub(crate) fn name_text(&self, name: NameId) -> &str {
         let start = self.name_starts[name as usize] as usize;
         let end = self.name_starts[name as usize + 1] as usize;
         &self.names[start..end]
     }
+}
+
+/// The letter fingerprint: one bit for each letter, digit or common symbol in `text`.
+pub(crate) fn letters(text: &str) -> u64 {
+    text.bytes().fold(0, |bits, byte| {
+        bits | match byte.to_ascii_lowercase() {
+            b @ b'a'..=b'z' => 1 << (b - b'a'),
+            b @ b'0'..=b'9' => 1 << (26 + b - b'0'),
+            b'.' => 1 << 36,
+            b'-' => 1 << 37,
+            b'_' => 1 << 38,
+            b' ' => 1 << 39,
+            128.. => 0,
+            _ => 1 << 40,
+        }
+    })
 }
 
 pub(crate) struct IndexBuilder {
@@ -82,9 +108,10 @@ impl IndexBuilder {
             index: Index {
                 names: String::new(),
                 name_starts: vec![0],
+                name_letters: Vec::new(),
                 entry_name: Vec::new(),
                 entry_parent: Vec::new(),
-                entry_is_dir: Vec::new(),
+                folders: Vec::new(),
             },
             lookup: HashTable::new(),
             hasher: DefaultHashBuilder::default(),
@@ -96,7 +123,9 @@ impl IndexBuilder {
         let name = self.intern(name);
         self.index.entry_name.push(name);
         self.index.entry_parent.push(parent);
-        self.index.entry_is_dir.push(is_dir);
+        if is_dir {
+            self.index.folders.push(entry);
+        }
         entry
     }
 
@@ -117,13 +146,28 @@ impl IndexBuilder {
         id
     }
 
+    /// Fingerprints are added only after the lookup table is freed and the lists trimmed,
+    /// to keep the scan's peak low.
     pub(crate) fn finish(self) -> Index {
+        drop(self.lookup);
         let mut index = self.index;
         index.names.shrink_to_fit();
         index.name_starts.shrink_to_fit();
         index.entry_name.shrink_to_fit();
         index.entry_parent.shrink_to_fit();
-        index.entry_is_dir.shrink_to_fit();
+        index.folders.shrink_to_fit();
+        index.name_letters = (0..index.distinct_names())
+            .into_par_iter()
+            .map(|name| {
+                let text = index.name_text(name as NameId);
+                // The check only knows ASCII, so a name like "café" must always get through.
+                if text.is_ascii() {
+                    letters(text)
+                } else {
+                    u64::MAX
+                }
+            })
+            .collect();
         index
     }
 }
@@ -148,5 +192,11 @@ mod tests {
         assert_eq!(index.path(top), Path::new("/home/README.md"));
         assert!(index.is_dir(docs));
         assert!(!index.is_dir(nested));
+    }
+
+    #[test]
+    fn fingerprint_ignores_case_and_order() {
+        assert_eq!(letters("Plan.md"), letters("dm.nalp"));
+        assert_eq!(letters("café") & letters("e"), 0);
     }
 }

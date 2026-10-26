@@ -1,7 +1,6 @@
 //! The first scan: reads every folder under a root, on all cores at once.
 
 use crate::index::{EntryId, Index, IndexBuilder, NO_PARENT};
-use std::ffi::OsString;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -55,28 +54,37 @@ fn read_folder<'s>(
         shared.lock().unwrap().unreadable_folders += 1;
         return;
     };
-    let mut children: Vec<(OsString, bool)> = Vec::new();
+    // Names are gathered first so the shared lock is taken once per folder, not once per file.
+    let mut names = String::new();
+    let mut children: Vec<(usize, bool)> = Vec::new();
+    let mut subfolder_paths = Vec::new();
     for entry in entries {
         let Ok(entry) = entry else {
             shared.lock().unwrap().unreadable_folders += 1;
             break;
         };
         let is_dir = entry.file_type().is_ok_and(|kind| kind.is_dir());
-        children.push((entry.file_name(), is_dir));
+        let name = entry.file_name();
+        names.push_str(&name.to_string_lossy());
+        children.push((names.len(), is_dir));
+        if is_dir {
+            subfolder_paths.push(path.join(name));
+        }
     }
 
-    let mut subfolders = Vec::new();
+    let mut subfolder_ids = Vec::with_capacity(subfolder_paths.len());
     let mut state = shared.lock().unwrap();
-    for (name, is_dir) in children {
-        let child = state.builder.push(&name.to_string_lossy(), folder, is_dir);
+    let mut start = 0;
+    for (end, is_dir) in children {
+        let child = state.builder.push(&names[start..end], folder, is_dir);
         if is_dir {
-            subfolders.push((child, name));
+            subfolder_ids.push(child);
         }
+        start = end;
     }
     drop(state);
 
-    for (child, name) in subfolders {
-        let child_path = path.join(name);
+    for (child, child_path) in subfolder_ids.into_iter().zip(subfolder_paths) {
         scope.spawn(move |scope| read_folder(scope, child_path, child, shared));
     }
 }
