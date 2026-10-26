@@ -14,6 +14,7 @@ const MAX_WORDS: usize = 8;
 /// Ranking weights, in frizbee's units, where a matched letter is worth 12.
 const WHOLE_WORD_BONUS: u16 = 24;
 const DEPTH_PENALTY: u32 = 2;
+const RARER_BY: usize = 4;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Hit {
@@ -38,6 +39,10 @@ struct Scratch {
     name_words: Vec<u8>,
     name_score: Vec<u16>,
     folder_words: Vec<u8>,
+    /// One bit per distinct name a result could still need, for matching common words last.
+    possible: Vec<AtomicU64>,
+    /// One bit per folder already climbed while marking `possible`.
+    walked: Vec<AtomicU64>,
 }
 
 impl Default for Searcher {
@@ -124,12 +129,35 @@ fn run(
         return Some(Vec::new());
     }
 
-    let (mut matched, held) = match_names(index, &words, wanted, 0, scratch, stale)?;
+    let later = common_words(index, &words, wanted, typo_ready);
+    let (mut matched, held) = match_names(
+        index,
+        &words,
+        !later,
+        wanted,
+        Pass::Everywhere { typos: 0 },
+        scratch,
+        stale,
+    )?;
     // The file you want almost always holds each word you type, letter for letter. A word no
     // name holds is probably misspelled, like "desing", so it may take one typo.
     let unsure = wanted & typo_ready & !held;
-    if unsure != 0 && wanted & !matched & !unsure == 0 {
-        (matched, _) = match_names(index, &words, wanted, unsure, scratch, stale)?;
+    if unsure != 0 && wanted & !later & !matched & !unsure == 0 {
+        (matched, _) = match_names(
+            index,
+            &words,
+            !later,
+            wanted,
+            Pass::Everywhere { typos: unsure },
+            scratch,
+            stale,
+        )?;
+    }
+    if later != 0 && wanted & !later & !matched == 0 {
+        // Folder words without the common ones yet; they are worked out again below.
+        words_above(index, scratch, stale)?;
+        mark_possible(index, wanted & !later, unwanted, scratch, stale)?;
+        matched |= match_names(index, &words, later, wanted, Pass::Possible, scratch, stale)?.0;
     }
     if wanted & !matched != 0 {
         return Some(Vec::new());
@@ -154,6 +182,7 @@ fn run(
         name_words,
         name_score,
         folder_words,
+        ..
     } = scratch;
     let chunks: Vec<Vec<Hit>> = index
         .entry_name
@@ -213,30 +242,52 @@ fn run(
     Some(hits)
 }
 
-/// Each distinct name is matched once, however many folders hold it.
+#[derive(Clone, Copy)]
+enum Pass {
+    /// Every name, starting over, with one typo allowed for the `typos` words.
+    Everywhere { typos: u8 },
+    /// Only the names marked possible, adding to what the earlier pass found.
+    Possible,
+}
+
+/// Each distinct name is matched once, however many folders hold it, for the `active` words.
 /// Returns the words that matched at least one name, and the search words some name holds.
 fn match_names(
     index: &Index,
     words: &[Pattern],
+    active: u8,
     wanted: u8,
-    typo_words: u8,
+    pass: Pass,
     scratch: &mut Scratch,
     stale: &(impl Fn() -> bool + Sync),
 ) -> Option<(u8, u8)> {
     let mut config = Config::default().sort(SortStrategy::IndexAsc);
     // Typing in lower case must not favour lower-case names over NIB.pdf.
     config.scoring.matching_case_bonus = 0;
+    let typo_words = match pass {
+        Pass::Everywhere { typos } => typos,
+        Pass::Possible => 0,
+    };
     let typos = |w: usize| u16::from(typo_words >> w & 1);
     let needed: Vec<u64> = words.iter().map(|word| letters(&word.needle)).collect();
-    scratch.name_words.clear();
-    scratch.name_words.resize(index.distinct_names(), 0);
-    scratch.name_score.clear();
-    scratch.name_score.resize(index.distinct_names(), 0);
+    let Scratch {
+        name_words,
+        name_score,
+        possible,
+        ..
+    } = scratch;
+    let only_possible = matches!(pass, Pass::Possible);
+    if !only_possible {
+        name_words.clear();
+        name_words.resize(index.distinct_names(), 0);
+        name_score.clear();
+        name_score.resize(index.distinct_names(), 0);
+    }
+    let possible = &*possible;
 
-    scratch
-        .name_words
+    name_words
         .par_chunks_mut(NAME_CHUNK)
-        .zip(scratch.name_score.par_chunks_mut(NAME_CHUNK))
+        .zip(name_score.par_chunks_mut(NAME_CHUNK))
         .enumerate()
         .map_init(
             || {
@@ -254,11 +305,17 @@ fn match_names(
                 let first = chunk * NAME_CHUNK;
                 let (mut matched, mut held) = (0u8, 0u8);
                 for (w, matcher) in matchers.iter_mut().enumerate() {
+                    if active >> w & 1 == 0 {
+                        continue;
+                    }
                     ids.clear();
                     texts.clear();
                     // "zshrc" should find .zshrc as readily as zshrc.bak; typing ".zsh" keeps the dot.
                     let keep_dot = words[w].needle.starts_with('.');
                     for n in first..first + bits.len() {
+                        if only_possible && !is_marked(possible, n) {
+                            continue;
+                        }
                         let absent = (needed[w] & !index.name_letters[n]).count_ones();
                         if absent <= u32::from(typos(w)) {
                             let text = index.name_text(n as NameId);
@@ -340,6 +397,96 @@ fn positive(word: Pattern) -> Pattern {
     }
 }
 
+/// Short words like the "a" in "cv a" fit most names. Matched last, only on names a result
+/// could still need, they find the same results for a fraction of the work.
+/// A word that may take a typo is never put off, as its typo depends on every name.
+fn common_words(index: &Index, words: &[Pattern], wanted: u8, typo_ready: u8) -> u8 {
+    if wanted.count_ones() < 2 || wanted & !typo_ready == 0 {
+        return 0;
+    }
+    let fitting: Vec<usize> = (0..words.len())
+        .map(|w| {
+            if wanted >> w & 1 == 0 {
+                return usize::MAX;
+            }
+            let needed = letters(&words[w].needle);
+            let names = index.name_letters.par_iter();
+            names.filter(|&&name| needed & !name == 0).count()
+        })
+        .collect();
+    let rarest = fitting.iter().copied().min().unwrap_or(0);
+    // Unless a word fits far more names than the rarest, the extra passes cost more than they save.
+    let mut later = 0;
+    for (w, &fits) in fitting.iter().enumerate() {
+        if (wanted & !typo_ready) >> w & 1 == 1 && fits > RARER_BY * rarest {
+            later |= 1 << w;
+        }
+    }
+    later
+}
+
+/// Marks the names a result could still need: each entry whose path holds every `rare` word
+/// and no `unwanted` one, and each folder above one.
+fn mark_possible(
+    index: &Index,
+    rare: u8,
+    unwanted: u8,
+    scratch: &mut Scratch,
+    stale: &(impl Fn() -> bool + Sync),
+) -> Option<()> {
+    let Scratch {
+        name_words,
+        folder_words,
+        possible,
+        walked,
+        ..
+    } = scratch;
+    reset(possible, index.distinct_names());
+    reset(walked, index.len());
+    let (possible, walked) = (&*possible, &*walked);
+    index
+        .entry_name
+        .par_chunks(ENTRY_CHUNK)
+        .zip(index.entry_parent.par_chunks(ENTRY_CHUNK))
+        .try_for_each(|(names, parents)| {
+            if stale() {
+                return None;
+            }
+            for (&name, &parent) in names.iter().zip(parents) {
+                if parent == NO_PARENT {
+                    continue;
+                }
+                let path = name_words[name as usize] | folder_words[parent as usize];
+                if path & rare != rare || path & unwanted != 0 {
+                    continue;
+                }
+                mark(possible, name as usize);
+                let mut folder = parent;
+                // A folder someone already walked through has its own folders above marked.
+                while folder != NO_PARENT && !mark(walked, folder as usize) {
+                    mark(possible, index.entry_name[folder as usize] as usize);
+                    folder = index.entry_parent[folder as usize];
+                }
+            }
+            Some(())
+        })
+}
+
+fn reset(bits: &mut Vec<AtomicU64>, len: usize) {
+    bits.clear();
+    bits.resize_with(len.div_ceil(64), AtomicU64::default);
+}
+
+/// Sets bit `i`, and says whether it was set already.
+fn mark(bits: &[AtomicU64], i: usize) -> bool {
+    let bit = 1 << (i % 64);
+    bits[i / 64].fetch_or(bit, Ordering::Relaxed) & bit != 0
+}
+
+fn is_marked(bits: &[AtomicU64], i: usize) -> bool {
+    bits[i / 64].load(Ordering::Relaxed) >> (i % 64) & 1 == 1
+}
+
 /// One pass in entry order works because a folder is numbered before its contents.
 /// The root's own name, the full path you scanned, never counts.
 fn words_above(
@@ -389,6 +536,33 @@ fn keep_best(hits: &mut Vec<Hit>, limit: usize) {
 mod tests {
     use super::*;
     use crate::index::IndexBuilder;
+
+    #[test]
+    fn a_common_word_still_counts_in_any_folder_above() {
+        let mut builder = IndexBuilder::new();
+        let root = builder.push("/home", NO_PARENT, true);
+        let cv = builder.push("cv", root, true);
+        builder.push("a.pdf", cv, false);
+        builder.push("zz.txt", cv, false);
+        let data = builder.push("data", root, true);
+        let deep = builder.push("deep", data, true);
+        builder.push("cv.txt", deep, false);
+        builder.push("cv-plan.md", root, false);
+        builder.push("notes.md", root, false);
+        // Enough names holding "a" that it is matched last.
+        for i in 0..20 {
+            builder.push(&format!("bar{i}.txt"), root, false);
+        }
+        let index = builder.finish();
+        assert_eq!(
+            paths(&index, "cv a"),
+            [
+                "/home/cv-plan.md",
+                "/home/cv/a.pdf",
+                "/home/data/deep/cv.txt"
+            ]
+        );
+    }
 
     fn sample() -> Index {
         let mut builder = IndexBuilder::new();
