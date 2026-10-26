@@ -6,4 +6,4 @@ mod walk;
 
 pub use index::{EntryId, Index};
 pub use search::{Hit, Searcher, Ticket};
-pub use walk::{Scan, scan};
+pub use walk::{Clutter, Scan, scan};
