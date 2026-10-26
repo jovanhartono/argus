@@ -1,0 +1,841 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Telescope Plan</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,600;12..96,700&family=IBM+Plex+Sans:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap">
+<style>
+/* Layout: one 1080px frame; prose capped at 68ch, tables and figures use the full frame */
+:root {
+  --bg: #f4f6f9;
+  --surface: #ffffff;
+  --ink: #121a27;
+  --muted: #586377;
+  --line: #d9dfe8;
+  --accent: #2c45c4;
+  --accent-soft: #e6eafb;
+  --good: #1d7a4b;
+  --good-soft: #e1f3e9;
+  --warn: #8f5400;
+  --warn-soft: #fbefd9;
+  --bad: #b3242d;
+  --bad-soft: #fbe5e6;
+  --font-display: "Bricolage Grotesque", "Avenir Next", system-ui, sans-serif;
+  --font-body: "IBM Plex Sans", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #0d121b; --surface: #141b27; --ink: #e4e9f2; --muted: #97a2b6; --line: #253044;
+    --accent: #8fa2ff; --accent-soft: #1c2547; --good: #5ccb91; --good-soft: #12301f;
+    --warn: #f0b35a; --warn-soft: #33260e; --bad: #ff7b82; --bad-soft: #3a1519;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #0d121b; --surface: #141b27; --ink: #e4e9f2; --muted: #97a2b6; --line: #253044;
+  --accent: #8fa2ff; --accent-soft: #1c2547; --good: #5ccb91; --good-soft: #12301f;
+  --warn: #f0b35a; --warn-soft: #33260e; --bad: #ff7b82; --bad-soft: #3a1519;
+  color-scheme: dark;
+}
+*, *::before, *::after { box-sizing: border-box; }
+:root { color-scheme: light; }
+body { margin: 0; background: var(--bg); color: var(--ink); font-family: var(--font-body); font-size: 16px; line-height: 1.6; -webkit-font-smoothing: antialiased; }
+.wrap {
+  max-width: 1080px; margin: 0 auto;
+  padding-left: max(16px, env(safe-area-inset-left, 0px));
+  padding-right: max(16px, env(safe-area-inset-right, 0px));
+  padding-block: 40px 72px;
+  overflow-x: clip;
+}
+a { color: var(--accent); text-underline-offset: 2px; }
+a:focus-visible, .term:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 2px; }
+h1, h2 { font-family: var(--font-display); font-weight: 700; letter-spacing: -0.01em; text-wrap: balance; }
+h1 { font-size: clamp(2.1rem, 5.5vw, 3.2rem); line-height: 1.05; margin: 10px 0 14px; }
+h2 { font-size: clamp(1.4rem, 3vw, 1.75rem); line-height: 1.2; margin: 0 0 12px; }
+h3 { font-size: 1rem; font-weight: 600; margin: 0 0 8px; }
+p { margin: 0 0 12px; }
+.prose { max-width: 68ch; }
+.lede { font-size: 1.12rem; color: var(--muted); max-width: 64ch; }
+.eyebrow { font-family: var(--font-mono); font-size: 0.74rem; letter-spacing: 0.06em; text-transform: uppercase; color: var(--muted); }
+header { display: grid; gap: 4px; padding-bottom: 28px; }
+.chips { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; }
+.chip {
+  font-family: var(--font-mono); font-size: 0.74rem; line-height: 1.4;
+  padding: 3px 10px; border-radius: 999px; white-space: nowrap;
+  border: 1px solid var(--line); background: var(--surface); color: var(--muted);
+}
+.chip.keep { background: var(--good-soft); color: var(--good); border-color: transparent; }
+.chip.open { background: var(--accent-soft); color: var(--accent); border-color: transparent; }
+nav.toc { display: flex; flex-wrap: wrap; gap: 6px 18px; font-size: 0.9rem; padding: 14px 0 0; }
+section { border-top: 1px solid var(--line); padding-block: 40px 12px; display: grid; gap: 16px; }
+section > * { min-width: 0; }
+ul, ol { margin: 0; padding-left: 1.25rem; }
+li { margin-bottom: 6px; }
+li:last-child { margin-bottom: 0; }
+.stats {
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+  gap: 1px; background: var(--line); border: 1px solid var(--line); border-radius: 10px; overflow: hidden;
+}
+.stat { background: var(--surface); padding: 16px 18px; display: grid; gap: 4px; align-content: start; }
+.stat b { font-family: var(--font-mono); font-weight: 500; font-size: 1.45rem; line-height: 1.2; font-variant-numeric: tabular-nums; }
+.stat span { color: var(--muted); font-size: 0.88rem; line-height: 1.45; }
+.table-wrap { overflow-x: auto; border: 1px solid var(--line); border-radius: 10px; background: var(--surface); }
+table { border-collapse: collapse; width: 100%; font-size: 0.89rem; line-height: 1.5; }
+.table-wrap table { min-width: 780px; }
+th, td { text-align: left; vertical-align: top; padding: 10px 14px; border-bottom: 1px solid var(--line); }
+tr:last-child td { border-bottom: 0; }
+th { font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); font-weight: 600; white-space: nowrap; }
+td.n, .mono { font-family: var(--font-mono); font-size: 0.8rem; font-variant-numeric: tabular-nums; }
+td.n { white-space: nowrap; }
+td.name { font-weight: 600; white-space: nowrap; }
+td .sub { display: block; color: var(--muted); font-size: 0.82rem; }
+figure { margin: 0; display: grid; gap: 8px; }
+.fig-wrap { overflow-x: auto; background: var(--surface); border: 1px solid var(--line); border-radius: 10px; padding: 14px 12px; }
+figure svg { display: block; width: 100%; height: auto; min-width: 620px; }
+figcaption { font-size: 0.86rem; color: var(--muted); max-width: 72ch; }
+.s-text { fill: var(--ink); font-family: var(--font-body); font-size: 13px; }
+.s-small { fill: var(--muted); font-family: var(--font-body); font-size: 12px; }
+.s-val { fill: var(--ink); font-family: var(--font-mono); font-size: 12px; }
+.s-title { fill: var(--ink); font-family: var(--font-body); font-size: 14px; font-weight: 600; }
+.s-grid { stroke: var(--line); stroke-width: 1; }
+.chart .s-val { paint-order: stroke; stroke: var(--surface); stroke-width: 4px; stroke-linejoin: round; }
+.s-bar { fill: var(--accent); }
+.s-bar-light { fill: var(--accent); opacity: 0.4; }
+.s-ref { fill: var(--muted); opacity: 0.55; }
+.s-ref-light { fill: var(--muted); opacity: 0.25; }
+.s-box { fill: var(--surface); stroke: var(--line); stroke-width: 1.5; }
+.s-box-hi { fill: var(--accent-soft); stroke: var(--accent); stroke-width: 1.5; }
+.s-frame { fill: none; stroke: var(--muted); stroke-width: 1.2; stroke-dasharray: 6 5; }
+.s-arrow { stroke: var(--muted); stroke-width: 1.6; fill: none; }
+.s-head { fill: var(--muted); }
+.cols { display: grid; grid-template-columns: repeat(auto-fit, minmax(290px, 1fr)); gap: 16px; }
+.cols.pairs { grid-template-columns: repeat(auto-fit, minmax(min(100%, 420px), 1fr)); }
+.panel { background: var(--surface); border: 1px solid var(--line); border-radius: 10px; padding: 16px 20px; display: grid; gap: 8px; align-content: start; }
+.panel ul { font-size: 0.92rem; }
+.idea { display: grid; gap: 10px; padding-top: 24px; border-top: 1px dashed var(--line); }
+.idea:first-of-type { border-top: 0; padding-top: 4px; }
+.idea h3 { font-family: var(--font-display); font-size: 1.2rem; font-weight: 700; display: flex; gap: 10px; align-items: baseline; margin: 0; }
+.idea .num { font-family: var(--font-mono); font-size: 0.78rem; font-weight: 500; color: var(--accent); background: var(--accent-soft); border-radius: 999px; padding: 1px 9px; }
+.idea p { max-width: 68ch; margin: 0; }
+.analogy { border-left: 3px solid var(--accent); padding: 2px 0 2px 14px; }
+.settled { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 0 32px; margin: 0; }
+.settled div { padding: 10px 0; border-bottom: 1px solid var(--line); display: grid; gap: 2px; }
+.settled dt { font-size: 0.74rem; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); font-weight: 600; }
+.settled dd { margin: 0; }
+.note { font-size: 0.9rem; color: var(--muted); }
+footer { border-top: 1px solid var(--line); margin-top: 32px; padding-top: 20px; font-size: 0.85rem; color: var(--muted); }
+.term { border-bottom: 1.5px dotted var(--accent); cursor: help; position: relative; }
+.term:focus { outline: none; }
+.term::after {
+  content: attr(data-tip); position: absolute; bottom: calc(100% + 8px);
+  left: 50%; transform: translateX(-50%); width: max-content; max-width: min(260px, 80vw);
+  background: var(--ink); color: var(--bg); font-size: 0.8rem; line-height: 1.45; font-weight: 400;
+  padding: 0.45rem 0.65rem; border-radius: 6px; text-transform: none; letter-spacing: 0;
+  opacity: 0; visibility: hidden; transition: opacity 0.15s; pointer-events: none; z-index: 10;
+}
+.term:hover::after, .term:focus::after { opacity: 1; visibility: visible; }
+@media (prefers-reduced-motion: reduce) { .term::after { transition: none; } }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <span class="eyebrow">Plan &middot; updated 26 Oct 2026 &middot; measured on your Mac: Apple M1, 8 GB, macOS 26.6</span>
+  <h1>Telescope plan</h1>
+  <p class="lede">A fast, light launcher that finds any file, folder or app on macOS and Windows as you type.</p>
+  <div class="chips">
+    <span class="chip keep">Research complete</span>
+    <span class="chip keep">Signed off 26 Oct 2026</span>
+    <span class="chip">Mac first, Windows later (M5)</span>
+    <span class="chip">Rust core, Swift window</span>
+    <span class="chip">MIT OR Apache-2.0</span>
+  </div>
+  <nav class="toc" aria-label="Sections">
+    <a href="#verdict">Bottom line</a>
+    <a href="#how">How it works</a>
+    <a href="#measured">Measured</a>
+    <a href="#pains">User pains</a>
+    <a href="#competitors">Competitors</a>
+    <a href="#stack">Tech choices</a>
+    <a href="#macos-app">macOS app</a>
+    <a href="#targets">Targets</a>
+    <a href="#milestones">Milestones</a>
+    <a href="#risks">Risks</a>
+    <a href="#decisions">Decisions</a>
+    <a href="#unverified">Unverified</a>
+    <a href="#next">Next steps</a>
+  </nav>
+</header>
+
+<section id="verdict">
+  <h2>Bottom line</h2>
+  <ul class="prose">
+    <li>Worth building as your daily driver and as open source. Raycast 2 and Wox 2.4 already keep their own file lists on both systems, so Telescope's edge is weight: no hidden web browser inside, a target of under 60 MB of memory while idle, and a goal of running well on a 4 GB PC (not yet tested beyond your Mac).</li>
+    <li>Speed is mostly solved. <span class="term" tabindex="0" data-tip="Finding a name from letters typed in order with gaps allowed, so 'tlpl' finds 'telescope-plan'.">Fuzzy matching</span> every name in your home folder took 6-12 ms per keystroke on your Mac.</li>
+    <li>The hard parts are putting the right file first, keeping up with file changes, making the window feel like Spotlight, and Windows.</li>
+    <li>Rust does all the searching. A thin <span class="term" tabindex="0" data-tip="Apple's own programming language for Mac and iPhone apps.">Swift</span> window shows the results on macOS. Windows gets its own thin window at milestone 5 (M5).</li>
+    <li>No database. The list of file names is Telescope's own file, read straight from disk.</li>
+    <li>Shipping is free: a .dmg on GitHub. Because we never pay Apple's $99 a year, each user approves the app once in System Settings (still to confirm on macOS 15.1).</li>
+    <li>Spotlight is not a reliable backup. On your Mac it found 16 of the 141 files named "telescope".</li>
+    <li>The biggest risk is the project stalling. Three Rust launchers, Loungy, Gauntlet and Kunkun, went quiet. Every milestone has a time limit.</li>
+  </ul>
+</section>
+
+<section id="how">
+  <h2>How it works, in plain words</h2>
+  <p class="prose">Eight ideas carry the whole design.</p>
+
+  <div class="idea">
+    <h3><span class="num">1</span>A kitchen and a waiter</h3>
+    <p>Rust is great at fast searching and awkward at drawing Mac windows. Swift is the opposite.</p>
+    <p class="analogy">Picture a restaurant. The waiter takes your order and brings the plate; the kitchen cooks. They talk only through a small hatch, using a fixed set of order slips.</p>
+    <p>The waiter is a thin Swift window. The kitchen is the Rust core, where every search happens. The hatch is about 10 Rust functions written in <span class="term" tabindex="0" data-tip="C is an old, simple language. Almost every language can call functions written in its style, so it works as a shared format.">C style</span>, the one format both sides understand; you write no C yourself. At M5, Windows gets its own waiter and reuses the same kitchen.</p>
+    <figure>
+      <div class="fig-wrap">
+        <svg viewBox="0 0 960 360" role="img" aria-label="Big picture: you press the hotkey and type; the Swift panel sends each query with a ticket number to the Rust core; searchers read the index file and send back 50 rows; the indexer updates the index from the macOS change log.">
+          <defs>
+            <marker id="m1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="s-head" d="M0,0 L10,5 L0,10 z"/></marker>
+          </defs>
+          <rect class="s-box" x="16" y="60" width="160" height="80" rx="8"/>
+          <text class="s-title" x="32" y="88">You</text>
+          <text class="s-small" x="32" y="110">press the hotkey,</text>
+          <text class="s-small" x="32" y="127">then type</text>
+          <line class="s-arrow" x1="177" y1="100" x2="233" y2="100" marker-end="url(#m1)"/>
+          <text class="s-small" x="205" y="92" text-anchor="middle">keys</text>
+
+          <rect class="s-box-hi" x="236" y="40" width="210" height="130" rx="8"/>
+          <text class="s-title" x="252" y="66">Swift panel, the waiter</text>
+          <text class="s-text" x="252" y="98">Shows the window</text>
+          <text class="s-text" x="252" y="120">Sends what you type</text>
+          <text class="s-text" x="252" y="142">Draws the top 50 rows</text>
+
+          <rect class="s-frame" x="536" y="24" width="408" height="318" rx="12"/>
+          <text class="s-title" x="556" y="52">Rust core, the kitchen</text>
+
+          <rect class="s-box" x="556" y="70" width="372" height="76" rx="8"/>
+          <text class="s-title" x="572" y="94">Searchers</text>
+          <text class="s-small" x="572" y="114">one per CPU core, minus one kept for the window</text>
+          <text class="s-small" x="572" y="132">drop old work when a newer ticket arrives</text>
+
+          <rect class="s-box" x="556" y="176" width="372" height="56" rx="8"/>
+          <text class="s-title" x="572" y="199">Index file</text>
+          <text class="s-small" x="572" y="218">every file name, read straight from disk</text>
+
+          <rect class="s-box" x="556" y="262" width="372" height="64" rx="8"/>
+          <text class="s-title" x="572" y="286">Indexer</text>
+          <text class="s-small" x="572" y="306">one background worker that keeps the index fresh</text>
+
+          <line class="s-arrow" x1="447" y1="92" x2="553" y2="92" marker-end="url(#m1)"/>
+          <text class="s-small" x="501" y="84" text-anchor="middle">query #7</text>
+          <line class="s-arrow" x1="555" y1="128" x2="449" y2="128" marker-end="url(#m1)"/>
+          <text class="s-small" x="501" y="120" text-anchor="middle">50 rows, #7</text>
+
+          <line class="s-arrow" x1="740" y1="175" x2="740" y2="149" marker-end="url(#m1)"/>
+          <text class="s-small" x="750" y="166">read</text>
+          <line class="s-arrow" x1="740" y1="261" x2="740" y2="235" marker-end="url(#m1)"/>
+          <text class="s-small" x="750" y="252">update</text>
+
+          <rect class="s-box" x="236" y="262" width="210" height="64" rx="8"/>
+          <text class="s-title" x="252" y="286">macOS change log</text>
+          <text class="s-small" x="252" y="306">numbered change notes</text>
+          <line class="s-arrow" x1="447" y1="294" x2="553" y2="294" marker-end="url(#m1)"/>
+          <text class="s-small" x="501" y="286" text-anchor="middle">new notes</text>
+        </svg>
+      </div>
+      <figcaption>Everything runs inside one app <span class="term" tabindex="0" data-tip="One running program with its own private memory. Each extra process costs memory of its own.">process</span>. A separate Windows helper with admin rights comes only if measurements show it is needed.</figcaption>
+    </figure>
+  </div>
+
+  <div class="idea">
+    <h3><span class="num">2</span>A phone book of file names</h3>
+    <p>Asking the disk "which files match tel?" means opening every one of the 266,968 folders in your home folder. That took 10.7 s on your Mac.</p>
+    <p class="analogy">A phone book solves this: write every name down once, then look names up in the book instead of knocking on every door.</p>
+    <p>The book is called the index. By default it skips clutter like ~/Library, node_modules, .git and hidden folders. On your Mac that leaves 352,939 entries, indexed in 2.3 s. An "index everything" switch covers all 2.36 million.</p>
+  </div>
+
+  <div class="idea">
+    <h3><span class="num">3</span>Writing each folder once</h3>
+    <p>Storing every file's full path repeats "/Users/you/Documents/" for every file inside that folder. For your Mac that adds up to 491 MB.</p>
+    <p class="analogy">An address book can say "same street as #3" instead of writing the street out again.</p>
+    <p>Telescope stores each entry's own name plus the number of the folder it sits in. The names alone take 66 MB for your whole home folder and about 14 MB (estimate) for the default folders. Full paths are rebuilt only for the 50 rows on screen.</p>
+    <figure>
+      <div class="fig-wrap">
+        <svg viewBox="0 0 960 280" role="img" aria-label="Comparison: full paths repeat the folder part for every file, 491 MB; Telescope stores each name once with the number of its folder, 66 MB.">
+          <text class="s-title" x="16" y="24">Full paths: 491 MB on your Mac</text>
+          <rect class="s-box" x="16" y="38" width="440" height="200" rx="8"/>
+          <text class="s-val" x="36" y="80">/Users/you/Documents/plan.pdf</text>
+          <text class="s-val" x="36" y="112">/Users/you/Documents/notes.md</text>
+          <text class="s-val" x="36" y="144">/Users/you/Desktop/plan.pdf</text>
+          <text class="s-small" x="36" y="176">and 2.36 million more</text>
+          <text class="s-small" x="16" y="266">The folder part is written again for every file inside it</text>
+
+          <text class="s-title" x="504" y="24">Telescope: 66 MB</text>
+          <rect class="s-box-hi" x="504" y="38" width="440" height="200" rx="8"/>
+          <text class="s-val" x="524" y="66">#1</text><text class="s-val" x="564" y="66">Users</text><text class="s-small" x="720" y="66">top level</text>
+          <text class="s-val" x="524" y="90">#2</text><text class="s-val" x="564" y="90">you</text><text class="s-small" x="720" y="90">inside #1</text>
+          <text class="s-val" x="524" y="114">#3</text><text class="s-val" x="564" y="114">Documents</text><text class="s-small" x="720" y="114">inside #2</text>
+          <text class="s-val" x="524" y="138">#4</text><text class="s-val" x="564" y="138">plan.pdf</text><text class="s-small" x="720" y="138">inside #3</text>
+          <text class="s-val" x="524" y="162">#5</text><text class="s-val" x="564" y="162">notes.md</text><text class="s-small" x="720" y="162">inside #3</text>
+          <text class="s-val" x="524" y="186">#6</text><text class="s-val" x="564" y="186">Desktop</text><text class="s-small" x="720" y="186">inside #2</text>
+          <text class="s-val" x="524" y="210">#7</text><text class="s-val" x="564" y="210">plan.pdf</text><text class="s-small" x="720" y="210">inside #6</text>
+          <text class="s-small" x="504" y="266">To show #7's path, follow the numbers: #7, #6, #2, #1</text>
+        </svg>
+      </div>
+      <figcaption>Same three files, two ways to store them. Sizes are for the 2.36 million entries in your home folder.</figcaption>
+    </figure>
+  </div>
+
+  <div class="idea">
+    <h3><span class="num">4</span>Reading the index without loading it</h3>
+    <p>Loading the whole index file into memory at every launch is slow, and the app keeps holding that memory while the window is hidden.</p>
+    <p class="analogy">Compare photocopying a whole reference book with reading it on the library shelf. On the shelf you touch only the pages you need, and the librarian can put pages away when space runs short.</p>
+    <p>Programmers call this memory-mapping. macOS loads pages of the index file only when a search touches them, and can drop them while you are not searching.</p>
+  </div>
+
+  <div class="idea">
+    <h3><span class="num">5</span>What happens when you type</h3>
+    <p>Every keystroke has to check up to 2.36 million entries (your whole home folder) within a few milliseconds.</p>
+    <p class="analogy">Think of sorting job applications: a quick scan throws out every CV missing a required skill, and only the rest get read carefully.</p>
+    <p>The quick scan is a letter fingerprint: 8 bytes per name recording which letters it contains, so any name missing a typed letter is skipped. The careful read is fuzzy matching. Your 2.36 million entries share only 1.02 million different names, because names like README.md repeat across folders, so each name is matched once. Results are then ranked by match quality, by <span class="term" tabindex="0" data-tip="A score that combines how often and how recently you opened something, so your usual files rise to the top.">frecency</span>, and by how deep the file sits.</p>
+    <figure>
+      <div class="fig-wrap">
+        <svg viewBox="0 0 640 448" style="max-width: 680px; margin: 0 auto;" role="img" aria-label="Keystroke funnel: you type tel plan; a quick letter check over 2.36 million entries; fuzzy match on the names that pass; ranking; top 50 rows shown.">
+          <defs>
+            <marker id="m2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="s-head" d="M0,0 L10,5 L0,10 z"/></marker>
+          </defs>
+          <rect class="s-box-hi" x="40" y="16" width="560" height="56" rx="8"/>
+          <text class="s-title" x="60" y="40">You type: tel plan</text>
+          <text class="s-small" x="60" y="60">Each word must match the file name or one of its folders</text>
+
+          <line class="s-arrow" x1="320" y1="73" x2="320" y2="103" marker-end="url(#m2)"/>
+          <text class="s-small" x="332" y="92">all 2.36M entries</text>
+
+          <rect class="s-box" x="40" y="106" width="560" height="56" rx="8"/>
+          <text class="s-title" x="60" y="130">Quick letter check</text>
+          <text class="s-small" x="60" y="150">skips names missing a typed letter: 0.4-2 ms</text>
+
+          <line class="s-arrow" x1="320" y1="163" x2="320" y2="193" marker-end="url(#m2)"/>
+          <text class="s-small" x="332" y="182">only names holding every typed letter</text>
+
+          <rect class="s-box" x="40" y="196" width="560" height="56" rx="8"/>
+          <text class="s-title" x="60" y="220">Fuzzy match on the names that pass</text>
+          <text class="s-small" x="60" y="240">letters in order, gaps allowed: 6-12 ms on your Mac</text>
+
+          <line class="s-arrow" x1="320" y1="253" x2="320" y2="283" marker-end="url(#m2)"/>
+          <text class="s-small" x="332" y="272">matching names, then their files</text>
+
+          <rect class="s-box" x="40" y="286" width="560" height="56" rx="8"/>
+          <text class="s-title" x="60" y="310">Ranking</text>
+          <text class="s-small" x="60" y="330">blends match quality, how often you open it, and how deep it sits</text>
+
+          <line class="s-arrow" x1="320" y1="343" x2="320" y2="373" marker-end="url(#m2)"/>
+          <text class="s-small" x="332" y="362">best 50</text>
+
+          <rect class="s-box" x="40" y="376" width="560" height="56" rx="8"/>
+          <text class="s-title" x="60" y="400">Top 50 rows shown</text>
+          <text class="s-small" x="60" y="420">full paths rebuilt only for these 50</text>
+        </svg>
+      </div>
+      <figcaption>Timings measured on your real file list, whole home folder. Matching file names rather than full paths is both faster and less noisy.</figcaption>
+    </figure>
+  </div>
+
+  <div class="idea">
+    <h3><span class="num">6</span>Throwing away old searches</h3>
+    <p>Typing "tel plan" starts 8 searches in under a second. Finishing all 8 wastes CPU on searches you no longer want.</p>
+    <p class="analogy">Give each search a ticket number. The kitchen abandons any order whose ticket is no longer the newest, and the waiter throws away any plate with an old ticket.</p>
+    <p>The searchers are threads: workers that share one app's memory, one per CPU core minus one, so the window always has a core free. In a test with a single searcher, 8 fast keystrokes delivered 1 result; the full set of searchers is tested at M1.</p>
+  </div>
+
+  <div class="idea">
+    <h3><span class="num">7</span>Keeping up with new files</h3>
+    <p>Files change all day, and rescanning everything at each launch takes seconds.</p>
+    <p class="analogy">macOS keeps a numbered logbook noting which folders changed. Telescope bookmarks the last entry it read; after a restart it reads only the new entries and re-checks just those folders.</p>
+    <p>The logbook is called FSEvents. On your Mac, catching up on a short gap after a restart took 8 ms, and macOS reported new files 4-12 ms after they were created.</p>
+  </div>
+
+  <div class="idea">
+    <h3><span class="num">8</span>Why macOS keeps Telescope's permissions</h3>
+    <p>Telescope needs <span class="term" tabindex="0" data-tip="A macOS privacy permission the user grants in System Settings. Without it, some folders are invisible to the app.">Full Disk Access</span> to see some folders. If macOS forgot that after every update, you would grant it again each time.</p>
+    <p class="analogy">macOS recognises apps the way a building guard recognises ID cards. By default every build gets a throwaway card that changes each time, so the guard forgets you. One homemade card that never changes keeps you recognised.</p>
+    <p>The card is a code-signing certificate; the throwaway kind is called an ad-hoc signature. The certificate comes with a secret key used to stamp each build, and whoever holds the key can stamp builds that look like yours. Telescope uses one self-signed certificate, valid for 10 years, with the key kept on your Mac. Rebuilds on the same Mac keep their permissions; updates downloaded on other Macs are tested at M2.</p>
+  </div>
+</section>
+
+<section id="measured">
+  <h2>Measured on your Mac</h2>
+  <p class="prose">Every number here was measured on 25 Oct 2026 on your Mac against your own home folder.</p>
+  <div class="stats">
+    <div class="stat"><b>2,355,237</b><span>entries in your home folder; 266,968 are folders and 1,021,914 names are different</span></div>
+    <div class="stat"><b>352,939</b><span>left (15%) after skipping ~/Library, node_modules, .git and hidden folders</span></div>
+    <div class="stat"><b>10.7 s / 2.3 s</b><span>to scan the whole home folder vs only the default folders</span></div>
+    <div class="stat"><b>6-12 ms</b><span>to fuzzy-match every name per keystroke (8 threads); 2-5 ms for the default folders on 4 slow cores (your Mac's power-saving cores, standing in for a cheap PC)</span></div>
+    <div class="stat"><b>0.6-2 s</b><span>per Spotlight search from the command line, and it found only 16 of the 141 files named "telescope"</span></div>
+    <div class="stat"><b>8 ms</b><span>to catch up on a short gap of file changes after a restart (4.1 s at worst); macOS reported new files 4-12 ms after they were created</span></div>
+  </div>
+  <figure>
+    <div class="fig-wrap">
+      <svg class="chart" viewBox="0 0 930 300" role="img" aria-label="Bar chart of memory needed to hold 2.36 million file names: full paths as separate strings 491 MB, one buffer 265 MB, Everything's rule 235 MB, folder numbers with size and date 92 MB, folder numbers names only 66 MB, each name stored once about 50 MB, default folders about 14 MB.">
+        <line class="s-grid" x1="260" y1="26" x2="260" y2="270"/>
+        <line class="s-grid" x1="380" y1="26" x2="380" y2="270"/>
+        <line class="s-grid" x1="500" y1="26" x2="500" y2="270"/>
+        <line class="s-grid" x1="620" y1="26" x2="620" y2="270"/>
+        <line class="s-grid" x1="740" y1="26" x2="740" y2="270"/>
+        <line class="s-grid" x1="860" y1="26" x2="860" y2="270"/>
+        <text class="s-small" x="260" y="290" text-anchor="middle">0</text>
+        <text class="s-small" x="380" y="290" text-anchor="middle">100</text>
+        <text class="s-small" x="500" y="290" text-anchor="middle">200</text>
+        <text class="s-small" x="620" y="290" text-anchor="middle">300</text>
+        <text class="s-small" x="740" y="290" text-anchor="middle">400</text>
+        <text class="s-small" x="860" y="290" text-anchor="middle">500 MB</text>
+
+        <text class="s-text" x="250" y="50" text-anchor="end">Full paths, each stored separately</text>
+        <rect class="s-bar" x="260" y="36" width="589.2" height="20" rx="2"/>
+        <text class="s-val" x="855" y="50">491</text>
+
+        <text class="s-text" x="250" y="84" text-anchor="end">Full paths packed end to end</text>
+        <rect class="s-bar" x="260" y="70" width="318" height="20" rx="2"/>
+        <text class="s-val" x="586" y="84">265</text>
+
+        <text class="s-text" x="250" y="118" text-anchor="end">Everything's rule, 100 MB per 1M</text>
+        <rect class="s-ref" x="260" y="104" width="282" height="20" rx="2"/>
+        <text class="s-val" x="550" y="118">~235</text>
+
+        <text class="s-text" x="250" y="152" text-anchor="end">Folder numbers, plus size and date</text>
+        <rect class="s-bar" x="260" y="138" width="110.4" height="20" rx="2"/>
+        <text class="s-val" x="378" y="152">92</text>
+
+        <text class="s-text" x="250" y="186" text-anchor="end">Folder numbers, names only</text>
+        <rect class="s-bar" x="260" y="172" width="79.2" height="20" rx="2"/>
+        <text class="s-val" x="347" y="186">66</text>
+
+        <text class="s-text" x="250" y="220" text-anchor="end">Plus each name stored once</text>
+        <rect class="s-ref" x="260" y="206" width="60" height="20" rx="2"/>
+        <text class="s-val" x="328" y="220">~50 est.</text>
+
+        <text class="s-text" x="250" y="254" text-anchor="end">Default folders only (353k)</text>
+        <rect class="s-ref" x="260" y="240" width="16.8" height="20" rx="2"/>
+        <text class="s-val" x="285" y="254">~14 est.</text>
+      </svg>
+    </div>
+    <figcaption>Memory needed to hold the names of your 2.36 million entries, in MB. Blue bars were measured on your file list; grey bars are a reference figure from <span class="term" tabindex="0" data-tip="A popular free Windows search tool that lists every file on a drive almost instantly.">Everything</span> (<a href="https://www.voidtools.com/faq/">voidtools FAQ</a>) or an estimate. Storing folder numbers instead of full paths cuts memory about 7 times (491 MB to 66 MB) before any other tuning.</figcaption>
+  </figure>
+</section>
+
+<section id="pains">
+  <h2>What users hate about Spotlight and Windows Search</h2>
+  <p class="prose">About 90 complaints from Apple and Microsoft forums, Hacker News and specialist blogs boil down to 32 distinct pains. These ten matter most, and Telescope can fix all of them. Reddit was unreachable, so Reddit opinion is second-hand only.</p>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Pain</th><th>Evidence</th><th>Telescope's answer</th></tr></thead>
+      <tbody>
+        <tr><td>The system's search breaks, often after an update, and returns no local files</td><td><a href="https://discussions.apple.com/thread/256138998">Tahoe (macOS 26) thread</a>, 227 "me too"; Windows rebuilds take <a href="https://learn.microsoft.com/en-us/answers/a/5951232">4-5 days</a></td><td>Its own index; never depends on Spotlight or Windows Search</td></tr>
+        <tr><td>Installed apps missing from search</td><td><a href="https://discussions.apple.com/thread/255834181">Sequoia (macOS 15) thread</a>, 270 "me too"</td><td>Reads the app folders and the Start Menu directly; apps match on the first keystroke</td></tr>
+        <tr><td>Web, Bing and Siri results bury local files</td><td><a href="https://www.digitaltrends.com/computing/microsoft-is-fixing-a-windows-11-search-issue-that-has-probably-troubled-you-a-dozen-times/">Digital Trends, May 2026</a></td><td>Local only; web search is one optional last row</td></tr>
+        <tr><td>Results take 2-3 s</td><td><a href="https://sixcolors.com/post/2026/04/im-switching-back-from-spotlight-at-least-for-now/">Six Colors</a> went back to LaunchBar</td><td>Always running, with the window built in advance</td></tr>
+        <tr><td>Only matches the start of words; no fuzzy, no typo tolerance</td><td><a href="https://eclecticlight.co/2025/05/29/searching-for-the-file-that-wont-be-found/">Eclectic Light</a></td><td>Fuzzy matching, several words, typo fallback</td></tr>
+        <tr><td>The top result jumps while typing, so Enter opens the wrong item</td><td><a href="https://talk.tidbits.com/t/changes-in-using-spotlight-as-a-launcher-alternatives/32236">TidBITS</a>, <a href="https://news.ycombinator.com/item?id=41337268">HN</a></td><td>Stable ranking; nothing above the selection moves once results show</td></tr>
+        <tr><td>Spotlight never reads the text of some files (bug since Mojave, macOS 10.14)</td><td><a href="https://eclecticlight.co/2026/05/24/last-week-on-my-mac-intel-macs-will-be-stuck-with-bugs/">Eclectic Light</a>; fixed only in macOS 27, which drops Intel Macs</td><td>Its own text search over a list of file types; skipped files are reported</td></tr>
+        <tr><td>Replacement launchers are heavy</td><td>Flow up to 1.4 GB (<a href="https://github.com/Flow-Launcher/Flow.Launcher/issues/2940">#2940</a>); Raycast 2 at <a href="https://raycast.com/blog/a-technical-deep-dive-into-the-new-raycast">350-450 MB</a> before v2.6</td><td>Native window, under 60 MB while idle, checked automatically on every change</td></tr>
+        <tr><td>Reindex rituals that don't last</td><td>"<a href="https://discussions.apple.com/thread/256178172">a week later I'm back</a>"</td><td>An index health view and a one-click rebuild that takes minutes</td></tr>
+        <tr><td>Results don't show where a file lives</td><td><a href="https://discussions.apple.com/thread/254972617">Apple thread</a></td><td>Folder path on every row; keys to reveal it and copy the path</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <div class="cols">
+    <div class="panel">
+      <h3>Out of reach, so never promised</h3>
+      <ul>
+        <li>Stopping the system's own indexer from using CPU and battery</li>
+        <li>Taking over Cmd+Space; you unbind Spotlight yourself</li>
+        <li>Fixing the system Open and Save dialogs</li>
+        <li>Searching inside cloud-only files without downloading them</li>
+        <li>Recents for files opened without leaving any trace</li>
+        <li>Getting Full Disk Access or admin rights silently</li>
+      </ul>
+    </div>
+    <div class="panel">
+      <h3>Traps that look small</h3>
+      <ul>
+        <li>Reading text out of images and scans</li>
+        <li>Reading the text of every file format</li>
+        <li>A text index of the whole disk</li>
+        <li>Live-watching network drives</li>
+        <li>AI or meaning-based search</li>
+        <li>Plugins running inside the app</li>
+        <li>Thumbnail and preview caches</li>
+      </ul>
+    </div>
+  </div>
+</section>
+
+<section id="competitors">
+  <h2>Who already does this</h2>
+  <p class="prose">Raycast 2 and Wox 2.4 are the real competitors. Spotlight and Windows Search are what users are leaving.</p>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Tool</th><th>Runs on</th><th>Licence</th><th>How it finds files</th><th>Memory</th><th>What Telescope adds</th></tr></thead>
+      <tbody>
+        <tr><td class="name">Raycast 2</td><td>macOS, Windows</td><td>Closed, freemium, needs an account</td><td>Own Rust index; asks the system's search for file contents</td><td class="n">350-450 MB<span class="sub">published before v2.6</span></td><td>Open source, no account, several times lighter</td></tr>
+        <tr><td class="name">Wox 2.4</td><td>macOS, Windows, Linux</td><td><span class="term" tabindex="0" data-tip="A licence requiring anything built with the code to be released under the same terms, so it can't be mixed into an MIT or Apache app.">GPL-3</span>, free</td><td>Own index; needs an admin service on Windows; optional content index</td><td class="n">~150 MB daily<span class="sub">about 440-525 MB while indexing</span></td><td>Lighter; a more permissive licence; no admin service</td></tr>
+        <tr><td class="name">Cardinal</td><td>macOS</td><td><span class="term" tabindex="0" data-tip="A permissive licence: anyone may use and change the code, even in closed-source apps. Telescope uses MIT or Apache-2.0.">MIT</span>, free</td><td>Own index built the same way we plan</td><td class="n">Hidden browser</td><td>Fuzzy matching, apps, Windows, no browser inside</td></tr>
+        <tr><td class="name">Everything</td><td>Windows</td><td>Freeware</td><td>Reads the drive's master file list; needs admin or its service</td><td class="n">~100 MB per 1M files</td><td>macOS, fuzzy matching, apps, less memory</td></tr>
+        <tr><td class="name">Spotlight</td><td>macOS</td><td>Built in</td><td>System index; hides hidden folders and ~/Library</td><td class="n">System processes</td><td>Reliability, fuzzy matching, hidden folders</td></tr>
+        <tr><td class="name">Flow, Command Palette</td><td>Windows</td><td>MIT</td><td>None of its own; uses Everything or Windows Search</td><td class="n">Flow 135 MB to 1.4 GB</td><td>Its own index, macOS</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p class="note prose">Dormant or not comparable: Loungy (archived Aug 2026), Gauntlet, Kunkun, Vicinae (uses Spotlight, no Windows), ueli (Electron). Sources: <a href="https://raycast.com/blog/a-technical-deep-dive-into-the-new-raycast">Raycast deep dive</a>, <a href="https://github.com/Wox-launcher/Wox/releases">Wox releases</a>, <a href="https://github.com/cardisoft/cardinal">Cardinal</a>, <a href="https://www.voidtools.com/faq/">voidtools FAQ</a>.</p>
+</section>
+
+<section id="stack">
+  <h2>Tech choices</h2>
+  <p class="prose">Each job was judged on your priority order: speed, then memory, then build speed, then newest tech. Rust libraries are called crates.</p>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Job</th><th>We use</th><th>Instead of</th><th>Why</th></tr></thead>
+      <tbody>
+        <tr><td class="name">App layout</td><td>One app process with a few worker threads</td><td><span class="term" tabindex="0" data-tip="A popular Rust toolkit that draws app windows with a built-in web browser.">Tauri</span>, which adds hidden browser processes</td><td>Each extra process costs 10-15 MB, plus a way for the processes to talk</td></tr>
+        <tr><td class="name">Window</td><td>Swift + <span class="term" tabindex="0" data-tip="Apple's classic toolkit for Mac windows, text fields and lists.">AppKit</span> on macOS. Windows picked at M5: default <span class="term" tabindex="0" data-tip="Windows' original, lightweight way to make windows. Needs no extra runtime.">Win32</span>; reviewers ranked Slint 1.18 first, gpui second</td><td>Tauri + React</td><td>Empty native window: 14 MB. Tauri + React: about 159 MB and about 1 s to first paint</td></tr>
+        <tr><td class="name">Swift talking to Rust</td><td>About 10 hand-written Rust functions in C style</td><td>UniFFI, a code generator</td><td>7.6 <span class="term" tabindex="0" data-tip="Microseconds: millionths of a second. 1,000 µs make 1 ms.">µs</span> vs 130.5 µs per 50 rows; about 1 MB smaller; the Windows window can reuse it</td></tr>
+        <tr><td class="name">Storing names</td><td>Folder numbers in flat lists, each name once</td><td>A list of full paths, SQLite, or tantivy (a Rust search-engine crate)</td><td>66 MB vs 491 MB on your Mac; Vicinae and Spacedrive, two other open-source file tools, moved names out of SQLite</td></tr>
+        <tr><td class="name">Saving the index</td><td>Own file format, memory-mapped; two copies saved in turn</td><td>SQLite, JSON</td><td>No loading step; macOS can drop it from memory while hidden; a crash mid-save leaves the other copy intact</td></tr>
+        <tr><td class="name">First scan</td><td>Parallel folder walk (jwalk or ignore crate) that hands each folder's number to its children</td><td>The same walk plus a path-to-number lookup table</td><td>The lookup table pushed memory to 252 MB while indexing; the walk takes 2.3 s for your default folders</td></tr>
+        <tr><td class="name">New files on macOS</td><td>FSEvents read directly, remembering the last entry</td><td>notify crate</td><td>notify cannot catch up after a restart, so every launch would rescan for 5-15 s</td></tr>
+        <tr><td class="name">New files on Windows</td><td>Normal folder reads plus change notices; Everything when installed</td><td>walkdir + notify</td><td>Everything-level speed without Everything needs admin rights, which also blocks free Microsoft Store signing; an admin helper only after measuring</td></tr>
+        <tr><td class="name">Fuzzy matching</td><td>frizbee 0.13 crate, version pinned; nucleo-matcher as a fallback</td><td>nucleo, skim</td><td>2-5 times faster than nucleo on your names; nucleo's last release was Feb 2024</td></tr>
+        <tr><td class="name">Ranking</td><td>Match quality, exact and prefix bonus, frecency (an open 30 days ago counts half as much as one today), app boost, depth</td><td>Match score alone</td><td>"tele" fuzzy-matches 69,000 names, so order decides usefulness</td></tr>
+        <tr><td class="name">Search inside files</td><td>v1: live search of text and code in the folder you pick</td><td>A text index of the whole home folder</td><td>Whole-disk indexes are how Spotlight breaks; Apple's PDF reader took 1.2-12.6 s per text-heavy PDF</td></tr>
+        <tr><td class="name">PDF and Office text</td><td>v2: pdf_oxide and calamine, in a separate helper with a memory cap</td><td>pdf-extract, Tika</td><td>Broken files crash readers, so a helper keeps the main app safe; MuPDF is AGPL, a stricter GPL that would force Telescope's licence to change</td></tr>
+        <tr><td class="name">Hotkey</td><td>KeyboardShortcuts 3.1.0, a Swift library</td><td>global-hotkey crate</td><td>No permission needed; comes with a "record new shortcut" box. Creating a window takes 150-275 ms, so the window is built once and then shown in about 0.4 ms</td></tr>
+        <tr><td class="name">Shipping</td><td>One .dmg for both Mac chip types on GitHub, self-signed</td><td>Default ad-hoc signing, which changes every build</td><td>Ad-hoc signatures make macOS drop permissions; one fixed certificate keeps them across rebuilds (downloaded updates tested at M2); no Apple fee</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <figure>
+    <div class="fig-wrap">
+      <svg class="chart" viewBox="0 0 930 402" role="img" aria-label="Bar chart of idle memory of an empty window by toolkit: plain macOS window 14 MB, Telescope test app 16 to 18, Slint CPU 24, gpui 29 to 34, iced 41 to 46, Slint GPU 44, egui 49 to 50, Tauri browser layer 60, Tauri plus React 159, Raycast 2 350 to 450.">
+        <line class="s-grid" x1="250" y1="26" x2="250" y2="372"/>
+        <line class="s-grid" x1="383.3" y1="26" x2="383.3" y2="372"/>
+        <line class="s-grid" x1="516.7" y1="26" x2="516.7" y2="372"/>
+        <line class="s-grid" x1="650" y1="26" x2="650" y2="372"/>
+        <line class="s-grid" x1="783.3" y1="26" x2="783.3" y2="372"/>
+        <text class="s-small" x="250" y="392" text-anchor="middle">0</text>
+        <text class="s-small" x="383.3" y="392" text-anchor="middle">100</text>
+        <text class="s-small" x="516.7" y="392" text-anchor="middle">200</text>
+        <text class="s-small" x="650" y="392" text-anchor="middle">300</text>
+        <text class="s-small" x="783.3" y="392" text-anchor="middle">400 MB</text>
+
+        <text class="s-text" x="240" y="50" text-anchor="end">Plain macOS window (the floor)</text>
+        <rect class="s-bar" x="250" y="36" width="18.7" height="20" rx="2"/>
+        <text class="s-val" x="276" y="50">14</text>
+
+        <text class="s-text" x="240" y="84" text-anchor="end">Telescope test app</text>
+        <rect class="s-bar" x="250" y="70" width="21.3" height="20" rx="2"/>
+        <rect class="s-bar-light" x="271.3" y="70" width="2.7" height="20"/>
+        <text class="s-val" x="282" y="84">16-18</text>
+
+        <text class="s-text" x="240" y="118" text-anchor="end">Slint, CPU drawing</text>
+        <rect class="s-bar" x="250" y="104" width="32" height="20" rx="2"/>
+        <text class="s-val" x="290" y="118">24</text>
+
+        <text class="s-text" x="240" y="152" text-anchor="end">gpui</text>
+        <rect class="s-bar" x="250" y="138" width="38.7" height="20" rx="2"/>
+        <rect class="s-bar-light" x="288.7" y="138" width="6.6" height="20"/>
+        <text class="s-val" x="303" y="152">29-34</text>
+
+        <text class="s-text" x="240" y="186" text-anchor="end">iced</text>
+        <rect class="s-bar" x="250" y="172" width="54.7" height="20" rx="2"/>
+        <rect class="s-bar-light" x="304.7" y="172" width="6.6" height="20"/>
+        <text class="s-val" x="319" y="186">41-46</text>
+
+        <text class="s-text" x="240" y="220" text-anchor="end">Slint, GPU drawing</text>
+        <rect class="s-bar" x="250" y="206" width="58.7" height="20" rx="2"/>
+        <text class="s-val" x="317" y="220">44</text>
+
+        <text class="s-text" x="240" y="254" text-anchor="end">egui</text>
+        <rect class="s-bar" x="250" y="240" width="65.3" height="20" rx="2"/>
+        <rect class="s-bar-light" x="315.3" y="240" width="1.4" height="20"/>
+        <text class="s-val" x="324" y="254">49-50</text>
+
+        <text class="s-text" x="240" y="288" text-anchor="end">Tauri browser layer alone</text>
+        <rect class="s-bar" x="250" y="274" width="80" height="20" rx="2"/>
+        <text class="s-val" x="338" y="288">~60, 4 processes</text>
+
+        <text class="s-text" x="240" y="322" text-anchor="end">Tauri + React app</text>
+        <rect class="s-ref" x="250" y="308" width="212" height="20" rx="2"/>
+        <text class="s-val" x="470" y="322">~159, reported</text>
+
+        <text class="s-text" x="240" y="356" text-anchor="end">Raycast 2</text>
+        <rect class="s-ref" x="250" y="342" width="466.7" height="20" rx="2"/>
+        <rect class="s-ref-light" x="716.7" y="342" width="133.3" height="20"/>
+        <text class="s-val" x="858" y="356">350-450</text>
+      </svg>
+    </div>
+    <figcaption>Memory of an empty window per UI toolkit, in MB of <span class="term" tabindex="0" data-tip="Memory that belongs to the app alone, the number in Activity Monitor's Memory column.">footprint</span>. Slint, gpui, iced and egui are Rust toolkits that draw windows without a browser. Blue bars were measured on your Mac; grey bars are published figures. The Telescope test app ran with a stand-in core, and two ways of measuring it differ by about 6 MB. Raycast published 350-450 MB before v2.6, which roughly halved one of its processes. No Windows numbers exist yet.</figcaption>
+  </figure>
+</section>
+
+<section id="macos-app">
+  <h2>The macOS app</h2>
+  <p class="prose">The Swift side only draws rows and passes keys along. These numbers come from small test apps with a stand-in Rust core on your Mac, with the window kept off-screen so the tests never took your focus.</p>
+  <div class="stats">
+    <div class="stat"><b>7.6 µs</b><span>to hand 50 rows from Rust to Swift; the UniFFI generator took 130.5 µs</span></div>
+    <div class="stat"><b>2.7-3.4 ms</b><span>to redraw 50 rows in AppKit by rewriting the visible ones; a <span class="term" tabindex="0" data-tip="Apple's newer UI toolkit. You describe the screen and it updates itself, much like React.">SwiftUI</span> list took 16-20 ms</span></div>
+    <div class="stat"><b>16-18 MB</b><span>for the AppKit window while idle (SwiftUI: 19-20 MB); two measuring methods differ by about 6 MB</span></div>
+    <div class="stat"><b>+0.3 MB</b><span>added by the Rust core per chip type; the whole test app is 368 KB</span></div>
+    <div class="stat"><b>~0.4 ms</b><span>to show the ready-made window; the very first show costs 30-50 ms, so it happens off-screen at launch</span></div>
+    <div class="stat"><b>8 &rarr; 1</b><span>8 fast keystrokes delivered 1 result; proven with one searcher, not yet with all of them</span></div>
+  </div>
+  <figure>
+    <div class="fig-wrap">
+      <svg viewBox="0 0 960 540" role="img" aria-label="Sequence of one search between Swift and Rust: the hotkey warms up the index, each keystroke sends a search with a ticket number, Rust signals the ticket is ready, Swift copies the 50 rows and Rust frees its copy, Swift redraws the visible rows; the indexer reports progress at most 10 times a second.">
+        <defs>
+          <marker id="m3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="s-head" d="M0,0 L10,5 L0,10 z"/></marker>
+        </defs>
+        <rect class="s-box-hi" x="160" y="12" width="280" height="40" rx="8"/>
+        <text class="s-title" x="300" y="37" text-anchor="middle">Swift window (main thread)</text>
+        <rect class="s-box" x="520" y="12" width="280" height="40" rx="8"/>
+        <text class="s-title" x="660" y="37" text-anchor="middle">Rust core (worker threads)</text>
+        <line class="s-frame" x1="300" y1="52" x2="300" y2="528"/>
+        <line class="s-frame" x1="660" y1="52" x2="660" y2="528"/>
+
+        <text class="s-text" x="288" y="96" text-anchor="end">Hotkey: show the ready-made window</text>
+        <text class="s-small" x="288" y="113" text-anchor="end">about 0.4 ms</text>
+        <line class="s-arrow" x1="301" y1="104" x2="657" y2="104" marker-end="url(#m3)"/>
+        <text class="s-text" x="480" y="96" text-anchor="middle">1. warm up the index</text>
+        <text class="s-text" x="672" y="96">Touch the index pages</text>
+        <text class="s-small" x="672" y="113">they may have left memory during a long idle</text>
+
+        <text class="s-text" x="288" y="156" text-anchor="end">You type; this search gets ticket 7</text>
+        <text class="s-small" x="288" y="173" text-anchor="end">not sent mid-word in Japanese or Chinese</text>
+        <line class="s-arrow" x1="301" y1="164" x2="657" y2="164" marker-end="url(#m3)"/>
+        <text class="s-text" x="480" y="156" text-anchor="middle">2. search "tel plan", ticket 7</text>
+        <text class="s-text" x="672" y="156">Answers in under 0.1 ms</text>
+        <text class="s-small" x="672" y="173">and wakes the searchers</text>
+
+        <rect class="s-box" x="672" y="196" width="272" height="56" rx="8"/>
+        <text class="s-title" x="688" y="220">Searchers (cores minus 1)</text>
+        <text class="s-small" x="688" y="240">drop the work if a newer ticket arrives</text>
+
+        <line class="s-arrow" x1="659" y1="292" x2="303" y2="292" marker-end="url(#m3)"/>
+        <text class="s-text" x="480" y="284" text-anchor="middle">3. ticket 7 is ready</text>
+        <text class="s-text" x="672" y="284">Sent from a Rust worker</text>
+        <text class="s-small" x="672" y="301">carries the ticket number only</text>
+        <text class="s-text" x="288" y="284" text-anchor="end">Move to the main thread</text>
+        <text class="s-small" x="288" y="301" text-anchor="end">ignore it if 7 is no longer the newest</text>
+
+        <line class="s-arrow" x1="301" y1="352" x2="657" y2="352" marker-end="url(#m3)"/>
+        <text class="s-text" x="480" y="344" text-anchor="middle">4. take 50 rows, then free them</text>
+        <text class="s-text" x="672" y="344">Hands over the top 50 rows</text>
+        <text class="s-small" x="672" y="361">and frees its own copy</text>
+        <text class="s-text" x="288" y="344" text-anchor="end">Copy the 50 rows into Swift</text>
+        <text class="s-small" x="288" y="361" text-anchor="end">nothing points back into Rust</text>
+
+        <rect class="s-box-hi" x="16" y="388" width="272" height="56" rx="8"/>
+        <text class="s-title" x="32" y="412">Redraw the visible rows</text>
+        <text class="s-small" x="32" y="432">2.7-3.4 ms on your Mac</text>
+
+        <line class="s-arrow" x1="659" y1="488" x2="303" y2="488" marker-end="url(#m3)"/>
+        <text class="s-text" x="480" y="480" text-anchor="middle">5. indexing progress</text>
+        <text class="s-text" x="672" y="480">Indexer</text>
+        <text class="s-small" x="672" y="497">at most 10 updates a second</text>
+        <text class="s-text" x="288" y="480" text-anchor="end">Index health view</text>
+        <text class="s-small" x="288" y="497" text-anchor="end">never floods the window</text>
+      </svg>
+    </div>
+    <figcaption>One search through the hatch. Swift only ever calls Rust from the <span class="term" tabindex="0" data-tip="The one thread allowed to touch the window. If it waits on anything, the app freezes.">main thread</span> and never waits for an answer. Rust never pushes rows on its own: it only says which ticket is ready, and Swift then asks for the 50 rows. An old search is dropped twice: by the searchers and by the ticket check in Swift.</figcaption>
+  </figure>
+  <div class="cols pairs">
+    <div class="panel">
+      <h3>The window</h3>
+      <ul>
+        <li>Built once at launch, then only shown and hidden.</li>
+        <li>Telescope never takes over as the active app, so the app you came from gets focus back when the window closes.</li>
+        <li>Opens on the current <span class="term" tabindex="0" data-tip="A macOS virtual desktop. Swiping with three fingers moves between Spaces.">Space</span> and over full-screen apps.</li>
+        <li>Japanese and Chinese typing work: no search runs while the <span class="term" tabindex="0" data-tip="Input method editor: the system that turns keystrokes into characters for languages like Chinese or Japanese.">IME</span> is still composing a word.</li>
+        <li>Settings and the index health view use SwiftUI, which is fine for windows opened rarely.</li>
+      </ul>
+    </div>
+    <div class="panel">
+      <h3>Keys</h3>
+      <ul>
+        <li>Cmd+Shift+Space shows or hides it; you can change it.</li>
+        <li>Enter opens; Cmd+Enter shows it in Finder.</li>
+        <li>Tab searches inside the selected folder.</li>
+        <li>Cmd+Shift+C copies the path; Cmd+I opens the details pane.</li>
+        <li>Cmd+Y opens <span class="term" tabindex="0" data-tip="The macOS preview you get by pressing Space on a file in Finder.">Quick Look</span>; Space does too while the search box is empty.</li>
+        <li>Search in the current Finder folder has no default key and asks for Finder access the first time you use it.</li>
+      </ul>
+    </div>
+    <div class="panel">
+      <h3>Keeping the hatch safe</h3>
+      <ul>
+        <li>JavaScript cleans up memory for you; at the hatch, nobody does. If Swift kept a <span class="term" tabindex="0" data-tip="An address saying where some data sits in memory, like a locker number.">pointer</span> to Rust's results after Rust <span class="term" tabindex="0" data-tip="Gave the memory back so it can be reused for something else.">freed</span> them, it would read garbage or crash. So Swift copies the 50 rows, and Rust frees its own copy right away.</li>
+        <li>Every Rust function at the hatch catches <span class="term" tabindex="0" data-tip="Rust's emergency stop when it hits a bug. If one crossed into Swift, the whole app would close.">panics</span> and returns an error code, so a Rust bug shows an error instead of closing the app.</li>
+        <li>The app checks at launch that Swift and Rust agree on the hatch version, and <span class="term" tabindex="0" data-tip="Continuous integration: GitHub machines that build and test every change automatically.">CI</span> fails if they drift apart.</li>
+        <li>All the risky pointer code on the Swift side sits in one file.</li>
+      </ul>
+    </div>
+    <div class="panel">
+      <h3>Build and ship</h3>
+      <ul>
+        <li>One script builds the Rust core for Apple Silicon and Intel and merges them into one compiled file. Xcode, Apple's app builder, packs it into the app, much like a bundler pulls in a dependency.</li>
+        <li>Runs on macOS 13 or later.</li>
+        <li>One app for both chip types, in a .dmg on GitHub Releases, plus a one-command build from source.</li>
+        <li>Signed with the 10-year self-signed certificate on your Mac, never on CI machines.</li>
+        <li>Without Apple's $99 a year ID the app is not <span class="term" tabindex="0" data-tip="Scanned and approved by Apple. It needs the paid Apple Developer ID.">notarized</span>, so <span class="term" tabindex="0" data-tip="The macOS check that blocks downloaded apps Apple has not approved until the user allows them.">Gatekeeper</span> stops the first launch. Each user opens the app, then System Settings, Privacy &amp; Security, Open Anyway. <a href="https://developer.apple.com/news/?id=saqachfa">Control-click no longer skips this</a> since macOS 15.</li>
+        <li>The optional update check only links to the new .dmg; nothing installs itself.</li>
+      </ul>
+    </div>
+  </div>
+</section>
+
+<section id="targets">
+  <h2>Speed and memory targets</h2>
+  <p class="prose">Final targets for the finished app. Timing targets for keystrokes and hotkey presses must hold 95% of the time. CI and every milestone check against these; milestone limits differ because each milestone tests only one piece.</p>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>What</th><th>Target</th><th>Based on</th></tr></thead>
+      <tbody>
+        <tr><td>Hotkey to visible window</td><td class="n">under 50 ms on your Mac<span class="sub">under 100 ms on a low-end PC</span></td><td>The ready-made window shows in about 0.4 ms; drawing the first frame is the rest. Milestone M1 times only the app's own share, 4 ms</td></tr>
+        <tr><td>Keystroke to results</td><td class="n">under 5 ms, default folders<span class="sub">under 30 ms whole home folder; under 50 ms low-end PC</span></td><td>Measured on 4 slow cores: 2-5 ms default folders, 12-31 ms whole home folder</td></tr>
+        <tr><td>Results to screen</td><td class="n">under 4 ms on your Mac</td><td>Measured 7.6 µs to hand over 50 rows and 2.7-3.4 ms to draw them</td></tr>
+        <tr><td>Memory while idle</td><td class="n">under 60 MB<span class="sub">aim for 40 MB</span></td><td>Measured 16-18 MB for the window with a stand-in core, plus 12-18 MB of index (estimate)</td></tr>
+        <tr><td>Index memory</td><td class="n">12-18 MB, default folders<span class="sub">75-105 MB whole home folder</span></td><td>Estimate: 66 MB of names, 92 MB with sizes and dates, plus about 8 MB of letter fingerprints. The whole home folder is an opt-in switch</td></tr>
+        <tr><td>Peak memory while indexing</td><td class="n">under 150 MB, whole home folder</td><td>A prototype peaked at 252 MB from temporary lookup tables, which the design leaves out</td></tr>
+        <tr><td>First index</td><td class="n">under 3 s, default folders</td><td>Measured 2.3 s for 353k entries</td></tr>
+        <tr><td>Restart to searchable</td><td class="n">under 300 ms</td><td>The saved index is searchable as soon as it is opened, while the indexer catches up in the background. Catching up took 8 ms for a short gap and 4.1 s at worst</td></tr>
+        <tr><td>New file findable</td><td class="n">under 1 s</td><td>macOS reported new files 4-12 ms after they were created</td></tr>
+        <tr><td>CPU while hidden</td><td class="n">0%</td><td>Wakes only on change notes; no timers, no rescans</td></tr>
+        <tr><td>App size</td><td class="n">under 3 MB</td><td>The test app is 368 KB with the Rust core inside</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<section id="milestones">
+  <h2>Milestones</h2>
+  <p class="prose">Ordered so the riskiest guesses get tested first. Windows builds and core tests run on CI from the first commit; Windows features start once the Mac version is your daily driver. Effort assumes 2-3 evenings or one weekend day a week; multiply it by 1.5-2 while Rust is new.</p>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Milestone</th><th>What you get</th><th>Done when</th><th>Likely new to you</th><th>Effort</th></tr></thead>
+      <tbody>
+        <tr><td class="name">M0 engine</td><td>A command-line search over your real file list</td><td>On the full 2.36M-entry list: under 100 MB normally and 150 MB at peak; 95% of searches under 15 ms on your Mac (8 threads) and 40 ms on 4 slow cores; 8 fast searches with all searchers running deliver 2 results or fewer; the expected file is in the top 3 for 16 of your 20 <span class="term" tabindex="0" data-tip="Your list of 20 real searches, each with the file you expect on top. Rerun after every ranking change.">golden set</span> searches</td><td>Rust basics: <span class="term" tabindex="0" data-tip="Rust's build tool and package downloader, like npm.">Cargo</span>, <span class="term" tabindex="0" data-tip="Rust's way to group fields into one type, like a TypeScript interface that holds data.">structs</span>, <span class="term" tabindex="0" data-tip="Rust's growable list, like a JavaScript array.">vectors</span>, <span class="term" tabindex="0" data-tip="Rust's rule for who may use a piece of data and when. The compiler checks it before the program runs; it is what new Rust users struggle with most.">borrowing</span>, threads</td><td class="n">4-8 evenings</td></tr>
+        <tr><td class="name">M1 window</td><td>The Spotlight feel: the Swift window over a stand-in core with 1M made-up names</td><td>95% of the time: window drawn within 4 ms of the hotkey (timed inside the app) and results within 25 ms of a keystroke; 8 fast keystrokes with all searchers running show 2 results or fewer, and the last search always wins; focus returns to your previous app 20 of 20 times; works over full-screen apps; Japanese and Chinese typing never open a result mid-word; hidden with the stand-in core: under 22 MB and 0% CPU; builds in <span class="term" tabindex="0" data-tip="Swift's strictest setting, which catches threading mistakes before the app runs.">Swift 6 mode</span>; permissions survive 5 rebuilds; a downloaded .dmg opens through Open Anyway in 4 steps or fewer</td><td>Swift, AppKit, Xcode, calling Rust from Swift, code signing</td><td class="n">2-4 weekends<span class="sub">estimate</span></td></tr>
+        <tr><td class="name">M2 daily driver</td><td>It replaces opening folders one by one</td><td>You use it 7 days straight; 95% of searches under 30 ms; new files appear within 1 s; Full Disk Access survives an update installed from a downloaded .dmg</td><td>FSEvents, macOS permissions</td><td class="n">3-6 weekends</td></tr>
+        <tr><td class="name">M3 beats Spotlight</td><td>Quality that compounds</td><td>Frecency, Tab into a folder, apps, saved index with a restart under 300 ms, index health view, current-Finder-folder hotkey, Cmd+I details pane; 18 of 20 golden searches</td><td>Ranking, saving and loading the index file</td><td class="n">4-8 weekends</td></tr>
+        <tr><td class="name">M4 text search</td><td>Search inside text and code files</td><td>Live search in folders you choose; name results never wait for it; never downloads iCloud files</td><td>Fast file reading</td><td class="n">2-4 weekends</td></tr>
+        <tr><td class="name">M5 Windows</td><td>The low-end PC promise</td><td>A Windows window picked by a test build (default Win32), a scanner without admin rights, change notices, Everything support, Start Menu and Store apps, an MSIX package (Windows' modern app package format). On a low-end PC: hotkey under 100 ms, idle under 60 MB, searches under 50 ms</td><td>Windows system calls from Rust</td><td class="n">6-12 weekends<span class="sub">least certain</span></td></tr>
+        <tr><td class="name">v2</td><td>Search inside PDF and Office files</td><td>Text reading in a separate helper with a memory cap; optional per-folder index</td><td>PDF and Office file formats</td><td class="n">open-ended</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<section id="risks">
+  <h2>Risks</h2>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Risk</th><th>Chance</th><th>Damage</th><th>What we do</th><th>Early warning</th></tr></thead>
+      <tbody>
+        <tr><td>The project stalls, as three Rust launchers did</td><td>High</td><td>Fatal</td><td>A fixed out-of-scope list and a time limit per milestone</td><td>M0 not done after about 8 evenings</td></tr>
+        <tr><td>The wrong file comes first: "tele" fuzzy-matches 69,000 names</td><td>High</td><td>High</td><td>Match names, not full paths; bonuses; frecency; golden set</td><td>M0 golden set score</td></tr>
+        <tr><td>The index goes stale; Cardinal lost 237 batches of changes (<a href="https://github.com/cardisoft/cardinal/issues/229">#229</a>)</td><td>High</td><td>Medium-high</td><td>Rescan whenever macOS says notes were lost; resume from the saved logbook entry</td><td>M2: run git clone and npm install while it is open, then compare with a fresh scan</td></tr>
+        <tr><td>Six new things at once: Rust, Swift, AppKit, the C hatch, Xcode, code signing</td><td>High</td><td>Medium-high (slower)</td><td>Keep the Swift side thin; SwiftUI for settings; a ready-made hotkey library</td><td>M1, first weekend</td></tr>
+        <tr><td>No Windows PC, so the low-end PC promise is untested</td><td>High</td><td>High on Windows</td><td>CI plus testers; a cheap used laptop before M5</td><td>M5 day 1: time a first scan of C:\Users right after a reboot</td></tr>
+        <tr><td>The Windows scan is too slow on a hard disk, with no logbook after a restart</td><td>Medium</td><td>High</td><td>Fewer folders, saved index, a quick folder-date check, optional Everything or admin helper</td><td>M5 day 1</td></tr>
+        <tr><td>macOS forgets Full Disk Access after a rebuild or update</td><td>High if ad-hoc signed (the default)</td><td>Medium-high</td><td>The same self-signed certificate on every build; permission status in the health view</td><td>M1: 5 rebuilds. M2: update from a downloaded .dmg</td></tr>
+        <tr><td>A bug at the hatch closes the app: a Rust panic, or Swift reading freed memory</td><td>Medium</td><td>High</td><td>Catch panics at the hatch; copy rows across; risky code in one file</td><td>M1</td></tr>
+        <tr><td>The first keystroke stalls on a 4 GB Mac with a hard disk after a long idle</td><td>Medium-high</td><td>High</td><td>Warm up the index when the hotkey fires; keep the letter fingerprints (about 8 MB) in memory if needed</td><td>M1: first keystroke after clearing memory</td></tr>
+        <tr><td>The signing key leaks, so anyone could sign a fake Telescope that keeps users' Full Disk Access</td><td>Low</td><td>High</td><td>Sign only on your Mac, never on CI machines; keep the key offline</td><td>None until it happens</td></tr>
+        <tr><td>Text search downloads iCloud or OneDrive files</td><td>Medium</td><td>High</td><td>Check whether a file is cloud-only before opening it; skip cloud folders</td><td>M4</td></tr>
+        <tr><td>Intel Macs fade: macOS 26 is the last version for Intel</td><td>Certain</td><td>Medium</td><td>Test the Intel build on GitHub's Intel machines</td><td>GitHub retiring its Intel machines</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<section id="decisions">
+  <h2>Decisions</h2>
+  <h3>Settled</h3>
+  <dl class="settled">
+    <div><dt>Goal</dt><dd>Your daily driver, open source, donations welcome</dd></div>
+    <div><dt>Priority order</dt><dd>Speed, then memory, then build speed, then newest tech</dd></div>
+    <div><dt>Weakest machine</dt><dd>4 GB of memory, a hard disk, Windows 10; Intel Macs included</dd></div>
+    <div><dt>Rust experience</dt><dd>New to it</dd></div>
+    <div><dt>Platforms</dt><dd>Mac first; Windows built and tested on CI from the first commit, then tested by others</dd></div>
+    <div><dt>What gets indexed</dt><dd>Folders you use plus exceptions; an "index everything" switch</dd></div>
+    <div><dt>Search inside files</dt><dd>v1 text, code, markdown; v2 PDF and Office</dd></div>
+    <div><dt>Fuzzy matching</dt><dd>Letters in order, several words, typo tolerance, fzf-style operators such as ^ for "starts with" and ! to exclude</dd></div>
+    <div><dt>Typo tolerance</dt><dd>Only when nothing matches without typos</dd></div>
+    <div><dt>Window shape</dt><dd>Popup, Tab into a folder, Cmd+I details pane</dd></div>
+    <div><dt>v1 extras</dt><dd>Index health and rebuild, search in the current Finder folder, web search as the last row</dd></div>
+    <div><dt>Network</dt><dd>None by default; update check is opt-in</dd></div>
+    <div><dt>Licence</dt><dd>MIT OR Apache-2.0</dd></div>
+    <div><dt>Window approach</dt><dd>A native window per system around one Rust core</dd></div>
+    <div><dt>macOS window</dt><dd>Swift + AppKit with the Rust core linked in; SwiftUI for settings</dd></div>
+    <div><dt>Windows PC window</dt><dd>Picked by a test build at M5; default Win32</dd></div>
+    <div><dt>Windows indexing</dt><dd>No admin rights; Everything as a helper when installed</dd></div>
+    <div><dt>Searching file contents</dt><dd>Own search only; never through Spotlight or Windows Search</dd></div>
+    <div><dt>Apple fees</dt><dd>Never paid: no Developer ID, no notarization</dd></div>
+    <div><dt>Mac download</dt><dd>.dmg on GitHub Releases plus a one-command build from source</dd></div>
+    <div><dt>Release signing</dt><dd>One 10-year self-signed certificate, used only on your Mac</dd></div>
+    <div><dt>Hotkey</dt><dd>Cmd+Shift+Space on macOS; Windows combo picked at M5</dd></div>
+    <div><dt>Quick Look key</dt><dd>Cmd+Y; Space only while the search box is empty</dd></div>
+    <div><dt>Look</dt><dd>Solid background; blur and Liquid Glass (macOS 26's see-through style) are opt-in settings</dd></div>
+    <div><dt>Intel Mac testing</dt><dd>GitHub's Intel machines plus testers, like Windows</dd></div>
+    <div><dt>Name</dt><dd>Telescope is a codename; rename before the first public release</dd></div>
+  </dl>
+  <h3>Defaults, taken unless you object</h3>
+  <p class="prose note">Each is a reviewer's recommendation you haven't picked yourself.</p>
+  <dl class="settled">
+    <div><dt>The hatch</dt><dd>About 10 hand-written Rust functions in C style, rows copied across</dd></div>
+    <div><dt>Hotkey library</dt><dd>KeyboardShortcuts 3.1.0 (MIT), with a built-in box to record a new shortcut</dd></div>
+    <div><dt>Finder access</dt><dd>Asked the first time you use the Finder-folder hotkey, never at launch</dd></div>
+    <div><dt>Packaging</dt><dd>One app for Apple Silicon and Intel, about 0.3 MB bigger</dd></div>
+  </dl>
+</section>
+
+<section id="unverified">
+  <h2>Still unverified</h2>
+  <p class="prose">None of these blocks M0. Each one is settled by building the part it is about.</p>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Not yet proven</th><th>Why it is open</th><th>Settled by</th></tr></thead>
+      <tbody>
+        <tr><td>Cancelling old searches across all searchers</td><td>The test used a single searcher</td><td class="name">M0, again at M1</td></tr>
+        <tr><td>Keyboard focus, Japanese and Chinese typing, and Quick Look inside the window</td><td>Every test kept the window from taking focus</td><td class="name">M1, by hand</td></tr>
+        <tr><td>Whether hotkey presses arrive at all, on any macOS version</td><td>Only registering the hotkey on macOS 26.6 was tested</td><td class="name">M1</td></tr>
+        <tr><td>Whether Open Anyway still works on macOS 15.1</td><td>OSNews says 15.1 removed every way around Gatekeeper; Apple says Open Anyway remains</td><td class="name">M1 download test<span class="sub">needs a macOS 15 VM or a tester</span></td></tr>
+        <tr><td>Whether permissions tied to the self-signed certificate survive an update downloaded on another Mac</td><td>Sources only cover rebuilds on the same Mac</td><td class="name">M2</td></tr>
+        <tr><td>How long a scan without admin rights takes on a cold Windows hard disk</td><td>The estimate is minutes per million files</td><td class="name">M5 day 1</td></tr>
+        <tr><td>Whether Windows updates a folder's date on every create, delete and rename</td><td>The Windows catch-up check relies on it</td><td class="name">M5</td></tr>
+        <tr><td>Anything on Windows, a real Intel Mac, or a hard disk</td><td>Every number so far is from your Mac</td><td class="name">M5 and testers</td></tr>
+        <tr><td>Wox's 150 MB daily figure</td><td>Its release notes only say memory dropped "roughly in half"</td><td class="name">Never needed<span class="sub">changes the comparison, not the build</span></td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<section id="next">
+  <h2>Next steps</h2>
+  <ol class="prose">
+    <li>Write your golden set: 20 real searches, each with the file you expect at the top.</li>
+    <li>M0: build the search engine as a command-line tool against your real file list.</li>
+    <li>M1: the Swift window over a stand-in core.</li>
+  </ol>
+</section>
+
+<footer>
+  Versions checked on 25 Oct 2026: frizbee 0.13.0, nucleo-matcher 0.3.1, notify 8.2.1, slint 1.18.1, tauri 2.12.5, UniFFI 0.32.2, KeyboardShortcuts 3.1.0. Test apps built with Xcode 27.1 (Swift 6.4) on macOS 26.6.2. Your file list stays on your Mac and is never published.
+</footer>
+
+</div>
+</body>
+</html>
