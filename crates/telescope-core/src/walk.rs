@@ -14,7 +14,7 @@ pub struct Scan {
     pub unreadable_folders: usize,
 }
 
-/// Hidden folders, node_modules and ~/Library hold most of a home folder's entries,
+/// Hidden folders, node_modules, ~/Library and ~/go/pkg/mod hold most of a home folder's entries,
 /// and almost nobody searches them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Clutter {
@@ -68,6 +68,7 @@ fn is_clutter(folder: &Path, name: &OsStr, home: &Path) -> bool {
     name.as_encoded_bytes().starts_with(b".")
         || name == "node_modules"
         || (name == "Library" && folder == home)
+        || (name == "mod" && folder.strip_prefix(home) == Ok(Path::new("go/pkg")))
 }
 
 /// Each job carries its folder's number, so no path-to-number table is needed.
@@ -222,5 +223,12 @@ mod tests {
             OsStr::new("Library"),
             home
         ));
+    }
+
+    #[test]
+    fn go_downloads_are_clutter_only_in_the_home_folder() {
+        let home = Path::new("/Users/ana");
+        assert!(is_clutter(&home.join("go/pkg"), OsStr::new("mod"), home));
+        assert!(!is_clutter(&home.join("work/pkg"), OsStr::new("mod"), home));
     }
 }
