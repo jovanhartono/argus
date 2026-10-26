@@ -256,11 +256,17 @@ fn match_names(
                 for (w, matcher) in matchers.iter_mut().enumerate() {
                     ids.clear();
                     texts.clear();
+                    // "zshrc" should find .zshrc as readily as zshrc.bak; typing ".zsh" keeps the dot.
+                    let keep_dot = words[w].needle.starts_with('.');
                     for n in first..first + bits.len() {
                         let absent = (needed[w] & !index.name_letters[n]).count_ones();
                         if absent <= u32::from(typos(w)) {
+                            let text = index.name_text(n as NameId);
                             ids.push(n - first);
-                            texts.push(index.name_text(n as NameId));
+                            texts.push(match text.strip_prefix('.') {
+                                Some(hidden) if !keep_dot => hidden,
+                                _ => text,
+                            });
                         }
                     }
                     for found in matcher.match_list(texts) {
@@ -270,7 +276,11 @@ fn match_names(
                         if wanted >> w & 1 == 1 {
                             let mut score = found.score;
                             match held_in(texts[found.index as usize], &words[w].needle) {
-                                Held::Alone => {
+                                how @ (Held::Whole | Held::Alone) => {
+                                    if matches!(how, Held::Whole) && !found.exact {
+                                        score =
+                                            score.saturating_add(config.scoring.exact_match_bonus);
+                                    }
                                     score = score.saturating_add(WHOLE_WORD_BONUS);
                                     held |= 1 << w;
                                 }
@@ -287,12 +297,13 @@ fn match_names(
         .try_reduce(|| (0, 0), |a, b| Some((a.0 | b.0, a.1 | b.1)))
 }
 
-/// How a name holds a typed word, letter for letter: "nib" stands alone in "NIB.pdf",
-/// sits inside "nibble.go", and is not held by "nimble.go".
+/// How a name holds a typed word, letter for letter: "nib" is the whole of "NIB.pdf" bar its
+/// extension, stands alone in "my NIB.pdf", sits inside "nibble.go", and is not held by "nimble.go".
 enum Held {
     No,
     Inside,
     Alone,
+    Whole,
 }
 
 fn held_in(name: &str, word: &str) -> Held {
@@ -306,7 +317,11 @@ fn held_in(name: &str, word: &str) -> Held {
     for (i, window) in name.windows(word.len()).enumerate() {
         if window.eq_ignore_ascii_case(word) {
             if !alphanumeric(name[..i].last()) && !alphanumeric(name.get(i + word.len())) {
-                return Held::Alone;
+                return match &name[i + word.len()..] {
+                    [] if i == 0 => Held::Whole,
+                    [b'.', extension @ ..] if i == 0 && !extension.contains(&b'.') => Held::Whole,
+                    _ => Held::Alone,
+                };
             }
             result = Held::Inside;
         }
@@ -454,6 +469,32 @@ mod tests {
         builder.push("plan.md", deep, false);
         let index = builder.finish();
         assert_eq!(first(&index, "plan"), "/home/a/plan.md");
+    }
+
+    #[test]
+    fn the_word_plus_an_extension_beats_a_longer_name_above_it() {
+        let mut builder = IndexBuilder::new();
+        let root = builder.push("/home", NO_PARENT, true);
+        let ui = builder.push("ui", root, true);
+        builder.push("button.tsx", ui, false);
+        builder.push("button-submit.tsx", root, false);
+        builder.push("button.test.tsx", root, false);
+        let index = builder.finish();
+        assert_eq!(first(&index, "button"), "/home/ui/button.tsx");
+    }
+
+    #[test]
+    fn upper_case_names_and_dotfiles_count_as_the_whole_name() {
+        let mut builder = IndexBuilder::new();
+        let root = builder.push("/home", NO_PARENT, true);
+        let deep = builder.push("a", root, true);
+        builder.push("NIB.pdf", deep, false);
+        builder.push(".zshrc", deep, false);
+        builder.push("nib-old.pdf", root, false);
+        builder.push("zshrc-notes.md", root, false);
+        let index = builder.finish();
+        assert_eq!(first(&index, "nib"), "/home/a/NIB.pdf");
+        assert_eq!(first(&index, "zshrc"), "/home/a/.zshrc");
     }
 
     #[test]
