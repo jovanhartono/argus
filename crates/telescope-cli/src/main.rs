@@ -10,7 +10,7 @@ const USAGE: &str = "usage:
   tl search <folder>                      scan, then search each line you type
   tl bench <folder> <queries> [threads]   time every keystroke of each query
   tl golden <folder> <golden>             rank the expected file of each search
-add --all to include hidden folders, node_modules and ~/Library";
+add --all to include hidden folders, node_modules, ~/Library and ~/go/pkg/mod";
 
 fn main() -> ExitCode {
     let mut args: Vec<OsString> = std::env::args_os().skip(1).collect();
