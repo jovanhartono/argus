@@ -10,7 +10,7 @@ jobs:
     # macOS tests run on the dev Mac; add a macOS job once the repo is public and its minutes are free.
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
