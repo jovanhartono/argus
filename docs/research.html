@@ -509,7 +509,7 @@ footer { border-top: 1px solid var(--line); margin-top: 32px; padding-top: 20px;
         <tr><td class="name">New files on macOS</td><td>FSEvents read directly, remembering the last entry</td><td>notify crate</td><td>notify cannot catch up after a restart, so every launch would rescan for 5-15 s</td></tr>
         <tr><td class="name">New files on Windows</td><td>Normal folder reads plus change notices; Everything when installed</td><td>walkdir + notify</td><td>Everything-level speed without Everything needs admin rights, which also blocks free Microsoft Store signing; an admin helper only after measuring</td></tr>
         <tr><td class="name">Fuzzy matching</td><td>frizbee 0.13 crate, version pinned; nucleo-matcher as a fallback</td><td>nucleo, skim</td><td>2-5 times faster than nucleo on your names; nucleo's last release was Feb 2024</td></tr>
-        <tr><td class="name">Ranking</td><td>Match quality, exact and prefix bonus, frecency (an open 30 days ago counts half as much as one today), app boost, depth</td><td>Match score alone</td><td>"tele" fuzzy-matches 69,000 names, so order decides usefulness</td></tr>
+        <tr><td class="name">Ranking</td><td>Match quality, a bonus when a word stands alone in the name, words found in a folder above, depth, the shorter name on ties; later frecency (an open 30 days ago counts half as much as one today) and an app boost</td><td>Match score alone</td><td>"tele" fuzzy-matches 69,000 names, so order decides usefulness</td></tr>
         <tr><td class="name">Search inside files</td><td>v1: live search of text and code in the folder you pick</td><td>A text index of the whole home folder</td><td>Whole-disk indexes are how Spotlight breaks; Apple's PDF reader took 1.2-12.6 s per text-heavy PDF</td></tr>
         <tr><td class="name">PDF and Office text</td><td>v2: pdf_oxide and calamine, in a separate helper with a memory cap</td><td>pdf-extract, Tika</td><td>Broken files crash readers, so a helper keeps the main app safe; MuPDF is AGPL, a stricter GPL that would force Telescope's licence to change</td></tr>
         <tr><td class="name">Hotkey</td><td>KeyboardShortcuts 3.1.0, a Swift library</td><td>global-hotkey crate</td><td>No permission needed; comes with a "record new shortcut" box. Creating a window takes 150-275 ms, so the window is built once and then shown in about 0.4 ms</td></tr>
@@ -773,7 +773,7 @@ footer { border-top: 1px solid var(--line); margin-top: 32px; padding-top: 20px;
     <div><dt>What gets indexed</dt><dd>Folders you use plus exceptions; an "index everything" switch</dd></div>
     <div><dt>Search inside files</dt><dd>v1 text, code, markdown; v2 PDF and Office</dd></div>
     <div><dt>Fuzzy matching</dt><dd>Letters in order, several words, typo tolerance, fzf-style operators such as ^ for "starts with" and ! to exclude</dd></div>
-    <div><dt>Typo tolerance</dt><dd>One typo, only for a word that matches no name as typed</dd></div>
+    <div><dt>Typo tolerance</dt><dd>One typo, only for a word of 4 or more letters that no name holds letter for letter</dd></div>
     <div><dt>Window shape</dt><dd>Popup, Tab into a folder, Cmd+I details pane</dd></div>
     <div><dt>v1 extras</dt><dd>Index health and rebuild, search in the current Finder folder, web search as the last row</dd></div>
     <div><dt>Network</dt><dd>None by default; update check is opt-in</dd></div>

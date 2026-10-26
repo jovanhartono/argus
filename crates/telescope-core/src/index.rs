@@ -23,6 +23,8 @@ pub struct Index {
     pub(crate) name_letters: Vec<u64>,
     pub(crate) entry_name: Vec<NameId>,
     pub(crate) entry_parent: Vec<EntryId>,
+    /// Folders between the entry and the root: 1 for the root's own children.
+    pub(crate) entry_depth: Vec<u8>,
     /// Every folder's entry number, smallest first. Most entries are files, so this is
     /// smaller than a yes/no per entry.
     pub(crate) folders: Vec<EntryId>,
@@ -69,7 +71,12 @@ impl Index {
             + self.name_letters.capacity() * size_of::<u64>()
             + self.entry_name.capacity() * size_of::<NameId>()
             + self.entry_parent.capacity() * size_of::<EntryId>()
+            + self.entry_depth.capacity()
             + self.folders.capacity() * size_of::<EntryId>()
+    }
+
+    pub(crate) fn name_len(&self, name: NameId) -> u32 {
+        self.name_starts[name as usize + 1] - self.name_starts[name as usize]
     }
 
     pub(crate) fn name_text(&self, name: NameId) -> &str {
@@ -111,6 +118,7 @@ impl IndexBuilder {
                 name_letters: Vec::new(),
                 entry_name: Vec::new(),
                 entry_parent: Vec::new(),
+                entry_depth: Vec::new(),
                 folders: Vec::new(),
             },
             lookup: HashTable::new(),
@@ -156,6 +164,14 @@ impl IndexBuilder {
         index.entry_name.shrink_to_fit();
         index.entry_parent.shrink_to_fit();
         index.folders.shrink_to_fit();
+        index.entry_depth = Vec::with_capacity(index.len());
+        for &parent in &index.entry_parent {
+            let depth = match parent {
+                NO_PARENT => 0,
+                parent => index.entry_depth[parent as usize].saturating_add(1),
+            };
+            index.entry_depth.push(depth);
+        }
         index.name_letters = (0..index.distinct_names())
             .into_par_iter()
             .map(|name| {
@@ -192,6 +208,7 @@ mod tests {
         assert_eq!(index.path(top), Path::new("/home/README.md"));
         assert!(index.is_dir(docs));
         assert!(!index.is_dir(nested));
+        assert_eq!(index.entry_depth, [0, 1, 2, 1]);
     }
 
     #[test]

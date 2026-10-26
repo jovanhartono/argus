@@ -1,35 +1,51 @@
 use std::ffi::OsString;
 use std::io::BufRead;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Instant;
-use telescope_core::{Index, Searcher};
+use telescope_core::{Clutter, Index, Searcher};
 
 const USAGE: &str = "usage:
   tl index <folder>                       scan and report the index size
   tl search <folder>                      scan, then search each line you type
-  tl bench <folder> <queries> [threads]   time every keystroke of each query";
+  tl bench <folder> <queries> [threads]   time every keystroke of each query
+  tl golden <folder> <golden>             rank the expected file of each search
+add --all to include hidden folders, node_modules and ~/Library";
 
 fn main() -> ExitCode {
-    let args: Vec<OsString> = std::env::args_os().skip(1).collect();
+    let mut args: Vec<OsString> = std::env::args_os().skip(1).collect();
+    let clutter = if args.iter().any(|arg| arg == "--all") {
+        Clutter::Keep
+    } else {
+        Clutter::Skip
+    };
+    args.retain(|arg| arg != "--all");
     match args.as_slice() {
         [flag] if flag == "--version" => {
             println!("tl {}", env!("CARGO_PKG_VERSION"));
             ExitCode::SUCCESS
         }
-        [command, folder] if command == "index" => match load(Path::new(folder)) {
+        [command, folder] if command == "index" => match load(Path::new(folder), clutter) {
             Some(_) => ExitCode::SUCCESS,
             None => ExitCode::FAILURE,
         },
-        [command, folder] if command == "search" => search(Path::new(folder)),
+        [command, folder] if command == "search" => search(Path::new(folder), clutter),
         [command, folder, queries] if command == "bench" => {
-            bench(Path::new(folder), Path::new(queries), None)
+            bench(Path::new(folder), clutter, Path::new(queries), None)
         }
         [command, folder, queries, threads] if command == "bench" => {
             match threads.to_str().and_then(|t| t.parse().ok()) {
-                Some(threads) => bench(Path::new(folder), Path::new(queries), Some(threads)),
+                Some(threads) => bench(
+                    Path::new(folder),
+                    clutter,
+                    Path::new(queries),
+                    Some(threads),
+                ),
                 None => usage(),
             }
+        }
+        [command, folder, cases] if command == "golden" => {
+            golden(Path::new(folder), clutter, Path::new(cases))
         }
         _ => usage(),
     }
@@ -40,9 +56,9 @@ fn usage() -> ExitCode {
     ExitCode::FAILURE
 }
 
-fn load(folder: &Path) -> Option<Index> {
+fn load(folder: &Path, clutter: Clutter) -> Option<Index> {
     let started = Instant::now();
-    let scan = match telescope_core::scan(folder) {
+    let scan = match telescope_core::scan(folder, clutter) {
         Ok(scan) => scan,
         Err(error) => {
             eprintln!("tl: cannot scan {}: {error}", folder.display());
@@ -69,8 +85,8 @@ fn load(folder: &Path) -> Option<Index> {
     Some(index)
 }
 
-fn search(folder: &Path) -> ExitCode {
-    let Some(index) = load(folder) else {
+fn search(folder: &Path, clutter: Clutter) -> ExitCode {
+    let Some(index) = load(folder, clutter) else {
         return ExitCode::FAILURE;
     };
     let searcher = Searcher::default();
@@ -89,13 +105,15 @@ fn search(folder: &Path) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-fn bench(folder: &Path, query_file: &Path, threads: Option<usize>) -> ExitCode {
-    let text = match std::fs::read_to_string(query_file) {
-        Ok(text) => text,
-        Err(error) => {
-            eprintln!("tl: cannot read {}: {error}", query_file.display());
-            return ExitCode::FAILURE;
-        }
+fn read(file: &Path) -> Option<String> {
+    std::fs::read_to_string(file)
+        .inspect_err(|error| eprintln!("tl: cannot read {}: {error}", file.display()))
+        .ok()
+}
+
+fn bench(folder: &Path, clutter: Clutter, query_file: &Path, threads: Option<usize>) -> ExitCode {
+    let Some(text) = read(query_file) else {
+        return ExitCode::FAILURE;
     };
     let queries: Vec<&str> = text
         .lines()
@@ -107,7 +125,7 @@ fn bench(folder: &Path, query_file: &Path, threads: Option<usize>) -> ExitCode {
         eprintln!("tl: no queries in {}", query_file.display());
         return ExitCode::FAILURE;
     }
-    let Some(index) = load(folder) else {
+    let Some(index) = load(folder, clutter) else {
         return ExitCode::FAILURE;
     };
     let searcher = threads.map_or_else(Searcher::default, Searcher::with_threads);
@@ -166,6 +184,60 @@ fn bench(folder: &Path, query_file: &Path, threads: Option<usize>) -> ExitCode {
     println!(
         "bursts of 8 keystrokes: at most {most_delivered} results delivered, slowest burst {slowest_burst:.1} ms"
     );
+    ExitCode::SUCCESS
+}
+
+/// Each line is a search, a tab, and the file you expect near the top.
+fn golden(folder: &Path, clutter: Clutter, case_file: &Path) -> ExitCode {
+    let Some(text) = read(case_file) else {
+        return ExitCode::FAILURE;
+    };
+    let home = std::env::home_dir().unwrap_or_default();
+    let cases: Vec<(&str, PathBuf)> = text
+        .lines()
+        .filter(|line| !line.starts_with('#'))
+        .filter_map(|line| line.split_once('\t'))
+        .map(|(query, expected)| {
+            let expected = match expected.strip_prefix("~/") {
+                Some(rest) => home.join(rest),
+                None => PathBuf::from(expected),
+            };
+            // The index holds real paths, as the scan resolved them.
+            (query, std::fs::canonicalize(&expected).unwrap_or(expected))
+        })
+        .collect();
+    if cases.is_empty() {
+        eprintln!("tl: no searches in {}", case_file.display());
+        return ExitCode::FAILURE;
+    }
+    let Some(index) = load(folder, clutter) else {
+        return ExitCode::FAILURE;
+    };
+    let searcher = Searcher::default();
+
+    let mut in_top_3 = 0;
+    for (query, expected) in &cases {
+        let hits = searcher
+            .search(&index, query, searcher.ticket(), 100)
+            .unwrap_or_default();
+        let rank = hits
+            .iter()
+            .position(|hit| index.path(hit.entry) == *expected);
+        let place = match rank {
+            Some(rank) => (rank + 1).to_string(),
+            None if expected.exists() => "-".to_string(),
+            None => "gone".to_string(),
+        };
+        println!("{place:>4}  {query}");
+        if rank.is_some_and(|rank| rank < 3) {
+            in_top_3 += 1;
+        } else {
+            for hit in hits.iter().take(3) {
+                println!("{:>10}  {}", hit.score, index.path(hit.entry).display());
+            }
+        }
+    }
+    println!("expected file in the top 3: {in_top_3} of {}", cases.len());
     ExitCode::SUCCESS
 }
 
