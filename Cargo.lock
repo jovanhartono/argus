@@ -350,6 +350,7 @@ dependencies = [
  "libc",
  "telescope-core",
  "telescope-grep",
+ "tempfile",
 ]
 
 [[package]]

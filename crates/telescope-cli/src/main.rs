@@ -3,7 +3,7 @@ use std::io::BufRead;
 use std::num::NonZero;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::sync::{Mutex, OnceLock};
+use std::sync::OnceLock;
 use std::time::Instant;
 use telescope_core::{Access, Clutter, Ignore, Index, Opened, Searcher, Settings};
 use telescope_grep::Grep;
@@ -20,6 +20,7 @@ and tool downloads and caches like node_modules
 add --load <file> to open a saved index instead of scanning (it scans when the file is missing,
 damaged or built with other settings, and does not catch up on changes made since it was saved),
 and --save <file> to save the index afterwards
+put -- before text that starts with --, like: tl grep ~ -- --all
 
 your own ignore list, ~/.config/telescope/ignore, takes one folder per line
 (--all leaves it out too):
@@ -30,6 +31,8 @@ your own ignore list, ~/.config/telescope/ignore, takes one folder per line
 
 /// Lines `tl grep` shows, as many as the window would.
 const GREP_LIMIT: usize = 100;
+/// Far more than any Mac has cores; a count in the millions would fail to start the threads.
+const MAX_THREADS: usize = 256;
 
 #[derive(Debug, PartialEq)]
 struct Options {
@@ -64,6 +67,12 @@ enum Command {
 }
 
 fn main() -> ExitCode {
+    // Piped into `head`, stop quietly like other command-line tools instead of panicking.
+    // SAFETY: nothing else runs yet, and the default action is a valid one for SIGPIPE.
+    #[cfg(unix)]
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
     let Some((command, options)) = parse(std::env::args_os().skip(1).collect()) else {
         return usage();
     };
@@ -95,6 +104,10 @@ fn main() -> ExitCode {
 
 /// `None` when the line does not fit any command, so usage is shown.
 fn parse(mut args: Vec<OsString>) -> Option<(Command, Options)> {
+    let after_dashes: Vec<OsString> = match args.iter().position(|arg| arg == "--") {
+        Some(at) => args.drain(at..).skip(1).collect(),
+        None => Vec::new(),
+    };
     let clutter = if args.iter().any(|arg| arg == "--all") {
         Clutter::Keep
     } else {
@@ -103,6 +116,7 @@ fn parse(mut args: Vec<OsString>) -> Option<(Command, Options)> {
     args.retain(|arg| arg != "--all");
     let load = take(&mut args, "--load")?;
     let save = take(&mut args, "--save")?;
+    args.extend(after_dashes);
     let command = match args.as_slice() {
         [flag] if flag == "--version" => Command::Version,
         [command, folder] if command == "index" => Command::Index(folder.into()),
@@ -118,7 +132,11 @@ fn parse(mut args: Vec<OsString>) -> Option<(Command, Options)> {
         },
         [command, folder, text] if command == "grep" => Command::Grep {
             folder: folder.into(),
-            text: text.to_str()?.to_owned(),
+            // Empty text, or text over two lines, would find nothing after a whole scan.
+            text: text
+                .to_str()
+                .filter(|text| !text.is_empty() && !text.contains('\n'))?
+                .to_owned(),
         },
         [command, folder, queries, rest @ ..] if command == "grep-bench" => Command::GrepBench {
             folder: folder.into(),
@@ -142,14 +160,16 @@ fn parse(mut args: Vec<OsString>) -> Option<(Command, Options)> {
 fn threads(rest: &[OsString]) -> Option<Option<usize>> {
     match rest {
         [] => Some(None),
-        [threads] => Some(Some(
-            threads.to_str()?.parse::<NonZero<usize>>().ok()?.get(),
-        )),
+        [threads] => {
+            let threads = threads.to_str()?.parse::<NonZero<usize>>().ok()?.get();
+            (threads <= MAX_THREADS).then_some(Some(threads))
+        }
         _ => None,
     }
 }
 
-/// Removes `flag` and the file after it. `None` when the file is missing.
+/// Removes `flag` and the file after it. `None` when the file is missing or the flag comes
+/// twice.
 fn take(args: &mut Vec<OsString>, flag: &str) -> Option<Option<PathBuf>> {
     let Some(at) = args.iter().position(|arg| arg == flag) else {
         return Some(None);
@@ -160,7 +180,7 @@ fn take(args: &mut Vec<OsString>, flag: &str) -> Option<Option<PathBuf>> {
     }
     let file = PathBuf::from(file);
     args.drain(at..=at + 1);
-    Some(Some(file))
+    (!args.iter().any(|arg| arg == flag)).then_some(Some(file))
 }
 
 fn usage() -> ExitCode {
@@ -221,10 +241,7 @@ fn load(folder: &Path, options: &Options) -> Option<Index> {
         index.folder_count(),
         index.distinct_names()
     );
-    println!(
-        "index memory: {:.1} MB",
-        index.heap_bytes() as f64 / 1_048_576.0
-    );
+    println!("index memory: {:.1} MB", mb(index.heap_bytes() as u64));
     if scan.unreadable_folders > 0 {
         println!("folders not fully read: {}", scan.unreadable_folders);
     }
@@ -237,11 +254,7 @@ fn load(folder: &Path, options: &Options) -> Option<Index> {
             match telescope_core::save_index(file, &scan, &settings, opened_at.unwrap_or(0)) {
                 Ok(()) => {
                     let size = std::fs::metadata(file).map_or(0, |file| file.len());
-                    println!(
-                        "saved {:.1} MB in {:.1} ms",
-                        size as f64 / 1_048_576.0,
-                        ms(started)
-                    );
+                    println!("saved {:.1} MB in {:.1} ms", mb(size), ms(started));
                 }
                 Err(error) => eprintln!("tl: cannot save {}: {error}", file.display()),
             }
@@ -286,9 +299,10 @@ fn queries(text: &str) -> Vec<&str> {
         .collect()
 }
 
-/// The time below which `share` percent of the sorted `times` fall, as `bench` counts it.
-fn percentile(times: &[f64], share: usize) -> f64 {
-    times[(times.len() * share / 100).min(times.len() - 1)]
+/// The item below which `share` percent of the non-empty `sorted` fall. With 20 items or fewer,
+/// p95 is the last one.
+fn percentile<T>(sorted: &[T], share: usize) -> &T {
+    &sorted[(sorted.len() * share / 100).min(sorted.len() - 1)]
 }
 
 fn bench(folder: &Path, options: &Options, query_file: &Path, threads: Option<usize>) -> ExitCode {
@@ -314,7 +328,7 @@ fn bench(folder: &Path, options: &Options, query_file: &Path, threads: Option<us
         }
     }
     times.sort_by(|a, b| a.0.total_cmp(&b.0));
-    let at = |share: usize| times[(times.len() * share / 100).min(times.len() - 1)].0;
+    let at = |share| percentile(&times, share).0;
     println!(
         "{} keystrokes from {} queries on {} search threads",
         times.len(),
@@ -422,20 +436,17 @@ fn grep(folder: &Path, options: &Options, text: &str) -> ExitCode {
     };
     let grep = Grep::default();
     let started = Instant::now();
-    let first = Mutex::new(None);
+    let first = OnceLock::new();
     let report = grep.search(&index, text, grep.ticket(), GREP_LIMIT, |found| {
-        first.lock().unwrap().get_or_insert_with(|| ms(started));
+        first.get_or_init(|| ms(started));
         println!("{}:{}: {}", found.path.display(), found.line, found.text);
     });
     let Some(report) = report else {
         return ExitCode::FAILURE;
     };
-    let first = first
-        .into_inner()
-        .unwrap()
-        .map_or_else(String::new, |first| {
-            format!(", the first after {first:.1} ms")
-        });
+    let first = first.into_inner().map_or_else(String::new, |first| {
+        format!(", the first after {first:.1} ms")
+    });
     println!(
         "{} lines in {} files searched in {:.1} ms on {} threads{first}",
         report.lines_found,
@@ -467,7 +478,7 @@ fn grep_bench(
     let Some(index) = load(folder, options) else {
         return ExitCode::FAILURE;
     };
-    let indexed_peak = peak_memory();
+    let loaded = memory();
     let grep = threads.map_or_else(Grep::default, Grep::with_threads);
 
     let mut firsts = Vec::with_capacity(queries.len());
@@ -510,41 +521,60 @@ fn grep_bench(
         );
     }
     totals.sort_by(|a, b| a.0.total_cmp(&b.0));
-    let total_times: Vec<f64> = totals.iter().map(|(time, _)| *time).collect();
+    let at = |share| percentile(&totals, share).0;
     println!(
         "all lines:  p50 {:.1} ms, p95 {:.1} ms, max {:.1} ms",
-        percentile(&total_times, 50),
-        percentile(&total_times, 95),
-        percentile(&total_times, 100)
+        at(50),
+        at(95),
+        at(100)
     );
     for (time, query) in totals.iter().rev().take(3) {
         println!("  slowest: {query:?} {time:.1} ms");
     }
-    if let (Some(indexed), Some(peak)) = (indexed_peak, peak_memory()) {
+    if let (Some(loaded), Some(after)) = (loaded, memory()) {
+        let when = if after.peak > loaded.peak {
+            "during the searches"
+        } else {
+            "while loading the index, which the searches stayed under"
+        };
         println!(
-            "peak memory: {:.1} MB with the index loaded, {:.1} MB after the searches",
-            mb(indexed),
-            mb(peak)
+            "memory: {:.1} MB with the index loaded, peak {:.1} MB {when}",
+            mb(loaded.now),
+            mb(after.peak)
         );
     }
     ExitCode::SUCCESS
 }
 
-/// The most memory this process has held, as `footprint` and Activity Monitor count it.
+/// Footprint, as the `footprint` tool and Activity Monitor count it.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+struct Memory {
+    now: u64,
+    /// The most this process has held since it started.
+    peak: u64,
+}
+
 #[cfg(target_os = "macos")]
-fn peak_memory() -> Option<u64> {
+fn memory() -> Option<Memory> {
     let pid = i32::try_from(std::process::id()).ok()?;
     let mut info = std::mem::MaybeUninit::<libc::rusage_info_v4>::uninit();
     // SAFETY: RUSAGE_INFO_V4 makes the call write one whole rusage_info_v4, which `info` has
     // room for, and `info` is read only when the call reports success.
     unsafe {
-        (libc::proc_pid_rusage(pid, libc::RUSAGE_INFO_V4, info.as_mut_ptr().cast()) == 0)
-            .then(|| info.assume_init().ri_lifetime_max_phys_footprint)
+        (libc::proc_pid_rusage(pid, libc::RUSAGE_INFO_V4, info.as_mut_ptr().cast()) == 0).then(
+            || {
+                let info = info.assume_init();
+                Memory {
+                    now: info.ri_phys_footprint,
+                    peak: info.ri_lifetime_max_phys_footprint,
+                }
+            },
+        )
     }
 }
 
 #[cfg(not(target_os = "macos"))]
-fn peak_memory() -> Option<u64> {
+fn memory() -> Option<Memory> {
     None
 }
 
@@ -596,10 +626,12 @@ mod tests {
     }
 
     #[test]
-    fn leaves_a_second_copy_of_the_flag_for_usage_to_refuse() {
+    fn refuses_a_flag_given_twice() {
         let mut line = args("index ~ --load a --load b");
-        assert_eq!(take(&mut line, "--load"), Some(Some("a".into())));
-        assert_eq!(line, args("index ~ --load b"));
+        assert_eq!(take(&mut line, "--load"), None);
+        assert_eq!(command("index ~ --load a --load b"), None);
+        assert_eq!(command("grep ~ --load a.idx --load"), None);
+        assert_eq!(command("grep ~ todo --save a --save b"), None);
     }
 
     fn command(line: &str) -> Option<Command> {
@@ -619,13 +651,17 @@ mod tests {
         assert_eq!(command("--version"), Some(Command::Version));
         assert_eq!(command("index ~"), Some(Command::Index("~".into())));
         assert_eq!(command("search ~"), Some(Command::Search("~".into())));
+        let bench_on = |threads| Command::Bench {
+            folder: "~".into(),
+            queries: "q.txt".into(),
+            threads,
+        };
+        assert_eq!(command("bench ~ q.txt"), Some(bench_on(None)));
+        assert_eq!(command("bench ~ q.txt 4"), Some(bench_on(Some(4))));
+        assert_eq!(command("bench ~ q.txt +4"), Some(bench_on(Some(4))));
         assert_eq!(
-            command("bench ~ q.txt 4"),
-            Some(Command::Bench {
-                folder: "~".into(),
-                queries: "q.txt".into(),
-                threads: Some(4),
-            })
+            command("bench ~ q.txt 256"),
+            Some(bench_on(Some(MAX_THREADS)))
         );
         assert_eq!(
             command("golden ~ g.tsv"),
@@ -659,13 +695,33 @@ mod tests {
                 text: "  fn main() {".into(),
             }
         );
-        assert_eq!(
-            command("grep ~ --version"),
+        let grep_for = |text: &str| {
             Some(Command::Grep {
                 folder: "~".into(),
-                text: "--version".into(),
+                text: text.into(),
             })
-        );
+        };
+        assert_eq!(command("grep ~ --version"), grep_for("--version"));
+        for flag in ["--all", "--load", "--save", "--"] {
+            assert_eq!(command(&format!("grep ~ -- {flag}")), grep_for(flag));
+        }
+        assert_eq!(command("grep -- ~ --all"), grep_for("--all"));
+        assert_eq!(command("grep ~ --load a.idx -- --load"), grep_for("--load"));
+        let (_, options) = parse(args("--all grep ~ -- --all")).unwrap();
+        assert_eq!(options.clutter, Clutter::Keep);
+        // A flag after the dashes is text, so this line has one word too many.
+        assert_eq!(command("grep ~ todo -- --all"), None);
+        assert_eq!(command("grep ~ --all"), None);
+    }
+
+    #[test]
+    fn refuses_text_that_can_never_be_found() {
+        for text in ["", "a\nb", "\n"] {
+            let line = ["grep", "~", text].map(OsString::from).to_vec();
+            assert!(parse(line).is_none(), "{text:?}");
+        }
+        let line = ["grep", "~", "a\rb"].map(OsString::from).to_vec();
+        assert!(parse(line).is_some());
     }
 
     #[test]
@@ -675,6 +731,15 @@ mod tests {
             "--version extra",
             "index",
             "index ~ extra",
+            "search",
+            "search ~ x",
+            "golden ~",
+            "golden ~ g.tsv x",
+            "bench ~",
+            "bench ~ q.txt 4 5",
+            "bench ~ q.txt 257",
+            "bench ~ q.txt 1000000",
+            "bench ~ q.txt 99999999999999999999999",
             "find ~",
             "grep ~",
             "grep ~ two words",
@@ -693,10 +758,15 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn refuses_text_that_is_not_utf8() {
+    fn refuses_text_and_thread_counts_that_are_not_utf8_but_keeps_such_folders() {
         use std::os::unix::ffi::OsStringExt;
-        let line = vec!["grep".into(), "~".into(), OsString::from_vec(vec![0xFF])];
+        let broken = || OsString::from_vec(vec![0xFF]);
+        let line = vec!["grep".into(), "~".into(), broken()];
         assert!(parse(line).is_none());
+        let line = vec!["bench".into(), "~".into(), "q.txt".into(), broken()];
+        assert!(parse(line).is_none());
+        let line = vec!["index".into(), broken()];
+        assert_eq!(parse(line).unwrap().0, Command::Index(broken().into()));
     }
 
     #[test]
@@ -720,6 +790,9 @@ mod tests {
                 save: Some("b.idx".into()),
             }
         );
+        let (_, options) = parse(args("index ~ --load a.idx --save a.idx")).unwrap();
+        assert_eq!(options.load, Some("a.idx".into()));
+        assert_eq!(options.save, Some("a.idx".into()));
     }
 
     #[test]
@@ -731,30 +804,77 @@ mod tests {
         );
         assert!(queries("").is_empty());
         assert!(queries("# only\n# comments\n").is_empty());
+        // Searched exactly as written, so spaces and a stray carriage return stay.
+        assert_eq!(queries("todo \nlast\r"), ["todo ", "last\r"]);
+    }
+
+    #[test]
+    fn every_query_is_one_whole_line_of_text() {
+        let pieces = ["a", " ", "\t", "\n", "\r\n", "#", "b c"];
+        // Every 4-piece line built from the pieces, 7^4 of them.
+        for mut n in 0..pieces.len().pow(4) {
+            let mut text = String::new();
+            for _ in 0..4 {
+                text.push_str(pieces[n % pieces.len()]);
+                n /= pieces.len();
+            }
+            for query in queries(&text) {
+                assert!(!query.contains(['\t', '\n']), "{text:?} gave {query:?}");
+                assert!(!query.starts_with('#'), "{text:?} gave {query:?}");
+                assert!(!query.trim().is_empty(), "{text:?} gave {query:?}");
+            }
+        }
     }
 
     #[test]
     fn takes_percentiles_from_sorted_times() {
-        assert_eq!(percentile(&[7.0], 50), 7.0);
-        assert_eq!(percentile(&[7.0], 100), 7.0);
+        assert_eq!(*percentile(&[7.0], 50), 7.0);
+        assert_eq!(*percentile(&[7.0], 100), 7.0);
         let times: Vec<f64> = (1..=20).map(f64::from).collect();
-        assert_eq!(percentile(&times, 0), 1.0);
-        assert_eq!(percentile(&times, 50), 11.0);
-        assert_eq!(percentile(&times, 95), 20.0);
-        assert_eq!(percentile(&times, 100), 20.0);
+        assert_eq!(*percentile(&times, 0), 1.0);
+        assert_eq!(*percentile(&times, 50), 11.0);
+        assert_eq!(*percentile(&times, 100), 20.0);
         let times: Vec<f64> = (1..=100).map(f64::from).collect();
-        assert_eq!(percentile(&times, 95), 96.0);
+        assert_eq!(*percentile(&times, 95), 96.0);
+    }
+
+    #[test]
+    fn p95_is_the_slowest_with_20_times_or_fewer() {
+        for len in 1..=50 {
+            let times: Vec<usize> = (0..len).collect();
+            assert_eq!(*percentile(&times, 0), 0);
+            assert_eq!(*percentile(&times, 100), len - 1);
+            assert_eq!(*percentile(&times, 95) == len - 1, len <= 20, "{len}");
+            for share in 1..=100 {
+                assert!(percentile(&times, share) >= percentile(&times, share - 1));
+            }
+        }
+    }
+
+    #[test]
+    fn bench_and_grep_bench_count_percentiles_alike() {
+        let times: Vec<(f64, &str)> = (1..=30).map(|n| (f64::from(n), "q")).collect();
+        let alone: Vec<f64> = times.iter().map(|(time, _)| *time).collect();
+        for share in [50, 95, 100] {
+            assert_eq!(percentile(&times, share).0, *percentile(&alone, share));
+        }
     }
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn peak_memory_counts_memory_in_use() {
-        let before = peak_memory().unwrap();
-        assert!(before > 0);
+    fn memory_counts_what_is_held_and_keeps_the_peak() {
+        let before = memory().unwrap();
         let held = std::hint::black_box(vec![1u8; 64 << 20]);
-        let after = peak_memory().unwrap();
-        assert!(after >= before.max(held.len() as u64), "{before} {after}");
+        let during = memory().unwrap();
+        assert!(
+            during.now >= before.now + (60 << 20),
+            "{} {}",
+            before.now,
+            during.now
+        );
+        assert!(during.peak >= during.now);
         drop(held);
-        assert!(peak_memory().unwrap() >= after);
+        let after = memory().unwrap();
+        assert!(after.peak >= during.now, "{} {}", during.now, after.peak);
     }
 }
