@@ -32,9 +32,12 @@ impl Ignore {
                 None => (false, line),
             };
             let rule = rule.trim_end_matches('/');
+            // Rebuilt from its parts so a rule written with / matches Windows paths too.
             let path = match rule.strip_prefix("~/") {
-                Some(inside_home) => Some(home.join(inside_home)),
-                None if rule.starts_with('/') => Some(PathBuf::from(rule)),
+                Some(inside_home) => {
+                    Some(home.join(Path::new(inside_home).components().collect::<PathBuf>()))
+                }
+                None if rule.starts_with('/') => Some(Path::new(rule).components().collect()),
                 None => None,
             };
             // The scan reports real paths, so /tmp/build must become /private/tmp/build.
