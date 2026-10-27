@@ -5,7 +5,7 @@ mod qos {
     use std::ffi::{c_int, c_uint};
 
     // From sys/qos.h.
-    pub(super) const QOS_CLASS_UTILITY: c_uint = 0x11;
+    pub(super) const QOS_CLASS_BACKGROUND: c_uint = 0x09;
 
     // SAFETY: the signatures match pthread/qos.h and sys/qos.h; both take and return plain
     // integers and touch no memory of ours, so any arguments are safe.
@@ -19,15 +19,17 @@ mod qos {
     }
 }
 
-/// Lowers this thread's priority.
+/// Lowers this thread's priority. At the utility class, a running text search still pushed
+/// name searches over default folders from 2.5 to 10.8 ms at p95; at background it left them
+/// at 2.5 ms, and the text search took about a quarter longer.
 pub(crate) fn yield_to_names() {
     #[cfg(target_os = "macos")]
-    qos::pthread_set_qos_class_self_np(qos::QOS_CLASS_UTILITY, 0);
+    qos::pthread_set_qos_class_self_np(qos::QOS_CLASS_BACKGROUND, 0);
 }
 
 #[cfg(all(test, target_os = "macos"))]
 pub(crate) fn lowered() -> bool {
-    qos::qos_class_self() == qos::QOS_CLASS_UTILITY
+    qos::qos_class_self() == qos::QOS_CLASS_BACKGROUND
 }
 
 #[cfg(all(test, target_os = "macos"))]
