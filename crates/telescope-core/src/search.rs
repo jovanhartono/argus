@@ -33,9 +33,28 @@ impl Ticket {
     }
 }
 
+/// One ticket per keystroke; only the newest ticket's search is still wanted.
+#[derive(Debug, Default)]
+pub struct Tickets(AtomicU64);
+
+impl Tickets {
+    pub fn take(&self) -> Ticket {
+        Ticket(self.0.fetch_add(1, Ordering::Relaxed) + 1)
+    }
+
+    /// The number of the last ticket handed out.
+    pub fn newest(&self) -> u64 {
+        self.0.load(Ordering::Relaxed)
+    }
+
+    pub fn is_stale(&self, ticket: Ticket) -> bool {
+        self.newest() != ticket.0
+    }
+}
+
 pub struct Searcher {
     pool: rayon::ThreadPool,
-    newest: AtomicU64,
+    tickets: Tickets,
     /// One search at a time, reusing the same working lists, so a burst of keystrokes
     /// never holds several searches' memory and typing allocates nothing large.
     turn: Mutex<Scratch>,
@@ -69,7 +88,7 @@ impl Searcher {
             .expect("start search threads");
         Self {
             pool,
-            newest: AtomicU64::new(0),
+            tickets: Tickets::default(),
             turn: Mutex::new(Scratch::default()),
         }
     }
@@ -80,12 +99,12 @@ impl Searcher {
 
     /// Take one per keystroke. Every search holding an older ticket gives up.
     pub fn ticket(&self) -> Ticket {
-        Ticket(self.newest.fetch_add(1, Ordering::Relaxed) + 1)
+        self.tickets.take()
     }
 
     /// The number of the last ticket handed out; only its search is still wanted.
     pub fn newest(&self) -> u64 {
-        self.newest.load(Ordering::Relaxed)
+        self.tickets.newest()
     }
 
     /// The best `limit` hits, or `None` when a newer ticket arrived first.
@@ -96,7 +115,7 @@ impl Searcher {
         ticket: Ticket,
         limit: usize,
     ) -> Option<Vec<Hit>> {
-        let stale = || self.newest.load(Ordering::Relaxed) != ticket.0;
+        let stale = || self.tickets.is_stale(ticket);
         let mut turn = self.turn.lock().unwrap();
         if stale() {
             return None;

@@ -12,3 +12,4 @@ path = "src/main.rs"
 
 [dependencies]
 telescope-core = { path = "../telescope-core" }
+telescope-grep = { path = "../telescope-grep" }
