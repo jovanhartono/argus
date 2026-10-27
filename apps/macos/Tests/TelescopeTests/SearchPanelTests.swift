@@ -154,6 +154,89 @@ final class SearchPanelTests: XCTestCase {
         try await until { window.rows.count == 2 }
     }
 
+    func testANewListRewritesTheRowsOnScreenInPlace() async throws {
+        let notes = root.appendingPathComponent("notes")
+        try FileManager.default.createDirectory(at: notes, withIntermediateDirectories: false)
+        for name in ["budget a.txt", "budget b.txt", "report.txt"] {
+            try Data().write(to: notes.appendingPathComponent(name))
+        }
+        try FileManager.default.createDirectory(
+            at: notes.appendingPathComponent("budget c"), withIntermediateDirectories: false)
+        let window = try await opened(access: true)
+        window.show()
+        defer { window.hide() }
+        try await type("budget", in: window)
+        try await until { window.rows.count == 3 }
+        try await settled(window)
+        assertOnScreen(window)
+        let top = try XCTUnwrap(cell(window, 0))
+
+        try await type("report", in: window)
+        try await until { window.rows.map(\.name) == ["report.txt"] }
+        try await settled(window)
+        XCTAssertEqual(window.table.numberOfRows, 1)
+        XCTAssertTrue(cell(window, 0) === top, "the row is kept and only its words change")
+        assertOnScreen(window)
+
+        try await type("budget", in: window)
+        try await until { window.rows.count == 3 }
+        try await settled(window)
+        assertOnScreen(window)
+        let icons = window.rows.indices.map { cell(window, $0)?.icon.image }
+        let files = window.rows.indices.filter { !window.rows[$0].isFolder }
+        let folder = try XCTUnwrap(window.rows.firstIndex(where: \.isFolder))
+        XCTAssertTrue(icons[files[0]] === icons[files[1]], "one icon per kind of file")
+        XCTAssertFalse(icons[files[0]] === icons[folder])
+
+        try await type("", in: window)
+        XCTAssertEqual(window.table.numberOfRows, 0)
+    }
+
+    func testRowsScrolledIntoViewShowTheNewList() async throws {
+        let notes = root.appendingPathComponent("notes")
+        try FileManager.default.createDirectory(at: notes, withIntermediateDirectories: false)
+        for number in 1...12 {
+            for word in ["budget", "report"] {
+                try Data().write(to: notes.appendingPathComponent("\(word) \(number).txt"))
+            }
+        }
+        let window = try await opened(access: true)
+        window.show()
+        defer { window.hide() }
+        try await type("budget", in: window)
+        try await until { window.rows.count == 12 }
+        try await settled(window)
+        window.table.scrollRowToVisible(11)
+        window.panel.displayIfNeeded()
+        assertOnScreen(window)
+
+        // The same number of rows, so none is added or dropped: each one on screen is rewritten.
+        try await type("report", in: window)
+        try await until { window.rows.count == 12 && window.rows.allSatisfy { $0.name.hasPrefix("report") } }
+        try await settled(window)
+        assertOnScreen(window)
+        window.table.scrollRowToVisible(11)
+        window.panel.displayIfNeeded()
+        assertOnScreen(window)
+    }
+
+    func testRowIconsLookLikeFindersOwn() async throws {
+        let notes = root.appendingPathComponent("notes")
+        try FileManager.default.createDirectory(at: notes, withIntermediateDirectories: false)
+        try Data().write(to: notes.appendingPathComponent("budget.pdf"))
+        let window = try await opened(access: true)
+        window.show()
+        defer { window.hide() }
+        try await type("budget", in: window)
+        try await until { window.rows.count == 1 }
+        try await settled(window)
+        let drawn = try XCTUnwrap(cell(window, 0)?.icon.image)
+        let finder = NSWorkspace.shared.icon(for: .pdf)
+        let pixels = try XCTUnwrap(self.pixels(of: drawn))
+        XCTAssertGreaterThan(pixels.filter { $0 != 0 }.count, pixels.count / 4, "not blank")
+        XCTAssertEqual(pixels, self.pixels(of: finder))
+    }
+
     func testTheMadeUpNamesNeverShowTheLine() async throws {
         setenv("TELESCOPE_STAND_IN", "0", 1)
         defer { unsetenv("TELESCOPE_STAND_IN") }
@@ -698,6 +781,45 @@ final class SearchPanelTests: XCTestCase {
         window.quickLook(nil)
         XCTAssertEqual(window.missing, "“\(window.rows[1].name)” can’t be found.")
         XCTAssertFalse(window.previewing)
+    }
+
+    /// Waits out the 0.15 s resize: rows below the window's edge get no view until it grows.
+    private func settled(_ window: SearchPanel) async throws {
+        let rows = CGFloat(min(window.rows.count, Metric.visibleRows))
+        try await until { window.panel.frame.height == Metric.field + 1 + rows * Metric.row + 2 * Metric.inset }
+        window.panel.displayIfNeeded()
+    }
+
+    private func cell(_ window: SearchPanel, _ row: Int) -> ResultCell? {
+        window.table.view(atColumn: 0, row: row, makeIfNecessary: false) as? ResultCell
+    }
+
+    /// Every row with a view on screen shows its own result, and at least one does.
+    private func assertOnScreen(_ window: SearchPanel, file: StaticString = #filePath, line: UInt = #line) {
+        var seen = 0
+        window.table.enumerateAvailableRowViews { view, row in
+            guard let cell = view.view(atColumn: 0) as? ResultCell else { return }
+            seen += 1
+            XCTAssertLessThan(row, window.rows.count, file: file, line: line)
+            guard row < window.rows.count else { return }
+            XCTAssertEqual(cell.name.stringValue, window.rows[row].name, file: file, line: line)
+            XCTAssertEqual(cell.folder.stringValue, window.rows[row].folder, file: file, line: line)
+        }
+        XCTAssertGreaterThan(seen, 0, file: file, line: line)
+    }
+
+    /// The image as a row's 32-point icon view draws it, on a Retina screen.
+    private func pixels(of image: NSImage) -> [UInt8]? {
+        let view = NSImageView(frame: NSRect(x: 0, y: 0, width: 32, height: 32))
+        view.image = image
+        guard
+            let rep = NSBitmapImageRep(
+                bitmapDataPlanes: nil, pixelsWide: 64, pixelsHigh: 64, bitsPerSample: 8, samplesPerPixel: 4,
+                hasAlpha: true, isPlanar: false, colorSpaceName: .deviceRGB, bytesPerRow: 64 * 4, bitsPerPixel: 32)
+        else { return nil }
+        rep.size = view.bounds.size
+        view.cacheDisplay(in: view.bounds, to: rep)
+        return rep.bitmapData.map { Array(UnsafeBufferPointer(start: $0, count: 64 * 64 * 4)) }
     }
 
     private func item(_ window: SearchPanel) -> URL? {

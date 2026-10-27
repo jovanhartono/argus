@@ -395,7 +395,7 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
             sentAt = [:]
             rows = []
             answered = 0
-            table.reloadData()
+            refill()
             follow()
         }
         guard let hatch, indexed, !composing, !field.stringValue.isEmpty else { return fit() }
@@ -419,7 +419,7 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
         rerun = 0
         rows = fresh
         answered = ticket
-        table.reloadData()
+        refill()
         if !rows.isEmpty { select(rows.firstIndex { $0.path == keeping } ?? 0) }
         follow()
         fit()
@@ -617,18 +617,31 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
 
     func tableView(_ tableView: NSTableView, viewFor column: NSTableColumn?, row: Int) -> NSView? {
         let cell = tableView.makeView(withIdentifier: ResultCell.id, owner: nil) as? ResultCell ?? ResultCell()
-        let item = rows[row]
-        cell.name.stringValue = item.name
-        cell.folder.stringValue = item.folder
-        cell.icon.image = icon(for: item)
+        cell.show(rows[row], icon: icon(for: rows[row]))
         return cell
+    }
+
+    /// Rewrites the rows already on screen and only adds or drops the difference. reloadData
+    /// throws every row away and builds it again, which was most of the wait after a keystroke.
+    private func refill() {
+        table.noteNumberOfRowsChanged()
+        table.enumerateAvailableRowViews { view, row in
+            guard let cell = view.view(atColumn: 0) as? ResultCell, rows.indices.contains(row) else { return }
+            cell.show(rows[row], icon: icon(for: rows[row]))
+        }
     }
 
     private func icon(for row: Row) -> NSImage {
         let key = row.isFolder ? "/" : (row.name as NSString).pathExtension.lowercased()
         if let cached = icons[key] { return cached }
         let type = row.isFolder ? UTType.folder : (UTType(filenameExtension: key) ?? .data)
-        let image = NSWorkspace.shared.icon(for: type)
+        let icon = NSWorkspace.shared.icon(for: type)
+        // Handed the icon itself, a row's image view asks macOS for a stand-in picture each
+        // time, most of the time spent filling the rows. Drawn from a copy, it doesn't.
+        let image = NSImage(size: NSSize(width: 32, height: 32), flipped: false) { rect in
+            icon.draw(in: rect)
+            return true
+        }
         icons[key] = image
         return image
     }
