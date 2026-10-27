@@ -46,7 +46,7 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
         styleMask: [.titled, .fullSizeContentView, .nonactivatingPanel],
         backing: .buffered, defer: false)
     private let glass = NSImageView(frame: NSRect(x: 18, y: 16, width: 24, height: 24))
-    private let field = NSTextField(frame: NSRect(x: 50, y: 13, width: Metric.width - 68, height: 30))
+    let field = NSTextField(frame: NSRect(x: 50, y: 13, width: Metric.width - 68, height: 30))
     private let line = NSBox(frame: NSRect(x: 0, y: Metric.field, width: Metric.width, height: 1))
     private let scroll = NSScrollView()
     private let table = NSTableView()
@@ -66,7 +66,11 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
     private var missing: String?
     private var newest: UInt64 = 0
     private var sentAt: [UInt64: TimeInterval] = [:]
-    private var rows: [Row] = []
+    private(set) var rows: [Row] = []
+    /// The list changed while the window was hidden, so the results on screen may be old.
+    private(set) var stale = false
+    /// A search run again on a new list, which keeps the selected file when it answers.
+    private var rerun: UInt64 = 0
     /// The ticket the rows on screen answer; 0 before any answer, so an empty list isn't "No Results".
     private var answered: UInt64 = 0
     private var pending: (() -> Void)?
@@ -108,6 +112,7 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
     func show() {
         let pressed = pressedAt()
         recheckAccess()
+        if stale { runAgain() }
         shown = true
         place()
         panel.alphaValue = reduceMotion ? 1 : 0
@@ -219,17 +224,19 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
         panel.contentView = content
     }
 
-    /// Checked on each show while access is missing, so the line changes once it is switched on
-    /// in System Settings and Later is clicked.
+    /// Checked on each show while access is missing, so the line goes once access is switched
+    /// on in System Settings and Later is clicked, and the guarded folders come in.
     func recheckAccess() {
         guard notice == .needsAccess, hasAccess() else { return }
-        post(.needsRelaunch)
+        post(nil)
+        hatch?.grantFullDisk()
+        fit()
     }
 
     private func post(_ fresh: Notice?) {
         notice = fresh
         bar.isHidden = fresh == nil
-        settings.isHidden = fresh?.opensSettings != true
+        settings.isHidden = fresh == nil
         barText.stringValue = fresh?.text ?? ""
         let textWidth = Metric.width - 32 - (settings.isHidden ? 0 : settings.frame.width + 12)
         barText.frame = NSRect(x: 16, y: 1 + (Metric.message - 17) / 2, width: textWidth, height: 17)
@@ -328,7 +335,12 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
         case .indexed(let count):
             timing.notice("indexed \(count) entries in \(ms(since: self.indexingSince), format: .fixed(precision: 0)) ms")
             indexed = true
+            hatch?.watch()
             search()
+        case .rebuilt(let count, let took):
+            timing.notice("rebuilt \(count) entries in \(took) ms after a change")
+            hatch?.watch()
+            if shown { runAgain() } else { stale = true }
         case .ready(let ticket) where ticket == newest:
             take(ticket)
         case .ready:
@@ -362,12 +374,23 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
         fit()
     }
 
+    /// The same search on a new list. No keystroke started it, so it writes no timing line.
+    private func runAgain() {
+        stale = false
+        guard let hatch, indexed, !composing, !field.stringValue.isEmpty else { return }
+        newest = hatch.submit(field.stringValue)
+        rerun = newest
+    }
+
     private func take(_ ticket: UInt64) {
         guard let fresh = hatch?.take(ticket) else { return }
+        // A file you picked stays picked when a change moves it up or down the list.
+        let keeping = rerun == ticket ? selected?.path : nil
+        rerun = 0
         rows = fresh
         answered = ticket
         table.reloadData()
-        if !rows.isEmpty { select(0) }
+        if !rows.isEmpty { select(rows.firstIndex { $0.path == keeping } ?? 0) }
         fit()
         let typed = sentAt.removeValue(forKey: ticket)
         sentAt = sentAt.filter { $0.key > ticket }
@@ -401,7 +424,7 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
         if !rows.isEmpty { select(min(max(table.selectedRow + step, 0), rows.count - 1)) }
     }
 
-    private var selected: Row? {
+    var selected: Row? {
         rows.indices.contains(table.selectedRow) ? rows[table.selectedRow] : nil
     }
 
@@ -455,7 +478,7 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
         case #selector(NSResponder.insertNewline(_:)):
             onceAnswered { [weak self] in self?.open(revealing: false) }
         case #selector(NSResponder.insertTab(_:)), #selector(NSResponder.insertBacktab(_:)):
-            guard notice?.opensSettings == true else { return false }
+            guard notice != nil else { return false }
             panel.makeFirstResponder(settings)
         default:
             return false

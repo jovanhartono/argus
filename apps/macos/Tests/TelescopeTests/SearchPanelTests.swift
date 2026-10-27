@@ -32,26 +32,115 @@ final class SearchPanelTests: XCTestCase {
         XCTAssertNil(window.notice)
         XCTAssertEqual(window.panel.frame.height, Metric.field)
         window.recheckAccess()
-        XCTAssertEqual(checks, 1, "the list has every folder until a relaunch")
+        XCTAssertEqual(checks, 1, "with access there is nothing more to check")
     }
 
-    func testAccessGrantedWhileRunningAsksForARelaunchOnce() async throws {
+    func testAccessGrantedWhileRunningBringsInTheGuardedFoldersWithoutARelaunch() async throws {
+        let documents = root.appendingPathComponent("Documents")
+        try FileManager.default.createDirectory(at: documents, withIntermediateDirectories: false)
+        try Data().write(to: documents.appendingPathComponent("budget.pdf"))
         let window = try await opened(access: false)
+        try await type("budget", in: window)
+        // The line, then No Results.
+        try await until { window.panel.frame.height == Metric.field + 2 * (1 + Metric.message) }
         window.recheckAccess()
         XCTAssertEqual(window.notice, .needsAccess)
 
         access = true
         window.recheckAccess()
-        XCTAssertEqual(window.notice, .needsRelaunch)
+        XCTAssertNil(window.notice)
         XCTAssertTrue(window.settings.isHidden)
-        XCTAssertEqual(window.panel.frame.height, Metric.field + 1 + Metric.message)
-        assertFits(window)
+        XCTAssertEqual(window.panel.frame.height, Metric.field + 1 + Metric.message, "No Results moves up")
+        try await until { window.stale }
+        window.show()
+        defer { window.hide() }
+        try await until { window.rows.map(\.name) == ["budget.pdf"] }
 
         let before = checks
         access = false
         window.recheckAccess()
-        XCTAssertEqual(window.notice, .needsRelaunch)
-        XCTAssertEqual(checks, before, "nothing changes the line before a relaunch")
+        XCTAssertNil(window.notice)
+        XCTAssertEqual(checks, before, "with access there is nothing more to check")
+    }
+
+    func testANewListKeepsTheSelectedFileSelected() async throws {
+        let notes = root.appendingPathComponent("notes")
+        try FileManager.default.createDirectory(at: notes, withIntermediateDirectories: false)
+        for name in ["budget a.txt", "budget b.txt"] {
+            try Data().write(to: notes.appendingPathComponent(name))
+        }
+        let window = try await opened(access: true)
+        window.show()
+        defer { window.hide() }
+        try await type("budget", in: window)
+        try await until { window.rows.count == 2 }
+        down(window)
+        let picked = try XCTUnwrap(window.selected?.path)
+        XCTAssertEqual(window.rows.firstIndex { $0.path == picked }, 1)
+
+        // A shorter name ranks first, pushing the picked file down a row.
+        try Data().write(to: notes.appendingPathComponent("budget.txt"))
+        try await until { window.rows.count == 3 }
+        XCTAssertEqual(window.selected?.path, picked)
+        XCTAssertNotEqual(window.rows.firstIndex { $0.path == picked }, 1)
+    }
+
+    func testAFileGoneFromTheListMovesTheSelectionToTheTop() async throws {
+        let notes = root.appendingPathComponent("notes")
+        try FileManager.default.createDirectory(at: notes, withIntermediateDirectories: false)
+        for name in ["budget a.txt", "budget b.txt", "budget c.txt"] {
+            try Data().write(to: notes.appendingPathComponent(name))
+        }
+        let window = try await opened(access: true)
+        window.show()
+        defer { window.hide() }
+        try await type("budget", in: window)
+        try await until { window.rows.count == 3 }
+        down(window)
+        let picked = try XCTUnwrap(window.selected?.path)
+
+        try FileManager.default.removeItem(atPath: picked)
+        try await until { window.rows.count == 2 }
+        XCTAssertEqual(window.selected, window.rows.first)
+    }
+
+    func testAnArrowPressedBeforeTheSearchRunsAgainCounts() async throws {
+        let notes = root.appendingPathComponent("notes")
+        try FileManager.default.createDirectory(at: notes, withIntermediateDirectories: false)
+        for name in ["budget a.txt", "budget b.txt"] {
+            try Data().write(to: notes.appendingPathComponent(name))
+        }
+        let window = try await opened(access: true)
+        try await type("budget", in: window)
+        try await until { window.rows.count == 2 }
+        try Data().write(to: notes.appendingPathComponent("budget c.txt"))
+        try await until { window.stale }
+
+        // Shown, the search runs again; its answer can only arrive after the arrow.
+        window.show()
+        defer { window.hide() }
+        down(window)
+        let picked = try XCTUnwrap(window.selected?.path)
+        XCTAssertEqual(window.rows.firstIndex { $0.path == picked }, 1)
+        try await until { window.rows.count == 3 }
+        XCTAssertEqual(window.selected?.path, picked)
+    }
+
+    func testAHiddenWindowRunsTheSearchAgainWhenShown() async throws {
+        let notes = root.appendingPathComponent("notes")
+        try FileManager.default.createDirectory(at: notes, withIntermediateDirectories: false)
+        try Data().write(to: notes.appendingPathComponent("budget a.txt"))
+        let window = try await opened(access: true)
+        try await type("budget", in: window)
+        try await until { window.rows.count == 1 }
+
+        try Data().write(to: notes.appendingPathComponent("budget b.txt"))
+        try await until { window.stale }
+        XCTAssertEqual(window.rows.count, 1, "nothing runs while hidden")
+        window.show()
+        defer { window.hide() }
+        XCTAssertFalse(window.stale)
+        try await until { window.rows.count == 2 }
     }
 
     func testTheMadeUpNamesNeverShowTheLine() async throws {
@@ -74,13 +163,28 @@ final class SearchPanelTests: XCTestCase {
     }
 
     func testTabIsLeftAloneWithoutAButton() async throws {
-        let relaunch = try await opened(access: false)
+        let granted = try await opened(access: false)
         access = true
-        relaunch.recheckAccess()
-        XCTAssertFalse(relaunch.control(NSTextField(), textView: NSTextView(), doCommandBy: #selector(NSResponder.insertTab(_:))))
+        granted.recheckAccess()
+        XCTAssertFalse(granted.control(NSTextField(), textView: NSTextView(), doCommandBy: #selector(NSResponder.insertTab(_:))))
 
         let full = try await opened(access: true)
         XCTAssertFalse(full.control(NSTextField(), textView: NSTextView(), doCommandBy: #selector(NSResponder.insertTab(_:))))
+    }
+
+    private func type(_ text: String, in window: SearchPanel) async throws {
+        window.field.stringValue = text
+        window.controlTextDidChange(Notification(name: NSControl.textDidChangeNotification))
+    }
+
+    private func down(_ window: SearchPanel) {
+        XCTAssertTrue(window.control(NSTextField(), textView: NSTextView(), doCommandBy: #selector(NSResponder.moveDown(_:))))
+    }
+
+    /// Waits up to 5 s: a change takes FSEvents' 0.2 s, up to 0.5 s between rebuilds, and the rebuild.
+    private func until(_ done: () -> Bool, file: StaticString = #filePath, line: UInt = #line) async throws {
+        for _ in 0..<500 where !done() { try await Task.sleep(for: .milliseconds(10)) }
+        XCTAssertTrue(done(), file: file, line: line)
     }
 
     /// Waits for the scan, so its event can't reach the next test's core.

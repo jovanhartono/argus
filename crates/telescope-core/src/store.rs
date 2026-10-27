@@ -16,7 +16,8 @@
 
 use crate::Ignore;
 use crate::index::{EntryId, Index, NO_PARENT, NameId};
-use crate::walk::{Access, Clutter, Scan, scan};
+use crate::scope::Scope;
+use crate::walk::{Access, Clutter, Rules, Scan, scan};
 use crc32fast::Hasher;
 use std::fmt;
 use std::fs::{self, File};
@@ -99,6 +100,12 @@ impl Settings {
             &self.ignore,
             self.access,
         )
+    }
+
+    pub fn scope(&self) -> Scope {
+        let rules = Rules::new(&self.home, self.clutter, &self.ignore, self.access);
+        let list = (self.clutter == Clutter::Skip).then(|| Ignore::folder(&self.home, self.access));
+        Scope::new(self.root.clone(), rules, list)
     }
 }
 
