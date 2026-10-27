@@ -1,5 +1,6 @@
 import AppKit
 import OSLog
+import QuickLookUI
 import UniformTypeIdentifiers
 
 enum Metric {
@@ -20,9 +21,33 @@ let failures = Logger(subsystem: "io.github.jovanhartono.telescope", category: "
 final class Panel: NSPanel {
     override var canBecomeKey: Bool { true }
 
-    /// Esc while Open Settings has the focus; the box handles its own Esc.
+    /// Esc while Open Settings has the focus; the box handles its own Esc. A preview closes first.
     override func cancelOperation(_ sender: Any?) {
-        (delegate as? SearchPanel)?.hide()
+        guard let search = delegate as? SearchPanel else { return }
+        search.previewing ? search.closePreview() : search.hide()
+    }
+
+    override func acceptsPreviewPanelControl(_ panel: QLPreviewPanel!) -> Bool {
+        true
+    }
+
+    override func beginPreviewPanelControl(_ panel: QLPreviewPanel!) {
+        MainActor.assumeIsolated {
+            // Quick Look sits at the normal level, under this floating window, by default, and
+            // can't join a full-screen app's space.
+            panel.level = level
+            panel.collectionBehavior = collectionBehavior
+            panel.dataSource = delegate as? SearchPanel
+            panel.delegate = delegate
+        }
+    }
+
+    override func endPreviewPanelControl(_ panel: QLPreviewPanel!) {
+        MainActor.assumeIsolated {
+            panel.dataSource = nil
+            panel.delegate = nil
+            (delegate as? SearchPanel)?.settleKeys()
+        }
     }
 }
 
@@ -39,7 +64,7 @@ final class KeyButton: NSButton {
 
 @MainActor
 final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTableViewDataSource,
-    NSTableViewDelegate
+    NSTableViewDelegate, @preconcurrency QLPreviewPanelDataSource, @preconcurrency QLPreviewPanelDelegate
 {
     let panel = Panel(
         contentRect: NSRect(x: 0, y: 0, width: Metric.width, height: Metric.field),
@@ -49,7 +74,7 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
     let field = NSTextField(frame: NSRect(x: 50, y: 13, width: Metric.width - 68, height: 30))
     private let line = NSBox(frame: NSRect(x: 0, y: Metric.field, width: Metric.width, height: 1))
     private let scroll = NSScrollView()
-    private let table = NSTableView()
+    let table = NSTableView()
     private let message = NSTextField(labelWithString: "")
     private let bar = TopDown()
     private let barLine = NSBox(frame: NSRect(x: 0, y: 0, width: Metric.width, height: 1))
@@ -63,7 +88,7 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
     private(set) var indexed = false
     private var problem: String?
     /// The file you picked was moved or deleted after the list was built.
-    private var missing: String?
+    private(set) var missing: String?
     private var newest: UInt64 = 0
     private var sentAt: [UInt64: TimeInterval] = [:]
     private(set) var rows: [Row] = []
@@ -74,7 +99,10 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
     /// The ticket the rows on screen answer; 0 before any answer, so an empty list isn't "No Results".
     private var answered: UInt64 = 0
     private var pending: (() -> Void)?
-    private var shown = false
+    /// The file the open preview shows, so a new list with the same file picked doesn't reload it.
+    private(set) var inPreview: URL?
+    private var closing = false
+    private(set) var shown = false
     private var icons: [String: NSImage] = [:]
 
     init(root: String = NSHomeDirectory(), hasAccess: @escaping () -> Bool = { Hatch.hasFullDiskAccess() }) {
@@ -134,6 +162,7 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
         guard shown else { return }
         shown = false
         pending = nil
+        closePreview()
         // A word left half-typed when you click away is kept as typed, so searching isn't
         // blocked once you're back.
         if composing, let editor = field.currentEditor() as? NSTextView {
@@ -367,6 +396,7 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
             rows = []
             answered = 0
             table.reloadData()
+            follow()
         }
         guard let hatch, indexed, !composing, !field.stringValue.isEmpty else { return fit() }
         newest = hatch.submit(field.stringValue)
@@ -391,6 +421,7 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
         answered = ticket
         table.reloadData()
         if !rows.isEmpty { select(rows.firstIndex { $0.path == keeping } ?? 0) }
+        follow()
         fit()
         let typed = sentAt.removeValue(forKey: ticket)
         sentAt = sentAt.filter { $0.key > ticket }
@@ -428,15 +459,21 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
         rows.indices.contains(table.selectedRow) ? rows[table.selectedRow] : nil
     }
 
-    /// Japanese and Chinese input pick the half-typed word with Return, so nothing opens then.
-    private func open(revealing reveal: Bool) {
-        guard !composing, let row = selected else { return }
+    private func found(_ row: Row) -> Bool {
         guard FileManager.default.fileExists(atPath: row.path) else {
             missing = "“\(row.name)” can’t be found."
-            return fit()
+            closePreview()
+            fit()
+            return false
         }
+        return true
+    }
+
+    /// Japanese and Chinese input pick the half-typed word with Return, so nothing opens then.
+    private func open(revealing reveal: Bool) {
+        guard !composing, let row = selected, found(row) else { return }
         hide()
-        let url = URL(fileURLWithPath: row.path)
+        let url = row.url
         if reveal {
             NSWorkspace.shared.activateFileViewerSelecting([url])
         } else {
@@ -457,6 +494,77 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
         }
     }
 
+    /// Closing doesn't wait for the results: typing on would drop a close left waiting.
+    @objc func quickLook(_ sender: Any?) {
+        if previewing { return closePreview() }
+        onceAnswered { [weak self] in
+            guard let self, !composing, let row = selected, found(row) else { return }
+            // In front but not key, so typing and the arrows stay in the box. With no change of key
+            // window to notice, it is told to look for the window that feeds it.
+            let preview = QLPreviewPanel.shared()!
+            inPreview = row.url
+            closing = false
+            preview.updateController()
+            preview.orderFront(nil)
+        }
+    }
+
+    var previewing: Bool {
+        !closing && QLPreviewPanel.sharedPreviewPanelExists() && QLPreviewPanel.shared().isVisible
+    }
+
+    /// Quick Look takes about 0.2 s to close and stays visible meanwhile; a second close in
+    /// that time cancels the first and leaves it open (macOS 26), so Esc twice would keep it up.
+    func closePreview() {
+        guard previewing else { return }
+        closing = true
+        QLPreviewPanel.shared().orderOut(nil)
+    }
+
+    /// The preview moves with the selection, and closes once nothing is selected. It closes
+    /// quietly on a file gone since the list was built; "can't be found" is for ⌘Y and Return.
+    private func follow() {
+        guard previewing else { return }
+        guard let row = selected, FileManager.default.fileExists(atPath: row.path) else {
+            return closePreview()
+        }
+        guard row.url != inPreview else { return }
+        inPreview = row.url
+        QLPreviewPanel.shared().reloadData()
+    }
+
+    /// A click on the preview gives it the keys and closing it hands them back to the box; only
+    /// a click in another app hides the window.
+    func settleKeys() {
+        DispatchQueue.main.async { [weak self] in
+            guard let self, shown, !panel.isKeyWindow, !QLPreviewPanel.shared().isKeyWindow else { return }
+            guard NSApp.isActive else { return hide() }
+            panel.makeKey()
+            if field.currentEditor() == nil { panel.makeFirstResponder(field) }
+        }
+    }
+
+    func numberOfPreviewItems(in panel: QLPreviewPanel!) -> Int {
+        selected == nil ? 0 : 1
+    }
+
+    func previewPanel(_ panel: QLPreviewPanel!, previewItemAt index: Int) -> QLPreviewItem! {
+        selected?.url as NSURL?
+    }
+
+    /// The arrows still pick the next result while the preview has the keys.
+    func previewPanel(_ panel: QLPreviewPanel!, handle event: NSEvent!) -> Bool {
+        guard event.type == .keyDown, event.modifierFlags.isDisjoint(with: [.command, .option, .control]) else {
+            return false
+        }
+        switch event.specialKey {
+        case .downArrow: move(by: 1)
+        case .upArrow: move(by: -1)
+        default: return false
+        }
+        return true
+    }
+
     func controlTextDidChange(_ note: Notification) {
         search(typedAt: pressedAt())
     }
@@ -468,8 +576,10 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
         case #selector(NSResponder.moveUp(_:)):
             move(by: -1)
         case #selector(NSResponder.cancelOperation(_:)):
-            // The first Esc clears the box, the second hides the window.
-            if field.stringValue.isEmpty {
+            // The first Esc clears the box, the second hides the window. A preview closes first.
+            if previewing {
+                closePreview()
+            } else if field.stringValue.isEmpty {
                 hide()
             } else {
                 field.stringValue = ""
@@ -486,8 +596,15 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
         return true
     }
 
+    /// Also hears the preview, whose delegate this is while it shows.
     func windowDidResignKey(_ note: Notification) {
+        guard note.object as? NSWindow === panel, !previewing else { return settleKeys() }
         hide()
+    }
+
+    /// Arrows, a click on a row, and a new list all land here.
+    func tableViewSelectionDidChange(_ note: Notification) {
+        follow()
     }
 
     func numberOfRows(in tableView: NSTableView) -> Int {
