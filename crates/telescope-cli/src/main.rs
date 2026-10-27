@@ -2,14 +2,17 @@ use std::ffi::OsString;
 use std::io::BufRead;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::Mutex;
 use std::time::Instant;
 use telescope_core::{Access, Clutter, Ignore, Index, Opened, Searcher, Settings};
+use telescope_grep::Grep;
 
 const USAGE: &str = "usage:
   tl index <folder>                       scan and report the index size
   tl search <folder>                      scan, then search each line you type
   tl bench <folder> <queries> [threads]   time every keystroke of each query
   tl golden <folder> <golden>             rank the expected file of each search
+  tl grep <folder> <text>                 scan, then show lines holding the text
 add --all to include hidden folders, ~/Library, the insides of packages like Photos Library,
 and tool downloads and caches like node_modules
 add --load <file> to open a saved index instead of scanning (it scans when the file is missing,
@@ -73,6 +76,10 @@ fn main() -> ExitCode {
         [command, folder, cases] if command == "golden" => {
             golden(Path::new(folder), options, Path::new(cases))
         }
+        [command, folder, text] if command == "grep" => match text.to_str() {
+            Some(text) => grep(Path::new(folder), options, text),
+            None => usage(),
+        },
         _ => usage(),
     }
 }
@@ -332,6 +339,35 @@ fn golden(folder: &Path, options: &Options, case_file: &Path) -> ExitCode {
         }
     }
     println!("expected file in the top 3: {in_top_3} of {}", cases.len());
+    ExitCode::SUCCESS
+}
+
+fn grep(folder: &Path, options: &Options, text: &str) -> ExitCode {
+    let Some(index) = load(folder, options) else {
+        return ExitCode::FAILURE;
+    };
+    let grep = Grep::default();
+    let started = Instant::now();
+    let first = Mutex::new(None);
+    let report = grep.search(&index, text, grep.ticket(), 100, |found| {
+        first.lock().unwrap().get_or_insert_with(|| ms(started));
+        println!("{}:{}: {}", found.path.display(), found.line, found.text);
+    });
+    let Some(report) = report else {
+        return ExitCode::FAILURE;
+    };
+    println!(
+        "{} lines in {} files searched in {:.1} ms on {} threads, the first after {:.1} ms",
+        report.lines_found,
+        report.files_searched,
+        ms(started),
+        grep.threads(),
+        first.into_inner().unwrap().unwrap_or(0.0)
+    );
+    println!(
+        "skipped: {} binary, {} too large, {} cloud-only, {} unreadable",
+        report.binary, report.too_large, report.cloud_only, report.unreadable
+    );
     ExitCode::SUCCESS
 }
 
