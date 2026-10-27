@@ -1,3 +1,6 @@
 /target
 /local
+/build
+/apps/macos/.build
+.swiftpm
 .DS_Store

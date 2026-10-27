@@ -1,0 +1,5 @@
+module CTelescope [system] {
+    header "../../../../crates/telescope-ffi/include/telescope.h"
+    link "telescope_ffi"
+    export *
+}
