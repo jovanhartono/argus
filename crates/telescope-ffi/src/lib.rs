@@ -2421,7 +2421,12 @@ mod tests {
         let names = [
             "/a", "/a/b", "/a/b/c", "/ab", "/x", "/a/b2", "/a-b", "/a.b", "/a b",
         ];
-        let paths: Vec<PathBuf> = names.iter().map(PathBuf::from).collect();
+        // Under a root that never exists, so no name resolves to a real folder (CI on
+        // Windows has a D:\a).
+        let paths: Vec<PathBuf> = names
+            .iter()
+            .map(|name| PathBuf::from(format!("/telescope-no-such-root{name}")))
+            .collect();
         // Every set of these folders, each also named twice.
         for set in 0..1_u32 << names.len() {
             let chosen: Vec<PathBuf> = (0..names.len())
