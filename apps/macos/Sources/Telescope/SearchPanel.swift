@@ -48,7 +48,7 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
     /// The file you picked was moved or deleted after the list was built.
     private var missing: String?
     private var newest: UInt64 = 0
-    private var sentAt: [UInt64: CFAbsoluteTime] = [:]
+    private var sentAt: [UInt64: TimeInterval] = [:]
     private var rows: [Row] = []
     /// The ticket the rows on screen answer; 0 before any answer, so an empty list isn't "No Results".
     private var answered: UInt64 = 0
@@ -59,7 +59,9 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
     override init() {
         super.init()
         build()
-        hatch = Hatch(standIn: Metric.standIn) { [weak self] event in self?.heard(event) }
+        // TELESCOPE_STAND_IN=0 measures the window's own memory without the made-up list.
+        let count = ProcessInfo.processInfo.environment["TELESCOPE_STAND_IN"].flatMap(UInt64.init)
+        hatch = Hatch(standIn: count ?? Metric.standIn) { [weak self] event in self?.heard(event) }
         if hatch == nil { problem = "Search couldn't start. Rebuild Telescope." }
     }
 
@@ -77,17 +79,21 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
     }
 
     func show() {
-        let started = CFAbsoluteTimeGetCurrent()
+        let pressed = pressedAt()
         shown = true
         place()
         panel.alphaValue = reduceMotion ? 1 : 0
         panel.orderFrontRegardless()
         panel.makeKey()
-        panel.makeFirstResponder(field)
         // Your last search comes back selected, so typing replaces it.
-        field.selectText(nil)
+        if let editor = field.currentEditor() {
+            editor.selectAll(nil)
+        } else {
+            panel.makeFirstResponder(field)
+            field.selectText(nil)
+        }
         panel.displayIfNeeded()
-        timing.notice("window shown in \(ms(since: started), format: .fixed(precision: 2)) ms")
+        timing.notice("window drawn \(ms(since: pressed), format: .fixed(precision: 2)) ms after the hotkey")
         fade(to: 1)
     }
 
@@ -95,6 +101,13 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
         guard shown else { return }
         shown = false
         pending = nil
+        // A word left half-typed when you click away is kept as typed, so searching isn't
+        // blocked once you're back.
+        if composing, let editor = field.currentEditor() as? NSTextView {
+            editor.inputContext?.discardMarkedText()
+            editor.unmarkText()
+            search()
+        }
         fade(to: 0) { [weak self] in
             // Shown again while fading out: keep it.
             if self?.shown == false { self?.panel.orderOut(nil) }
@@ -252,7 +265,7 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
         }
     }
 
-    private func search() {
+    private func search(typedAt typed: TimeInterval = ProcessInfo.processInfo.systemUptime) {
         missing = nil
         pending = nil
         if field.stringValue.isEmpty {
@@ -265,7 +278,7 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
         }
         guard let hatch, indexed, !composing, !field.stringValue.isEmpty else { return fit() }
         newest = hatch.submit(field.stringValue)
-        sentAt[newest] = CFAbsoluteTimeGetCurrent()
+        sentAt[newest] = typed
         fit()
     }
 
@@ -276,13 +289,15 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
         table.reloadData()
         if !rows.isEmpty { select(0) }
         fit()
-        if let sent = sentAt.removeValue(forKey: ticket) {
-            timing.notice("results in \(ms(since: sent), format: .fixed(precision: 2)) ms")
-        }
+        let typed = sentAt.removeValue(forKey: ticket)
         sentAt = sentAt.filter { $0.key > ticket }
         if let action = pending {
             pending = nil
             action()
+        } else if let typed {
+            // The rows grow into view over the 0.15 s resize; this times their first frame.
+            panel.displayIfNeeded()
+            timing.notice("results drawn \(ms(since: typed), format: .fixed(precision: 2)) ms after the keystroke")
         }
     }
 
@@ -340,7 +355,7 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
     }
 
     func controlTextDidChange(_ note: Notification) {
-        search()
+        search(typedAt: pressedAt())
     }
 
     func control(_ control: NSControl, textView: NSTextView, doCommandBy selector: Selector) -> Bool {
@@ -396,6 +411,16 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
     }
 }
 
-private func ms(since start: CFAbsoluteTime) -> Double {
-    (CFAbsoluteTimeGetCurrent() - start) * 1000
+/// When the key behind the current event went down, so timings include the wait to reach us.
+/// The hotkey arrives as a system-defined event; anything else times from now.
+@MainActor
+private func pressedAt() -> TimeInterval {
+    guard let event = NSApp.currentEvent, [.keyDown, .systemDefined].contains(event.type) else {
+        return ProcessInfo.processInfo.systemUptime
+    }
+    return event.timestamp
+}
+
+private func ms(since start: TimeInterval) -> Double {
+    (ProcessInfo.processInfo.systemUptime - start) * 1000
 }
