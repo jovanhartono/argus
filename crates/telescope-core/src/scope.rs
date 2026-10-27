@@ -399,8 +399,10 @@ mod tests {
                 assert!(scope.holds(&folder, &index), "{folder:?} with {access:?}");
             }
             // As macOS reports folders, with a slash at the end.
-            let slashed = PathBuf::from(format!("{}/", home.join("work").display()));
-            assert!(scope.holds(&slashed, &index));
+            if cfg!(unix) {
+                let slashed = PathBuf::from(format!("{}/", home.join("work").display()));
+                assert!(scope.holds(&slashed, &index));
+            }
         }
     }
 
