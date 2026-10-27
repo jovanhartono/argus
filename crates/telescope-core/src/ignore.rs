@@ -2,6 +2,7 @@
 //! folders to bring back.
 
 use crate::Access;
+use crate::store::put;
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io;
@@ -92,6 +93,18 @@ impl Ignore {
         (ignore, problems)
     }
 
+    /// The rules as bytes, to tell whether a saved index was built with the same ones.
+    pub(crate) fn encode(&self, out: &mut Vec<u8>) {
+        let names = [&self.skip_names, &self.keep_names];
+        let paths = [&self.skip_paths, &self.keep_paths];
+        for list in names {
+            put_list(out, list.iter().map(OsString::as_os_str));
+        }
+        for list in paths {
+            put_list(out, list.iter().map(|path| path.as_os_str()));
+        }
+    }
+
     pub(crate) fn skips(&self, path: &Path, name: &OsStr) -> bool {
         self.skip_names.iter().any(|skip| same(skip, name))
             || self
@@ -141,6 +154,13 @@ fn is_linked(home: &Path) -> bool {
         path.push(part);
         fs::symlink_metadata(&path).is_ok_and(|meta| meta.file_type().is_symlink())
     })
+}
+
+fn put_list<'a>(out: &mut Vec<u8>, list: impl ExactSizeIterator<Item = &'a OsStr>) {
+    out.extend_from_slice(&(list.len() as u64).to_le_bytes());
+    for item in list {
+        put(out, item.as_encoded_bytes());
+    }
 }
 
 fn same(a: &OsStr, b: &OsStr) -> bool {
