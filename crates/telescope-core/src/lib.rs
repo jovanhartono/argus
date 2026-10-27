@@ -10,4 +10,4 @@ pub use ignore::Ignore;
 pub use index::{EntryId, Index};
 pub use search::{Hit, Searcher, Ticket};
 pub use stand_in::stand_in;
-pub use walk::{Clutter, Scan, home, scan};
+pub use walk::{Access, Clutter, Scan, home, scan};

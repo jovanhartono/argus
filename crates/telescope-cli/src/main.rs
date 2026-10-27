@@ -3,9 +3,7 @@ use std::io::BufRead;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Instant;
-use telescope_core::{Clutter, Ignore, Index, Searcher};
-
-const IGNORE_FILE: &str = ".config/telescope/ignore";
+use telescope_core::{Access, Clutter, Ignore, Index, Searcher};
 
 const USAGE: &str = "usage:
   tl index <folder>                       scan and report the index size
@@ -66,28 +64,22 @@ fn usage() -> ExitCode {
     ExitCode::FAILURE
 }
 
-/// A missing ignore file is the normal case and means no rules of your own.
-fn ignore_list() -> Ignore {
-    let home = telescope_core::home();
-    let file = home.join(IGNORE_FILE);
-    if home.as_os_str().is_empty() || !file.exists() {
-        return Ignore::default();
-    }
-    let text = read(&file).unwrap_or_default();
-    let (ignore, problems) = Ignore::parse(&text, &home);
+fn ignore_list(home: &Path) -> Ignore {
+    let (ignore, problems) = Ignore::load(home, Access::Full);
     for problem in problems {
-        eprintln!("tl: ~/{IGNORE_FILE} {problem}");
+        eprintln!("tl: {problem}");
     }
     ignore
 }
 
 fn load(folder: &Path, clutter: Clutter) -> Option<Index> {
     let started = Instant::now();
+    let home = telescope_core::home();
     let ignore = match clutter {
-        Clutter::Skip => ignore_list(),
+        Clutter::Skip => ignore_list(&home),
         Clutter::Keep => Ignore::default(),
     };
-    let scan = match telescope_core::scan(folder, clutter, &ignore) {
+    let scan = match telescope_core::scan(folder, &home, clutter, &ignore, Access::Full) {
         Ok(scan) => scan,
         Err(error) => {
             eprintln!("tl: cannot scan {}: {error}", folder.display());
