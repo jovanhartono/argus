@@ -25,6 +25,7 @@ private func keyMenu() -> NSMenu {
     // Finder's own "Copy as Pathname" key; ⌘⇧C belongs to clipboard managers such as Maccy.
     file.addItem(withTitle: "Copy Path", action: #selector(SearchPanel.copyPath(_:)), keyEquivalent: "c")
         .keyEquivalentModifierMask = [.command, .option]
+    file.addItem(withTitle: "Quick Look", action: #selector(SearchPanel.quickLook(_:)), keyEquivalent: "y")
     let edit = NSMenu(title: "Edit")
     edit.addItem(withTitle: "Undo", action: Selector(("undo:")), keyEquivalent: "z")
     edit.addItem(withTitle: "Redo", action: Selector(("redo:")), keyEquivalent: "Z")
