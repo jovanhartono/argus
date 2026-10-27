@@ -24,9 +24,51 @@ pub enum Clutter {
     Keep,
 }
 
+/// Without Full Disk Access, macOS stops the first read of Desktop, Documents, Downloads, a
+/// cloud drive, other apps' data and a few media folders for a pop-up, so `Limited` leaves
+/// them out unread.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Access {
+    Full,
+    Limited,
+}
+
+/// The guarded folders, by the folder in your home that holds them.
+const GUARDED: &[(&str, &[&str])] = &[
+    ("", &["Desktop", "Documents", "Downloads"]),
+    // iCloud Drive, cloud drives such as Dropbox, and other apps' data, which macOS 14 guards.
+    // Only your ignore list could bring the rest back: Calendar and Contacts each ask too,
+    // as a Terminal running `find ~` shows.
+    (
+        "Library",
+        &[
+            "Mobile Documents",
+            "CloudStorage",
+            "Containers",
+            "Group Containers",
+            "Calendars",
+        ],
+    ),
+    ("Library/Application Support", &["AddressBook"]),
+    // Found by trying on macOS 26: the Music and TV apps' folders ask for the media library,
+    // and the Photos and Photo Booth libraries for Photos. A library carried over from iTunes
+    // is assumed to ask the same; not tried.
+    ("Music", &["Music", "iTunes"]),
+    ("Movies", &["TV"]),
+    (
+        "Pictures",
+        &["Photos Library.photoslibrary", "Photo Booth Library"],
+    ),
+];
+
+type Guarded = Vec<(PathBuf, &'static [&'static str])>;
+
 struct Walk {
     shared: Mutex<Shared>,
     clutter: Clutter,
+    access: Access,
+    /// Empty with Full Disk Access.
+    guarded: Guarded,
     ignore: Ignore,
     root: EntryId,
     home: PathBuf,
@@ -39,25 +81,27 @@ struct Shared {
 }
 
 /// Symbolic links are listed but never followed. Your ignore list counts only when clutter
-/// is skipped.
-pub fn scan(root: &Path, clutter: Clutter, ignore: &Ignore) -> io::Result<Scan> {
-    scan_from(root, clutter, ignore, home())
-}
-
-/// The real home folder, the way the scan reports paths, or empty when there is none.
-pub fn home() -> PathBuf {
-    std::env::home_dir()
-        .and_then(|home| fs::canonicalize(home).ok())
-        .unwrap_or_default()
-}
-
-fn scan_from(root: &Path, clutter: Clutter, ignore: &Ignore, home: PathBuf) -> io::Result<Scan> {
+/// is skipped. `home` is a real path, as `home()` gives it.
+pub fn scan(
+    root: &Path,
+    home: &Path,
+    clutter: Clutter,
+    ignore: &Ignore,
+    access: Access,
+) -> io::Result<Scan> {
     // The real path, as macOS reports file changes: /tmp becomes /private/tmp, no "..".
     let root = fs::canonicalize(root)?;
-    if !fs::metadata(&root)?.is_dir() {
-        return Err(io::ErrorKind::NotADirectory.into());
+    let guarded: Guarded = match access {
+        Access::Full => Vec::new(),
+        Access::Limited => GUARDED
+            .iter()
+            .map(|&(parent, names)| (home.join(parent), names))
+            .collect(),
+    };
+    if is_guarded(&root, &guarded) {
+        return Err(io::ErrorKind::PermissionDenied.into());
     }
-    // A root you may not open is an error, not an empty index.
+    // A root you may not open, or a file, is an error with the system's own number.
     fs::read_dir(&root)?;
 
     let mut builder = IndexBuilder::new();
@@ -68,10 +112,12 @@ fn scan_from(root: &Path, clutter: Clutter, ignore: &Ignore, home: PathBuf) -> i
             unreadable_folders: 0,
         }),
         clutter,
+        access,
+        guarded,
         ignore: ignore.clone(),
         root: root_id,
         library: home.join("Library"),
-        home,
+        home: home.to_path_buf(),
     };
     rayon::scope(|scope| read_folder(scope, root, root_id, false, &walk));
 
@@ -80,6 +126,20 @@ fn scan_from(root: &Path, clutter: Clutter, ignore: &Ignore, home: PathBuf) -> i
         index: shared.builder.finish(),
         unreadable_folders: shared.unreadable_folders,
     })
+}
+
+/// The real home folder, the way the scan reports paths, or empty when there is none.
+pub fn home() -> PathBuf {
+    std::env::home_dir()
+        .and_then(|home| fs::canonicalize(home).ok())
+        .unwrap_or_default()
+}
+
+/// A guarded folder, or one inside it. `path` is real, so ~/documents is already ~/Documents.
+fn is_guarded(path: &Path, guarded: &Guarded) -> bool {
+    guarded
+        .iter()
+        .any(|(parent, names)| names.iter().any(|name| path.starts_with(parent.join(name))))
 }
 
 fn is_clutter(folder: &Path, name: &OsStr, home: &Path) -> bool {
@@ -125,8 +185,17 @@ const PACKAGES: &[&str] = &[
     "xcworkspace",
 ];
 
-/// Packages, and folders a tool labelled as its cache, are listed in their parent with nothing
-/// inside them.
+fn is_package(path: &Path) -> bool {
+    let extension = path.extension().and_then(OsStr::to_str);
+    extension.is_some_and(|extension| {
+        PACKAGES
+            .iter()
+            .any(|package| package.eq_ignore_ascii_case(extension))
+    })
+}
+
+/// Apps, documents saved as folders, and folders a tool labelled as its cache, are listed in
+/// their parent with nothing inside them, like packages.
 fn is_sealed(path: &Path, listing: &[(OsString, bool)]) -> bool {
     let has = |file: &str| listing.iter().any(|(name, _)| name == file);
     let extension = path.extension().and_then(OsStr::to_str);
@@ -138,7 +207,6 @@ fn is_sealed(path: &Path, listing: &[(OsString, bool)]) -> bool {
         Some("key" | "numbers" | "pages") => has("Index.zip") || has("Index"),
         Some("band") => has("projectData") || has("Alternatives"),
         Some("playground") => has("contents.xcplayground"),
-        Some(extension) if PACKAGES.contains(&extension) => true,
         _ => has("CACHEDIR.TAG") && is_cache_tag(&path.join("CACHEDIR.TAG")),
     }
 }
@@ -160,6 +228,23 @@ fn read_folder<'s>(
     walk: &'s Walk,
 ) {
     let shared = &walk.shared;
+    // What you scan is always read, whatever it is.
+    let skip = walk.clutter == Clutter::Skip && folder != walk.root;
+    let name = path.file_name().unwrap_or_default();
+    // A Photos library may be guarded under any name or folder, and a guard beats your list.
+    if walk.access == Access::Limited
+        && path
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("photoslibrary"))
+    {
+        return;
+    }
+    let kept = walk.ignore.keeps(&path, name);
+    let may_seal = skip && !passage && !kept;
+    let package = may_seal && is_package(&path);
+    if package && !walk.ignore.leads_to_kept(&path) {
+        return;
+    }
     let Ok(entries) = fs::read_dir(&path) else {
         shared.lock().unwrap().unreadable_folders += 1;
         return;
@@ -173,17 +258,19 @@ fn read_folder<'s>(
         let is_dir = entry.file_type().is_ok_and(|kind| kind.is_dir());
         listing.push((entry.file_name(), is_dir));
     }
-    // What you scan is always read, whatever it is.
-    let skip = walk.clutter == Clutter::Skip && folder != walk.root;
-    let name = path.file_name().unwrap_or_default();
-    let kept = walk.ignore.keeps(&path, name);
-    let sealed = skip && !passage && !kept && is_sealed(&path, &listing);
+    let sealed = package || (may_seal && is_sealed(&path, &listing));
     if sealed && !walk.ignore.leads_to_kept(&path) {
         return;
     }
     // Only cloud drives are kept from ~/Library: iCloud Drive, Dropbox, Google Drive, OneDrive.
     let in_library = skip && !kept && path == walk.library;
     let passage = passage || sealed || in_library;
+    // Only the few folders in GUARDED hold one, so no other folder compares names.
+    let guarded = walk
+        .guarded
+        .iter()
+        .find(|(parent, _)| *parent == path)
+        .map_or(&[][..], |&(_, names)| names);
 
     // Names are gathered first so the shared lock is taken once per folder, not once per file.
     let mut names = String::new();
@@ -191,6 +278,9 @@ fn read_folder<'s>(
     let mut subfolders = Vec::new();
     for (name, is_dir) in &listing {
         let is_dir = *is_dir;
+        if is_dir && guarded.iter().any(|guarded| name == guarded) {
+            continue;
+        }
         let child_path = is_dir.then(|| path.join(name));
         let mut child_passage = false;
         if walk.clutter == Clutter::Skip {
@@ -245,11 +335,11 @@ mod tests {
     use std::collections::BTreeSet;
 
     fn scan(root: &Path, clutter: Clutter) -> io::Result<Scan> {
-        super::scan(root, clutter, &Ignore::default())
+        super::scan(root, &home(), clutter, &Ignore::default(), Access::Full)
     }
 
     fn scan_from(root: &Path, clutter: Clutter, home: PathBuf) -> io::Result<Scan> {
-        super::scan_from(root, clutter, &Ignore::default(), home)
+        super::scan(root, &home, clutter, &Ignore::default(), Access::Full)
     }
 
     fn paths_below(root: &Path, index: &Index) -> BTreeSet<PathBuf> {
@@ -280,10 +370,10 @@ mod tests {
         }
         let rules = "old projects\n~/Movies/Exports\n!~/.config\n!~/.cache/keep\n\
                      !~/Trip.photoslibrary\n!~/Old.photoslibrary/originals\n";
-        let (ignore, problems) = Ignore::parse(rules, root);
+        let (ignore, problems) = Ignore::parse(rules, root, Access::Full);
         assert!(problems.is_empty());
 
-        let index = super::scan_from(root, Clutter::Skip, &ignore, PathBuf::new()).unwrap();
+        let index = super::scan(root, Path::new(""), Clutter::Skip, &ignore, Access::Full).unwrap();
         let expected: BTreeSet<PathBuf> = [
             "work",
             "Movies",
@@ -373,6 +463,23 @@ mod tests {
 
         assert_eq!(scan.index.len(), 2);
         assert_eq!(scan.unreadable_folders, 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn never_opens_a_package() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let photos = dir.path().join("Photos Library 2.photoslibrary");
+        fs::create_dir(&photos).unwrap();
+        fs::set_permissions(&photos, fs::Permissions::from_mode(0o000)).unwrap();
+
+        let scan = scan(dir.path(), Clutter::Skip);
+        fs::set_permissions(&photos, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let scan = scan.unwrap();
+        assert_eq!(scan.index.len(), 2);
+        assert_eq!(scan.unreadable_folders, 0);
     }
 
     #[test]
@@ -478,8 +585,8 @@ mod tests {
             fs::write(home.join(file), "").unwrap();
         }
         let names_with = |root: &Path, rules: &str| {
-            let (ignore, _) = Ignore::parse(rules, &home);
-            let index = super::scan_from(root, Clutter::Skip, &ignore, home.clone());
+            let (ignore, _) = Ignore::parse(rules, &home, Access::Full);
+            let index = super::scan(root, &home, Clutter::Skip, &ignore, Access::Full);
             let index = index.unwrap().index;
             let mut names: Vec<String> = (1..index.len() as EntryId)
                 .map(|entry| index.name(entry).to_owned())
@@ -504,6 +611,103 @@ mod tests {
         assert!(!found.contains(&"a.db".to_owned()));
         assert!(names_with(&home, "!~/Library").contains(&"a.db".to_owned()));
         assert!(!names_with(&home, "CloudStorage").contains(&"plan.md".to_owned()));
+    }
+
+    #[test]
+    fn without_full_disk_access_the_guarded_folders_stay_unread() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = &fs::canonicalize(dir.path()).unwrap();
+        for file in [
+            "Desktop/a.png",
+            "Documents/b.pdf",
+            "Downloads/c.zip",
+            "Library/Mobile Documents/com~apple~CloudDocs/d.pdf",
+            "Library/CloudStorage/Dropbox/e.md",
+            "Library/Containers/com.x/Data/m.txt",
+            "Library/Group Containers/group.x/n.txt",
+            "Library/Calendars/p.ics",
+            "Library/Application Support/AddressBook/q.abcddb",
+            "Music/Music/Media.localized/h.m4a",
+            "Music/iTunes/iTunes Media/r.m4a",
+            "Movies/TV/Media.localized/k.mp4",
+            "Pictures/Photos Library.photoslibrary/originals/l.heic",
+            "Pictures/Family.photoslibrary/originals/o.heic",
+            "Pictures/Photo Booth Library/Pictures/i.jpg",
+            "Pictures/j.png",
+            "Movies/f.mov",
+            "work/Documents/g.txt",
+        ] {
+            fs::create_dir_all(home.join(file).parent().unwrap()).unwrap();
+            fs::write(home.join(file), "").unwrap();
+        }
+        // Even a folder you brought back is not read inside a guarded one.
+        let rules = "!~/Documents\n!~/Downloads/inside\n!~/Library\n!~/Library/Containers\n\
+                     !Group Containers\n!~/Pictures/Family.photoslibrary";
+        let (ignore, _) = Ignore::parse(rules, home, Access::Full);
+        let paths = |access: Access, clutter: Clutter| {
+            let scan = super::scan(home, home, clutter, &ignore, access).unwrap();
+            assert_eq!(scan.unreadable_folders, 0);
+            paths_below(home, &scan.index)
+        };
+        let guarded = [
+            "Desktop",
+            "Documents/b.pdf",
+            "Downloads",
+            "Library/Mobile Documents",
+            "Library/CloudStorage/Dropbox/e.md",
+            "Library/Containers/com.x/Data/m.txt",
+            "Library/Group Containers/group.x/n.txt",
+            "Library/Calendars/p.ics",
+            "Library/Application Support/AddressBook/q.abcddb",
+            "Music/Music",
+            "Music/iTunes",
+            "Movies/TV",
+            "Pictures/Photos Library.photoslibrary",
+            "Pictures/Family.photoslibrary/originals/o.heic",
+            "Pictures/Photo Booth Library/Pictures/i.jpg",
+        ];
+
+        for clutter in [Clutter::Skip, Clutter::Keep] {
+            let full = paths(Access::Full, clutter);
+            let limited = paths(Access::Limited, clutter);
+            for path in guarded {
+                assert!(full.contains(Path::new(path)), "{path} with {clutter:?}");
+                assert!(
+                    !limited.contains(Path::new(path)),
+                    "{path} with {clutter:?}"
+                );
+            }
+            assert!(!limited.contains(Path::new("Documents")));
+            // Only those folders, not every folder sharing their names.
+            for path in [
+                "Movies/f.mov",
+                "Music",
+                "Pictures/j.png",
+                "work/Documents/g.txt",
+            ] {
+                assert!(limited.contains(Path::new(path)), "{path} with {clutter:?}");
+            }
+        }
+
+        for root in [
+            "Documents",
+            "documents",
+            "Library/CloudStorage/Dropbox",
+            "Music/Music",
+        ] {
+            let limited = super::scan(
+                &home.join(root),
+                home,
+                Clutter::Skip,
+                &ignore,
+                Access::Limited,
+            );
+            assert_eq!(
+                limited.err().map(|error| error.kind()),
+                Some(io::ErrorKind::PermissionDenied),
+                "{root}"
+            );
+        }
     }
 
     #[test]

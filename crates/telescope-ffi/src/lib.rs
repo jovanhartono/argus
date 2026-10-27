@@ -6,27 +6,33 @@
 //! that ticket's rows are ready; the window then copies them out with `tl_take`.
 //! `include/telescope.h` repeats everything here for Swift, and a test keeps the two in step.
 
-use std::ffi::c_void;
+use std::ffi::{CString, c_void};
+use std::io;
 use std::panic::{self, AssertUnwindSafe};
+use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use telescope_core::{Hit, Index, Searcher, Ticket};
+use telescope_core::{Access, Clutter, Hit, Ignore, Index, Searcher, Ticket};
 
 /// Raise this with any change below, so a window built against an older header refuses to start.
-pub const TL_ABI_VERSION: u32 = 1;
+pub const TL_ABI_VERSION: u32 = 2;
 
 pub const TL_OK: u32 = 0;
 /// No rows for that ticket: not ready yet, already taken, or a newer search replaced them.
 pub const TL_GONE: u32 = 1;
 pub const TL_PANICKED: u32 = 2;
 
-/// The made-up index is built; `value` is its entry count.
+/// The index is built; `value` is its entry count.
 pub const TL_EVENT_INDEXED: u32 = 1;
 /// `value` is the ticket whose rows are ready.
 pub const TL_EVENT_READY: u32 = 2;
-/// The worker hit a bug and stopped; no more results will come.
+/// The folder couldn't be scanned, or the worker hit a bug; no more results will come.
+/// `value` is the scan's OS error number (errno on a Mac), or 0.
 pub const TL_EVENT_FAILED: u32 = 3;
+/// A problem with your ignore list. `value` is the address of its text, NUL-terminated UTF-8,
+/// readable only until `on_event` returns.
+pub const TL_EVENT_NOTE: u32 = 4;
 
 const ROWS: usize = 50;
 
@@ -83,8 +89,13 @@ unsafe impl Send for Notify {}
 
 impl Notify {
     fn send(&self, event: u32, value: u64) {
-        // SAFETY: as promised to `tl_core_new_stand_in`.
+        // SAFETY: as promised to `tl_core_new`.
         unsafe { (self.on_event)(self.ctx, event, value) }
+    }
+
+    fn note(&self, text: &str) {
+        let text = CString::new(text).unwrap_or_default();
+        self.send(TL_EVENT_NOTE, text.as_ptr() as u64);
     }
 }
 
@@ -96,6 +107,49 @@ fn guard<T>(failed: T, body: impl FnOnce() -> T) -> T {
 #[unsafe(no_mangle)]
 pub extern "C" fn tl_abi_version() -> u32 {
     TL_ABI_VERSION
+}
+
+/// Starts a core that scans `root` in the background as a home folder (the app passes yours),
+/// skipping clutter and the ignore list inside it. Without `full_disk` (0), the folders macOS
+/// guards with a pop-up each are left unread. Searches sent before `TL_EVENT_INDEXED` wait for
+/// it; a scan that fails sends `TL_EVENT_FAILED`, and each problem with the ignore list a
+/// `TL_EVENT_NOTE` first. Returns null on failure, without `on_event`, or for a `root` that
+/// isn't UTF-8.
+///
+/// # Safety
+/// `root` points to `root_len` bytes. `on_event` may be called with `ctx` from any thread
+/// until `tl_core_free` returns.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tl_core_new(
+    root: *const u8,
+    root_len: usize,
+    full_disk: u32,
+    ctx: *mut c_void,
+    on_event: Option<TlEventFn>,
+) -> *mut TlCore {
+    guard(std::ptr::null_mut(), || {
+        if root.is_null() {
+            return std::ptr::null_mut();
+        }
+        let bytes = unsafe { std::slice::from_raw_parts(root, root_len) };
+        let Ok(root) = std::str::from_utf8(bytes).map(PathBuf::from) else {
+            return std::ptr::null_mut();
+        };
+        let access = match full_disk {
+            0 => Access::Limited,
+            _ => Access::Full,
+        };
+        start(ctx, on_event, move |notify| {
+            // The folder being scanned, not $HOME, which a launch from a terminal may change.
+            let home = std::fs::canonicalize(root)?;
+            let (ignore, problems) = Ignore::load(&home, access);
+            for problem in problems {
+                notify.note(&problem);
+            }
+            telescope_core::scan(&home, &home, Clutter::Skip, &ignore, access)
+                .map(|scan| scan.index)
+        })
+    })
 }
 
 /// Starts a core over `count` made-up names, built in the background. Searches sent before
@@ -111,35 +165,58 @@ pub unsafe extern "C" fn tl_core_new_stand_in(
     on_event: Option<TlEventFn>,
 ) -> *mut TlCore {
     guard(std::ptr::null_mut(), || {
-        let Some(on_event) = on_event else {
-            return std::ptr::null_mut();
-        };
         if count >= u64::from(u32::MAX) {
             return std::ptr::null_mut();
         }
-        let searcher = Arc::new(Searcher::default());
-        let done = Arc::default();
-        let (jobs, inbox) = mpsc::channel();
-        let notify = Notify { ctx, on_event };
-        let worker = {
-            let (searcher, done) = (Arc::clone(&searcher), Arc::clone(&done));
-            thread::Builder::new()
-                .name("hatch".into())
-                .spawn(move || work(count as usize, &searcher, &inbox, &done, &notify))
-                .expect("start the hatch worker")
-        };
-        Box::into_raw(Box::new(TlCore {
-            searcher,
-            jobs: Some(jobs),
-            done,
-            worker: Some(worker),
-        }))
+        start(ctx, on_event, move |_| {
+            Ok(telescope_core::stand_in(count as usize))
+        })
     })
 }
 
-fn work(count: usize, searcher: &Searcher, inbox: &Receiver<Job>, done: &Done, notify: &Notify) {
+fn start(
+    ctx: *mut c_void,
+    on_event: Option<TlEventFn>,
+    build: impl FnOnce(&Notify) -> io::Result<Index> + Send + 'static,
+) -> *mut TlCore {
+    let Some(on_event) = on_event else {
+        return std::ptr::null_mut();
+    };
+    let searcher = Arc::new(Searcher::default());
+    let done = Arc::default();
+    let (jobs, inbox) = mpsc::channel();
+    let notify = Notify { ctx, on_event };
+    let worker = {
+        let (searcher, done) = (Arc::clone(&searcher), Arc::clone(&done));
+        thread::Builder::new()
+            .name("hatch".into())
+            .spawn(move || work(build, &searcher, &inbox, &done, &notify))
+            .expect("start the hatch worker")
+    };
+    Box::into_raw(Box::new(TlCore {
+        searcher,
+        jobs: Some(jobs),
+        done,
+        worker: Some(worker),
+    }))
+}
+
+fn work(
+    build: impl FnOnce(&Notify) -> io::Result<Index>,
+    searcher: &Searcher,
+    inbox: &Receiver<Job>,
+    done: &Done,
+    notify: &Notify,
+) {
     let stopped_cleanly = panic::catch_unwind(AssertUnwindSafe(|| {
-        let index = telescope_core::stand_in(count);
+        let index = match build(notify) {
+            Ok(index) => index,
+            Err(error) => {
+                let code = error.raw_os_error().map_or(0, |code| code as u64);
+                notify.send(TL_EVENT_FAILED, code);
+                return;
+            }
+        };
         notify.send(TL_EVENT_INDEXED, index.len() as u64);
         while let Ok(job) = inbox.recv() {
             // A search replaced by a newer keystroke gives up and is never shown.
@@ -185,7 +262,7 @@ fn pack(index: &Index, hits: &[Hit]) -> Packed {
 /// Starts a search and returns its ticket, or 0 on failure. Every older search gives up.
 ///
 /// # Safety
-/// `core` came from `tl_core_new_stand_in`, and `query` points to `len` bytes of UTF-8
+/// `core` came from `tl_core_new` or `tl_core_new_stand_in`, and `query` points to `len` bytes of UTF-8
 /// (or `len` is 0).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn tl_submit(core: *const TlCore, query: *const u8, len: usize) -> u64 {
@@ -211,7 +288,7 @@ pub unsafe extern "C" fn tl_submit(core: *const TlCore, query: *const u8, len: u
 /// only when this returns `TL_OK`.
 ///
 /// # Safety
-/// `core` came from `tl_core_new_stand_in`, and `out` points to a `TlRows` to fill.
+/// `core` came from `tl_core_new` or `tl_core_new_stand_in`, and `out` points to a `TlRows` to fill.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn tl_take(core: *const TlCore, ticket: u64, out: *mut TlRows) -> u32 {
     guard(TL_PANICKED, || {
@@ -247,11 +324,11 @@ pub unsafe extern "C" fn tl_rows_free(rows: TlRows) {
 }
 
 /// Stops the core and waits for its worker, so `on_event` never runs once this returns.
-/// Called while the made-up names are still being built, it waits for them to finish
-/// (under 0.2 s for a million).
+/// Called while the index is still being built, it waits for the build to finish: under 0.2 s
+/// for a million made-up names, but a home folder scanned with nothing cached may take longer.
 ///
 /// # Safety
-/// `core` came from `tl_core_new_stand_in` and is freed once, never from inside `on_event`.
+/// `core` came from `tl_core_new` or `tl_core_new_stand_in` and is freed once, never from inside `on_event`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn tl_core_free(core: *mut TlCore) {
     guard((), || {
@@ -281,11 +358,21 @@ mod tests {
     #[derive(Default)]
     struct Events {
         seen: Mutex<Vec<(u32, u64)>>,
+        notes: Mutex<Vec<String>>,
         changed: Condvar,
     }
 
     unsafe extern "C" fn record(ctx: *mut c_void, event: u32, value: u64) {
         let events = unsafe { &*(ctx as *const Events) };
+        if event == TL_EVENT_NOTE {
+            let text = unsafe { std::ffi::CStr::from_ptr(value as *const std::ffi::c_char) };
+            events
+                .notes
+                .lock()
+                .unwrap()
+                .push(text.to_str().unwrap().to_owned());
+            return;
+        }
         events.seen.lock().unwrap().push((event, value));
         events.changed.notify_all();
     }
@@ -421,6 +508,82 @@ mod tests {
         assert_eq!(take(&core, ticket), Some(Vec::new()));
     }
 
+    fn scan(home: &str, full_disk: u32, events: &Events) -> Core {
+        let ctx = events as *const Events as *mut c_void;
+        let core = unsafe { tl_core_new(home.as_ptr(), home.len(), full_disk, ctx, Some(record)) };
+        assert!(!core.is_null());
+        Core(core)
+    }
+
+    #[test]
+    fn a_scanned_folder_comes_back_as_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        std::fs::create_dir_all(root.join("notes/node_modules")).unwrap();
+        std::fs::write(root.join("notes/budget 2026.txt"), "").unwrap();
+        std::fs::write(root.join("notes/node_modules/budget.js"), "").unwrap();
+
+        let events = Events::default();
+        let core = scan(root.to_str().unwrap(), 1, &events);
+        // The folder itself, notes and the budget: node_modules is clutter.
+        events.wait_for(TL_EVENT_INDEXED, 3);
+        let ticket = submit(&core, "budget");
+        events.wait_for(TL_EVENT_READY, ticket);
+        let notes = root.join("notes").to_string_lossy().into_owned();
+        assert_eq!(
+            take(&core, ticket),
+            Some(vec![("budget 2026.txt".to_owned(), notes, false)])
+        );
+    }
+
+    #[test]
+    fn without_full_disk_access_documents_stay_unread() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = std::fs::canonicalize(dir.path()).unwrap();
+        std::fs::create_dir(home.join("Documents")).unwrap();
+        std::fs::write(home.join("Documents/budget.pdf"), "").unwrap();
+
+        // The home folder, Documents and the budget; then the home folder alone.
+        for (full_disk, entries) in [(1, 3), (0, 1)] {
+            let events = Events::default();
+            let _core = scan(home.to_str().unwrap(), full_disk, &events);
+            events.wait_for(TL_EVENT_INDEXED, entries);
+        }
+    }
+
+    #[test]
+    fn a_folder_that_cannot_be_scanned_stops_the_core() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("notes.txt");
+        std::fs::write(&file, "").unwrap();
+        // A missing folder and a file each fail with the system's own number, never 0.
+        for root in [dir.path().join("gone"), file] {
+            let code = std::fs::read_dir(&root)
+                .unwrap_err()
+                .raw_os_error()
+                .unwrap() as u64;
+            let events = Events::default();
+            let _core = scan(root.to_str().unwrap(), 1, &events);
+            events.wait_for(TL_EVENT_FAILED, code);
+            assert_eq!(*events.seen.lock().unwrap(), [(TL_EVENT_FAILED, code)]);
+        }
+    }
+
+    #[test]
+    fn problems_with_the_ignore_list_are_told() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = std::fs::canonicalize(dir.path()).unwrap();
+        std::fs::create_dir_all(home.join(".config/telescope")).unwrap();
+        std::fs::write(home.join(".config/telescope/ignore"), "work/old\n").unwrap();
+
+        let events = Events::default();
+        let _core = scan(home.to_str().unwrap(), 1, &events);
+        events.wait_for(TL_EVENT_INDEXED, 1);
+        let notes = events.notes.lock().unwrap();
+        assert_eq!(notes.len(), 1);
+        assert!(notes[0].contains("line 1"), "{}", notes[0]);
+    }
+
     #[test]
     fn a_core_refuses_what_it_cannot_serve() {
         let nowhere = unsafe { tl_core_new_stand_in(100, std::ptr::null_mut(), None) };
@@ -429,6 +592,10 @@ mod tests {
         let ctx = &events as *const Events as *mut c_void;
         let too_many = unsafe { tl_core_new_stand_in(u64::from(u32::MAX), ctx, Some(record)) };
         assert!(too_many.is_null());
+        let not_utf8 = unsafe { tl_core_new([0xff].as_ptr(), 1, 1, ctx, Some(record)) };
+        assert!(not_utf8.is_null());
+        let no_root = unsafe { tl_core_new(std::ptr::null(), 0, 1, ctx, Some(record)) };
+        assert!(no_root.is_null());
     }
 
     #[test]

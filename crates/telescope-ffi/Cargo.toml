@@ -11,3 +11,6 @@ crate-type = ["staticlib"]
 
 [dependencies]
 telescope-core = { path = "../telescope-core" }
+
+[dev-dependencies]
+tempfile = "3.27.0"
