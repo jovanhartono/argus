@@ -103,12 +103,14 @@ mod tests {
         let (ignore, problems) = Ignore::parse(text, home);
 
         assert!(ignore.skips(Path::new("/a/Old Projects"), OsStr::new("Old Projects")));
-        assert!(ignore.skips(&home.join("movies/exports"), OsStr::new("exports")));
+        let nvim = home.join(".config").join("nvim");
+        let exports = home.join("movies").join("exports");
+        assert!(ignore.skips(&exports, OsStr::new("exports")));
         assert!(!ignore.skips(Path::new("/a/Exports"), OsStr::new("Exports")));
-        assert!(ignore.keeps(&home.join(".config/nvim"), OsStr::new("nvim")));
+        assert!(ignore.keeps(&nvim, OsStr::new("nvim")));
         assert!(ignore.leads_to_kept(&home.join(".config")));
         assert!(!ignore.leads_to_kept(&home.join(".conf")));
-        assert!(!ignore.leads_to_kept(&home.join(".config/nvim")));
+        assert!(!ignore.leads_to_kept(&nvim));
         assert!(ignore.keeps(Path::new("/a/.github"), OsStr::new(".github")));
         assert_eq!(problems.len(), 3);
         assert!(problems[0].starts_with("line 7:"));
