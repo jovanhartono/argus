@@ -26,6 +26,13 @@ pub struct Hit {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Ticket(u64);
 
+impl Ticket {
+    /// The ticket as a plain number, for a window on the other side of the hatch.
+    pub fn number(self) -> u64 {
+        self.0
+    }
+}
+
 pub struct Searcher {
     pool: rayon::ThreadPool,
     newest: AtomicU64,
@@ -74,6 +81,11 @@ impl Searcher {
     /// Take one per keystroke. Every search holding an older ticket gives up.
     pub fn ticket(&self) -> Ticket {
         Ticket(self.newest.fetch_add(1, Ordering::Relaxed) + 1)
+    }
+
+    /// The number of the last ticket handed out; only its search is still wanted.
+    pub fn newest(&self) -> u64 {
+        self.newest.load(Ordering::Relaxed)
     }
 
     /// The best `limit` hits, or `None` when a newer ticket arrived first.
