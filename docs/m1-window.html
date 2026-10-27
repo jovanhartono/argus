@@ -62,6 +62,7 @@ tr:last-child td { border-bottom: 0; }
 th { font-size: 0.78rem; color: var(--muted); font-weight: 600; white-space: nowrap; }
 td.name { font-weight: 600; white-space: nowrap; }
 td.n { white-space: nowrap; font-variant-numeric: tabular-nums; }
+td .sub { display: block; color: var(--muted); font-size: 0.82rem; }
 .mono { font-family: var(--font-mono); font-size: 0.82rem; }
 kbd { font-family: var(--font); font-size: 0.8rem; padding: 1px 7px; border-radius: 5px; background: var(--surface); border: 0.5px solid var(--line); box-shadow: 0 1px 0 var(--line); white-space: nowrap; }
 figure { margin: 0; display: grid; gap: 12px; }
@@ -308,7 +309,7 @@ footer { border-top: 0.5px solid var(--line); margin-top: 36px; padding-top: 20p
     <table>
       <thead><tr><th>Check</th><th>Target</th><th>Measured on your Mac, 27 Oct, while busy (load average 2.5-4.5)</th></tr></thead>
       <tbody>
-        <tr><td class="name">Hotkey to window drawn</td><td class="n">4 ms, 95% of the time</td><td><span class="chip open">Missed</span> 95% within 8.3 ms over 40 opens, half within 7.3 ms. Timed from the key press to the window drawn with the keyboard in it; the fade then takes 0.12 s to reach full strength. About 3 ms is macOS handing the keyboard to the window, which Telescope can't speed up</td></tr>
+        <tr><td class="name">Hotkey to window drawn</td><td class="n">10 ms, 95% of the time<span class="sub">was 4 ms; relaxed on 27 Oct</span></td><td><span class="chip keep">Pass</span> 95% within 8.3 ms over 40 opens, half within 7.3 ms. Timed from the key press to the window drawn with the keyboard in it; the fade then takes 0.12 s to reach full strength. About 3 ms is macOS handing the keyboard to the window, which Telescope can't speed up</td></tr>
         <tr><td class="name">Keystroke to results</td><td class="n">25 ms, 95% of the time</td><td><span class="chip keep">Pass</span> 38 of 40 within 23.9 ms, from the key press to the first frame with rows, for a one-letter search (the heaviest kind); the slowest took 48 ms. 12-15 ms of that is searching the 1M names. The window then grows to show all the rows over 0.15 s</td></tr>
         <tr><td class="name">8 fast keystrokes</td><td>2 results shown or fewer; the last always wins</td><td><span class="chip keep">Pass</span> 1 shown in 9 of 10 bursts, 2 in one; the box always ended on the last word typed. The test sends all 8 keys at once, so the last one waits behind the others: its results were drawn 23-71 ms after it</td></tr>
         <tr><td class="name">Focus goes back</td><td>20 of 20 times</td><td><span class="chip keep">Pass</span> 20 of 20, twice: TextEdit kept the keyboard and got every keystroke</td></tr>
@@ -318,7 +319,7 @@ footer { border-top: 0.5px solid var(--line); margin-top: 36px; padding-top: 20p
         <tr><td class="name"><span class="term" tabindex="0" data-tip="Swift's strictest setting, which catches threading mistakes before the app runs.">Swift 6 mode</span></td><td>Builds and runs</td><td><span class="chip keep">Pass</span> Every file compiles with Swift 6's checks and the app runs</td></tr>
         <tr><td class="name">Permissions after rebuilds</td><td>Survive 5 rebuilds</td><td><span class="chip keep">Pass</span> 5 different builds all meet the first build's signing rule, which macOS checks before keeping a permission; ad-hoc builds fail it</td></tr>
         <tr><td class="name">Downloaded .dmg</td><td>Opens through Open Anyway in 4 steps or fewer</td><td><span class="chip open">By hand</span> One app for Apple and Intel chips; a 2.0 MB download. Marked as downloaded, macOS holds it back as expected, which is where Open Anyway comes in. Published as <a href="https://github.com/jovanhartono/telescope/releases/tag/v0.1.0">v0.1.0</a> with the 4 steps in its notes; clicking through them needs you at the screen</td></tr>
-        <tr><td class="name">App size</td><td class="n">Under 3 MB (from the research)</td><td><span class="chip open">Missed</span> The app is 4.1 MB on disk: its program holds a 1.9 MB copy for Apple chips and a 2.3 MB copy for Intel. The Rust core is 1.27 MB of the Apple copy, mostly frizbee's matching code; <span class="term" tabindex="0" data-tip="Link-time optimisation: the compiler looks at the whole program at once and drops code nothing calls.">LTO</span> cuts about 0.2 MB per chip</td></tr>
+        <tr><td class="name">App size</td><td class="n">Under 6 MB for both chips<span class="sub">was 3 MB; relaxed on 27 Oct</span></td><td><span class="chip keep">Pass</span> The app is 4.1 MB on disk: its program holds a 1.9 MB copy for Apple chips and a 2.3 MB copy for Intel. The Rust core is 1.27 MB of the Apple copy, mostly frizbee's matching code; <span class="term" tabindex="0" data-tip="Link-time optimisation: the compiler looks at the whole program at once and drops code nothing calls.">LTO</span> cuts about 0.2 MB per chip</td></tr>
       </tbody>
     </table>
   </div>
