@@ -1,0 +1,342 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Telescope Window</title>
+<style>
+:root {
+  --bg: #f5f5f7; --surface: #ffffff; --ink: #1d1d1f; --muted: #6e6e73; --line: #d2d2d7;
+  --accent: #0066cc; --accent-soft: #e8f0fb; --good: #1d7a4b; --good-soft: #e3f4ea;
+  --warn: #8f5400; --warn-soft: #fbefd9;
+  --shot-shadow: 0 20px 50px rgba(0,0,0,0.18), 0 0 0 0.5px rgba(0,0,0,0.22);
+  --font: -apple-system, BlinkMacSystemFont, system-ui, "Segoe UI", sans-serif;
+  --font-mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  color-scheme: light;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #000000; --surface: #1c1c1e; --ink: #f5f5f7; --muted: #98989d; --line: #38383a;
+    --accent: #2997ff; --accent-soft: #10243d; --good: #5ccb91; --good-soft: #12301f;
+    --warn: #f0b35a; --warn-soft: #33260e;
+    --shot-shadow: 0 20px 50px rgba(0,0,0,0.6), 0 0 0 0.5px rgba(255,255,255,0.2);
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #000000; --surface: #1c1c1e; --ink: #f5f5f7; --muted: #98989d; --line: #38383a;
+  --accent: #2997ff; --accent-soft: #10243d; --good: #5ccb91; --good-soft: #12301f;
+  --warn: #f0b35a; --warn-soft: #33260e;
+  --shot-shadow: 0 20px 50px rgba(0,0,0,0.6), 0 0 0 0.5px rgba(255,255,255,0.2);
+  color-scheme: dark;
+}
+*, *::before, *::after { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--ink); font-family: var(--font); font-size: 17px; line-height: 1.55; -webkit-font-smoothing: antialiased; }
+.wrap { max-width: 980px; margin: 0 auto; padding: 56px max(16px, env(safe-area-inset-right, 0px)) 80px max(16px, env(safe-area-inset-left, 0px)); overflow-x: clip; }
+a { color: var(--accent); text-decoration: none; }
+a:hover { text-decoration: underline; }
+a:focus-visible, .term:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 2px; }
+h1, h2 { font-weight: 700; letter-spacing: -0.02em; text-wrap: balance; }
+h1 { font-size: clamp(2.2rem, 6vw, 3.4rem); line-height: 1.05; margin: 6px 0 12px; }
+h2 { font-size: clamp(1.5rem, 3.2vw, 2rem); line-height: 1.15; margin: 0 0 10px; }
+p { margin: 0 0 12px; }
+.prose { max-width: 66ch; }
+.lede { font-size: 1.2rem; color: var(--muted); max-width: 60ch; }
+.eyebrow { font-size: 0.8rem; font-weight: 600; color: var(--muted); }
+header { display: grid; gap: 4px; padding-bottom: 32px; }
+.chips { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
+.chip { font-size: 0.78rem; font-weight: 500; padding: 3px 11px; border-radius: 999px; white-space: nowrap; background: var(--surface); color: var(--muted); border: 0.5px solid var(--line); }
+.chip.keep { background: var(--good-soft); color: var(--good); border-color: transparent; }
+.chip.open { background: var(--warn-soft); color: var(--warn); border-color: transparent; }
+nav.toc { display: flex; flex-wrap: wrap; gap: 6px 20px; font-size: 0.92rem; padding-top: 16px; }
+section { border-top: 0.5px solid var(--line); padding-block: 48px 12px; display: grid; gap: 18px; }
+section > * { min-width: 0; }
+ul, ol { margin: 0; padding-left: 1.25rem; }
+li { margin-bottom: 6px; }
+li:last-child { margin-bottom: 0; }
+.table-wrap { overflow-x: auto; border-radius: 12px; background: var(--surface); }
+table { border-collapse: collapse; width: 100%; font-size: 0.9rem; line-height: 1.5; }
+.table-wrap table { min-width: 640px; }
+th, td { text-align: left; vertical-align: top; padding: 11px 16px; border-bottom: 0.5px solid var(--line); }
+tr:last-child td { border-bottom: 0; }
+th { font-size: 0.78rem; color: var(--muted); font-weight: 600; white-space: nowrap; }
+td.name { font-weight: 600; white-space: nowrap; }
+td.n { white-space: nowrap; font-variant-numeric: tabular-nums; }
+.mono { font-family: var(--font-mono); font-size: 0.82rem; }
+kbd { font-family: var(--font); font-size: 0.8rem; padding: 1px 7px; border-radius: 5px; background: var(--surface); border: 0.5px solid var(--line); box-shadow: 0 1px 0 var(--line); white-space: nowrap; }
+figure { margin: 0; display: grid; gap: 12px; }
+figcaption { font-size: 0.88rem; color: var(--muted); max-width: 66ch; }
+.desk { border-radius: 16px; padding: clamp(18px, 5vw, 48px); display: grid; justify-items: center; background: linear-gradient(160deg, #b9c7dc, #e8e1d6); }
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) .desk { background: linear-gradient(160deg, #1d2433, #2d2622); } }
+:root[data-theme="dark"] .desk { background: linear-gradient(160deg, #1d2433, #2d2622); }
+.shot { display: block; width: 100%; max-width: 680px; }
+.shot img { display: block; width: 100%; height: auto; border-radius: 16px; box-shadow: var(--shot-shadow); }
+.grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 420px), 1fr)); gap: 24px; }
+.grid .desk { padding: clamp(14px, 3vw, 24px); }
+footer { border-top: 0.5px solid var(--line); margin-top: 36px; padding-top: 20px; font-size: 0.85rem; color: var(--muted); }
+
+.fig-wrap { overflow-x: auto; background: var(--surface); border-radius: 12px; padding: 16px 12px; }
+.fig-wrap svg { display: block; width: 100%; height: auto; min-width: 640px; }
+.s-text { fill: var(--ink); font-family: var(--font); font-size: 13px; }
+.s-small { fill: var(--muted); font-family: var(--font); font-size: 12px; }
+.s-title { fill: var(--ink); font-family: var(--font); font-size: 13px; font-weight: 600; }
+.s-box { fill: var(--bg); stroke: var(--line); stroke-width: 1; }
+.s-box-hi { fill: var(--accent-soft); stroke: var(--accent); stroke-width: 1; }
+.s-lane { fill: none; stroke: var(--line); stroke-width: 1; stroke-dasharray: 4 5; }
+.s-arrow { stroke: var(--muted); stroke-width: 1.4; fill: none; }
+.s-head { fill: var(--muted); }
+
+.term { border-bottom: 1.5px dotted var(--accent); cursor: help; position: relative; }
+.term:focus { outline: none; }
+.term::after {
+  content: attr(data-tip); position: absolute; bottom: calc(100% + 8px); left: 50%; transform: translateX(-50%);
+  width: max-content; max-width: min(260px, 80vw); background: var(--ink); color: var(--bg);
+  font-size: 0.8rem; line-height: 1.45; font-weight: 400; padding: 0.45rem 0.65rem; border-radius: 8px;
+  opacity: 0; visibility: hidden; transition: opacity 0.15s; pointer-events: none; z-index: 10;
+}
+.term:hover::after, .term:focus::after { opacity: 1; visibility: visible; }
+@media (prefers-reduced-motion: reduce) { .term::after { transition: none; } }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <span class="eyebrow">Design draft · 27 Oct 2026 · M1 step 2, for your review</span>
+  <h1>Telescope window</h1>
+  <p class="lede">What the Mac window looks like and how it behaves at the end of milestone M1. Every picture here is a real screenshot of the preview app, built only from Apple's own parts.</p>
+  <div class="chips">
+    <span class="chip keep">Step 1 hatch built</span>
+    <span class="chip keep">Design decided 27 Oct 2026</span>
+    <span class="chip">Swift + AppKit</span>
+    <span class="chip">Apple Human Interface Guidelines</span>
+  </div>
+  <nav class="toc" aria-label="Sections">
+    <a href="#look">The window</a>
+    <a href="#apple">Apple's parts</a>
+    <a href="#states">Other states</a>
+    <a href="#keys">Keys</a>
+    <a href="#behaviour">Behaviour</a>
+    <a href="#keystroke">One keystroke</a>
+    <a href="#targets">M1 targets</a>
+    <a href="#decide">Decisions</a>
+    <a href="#next">Next steps</a>
+  </nav>
+</header>
+
+<main>
+<section id="look">
+  <h2>The window</h2>
+  <ul class="prose">
+    <li>You press <kbd>⌘</kbd> <kbd>⇧</kbd> <kbd>Space</kbd> and a single search box appears, a fifth of the way down the screen.</li>
+    <li>It grows downward as results arrive, up to 8 rows, and shrinks back when the box is empty.</li>
+    <li>Each row shows Finder's icon for the file, its name, and the folder it sits in. Nothing else: no footer, no hints, no timings.</li>
+  </ul>
+  <figure>
+    <div class="desk">
+      <picture class="shot">
+        <source srcset="m1-window/empty-dark.png" media="(prefers-color-scheme: dark)">
+        <img src="m1-window/empty-light.png" alt="Empty Telescope window: a magnifying glass and the word Search" width="1360" height="112">
+      </picture>
+    </div>
+    <figcaption>Empty. The box alone: 680 by 56 points.</figcaption>
+  </figure>
+  <figure>
+    <div class="desk">
+      <picture class="shot">
+        <source srcset="m1-window/results-dark.png" media="(prefers-color-scheme: dark)">
+        <img src="m1-window/results-light.png" alt="Telescope window with the search telescope plan and eight results, the first selected in blue" width="1360" height="914">
+      </picture>
+    </div>
+    <figcaption>Results for "telescope plan" over 1,000,000 made-up names; the odd folder names come from the made-up list. 8 rows show and the rest of the top 50 scroll. The page switches to the dark screenshots when your Mac is in dark mode.</figcaption>
+  </figure>
+</section>
+
+<section id="apple">
+  <h2>Apple's parts</h2>
+  <p class="prose">Nothing is custom-drawn except the selection shape, so the window follows your Mac's light or dark mode, accent colour and text size.</p>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Part</th><th>What Apple provides</th></tr></thead>
+      <tbody>
+        <tr><td class="name">Text</td><td>San Francisco, the system font: 22 pt in the box, 13 pt for names (macOS's standard text size), 11 pt for folders (macOS's small size)</td></tr>
+        <tr><td class="name">Colours</td><td>System colours for text, secondary text, divider, background and selection, so light mode, dark mode and your accent colour all come for free</td></tr>
+        <tr><td class="name">Magnifier</td><td>The <span class="term" tabindex="0" data-tip="Apple's built-in icon set, drawn to match the system font.">SF Symbol</span> "magnifyingglass"</td></tr>
+        <tr><td class="name">File icons</td><td>Finder's own icon for each kind of file and for folders</td></tr>
+        <tr><td class="name">List</td><td>AppKit's standard list in its inset style: rounded selection in your accent colour, white text on it, as in Finder and Mail</td></tr>
+        <tr><td class="name">Window</td><td>A standard macOS <span class="term" tabindex="0" data-tip="A small floating window that can take your typing without making its app the active one.">panel</span> with the system's corner radius and shadow, and the title bar and buttons hidden</td></tr>
+        <tr><td class="name">Spacing</td><td>Apple's 8-point grid: 56 pt box, 48 pt rows, 8 pt insets</td></tr>
+        <tr><td class="name">Typing</td><td>A standard text field, so Japanese and Chinese input, the emoji picker and dictation work as in any Mac app</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<section id="states">
+  <h2>Other states</h2>
+  <div class="grid">
+    <figure>
+      <div class="desk"><picture class="shot">
+        <source srcset="m1-window/ime-dark.png" media="(prefers-color-scheme: dark)">
+        <img src="m1-window/ime-light.png" alt="Search box holding the unfinished Japanese word かいぎ, marked by macOS" width="1360" height="112">
+      </picture></div>
+      <figcaption>Japanese or Chinese typing. macOS marks the word you're still choosing; no search runs until you pick it, and <kbd>Return</kbd> picks the characters instead of opening a file.</figcaption>
+    </figure>
+    <figure>
+      <div class="desk"><picture class="shot">
+        <source srcset="m1-window/none-dark.png" media="(prefers-color-scheme: dark)">
+        <img src="m1-window/none-light.png" alt="Search zzqx with the message No Results" width="1360" height="210">
+      </picture></div>
+      <figcaption>Nothing matches.</figcaption>
+    </figure>
+    <figure>
+      <div class="desk"><picture class="shot">
+        <source srcset="m1-window/building-dark.png" media="(prefers-color-scheme: dark)">
+        <img src="m1-window/building-light.png" alt="Search budg with the message Getting ready" width="1360" height="210">
+      </picture></div>
+      <figcaption>Just launched. You can type at once; results follow when the file list is ready (under 0.2 s for 1M made-up names).</figcaption>
+    </figure>
+    <figure>
+      <div class="desk"><picture class="shot">
+        <source srcset="m1-window/error-dark.png" media="(prefers-color-scheme: dark)">
+        <img src="m1-window/error-light.png" alt="Search budget with the message Search stopped working. Quit and reopen Telescope." width="1360" height="210">
+      </picture></div>
+      <figcaption>A bug in the Rust core. The app stays open and says so instead of crashing.</figcaption>
+    </figure>
+  </div>
+</section>
+
+<section id="keys">
+  <h2>Keys</h2>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Key</th><th>Does</th><th>Comes in</th></tr></thead>
+      <tbody>
+        <tr><td class="n"><kbd>⌘</kbd> <kbd>⇧</kbd> <kbd>Space</kbd></td><td>Show or hide the window</td><td>M1 step 2</td></tr>
+        <tr><td class="n"><kbd>↑</kbd> <kbd>↓</kbd></td><td>Move the selection</td><td>M1 step 2</td></tr>
+        <tr><td class="n"><kbd>Esc</kbd></td><td>Clear the box; a second <kbd>Esc</kbd> hides the window</td><td>M1 step 2</td></tr>
+        <tr><td class="n"><kbd>Return</kbd></td><td>Open the selected file or folder</td><td>M1 step 3</td></tr>
+        <tr><td class="n"><kbd>⌘</kbd> <kbd>Return</kbd></td><td>Show it in Finder</td><td>M1 step 3</td></tr>
+        <tr><td class="n"><kbd>⌘</kbd> <kbd>⇧</kbd> <kbd>C</kbd></td><td>Copy its full path</td><td>M1 step 3</td></tr>
+        <tr><td class="n"><kbd>⌘</kbd> <kbd>Y</kbd></td><td>Preview it with <span class="term" tabindex="0" data-tip="The macOS preview you get by pressing Space on a file in Finder.">Quick Look</span>; <kbd>Space</kbd> does the same while the box is empty</td><td>M1 step 3</td></tr>
+        <tr><td class="n"><kbd>Tab</kbd></td><td>Search inside the selected folder</td><td>M3</td></tr>
+        <tr><td class="n"><kbd>⌘</kbd> <kbd>I</kbd></td><td>Details pane: preview, size, dates</td><td>M3</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<section id="behaviour">
+  <h2>Behaviour</h2>
+  <ul class="prose">
+    <li>The window is built once when Telescope starts, then only shown and hidden. Showing a ready window took about 0.4 ms in the research tests; building one takes 150-275 ms.</li>
+    <li>Telescope never becomes the active app, just like Spotlight. When the window hides, the app you were in still has the keyboard.</li>
+    <li>It opens on the desktop you're looking at, over full-screen apps too, and on the screen with your mouse.</li>
+    <li>Clicking anywhere outside the window hides it.</li>
+    <li>No Dock icon and no menu bar; only the hotkey. A menu bar icon can come with settings later.</li>
+  </ul>
+</section>
+
+<section id="keystroke">
+  <h2>One keystroke, start to finish</h2>
+  <p class="prose">This is what step 1 built. Think of a waiter and a kitchen: the Swift window takes your order and serves the plate, the Rust core cooks, and they talk through a small <span class="term" tabindex="0" data-tip="A handful of plain functions that Swift can call into Rust, written in C style because that's the one format both languages understand.">hatch</span>. Each order gets a ticket number, so a plate for an old order is thrown away.</p>
+  <figure>
+    <div class="fig-wrap">
+      <svg viewBox="0 0 900 300" role="img" aria-label="One keystroke: the window hands the query to the Rust core with ticket 12, the core searches while ticket 11 gives up, reports ticket 12 ready, and the window copies 50 rows and redraws">
+        <defs><marker id="h" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="s-head" d="M0,0 L10,5 L0,10 z"/></marker></defs>
+        <text class="s-small" x="20" y="22">Swift window, on the main thread</text>
+        <rect class="s-lane" x="10" y="30" width="880" height="80" rx="10"/>
+        <text class="s-small" x="20" y="182">Rust core, on worker threads</text>
+        <rect class="s-lane" x="10" y="190" width="880" height="80" rx="10"/>
+
+        <rect class="s-box" x="24" y="44" width="160" height="52" rx="9"/>
+        <text class="s-title" x="38" y="66">You type "p"</text>
+        <text class="s-small" x="38" y="84">box: telescope p</text>
+
+        <rect class="s-box" x="236" y="44" width="170" height="52" rx="9"/>
+        <text class="s-title" x="250" y="66">Hand the query over</text>
+        <text class="s-small" x="250" y="84">gets ticket 12 at once</text>
+
+        <rect class="s-box-hi" x="330" y="204" width="210" height="52" rx="9"/>
+        <text class="s-title" x="344" y="226">Search 1M names</text>
+        <text class="s-small" x="344" y="244">ticket 11's search gives up</text>
+
+        <rect class="s-box" x="560" y="44" width="160" height="52" rx="9"/>
+        <text class="s-title" x="574" y="66">Is 12 the newest?</text>
+        <text class="s-small" x="574" y="84">yes: take the rows</text>
+
+        <rect class="s-box" x="748" y="44" width="130" height="52" rx="9"/>
+        <text class="s-title" x="762" y="66">Redraw</text>
+        <text class="s-small" x="762" y="84">8 visible rows</text>
+
+        <line class="s-arrow" x1="184" y1="70" x2="234" y2="70" marker-end="url(#h)"/>
+        <path class="s-arrow" d="M330 96 L400 202" marker-end="url(#h)"/>
+        <text class="s-small" x="382" y="140">query + ticket 12</text>
+        <path class="s-arrow" d="M480 202 L600 98" marker-end="url(#h)"/>
+        <text class="s-small" x="552" y="160">"ticket 12 ready"</text>
+        <line class="s-arrow" x1="720" y1="70" x2="746" y2="70" marker-end="url(#h)"/>
+        <text class="s-small" x="604" y="128">50 rows copied over,</text>
+        <text class="s-small" x="604" y="144">Rust frees its own copy</text>
+      </svg>
+    </div>
+    <figcaption>The window never waits: handing over the query returns at once, and the core only says which ticket is ready. 7.3-7.4 ms from keystroke to rows in today's preview on a busy Mac, before drawing.</figcaption>
+  </figure>
+</section>
+
+<section id="targets">
+  <h2>What M1 must prove</h2>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Check</th><th>Target</th><th>So far</th></tr></thead>
+      <tbody>
+        <tr><td class="name">Hotkey to window drawn</td><td class="n">4 ms, 95% of the time</td><td>Not built yet; showing a ready window took 0.4 ms in research</td></tr>
+        <tr><td class="name">Keystroke to results</td><td class="n">25 ms, 95% of the time</td><td>7.3-7.4 ms for one search in the preview, before drawing</td></tr>
+        <tr><td class="name">8 fast keystrokes</td><td>2 results shown or fewer; the last always wins</td><td>1 shown, through the hatch, on 1M names</td></tr>
+        <tr><td class="name">Focus goes back</td><td>20 of 20 times</td><td>Step 3</td></tr>
+        <tr><td class="name">Over full-screen apps</td><td>Works</td><td>Step 3</td></tr>
+        <tr><td class="name">Japanese and Chinese typing</td><td>Never opens a result mid-word</td><td>Step 3; the preview already skips searching mid-word</td></tr>
+        <tr><td class="name">Hidden</td><td class="n">Under 22 MB, 0% CPU</td><td>See decision 6</td></tr>
+        <tr><td class="name"><span class="term" tabindex="0" data-tip="Swift's strictest setting, which catches threading mistakes before the app runs.">Swift 6 mode</span></td><td>Builds and runs</td><td>The preview does; one trap found and fixed</td></tr>
+        <tr><td class="name">Permissions after rebuilds</td><td>Survive 5 rebuilds</td><td>Step 4</td></tr>
+        <tr><td class="name">Downloaded .dmg</td><td>Opens through Open Anyway in 4 steps or fewer</td><td>Step 6</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<section id="decide">
+  <h2>Decisions</h2>
+  <p class="prose">Settled on 27 Oct 2026. The screenshots show every one of them.</p>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>#</th><th>Question</th><th>Decided</th><th>Not chosen</th></tr></thead>
+      <tbody>
+        <tr><td class="n">1</td><td>Row layout</td><td>Two lines: name, then folder underneath</td><td>One line, folder in grey on the right; fits about 11 rows instead of 8</td></tr>
+        <tr><td class="n">2</td><td>Fewer than 8 results</td><td>The window shrinks to fit them</td><td>Always 8 rows tall, so it never changes size</td></tr>
+        <tr><td class="n">3</td><td><kbd>Esc</kbd></td><td>Clears the box; a second <kbd>Esc</kbd> hides the window</td><td>Always hides at once</td></tr>
+        <tr><td class="n">4</td><td>Opening it again</td><td>Shows your last search, selected, so typing replaces it (Spotlight does this)</td><td>Always starts empty</td></tr>
+        <tr><td class="n">5</td><td>Position</td><td>Always the same spot, a fifth of the way down the screen</td><td>Remembers where you dragged it</td></tr>
+        <tr><td class="n">6</td><td>Idle memory</td><td>Judge the window alone against 22 MB, and report the made-up list on its own line: 1M names take about 25-30 MB by themselves (estimate scaled from M0's 61-67 MB for 2.44M entries)</td><td>Keep 22 MB for everything and cut the made-up list to about 100,000 names</td></tr>
+        <tr><td class="n">7</td><td>Animations</td><td>A quick fade when the window shows and hides, and a smooth height change as results grow or shrink. macOS moves the finished window image itself, so this costs Telescope about 0 MB (estimate; measured in step 5). Both stop when Reduce Motion is on.</td><td>The selection gliding between rows, or rows animating in while you type: a few MB each, and rows that move while you type make Return open the wrong file</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p class="note prose">Timings no longer appear in the window. During M1 they go to a log that the measuring step reads.</p>
+</section>
+
+<section id="next">
+  <h2>Next steps</h2>
+  <ol class="prose">
+    <li>Step 1, the hatch, lands as its own pull request.</li>
+    <li>Step 2 builds this window for real: the Swift package, the build script, the hotkey, these states and the two animations.</li>
+  </ol>
+</section>
+</main>
+
+<footer>
+  Screenshots taken on your Mac on 27 Oct 2026 from the throwaway preview app (macOS 26.6), in light and dark mode. Sizes are in points, the unit macOS draws in. Plan and targets: <a href="research.html">research.html</a>.
+</footer>
+
+</div>
+</body>
+</html>
