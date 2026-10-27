@@ -7,7 +7,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-static const uint32_t TL_ABI_VERSION = 4;
+static const uint32_t TL_ABI_VERSION = 5;
 
 static const uint32_t TL_OK = 0;
 static const uint32_t TL_GONE = 1;
@@ -74,6 +74,7 @@ TlCore *tl_core_new_stand_in(uint64_t count, void *ctx, TlEventFn on_event);
 uint64_t tl_submit(const TlCore *core, const uint8_t *query, size_t len);
 uint32_t tl_changed(const TlCore *core, const uint8_t *paths, size_t len, uint32_t rescan, uint64_t mark);
 void tl_grant_full_disk(const TlCore *core, uint64_t mark);
+uint32_t tl_index_everything(const TlCore *core, uint32_t on, uint64_t mark);
 uint32_t tl_watched(const TlCore *core, TlRows *out, uint64_t *since);
 uint32_t tl_take(const TlCore *core, uint64_t ticket, TlRows *out);
 void tl_rows_free(TlRows rows);

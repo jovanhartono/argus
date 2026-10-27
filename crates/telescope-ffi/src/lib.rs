@@ -21,12 +21,15 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 use telescope_core::{
-    Access, Clutter, Hit, Ignore, Index, Scope, Searcher, Settings, Ticket, Watch,
+    Access, Clutter, Hit, Ignore, Index, Pages, Scope, Searcher, Settings, Ticket, Watch,
 };
 use telescope_grep::{Found, Grep, Report};
 
+#[global_allocator]
+static PAGES: Pages = Pages;
+
 /// Raise this with any change below, so a window built against an older header refuses to start.
-pub const TL_ABI_VERSION: u32 = 4;
+pub const TL_ABI_VERSION: u32 = 5;
 
 pub const TL_OK: u32 = 0;
 /// No rows for that ticket: not ready yet, already taken, or a newer search replaced them.
@@ -246,9 +249,19 @@ struct Live {
     /// None for made-up names, or before the first list.
     newest: Mutex<Newest>,
     watched: Mutex<Watched>,
+    /// Clutter is kept from the next list on.
+    everything: AtomicBool,
 }
 
 impl Live {
+    fn clutter(&self) -> Clutter {
+        if self.everything.load(Ordering::Relaxed) {
+            Clutter::Keep
+        } else {
+            Clutter::Skip
+        }
+    }
+
     fn plan(&self, change: impl FnOnce(&mut Plan)) {
         change(&mut self.plan.lock().unwrap());
         self.wake.notify_all();
@@ -296,7 +309,7 @@ struct Built {
 }
 
 impl Source {
-    fn build(&mut self, notify: &Notify) -> io::Result<Built> {
+    fn build(&mut self, clutter: Clutter, notify: &Notify) -> io::Result<Built> {
         let (root, access, told) = match self {
             Self::StandIn(count) => {
                 let index = telescope_core::stand_in(*count);
@@ -314,7 +327,7 @@ impl Source {
             }
             *told = problems;
         }
-        let settings = Settings::new(&home, &home, Clutter::Skip, ignore, access);
+        let settings = Settings::new(&home, &home, clutter, ignore, access);
         let index = settings.scan()?.index;
         Ok(Built {
             index,
@@ -464,7 +477,10 @@ fn work(
 ) {
     let started = Instant::now();
     let first = panic::catch_unwind(AssertUnwindSafe(|| {
-        source.build(&notify).map(|built| live.publish(built, 0))
+        let clutter = live.clutter();
+        source
+            .build(clutter, &notify)
+            .map(|built| live.publish(built, 0))
     }));
     let index = match first {
         Ok(Ok(index)) => index,
@@ -587,7 +603,9 @@ fn rebuild(
     }
     let started = Instant::now();
     let built = panic::catch_unwind(AssertUnwindSafe(|| {
-        source.build(notify).map(|built| live.publish(built, mark))
+        source
+            .build(live.clutter(), notify)
+            .map(|built| live.publish(built, mark))
     }))
     .unwrap_or_else(|_| Err(io::Error::other("a bug in the engine")));
     match built {
@@ -749,6 +767,30 @@ pub unsafe extern "C" fn tl_grant_full_disk(core: *const TlCore, mark: u64) {
             plan.full_disk = true;
             plan.want(mark);
         });
+    })
+}
+
+/// Lists everything in the scanned folder from the next list on when `on` isn't 0, clutter and
+/// the folders the ignore list skips included, and only what `tl_core_new` keeps when it is. A
+/// whole home folder is about 2.4 million entries, and scanning it takes 10 to 20 s. Returns 1
+/// when that changes the setting, so a new list is coming, else 0. `mark` is as for
+/// `tl_changed`. Safe to call from any thread.
+///
+/// # Safety
+/// `core` came from `tl_core_new` or `tl_core_new_stand_in`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tl_index_everything(core: *const TlCore, on: u32, mark: u64) -> u32 {
+    guard(0, || {
+        let core = unsafe { &*core };
+        let live = &core.live;
+        let mut plan = live.plan.lock().unwrap();
+        if plan.stopped || live.everything.swap(on != 0, Ordering::Relaxed) == (on != 0) {
+            return 0;
+        }
+        plan.want(mark);
+        drop(plan);
+        live.wake.notify_all();
+        1
     })
 }
 
@@ -1751,6 +1793,58 @@ mod tests {
         assert_eq!(watched(&core).1, 9);
         std::fs::write(documents.join("taxes.pdf"), "").unwrap();
         assert_eq!(changed(&core, &[&documents], 0), 1);
+    }
+
+    #[test]
+    fn indexing_everything_turns_on_and_off_without_a_new_core() {
+        let (_dir, home) = home_with(&[
+            "notes/a.txt",
+            "Library/Caches/com.example/cache.db",
+            ".config/telescope/ignore",
+        ]);
+        std::fs::write(home.join(".config/telescope/ignore"), "notes\n").unwrap();
+        let events = Events::default();
+        let core = scan(home.to_str().unwrap(), 1, &events);
+        // The home folder, and Library read only on the way to its cloud drives.
+        events.wait_for(TL_EVENT_INDEXED, 2);
+        let found = |query: &str| {
+            let ticket = submit(&core, query);
+            events.wait_for(TL_EVENT_READY, ticket);
+            let rows = take(&core, ticket).unwrap();
+            rows.into_iter().map(|(name, ..)| name).collect::<Vec<_>>()
+        };
+        assert!(found("cache.db").is_empty());
+
+        assert_eq!(unsafe { tl_index_everything(core.0, 1, 3) }, 1);
+        assert_eq!(
+            unsafe { tl_index_everything(core.0, 7, 4) },
+            0,
+            "already on"
+        );
+        assert_eq!(events.wait_for_rebuilt(1), 10);
+        assert_eq!(found("cache.db"), ["cache.db"]);
+        assert_eq!(found("a.txt"), ["a.txt"]);
+        assert_eq!(watched(&core).1, 3);
+
+        assert_eq!(unsafe { tl_index_everything(core.0, 0, 5) }, 1);
+        assert_eq!(events.wait_for_rebuilt(2), 2);
+        assert!(found("cache.db").is_empty());
+        assert_eq!(
+            unsafe { tl_index_everything(core.0, 0, 6) },
+            0,
+            "already off"
+        );
+        std::thread::sleep(GAP + Duration::from_millis(200));
+        assert_eq!(events.rebuilt().len(), 2);
+    }
+
+    #[test]
+    fn a_stopped_core_ignores_the_switch() {
+        let dir = tempfile::tempdir().unwrap();
+        let events = Events::default();
+        let core = scan(dir.path().join("gone").to_str().unwrap(), 1, &events);
+        events.wait_for_event(TL_EVENT_FAILED);
+        assert_eq!(unsafe { tl_index_everything(core.0, 1, 1) }, 0);
     }
 
     #[test]
