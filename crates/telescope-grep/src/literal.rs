@@ -5,6 +5,10 @@
 use grep_matcher::{LineTerminator, Match, Matcher, NoCaptures, NoError};
 use memchr::memmem::Finder;
 
+#[allow(
+    clippy::large_enum_variant,
+    reason = "one per search; x86-64 finders are larger, and boxing adds a jump to every find"
+)]
 pub(crate) enum Literal {
     Exact(Finder<'static>),
     /// ASCII text, lower-cased, and the place of its rarest byte, which is looked for first.
