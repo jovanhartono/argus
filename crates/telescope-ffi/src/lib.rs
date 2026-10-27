@@ -389,6 +389,18 @@ mod tests {
             assert!(!waited.timed_out(), "no event {event} for {value}");
         }
 
+        fn wait_for_event(&self, event: u32) -> u64 {
+            let seen = self.seen.lock().unwrap();
+            let (seen, waited) = self
+                .changed
+                .wait_timeout_while(seen, Duration::from_secs(60), |seen| {
+                    !seen.iter().any(|(e, _)| *e == event)
+                })
+                .unwrap();
+            assert!(!waited.timed_out(), "no event {event}");
+            seen.iter().find(|(e, _)| *e == event).unwrap().1
+        }
+
         fn ready(&self) -> Vec<u64> {
             let seen = self.seen.lock().unwrap();
             seen.iter()
@@ -564,8 +576,13 @@ mod tests {
                 .unwrap() as u64;
             let events = Events::default();
             let _core = scan(root.to_str().unwrap(), 1, &events);
-            events.wait_for(TL_EVENT_FAILED, code);
-            assert_eq!(*events.seen.lock().unwrap(), [(TL_EVENT_FAILED, code)]);
+            let failed = events.wait_for_event(TL_EVENT_FAILED);
+            assert_ne!(failed, 0);
+            // Windows reports a missing folder through a different call than read_dir.
+            if cfg!(unix) {
+                assert_eq!(failed, code);
+            }
+            assert_eq!(*events.seen.lock().unwrap(), [(TL_EVENT_FAILED, failed)]);
         }
     }
 
