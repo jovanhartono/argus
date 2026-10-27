@@ -345,7 +345,7 @@ dependencies = [
 
 [[package]]
 name = "telescope-cli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "libc",
  "telescope-core",
@@ -355,7 +355,7 @@ dependencies = [
 
 [[package]]
 name = "telescope-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "crc32fast",
  "frizbee",
@@ -366,7 +366,7 @@ dependencies = [
 
 [[package]]
 name = "telescope-ffi"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "telescope-core",
  "tempfile",
@@ -374,7 +374,7 @@ dependencies = [
 
 [[package]]
 name = "telescope-grep"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "grep-matcher",
  "grep-searcher",
