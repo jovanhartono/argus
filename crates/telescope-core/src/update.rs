@@ -1283,7 +1283,10 @@ mod tests {
             (index.names.len(), index.names.capacity()),
             (index.name_starts.len(), index.name_starts.capacity()),
             (index.name_letters.len(), index.name_letters.capacity()),
-            (index.name_word_starts.len(), index.name_word_starts.capacity()),
+            (
+                index.name_word_starts.len(),
+                index.name_word_starts.capacity(),
+            ),
             (index.entry_name.len(), index.entry_name.capacity()),
             (index.entry_parent.len(), index.entry_parent.capacity()),
             (index.entry_depth.len(), index.entry_depth.capacity()),
