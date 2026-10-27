@@ -16,6 +16,7 @@ cargo test --workspace
 Needs Xcode 16 or later (Swift 6).
 
 ```sh
+./scripts/make-signing-cert.sh               # once per Mac, so permissions survive rebuilds
 ./scripts/build-mac.sh                       # builds build/Telescope.app
 open build/Telescope.app                     # then press ⌘⇧Space
 swift test --package-path apps/macos
