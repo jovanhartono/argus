@@ -13,3 +13,9 @@ path = "src/main.rs"
 [dependencies]
 telescope-core = { path = "../telescope-core" }
 telescope-grep = { path = "../telescope-grep" }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2.191"
+
+[dev-dependencies]
+tempfile = "3.27.0"

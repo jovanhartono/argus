@@ -44,7 +44,7 @@ pub struct Found<'a> {
 
 /// What the search did with each file, so skipped files can be shown. Each file counts once,
 /// and a file that showed lines counts as searched even when a later zero byte or long line
-/// ended it.
+/// ended it. A file still open when the search ended counts only if it showed lines.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Report {
     pub files_searched: usize,
@@ -239,10 +239,17 @@ impl<F: Fn(Found<'_>) + Sync, S: Fn() -> bool + Sync> Job<'_, F, S> {
             path,
             count: 0,
             binary: false,
+            stopped: false,
         };
-        let reader = Stoppable { file, job: self };
-        match searcher.search_reader(self.matcher, reader, &mut sink) {
+        let mut reader = Stoppable {
+            file,
+            job: self,
+            stopped: false,
+        };
+        match searcher.search_reader(self.matcher, &mut reader, &mut sink) {
             _ if sink.count > 0 => report.files_searched = 1,
+            // Ended by the search before any line: neither searched nor skipped.
+            _ if reader.stopped || sink.stopped => {}
             Ok(()) if sink.binary => report.binary = 1,
             Ok(()) => report.files_searched = 1,
             // The searcher's own errors carry no system code; its only one here is a line
@@ -255,15 +262,16 @@ impl<F: Fn(Found<'_>) + Sync, S: Fn() -> bool + Sync> Job<'_, F, S> {
     }
 }
 
-/// Ends a file early, at the next read, once the search is stale or has all its lines.
 struct Stoppable<'a, F, S> {
     file: File,
     job: &'a Job<'a, F, S>,
+    stopped: bool,
 }
 
 impl<F: Fn(Found<'_>) + Sync, S: Fn() -> bool + Sync> Read for Stoppable<'_, F, S> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         if (self.job.stale)() || self.job.done() {
+            self.stopped = true;
             return Ok(0);
         }
         self.file.read(buf)
@@ -276,6 +284,7 @@ struct Lines<'a, F, S> {
     path: &'a Path,
     count: usize,
     binary: bool,
+    stopped: bool,
 }
 
 impl<F: Fn(Found<'_>) + Sync, S: Fn() -> bool + Sync> Sink for Lines<'_, F, S> {
@@ -285,6 +294,7 @@ impl<F: Fn(Found<'_>) + Sync, S: Fn() -> bool + Sync> Sink for Lines<'_, F, S> {
         if (self.job.stale)()
             || self.job.delivered.fetch_add(1, Ordering::Relaxed) >= self.job.limit
         {
+            self.stopped = true;
             return Ok(false);
         }
         let (text, span) = excerpt(self.job.matcher, line.bytes());
@@ -353,7 +363,8 @@ fn shown_match(matcher: &Literal, line: &[u8], kept: Range<usize>) -> Range<usiz
     0..0
 }
 
-/// The length once each run of broken bytes becomes one stand-in letter.
+/// The length once each broken sequence becomes one stand-in letter, as `from_utf8_lossy`
+/// does it: a run of broken bytes can hold several sequences.
 fn lossy_len(bytes: &[u8]) -> usize {
     bytes
         .utf8_chunks()
