@@ -1,9 +1,9 @@
 //! The first scan: reads every folder under a root, on all cores at once.
 
 use crate::index::{EntryId, Index, IndexBuilder, NO_PARENT};
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::fs;
-use std::io;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -14,8 +14,9 @@ pub struct Scan {
     pub unreadable_folders: usize,
 }
 
-/// Hidden folders, node_modules, ~/Library and ~/go/pkg/mod hold most of a home folder's entries,
-/// and almost nobody searches them.
+/// Hidden folders, ~/Library bar its cloud drives, the insides of packages like Photos Library,
+/// and tool downloads and caches hold most of a home folder's entries, and almost nobody
+/// searches them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Clutter {
     Skip,
@@ -25,7 +26,9 @@ pub enum Clutter {
 struct Walk {
     shared: Mutex<Shared>,
     clutter: Clutter,
+    root: EntryId,
     home: PathBuf,
+    library: PathBuf,
 }
 
 struct Shared {
@@ -35,6 +38,13 @@ struct Shared {
 
 /// Symbolic links are listed but never followed.
 pub fn scan(root: &Path, clutter: Clutter) -> io::Result<Scan> {
+    let home = std::env::home_dir()
+        .and_then(|home| fs::canonicalize(home).ok())
+        .unwrap_or_default();
+    scan_from(root, clutter, home)
+}
+
+fn scan_from(root: &Path, clutter: Clutter, home: PathBuf) -> io::Result<Scan> {
     // The real path, as macOS reports file changes: /tmp becomes /private/tmp, no "..".
     let root = fs::canonicalize(root)?;
     if !fs::metadata(&root)?.is_dir() {
@@ -51,9 +61,9 @@ pub fn scan(root: &Path, clutter: Clutter) -> io::Result<Scan> {
             unreadable_folders: 0,
         }),
         clutter,
-        home: std::env::home_dir()
-            .and_then(|home| fs::canonicalize(home).ok())
-            .unwrap_or_default(),
+        root: root_id,
+        library: home.join("Library"),
+        home,
     };
     rayon::scope(|scope| read_folder(scope, root, root_id, &walk));
 
@@ -67,8 +77,69 @@ pub fn scan(root: &Path, clutter: Clutter) -> io::Result<Scan> {
 fn is_clutter(folder: &Path, name: &OsStr, home: &Path) -> bool {
     name.as_encoded_bytes().starts_with(b".")
         || name == "node_modules"
-        || (name == "Library" && folder == home)
+        || name == "__pycache__"
         || (name == "mod" && folder.strip_prefix(home) == Ok(Path::new("go/pkg")))
+}
+
+/// Downloads a tool keeps beside its project, known by the project file next to them.
+/// A folder that happens to be called "vendor" is kept.
+fn is_tool_download(name: &OsStr, listing: &[(OsString, bool)]) -> bool {
+    let beside = |file: &str| listing.iter().any(|(name, _)| name == file);
+    match name.to_str() {
+        Some("vendor") => beside("composer.json") || beside("go.mod"),
+        Some("Pods") => beside("Podfile"),
+        // A Python environment, even one made inside a project with `python -m venv .`.
+        Some("bin" | "include" | "Include" | "lib" | "Lib" | "lib64" | "Scripts") => {
+            beside("pyvenv.cfg")
+        }
+        _ => false,
+    }
+}
+
+/// Finder shows these folders as one file, like the thousands of pieces inside Photos Library.
+const PACKAGES: &[&str] = &[
+    "aplibrary",
+    "fcpbundle",
+    "imovielibrary",
+    "logicx",
+    "lrlibrary",
+    "musiclibrary",
+    "photolibrary",
+    "photoslibrary",
+    "pvm",
+    "rtfd",
+    "sparsebundle",
+    "tvlibrary",
+    "utm",
+    "vmwarevm",
+    "xcarchive",
+    "xcodeproj",
+    "xcworkspace",
+];
+
+/// Packages, and folders a tool labelled as its cache, are listed in their parent with nothing
+/// inside them.
+fn is_sealed(path: &Path, listing: &[(OsString, bool)]) -> bool {
+    let has = |file: &str| listing.iter().any(|(name, _)| name == file);
+    let extension = path.extension().and_then(OsStr::to_str);
+    match extension.map(str::to_ascii_lowercase).as_deref() {
+        // Ordinary folders get these names too, like a project called storefront.app.
+        Some("app" | "appex" | "bundle" | "framework" | "plugin") => {
+            has("Contents") || has("Versions") || has("Info.plist")
+        }
+        Some("key" | "numbers" | "pages") => has("Index.zip") || has("Index"),
+        Some("band") => has("projectData") || has("Alternatives"),
+        Some("playground") => has("contents.xcplayground"),
+        Some(extension) if PACKAGES.contains(&extension) => true,
+        _ => has("CACHEDIR.TAG") && is_cache_tag(&path.join("CACHEDIR.TAG")),
+    }
+}
+
+/// The cache-tag standard Rust, pytest and others follow: a file that starts with this line.
+fn is_cache_tag(file: &Path) -> bool {
+    let mut start = [0; 43];
+    let read = fs::File::open(file).and_then(|mut file| file.read_exact(&mut start));
+    read.is_ok() && start == *b"Signature: 8a477f597d28d172789f06886806bc55"
 }
 
 /// Each job carries its folder's number, so no path-to-number table is needed.
@@ -78,18 +149,36 @@ fn read_folder<'s>(scope: &rayon::Scope<'s>, path: PathBuf, folder: EntryId, wal
         shared.lock().unwrap().unreadable_folders += 1;
         return;
     };
-    // Names are gathered first so the shared lock is taken once per folder, not once per file.
-    let mut names = String::new();
-    let mut children: Vec<(usize, bool)> = Vec::new();
-    let mut subfolder_paths = Vec::new();
+    let mut listing = Vec::new();
     for entry in entries {
         let Ok(entry) = entry else {
             shared.lock().unwrap().unreadable_folders += 1;
             break;
         };
         let is_dir = entry.file_type().is_ok_and(|kind| kind.is_dir());
-        let name = entry.file_name();
-        if is_dir && walk.clutter == Clutter::Skip && is_clutter(&path, &name, &walk.home) {
+        listing.push((entry.file_name(), is_dir));
+    }
+    // What you scan is always read, whatever it is.
+    let skip = walk.clutter == Clutter::Skip && folder != walk.root;
+    if skip && is_sealed(&path, &listing) {
+        return;
+    }
+    // Only cloud drives are kept from ~/Library: iCloud Drive, Dropbox, Google Drive, OneDrive.
+    let in_library = skip && path == walk.library;
+
+    // Names are gathered first so the shared lock is taken once per folder, not once per file.
+    let mut names = String::new();
+    let mut children: Vec<(usize, bool)> = Vec::new();
+    let mut subfolder_paths = Vec::new();
+    for (name, is_dir) in &listing {
+        let is_dir = *is_dir;
+        if in_library && !(is_dir && (name == "Mobile Documents" || name == "CloudStorage")) {
+            continue;
+        }
+        if walk.clutter == Clutter::Skip
+            && is_dir
+            && (is_clutter(&path, name, &walk.home) || is_tool_download(name, &listing))
+        {
             continue;
         }
         names.push_str(&name.to_string_lossy());
@@ -215,14 +304,96 @@ mod tests {
     }
 
     #[test]
-    fn library_is_clutter_only_in_the_home_folder() {
-        let home = Path::new("/Users/ana");
-        assert!(is_clutter(home, OsStr::new("Library"), home));
-        assert!(!is_clutter(
-            &home.join("Documents"),
-            OsStr::new("Library"),
-            home
-        ));
+    fn lists_packages_and_tool_folders_without_their_insides() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = &fs::canonicalize(dir.path()).unwrap();
+        let files = [
+            "Photos Library.photoslibrary/resources/a.jpeg",
+            "Notes.app/Contents/Info.plist",
+            "storefront.app/src/main.ts",
+            "site/vendor/lib.php",
+            "site/composer.json",
+            "notes/vendor/contract.pdf",
+            "notes/CACHEDIR.TAG",
+            "app/Pods/Alamofire/a.swift",
+            "app/Podfile",
+            "rust/target/CACHEDIR.TAG",
+            "rust/target/debug/tl",
+            "py/pyvenv.cfg",
+            "py/lib/site.py",
+            "py/main.py",
+        ];
+        for file in files {
+            fs::create_dir_all(root.join(file).parent().unwrap()).unwrap();
+            fs::write(root.join(file), "").unwrap();
+        }
+        let tag = "Signature: 8a477f597d28d172789f06886806bc55\n";
+        fs::write(root.join("rust/target/CACHEDIR.TAG"), tag).unwrap();
+
+        let index = scan_from(root, Clutter::Skip, PathBuf::new())
+            .unwrap()
+            .index;
+        let found: BTreeSet<PathBuf> = (1..index.len() as EntryId)
+            .map(|entry| index.path(entry).strip_prefix(root).unwrap().to_path_buf())
+            .collect();
+        let expected: BTreeSet<PathBuf> = [
+            "Photos Library.photoslibrary",
+            "Notes.app",
+            "storefront.app",
+            "storefront.app/src",
+            "storefront.app/src/main.ts",
+            "site",
+            "site/composer.json",
+            "notes",
+            "notes/vendor",
+            "notes/vendor/contract.pdf",
+            "notes/CACHEDIR.TAG",
+            "app",
+            "app/Podfile",
+            "rust",
+            "rust/target",
+            "py",
+            "py/pyvenv.cfg",
+            "py/main.py",
+        ]
+        .iter()
+        .map(PathBuf::from)
+        .collect();
+        assert_eq!(found, expected);
+        let everything = scan_from(root, Clutter::Keep, PathBuf::new()).unwrap();
+        assert_eq!(everything.index.len(), 33);
+    }
+
+    #[test]
+    fn keeps_only_cloud_drives_from_the_home_library() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = fs::canonicalize(dir.path()).unwrap();
+        for file in [
+            "Library/Caches/a.db",
+            "Library/notes.txt",
+            "Library/Mobile Documents/com~apple~CloudDocs/cv.pdf",
+            "Library/CloudStorage/Dropbox/plan.md",
+            "Documents/Library/book.pdf",
+        ] {
+            fs::create_dir_all(home.join(file).parent().unwrap()).unwrap();
+            fs::write(home.join(file), "").unwrap();
+        }
+        let names = |root: &Path| {
+            let index = scan_from(root, Clutter::Skip, home.clone()).unwrap().index;
+            let mut names: Vec<String> = (1..index.len() as EntryId)
+                .map(|entry| index.name(entry).to_owned())
+                .collect();
+            names.sort();
+            names
+        };
+
+        let found = names(&home);
+        assert!(found.contains(&"cv.pdf".to_owned()));
+        assert!(found.contains(&"plan.md".to_owned()));
+        assert!(found.contains(&"book.pdf".to_owned()));
+        assert!(!found.contains(&"a.db".to_owned()));
+        assert!(!found.contains(&"notes.txt".to_owned()));
+        assert!(names(&home.join("Library")).contains(&"a.db".to_owned()));
     }
 
     #[test]
