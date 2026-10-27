@@ -25,6 +25,13 @@ final class ResultCell: NSTableCellView {
 
     required init?(coder: NSCoder) { nil }
 
+    /// Only what differs is set: each label set again lays itself out again.
+    func show(_ row: Row, icon image: NSImage) {
+        if name.stringValue != row.name { name.stringValue = row.name }
+        if folder.stringValue != row.folder { folder.stringValue = row.folder }
+        if icon.image !== image { icon.image = image }
+    }
+
     override var backgroundStyle: NSView.BackgroundStyle {
         didSet {
             let selected = backgroundStyle == .emphasized
