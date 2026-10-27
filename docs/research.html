@@ -668,7 +668,7 @@ footer { border-top: 1px solid var(--line); margin-top: 32px; padding-top: 20px;
         <li>Cmd+Shift+Space shows or hides it; you can change it.</li>
         <li>Enter opens; Cmd+Enter shows it in Finder.</li>
         <li>Tab searches inside the selected folder.</li>
-        <li>Cmd+Shift+C copies the path; Cmd+I opens the details pane.</li>
+        <li>Option+Cmd+C copies the path, as in Finder; Cmd+I opens the details pane.</li>
         <li>Cmd+Y opens <span class="term" tabindex="0" data-tip="The macOS preview you get by pressing Space on a file in Finder.">Quick Look</span>; Space does too while the search box is empty.</li>
         <li>Search in the current Finder folder has no default key and asks for Finder access the first time you use it.</li>
       </ul>
@@ -810,7 +810,7 @@ footer { border-top: 1px solid var(--line); margin-top: 32px; padding-top: 20px;
       <thead><tr><th>Not yet proven</th><th>Why it is open</th><th>Settled by</th></tr></thead>
       <tbody>
         <tr><td>Cancelling old searches across all searchers</td><td>The test used a single searcher</td><td class="name">M0, again at M1</td></tr>
-        <tr><td>Keyboard focus, Japanese and Chinese typing, and Quick Look inside the window</td><td>Every test kept the window from taking focus</td><td class="name">M1, by hand</td></tr>
+        <tr><td>Keyboard focus, Japanese and Chinese typing, and Quick Look inside the window</td><td>Every test kept the window from taking focus</td><td class="name">M1, by hand<span class="sub">Quick Look moves to M2, when there are real files to preview</span></td></tr>
         <tr><td>Whether hotkey presses arrive at all, on any macOS version</td><td>Only registering the hotkey on macOS 26.6 was tested</td><td class="name">M1</td></tr>
         <tr><td>Whether Open Anyway still works on macOS 15.1</td><td>OSNews says 15.1 removed every way around Gatekeeper; Apple says Open Anyway remains</td><td class="name">M1 download test<span class="sub">needs a macOS 15 VM or a tester</span></td></tr>
         <tr><td>Whether permissions tied to the self-signed certificate survive an update downloaded on another Mac</td><td>Sources only cover rebuilds on the same Mac</td><td class="name">M2</td></tr>

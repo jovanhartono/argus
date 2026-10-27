@@ -5,6 +5,9 @@ struct Row: Equatable {
     let name: String
     let folder: String
     let isFolder: Bool
+
+    /// The folder you index is listed under its full path, so its name is the path already.
+    var path: String { name.hasPrefix("/") ? name : (folder as NSString).appendingPathComponent(name) }
 }
 
 /// The only file that touches Rust's pointers. Rows are copied into Swift strings and Rust's
