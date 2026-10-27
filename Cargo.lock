@@ -369,6 +369,7 @@ name = "telescope-ffi"
 version = "0.1.0"
 dependencies = [
  "telescope-core",
+ "telescope-grep",
  "tempfile",
 ]
 
