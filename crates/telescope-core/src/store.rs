@@ -778,6 +778,38 @@ mod tests {
     }
 
     #[test]
+    fn a_list_saved_by_another_release_is_scanned_again() {
+        let dir = tree();
+        let root = dir.path();
+        let current = keep(root);
+        let version = env!("CARGO_PKG_VERSION");
+        assert!(current.key[8..].starts_with(version.as_bytes()));
+        let mut older = current.clone();
+        older.key.clear();
+        put(&mut older.key, b"0.1.0");
+        older
+            .key
+            .extend_from_slice(&current.key[8 + version.len()..]);
+        assert_ne!(older, current);
+
+        let scan = current.scan().unwrap();
+        let bytes = encode(&scan, &older, 1);
+        assert!(matches!(
+            decode(&bytes, &current),
+            Err(OpenError::OtherSettings)
+        ));
+
+        let saves = tempfile::tempdir().unwrap();
+        let file = saves.path().join("index");
+        save_index(&file, &scan, &older, 1).unwrap();
+        let Opened::Scanned { scan: fresh, why } = open_or_scan(&file, &current).unwrap() else {
+            panic!("opened a list an older release saved");
+        };
+        assert!(matches!(why, OpenError::OtherSettings));
+        assert_eq!(fresh.index.len(), scan.index.len());
+    }
+
+    #[test]
     fn every_ignore_rule_counts_but_comments_do_not() {
         let root = Path::new(HOME);
         let rules = |text: &str| {
