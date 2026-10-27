@@ -54,6 +54,12 @@ impl Ignore {
         }
     }
 
+    /// The folder that holds your list, as macOS reports changes in it.
+    pub(crate) fn folder(home: &Path, access: Access) -> PathBuf {
+        let folder = Path::new(IGNORE_FILE).parent().unwrap_or(Path::new(""));
+        real(home.join(folder), access)
+    }
+
     /// The rules, and a note for each line that is not one.
     pub fn parse(text: &str, home: &Path, access: Access) -> (Self, Vec<String>) {
         let mut ignore = Self::default();
