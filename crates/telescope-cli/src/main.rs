@@ -3,7 +3,9 @@ use std::io::BufRead;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Instant;
-use telescope_core::{Clutter, Index, Searcher};
+use telescope_core::{Clutter, Ignore, Index, Searcher};
+
+const IGNORE_FILE: &str = ".config/telescope/ignore";
 
 const USAGE: &str = "usage:
   tl index <folder>                       scan and report the index size
@@ -11,7 +13,14 @@ const USAGE: &str = "usage:
   tl bench <folder> <queries> [threads]   time every keystroke of each query
   tl golden <folder> <golden>             rank the expected file of each search
 add --all to include hidden folders, ~/Library, the insides of packages like Photos Library,
-and tool downloads and caches like node_modules";
+and tool downloads and caches like node_modules
+
+your own ignore list, ~/.config/telescope/ignore, takes one folder per line
+(--all leaves it out too):
+  Old Projects        skip every folder with this name
+  ~/Movies/Exports    skip this one folder
+  !~/.config/nvim     bring back a folder Telescope skips, even inside a skipped one
+  # a comment";
 
 fn main() -> ExitCode {
     let mut args: Vec<OsString> = std::env::args_os().skip(1).collect();
@@ -57,9 +66,28 @@ fn usage() -> ExitCode {
     ExitCode::FAILURE
 }
 
+/// A missing ignore file is the normal case and means no rules of your own.
+fn ignore_list() -> Ignore {
+    let home = telescope_core::home();
+    let file = home.join(IGNORE_FILE);
+    if home.as_os_str().is_empty() || !file.exists() {
+        return Ignore::default();
+    }
+    let text = read(&file).unwrap_or_default();
+    let (ignore, problems) = Ignore::parse(&text, &home);
+    for problem in problems {
+        eprintln!("tl: ~/{IGNORE_FILE} {problem}");
+    }
+    ignore
+}
+
 fn load(folder: &Path, clutter: Clutter) -> Option<Index> {
     let started = Instant::now();
-    let scan = match telescope_core::scan(folder, clutter) {
+    let ignore = match clutter {
+        Clutter::Skip => ignore_list(),
+        Clutter::Keep => Ignore::default(),
+    };
+    let scan = match telescope_core::scan(folder, clutter, &ignore) {
         Ok(scan) => scan,
         Err(error) => {
             eprintln!("tl: cannot scan {}: {error}", folder.display());

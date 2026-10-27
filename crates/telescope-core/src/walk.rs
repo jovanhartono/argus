@@ -1,5 +1,6 @@
 //! The first scan: reads every folder under a root, on all cores at once.
 
+use crate::Ignore;
 use crate::index::{EntryId, Index, IndexBuilder, NO_PARENT};
 use std::ffi::{OsStr, OsString};
 use std::fs;
@@ -26,6 +27,7 @@ pub enum Clutter {
 struct Walk {
     shared: Mutex<Shared>,
     clutter: Clutter,
+    ignore: Ignore,
     root: EntryId,
     home: PathBuf,
     library: PathBuf,
@@ -36,15 +38,20 @@ struct Shared {
     unreadable_folders: usize,
 }
 
-/// Symbolic links are listed but never followed.
-pub fn scan(root: &Path, clutter: Clutter) -> io::Result<Scan> {
-    let home = std::env::home_dir()
-        .and_then(|home| fs::canonicalize(home).ok())
-        .unwrap_or_default();
-    scan_from(root, clutter, home)
+/// Symbolic links are listed but never followed. Your ignore list counts only when clutter
+/// is skipped.
+pub fn scan(root: &Path, clutter: Clutter, ignore: &Ignore) -> io::Result<Scan> {
+    scan_from(root, clutter, ignore, home())
 }
 
-fn scan_from(root: &Path, clutter: Clutter, home: PathBuf) -> io::Result<Scan> {
+/// The real home folder, the way the scan reports paths, or empty when there is none.
+pub fn home() -> PathBuf {
+    std::env::home_dir()
+        .and_then(|home| fs::canonicalize(home).ok())
+        .unwrap_or_default()
+}
+
+fn scan_from(root: &Path, clutter: Clutter, ignore: &Ignore, home: PathBuf) -> io::Result<Scan> {
     // The real path, as macOS reports file changes: /tmp becomes /private/tmp, no "..".
     let root = fs::canonicalize(root)?;
     if !fs::metadata(&root)?.is_dir() {
@@ -61,11 +68,12 @@ fn scan_from(root: &Path, clutter: Clutter, home: PathBuf) -> io::Result<Scan> {
             unreadable_folders: 0,
         }),
         clutter,
+        ignore: ignore.clone(),
         root: root_id,
         library: home.join("Library"),
         home,
     };
-    rayon::scope(|scope| read_folder(scope, root, root_id, &walk));
+    rayon::scope(|scope| read_folder(scope, root, root_id, false, &walk));
 
     let shared = walk.shared.into_inner().unwrap();
     Ok(Scan {
@@ -143,7 +151,14 @@ fn is_cache_tag(file: &Path) -> bool {
 }
 
 /// Each job carries its folder's number, so no path-to-number table is needed.
-fn read_folder<'s>(scope: &rayon::Scope<'s>, path: PathBuf, folder: EntryId, walk: &'s Walk) {
+/// A `passage` folder is one the rules skip, read only on the way to one you brought back.
+fn read_folder<'s>(
+    scope: &rayon::Scope<'s>,
+    path: PathBuf,
+    folder: EntryId,
+    passage: bool,
+    walk: &'s Walk,
+) {
     let shared = &walk.shared;
     let Ok(entries) = fs::read_dir(&path) else {
         shared.lock().unwrap().unreadable_folders += 1;
@@ -160,35 +175,54 @@ fn read_folder<'s>(scope: &rayon::Scope<'s>, path: PathBuf, folder: EntryId, wal
     }
     // What you scan is always read, whatever it is.
     let skip = walk.clutter == Clutter::Skip && folder != walk.root;
-    if skip && is_sealed(&path, &listing) {
+    let name = path.file_name().unwrap_or_default();
+    let kept = walk.ignore.keeps(&path, name);
+    let sealed = skip && !passage && !kept && is_sealed(&path, &listing);
+    if sealed && !walk.ignore.leads_to_kept(&path) {
         return;
     }
     // Only cloud drives are kept from ~/Library: iCloud Drive, Dropbox, Google Drive, OneDrive.
-    let in_library = skip && path == walk.library;
+    let in_library = skip && !kept && path == walk.library;
+    let passage = passage || sealed || in_library;
 
     // Names are gathered first so the shared lock is taken once per folder, not once per file.
     let mut names = String::new();
     let mut children: Vec<(usize, bool)> = Vec::new();
-    let mut subfolder_paths = Vec::new();
+    let mut subfolders = Vec::new();
     for (name, is_dir) in &listing {
         let is_dir = *is_dir;
-        if in_library && !(is_dir && (name == "Mobile Documents" || name == "CloudStorage")) {
-            continue;
-        }
-        if walk.clutter == Clutter::Skip
-            && is_dir
-            && (is_clutter(&path, name, &walk.home) || is_tool_download(name, &listing))
-        {
-            continue;
+        let child_path = is_dir.then(|| path.join(name));
+        let mut child_passage = false;
+        if walk.clutter == Clutter::Skip {
+            match &child_path {
+                None if passage => continue,
+                None => {}
+                Some(child) => {
+                    let cloud =
+                        in_library && (name == "Mobile Documents" || name == "CloudStorage");
+                    let wanted = walk.ignore.keeps(child, name)
+                        || (cloud && !walk.ignore.skips(child, name));
+                    let dropped = passage
+                        || is_clutter(&path, name, &walk.home)
+                        || is_tool_download(name, &listing)
+                        || walk.ignore.skips(child, name);
+                    if !wanted && dropped {
+                        // A skipped folder on the way to one you brought back is walked
+                        // through, keeping only the way there.
+                        if !walk.ignore.leads_to_kept(child) {
+                            continue;
+                        }
+                        child_passage = true;
+                    }
+                }
+            }
         }
         names.push_str(&name.to_string_lossy());
         children.push((names.len(), is_dir));
-        if is_dir {
-            subfolder_paths.push(path.join(name));
-        }
+        subfolders.extend(child_path.map(|child| (child, child_passage)));
     }
 
-    let mut subfolder_ids = Vec::with_capacity(subfolder_paths.len());
+    let mut subfolder_ids = Vec::with_capacity(subfolders.len());
     let mut state = shared.lock().unwrap();
     let mut start = 0;
     for (end, is_dir) in children {
@@ -200,8 +234,8 @@ fn read_folder<'s>(scope: &rayon::Scope<'s>, path: PathBuf, folder: EntryId, wal
     }
     drop(state);
 
-    for (child, child_path) in subfolder_ids.into_iter().zip(subfolder_paths) {
-        scope.spawn(move |scope| read_folder(scope, child_path, child, walk));
+    for (child, (child_path, passage)) in subfolder_ids.into_iter().zip(subfolders) {
+        scope.spawn(move |scope| read_folder(scope, child_path, child, passage, walk));
     }
 }
 
@@ -209,6 +243,69 @@ fn read_folder<'s>(scope: &rayon::Scope<'s>, path: PathBuf, folder: EntryId, wal
 mod tests {
     use super::*;
     use std::collections::BTreeSet;
+
+    fn scan(root: &Path, clutter: Clutter) -> io::Result<Scan> {
+        super::scan(root, clutter, &Ignore::default())
+    }
+
+    fn scan_from(root: &Path, clutter: Clutter, home: PathBuf) -> io::Result<Scan> {
+        super::scan_from(root, clutter, &Ignore::default(), home)
+    }
+
+    fn paths_below(root: &Path, index: &Index) -> BTreeSet<PathBuf> {
+        (1..index.len() as EntryId)
+            .map(|entry| index.path(entry).strip_prefix(root).unwrap().to_path_buf())
+            .collect()
+    }
+
+    #[test]
+    fn your_ignore_list_skips_folders_and_brings_others_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = &fs::canonicalize(dir.path()).unwrap();
+        for file in [
+            "Old Projects/a.txt",
+            "work/Old Projects/b.txt",
+            "Movies/Exports/c.mov",
+            "Movies/Clips/d.mov",
+            ".config/e.toml",
+            ".cache/f",
+            ".cache/other/g",
+            ".cache/keep/h.txt",
+            "Trip.photoslibrary/originals/i.heic",
+            "Old.photoslibrary/originals/j.heic",
+            "Old.photoslibrary/resources/k.jpeg",
+        ] {
+            fs::create_dir_all(root.join(file).parent().unwrap()).unwrap();
+            fs::write(root.join(file), "").unwrap();
+        }
+        let rules = "old projects\n~/Movies/Exports\n!~/.config\n!~/.cache/keep\n\
+                     !~/Trip.photoslibrary\n!~/Old.photoslibrary/originals\n";
+        let (ignore, problems) = Ignore::parse(rules, root);
+        assert!(problems.is_empty());
+
+        let index = super::scan_from(root, Clutter::Skip, &ignore, PathBuf::new()).unwrap();
+        let expected: BTreeSet<PathBuf> = [
+            "work",
+            "Movies",
+            "Movies/Clips",
+            "Movies/Clips/d.mov",
+            ".config",
+            ".config/e.toml",
+            ".cache",
+            ".cache/keep",
+            ".cache/keep/h.txt",
+            "Trip.photoslibrary",
+            "Trip.photoslibrary/originals",
+            "Trip.photoslibrary/originals/i.heic",
+            "Old.photoslibrary",
+            "Old.photoslibrary/originals",
+            "Old.photoslibrary/originals/j.heic",
+        ]
+        .iter()
+        .map(PathBuf::from)
+        .collect();
+        assert_eq!(paths_below(root, &index.index), expected);
+    }
 
     #[test]
     fn finds_every_file_and_folder() {
@@ -373,19 +470,24 @@ mod tests {
             "Library/notes.txt",
             "Library/Mobile Documents/com~apple~CloudDocs/cv.pdf",
             "Library/CloudStorage/Dropbox/plan.md",
+            "Library/Application Support/Foo/foo.db",
+            "Library/Application Support/Bar/bar.db",
             "Documents/Library/book.pdf",
         ] {
             fs::create_dir_all(home.join(file).parent().unwrap()).unwrap();
             fs::write(home.join(file), "").unwrap();
         }
-        let names = |root: &Path| {
-            let index = scan_from(root, Clutter::Skip, home.clone()).unwrap().index;
+        let names_with = |root: &Path, rules: &str| {
+            let (ignore, _) = Ignore::parse(rules, &home);
+            let index = super::scan_from(root, Clutter::Skip, &ignore, home.clone());
+            let index = index.unwrap().index;
             let mut names: Vec<String> = (1..index.len() as EntryId)
                 .map(|entry| index.name(entry).to_owned())
                 .collect();
             names.sort();
             names
         };
+        let names = |root: &Path| names_with(root, "");
 
         let found = names(&home);
         assert!(found.contains(&"cv.pdf".to_owned()));
@@ -394,6 +496,14 @@ mod tests {
         assert!(!found.contains(&"a.db".to_owned()));
         assert!(!found.contains(&"notes.txt".to_owned()));
         assert!(names(&home.join("Library")).contains(&"a.db".to_owned()));
+
+        let found = names_with(&home, "!~/Library/Application Support/Foo");
+        assert!(found.contains(&"foo.db".to_owned()));
+        assert!(found.contains(&"cv.pdf".to_owned()));
+        assert!(!found.contains(&"bar.db".to_owned()));
+        assert!(!found.contains(&"a.db".to_owned()));
+        assert!(names_with(&home, "!~/Library").contains(&"a.db".to_owned()));
+        assert!(!names_with(&home, "CloudStorage").contains(&"plan.md".to_owned()));
     }
 
     #[test]
