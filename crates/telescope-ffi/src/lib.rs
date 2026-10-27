@@ -353,7 +353,7 @@ fn work(
             return;
         }
     };
-    notify.send(TL_EVENT_INDEXED, index.len() as u64);
+    notify.send(TL_EVENT_INDEXED, index.entry_count() as u64);
     let rebuilds = {
         let live = Arc::clone(live);
         thread::Builder::new()
@@ -388,7 +388,10 @@ fn serve(
             // Searches sent before this one ran on the old list; the old list is freed here.
             Job::Swap { index: fresh, took } => {
                 index = fresh;
-                notify.send(TL_EVENT_REBUILT, u64::from(took) << 32 | index.len() as u64);
+                notify.send(
+                    TL_EVENT_REBUILT,
+                    u64::from(took) << 32 | index.entry_count() as u64,
+                );
                 continue;
             }
             Job::Search { ticket, query } => (ticket, query),
@@ -1359,8 +1362,8 @@ mod tests {
         let (_old_dir, old) = index_of(&["a.txt"]);
         let (_new_dir, new) = index_of(&["a.txt", "budget.txt"]);
         let (_newer_dir, newer) = index_of(&["a.txt", "budget.txt", "budget 2.txt"]);
-        let new_len = new.len() as u64;
-        let newer_len = newer.len() as u64;
+        let new_len = new.entry_count() as u64;
+        let newer_len = newer.entry_count() as u64;
         let events = Events::default();
         let notify = Notify {
             ctx: &events as *const Events as *mut c_void,
