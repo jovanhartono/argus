@@ -1,3 +1,4 @@
+import CoreServices
 import XCTest
 
 @testable import Telescope
@@ -84,6 +85,119 @@ final class HatchTests: XCTestCase {
         hatch.watch()
         try Data().write(to: work.appendingPathComponent("plan.md"))
         try await counts.reach(5, within: 5)
+    }
+
+    func testAChangeMissedByTheNewListIsReplayedOnceItsFolderIsWatched() async throws {
+        let (root, notes) = try folderWithNotes()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let (hatch, counts) = try await watching(root)
+        let work = root.appendingPathComponent("work")
+        try FileManager.default.createDirectory(at: work, withIntermediateDirectories: false)
+        try await counts.reach(4, within: 5)
+        // Before work is watched: a file in it, then a save the old stream hears after it.
+        try Data().write(to: work.appendingPathComponent("plan.md"))
+        try Data("edited".utf8).write(to: notes.appendingPathComponent("a.txt"))
+        try await Task.sleep(for: .seconds(1))
+        hatch.watch()
+        try await counts.reach(5, within: 5)
+    }
+
+    func testChangesMadeWhileTheFirstListIsBuiltStillCount() async throws {
+        let (root, notes) = try folderWithNotes()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let counts = Counts()
+        let indexed = expectation(description: "indexed")
+        var first: UInt64 = 0
+        let hatch = try XCTUnwrap(
+            Hatch(root: root.path, fullDisk: true) { event in
+                switch event {
+                case .indexed(let count):
+                    first = count
+                    indexed.fulfill()
+                case .rebuilt(let count, _): counts.add(count)
+                case .ready: break
+                case .failed: XCTFail("the scan failed")
+                }
+            })
+        // The scan may or may not have read them yet; either way the list ends up with them.
+        try FileManager.default.createDirectory(
+            at: root.appendingPathComponent("work"), withIntermediateDirectories: false)
+        try Data().write(to: notes.appendingPathComponent("budget.txt"))
+        await fulfillment(of: [indexed], timeout: 5)
+        hatch.watch()
+        // The folder, notes, a.txt, budget.txt and work.
+        if first != 5 { try await counts.reach(5, within: 5) }
+    }
+
+    func testAFolderAppearingInLibraryIsNoticed() async throws {
+        let (root, _) = try folderWithNotes()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let library = root.appendingPathComponent("Library")
+        try FileManager.default.createDirectory(
+            at: library.appendingPathComponent("Caches"), withIntermediateDirectories: true)
+        let (hatch, counts) = try await watching(root)
+        let cloud = library.appendingPathComponent("CloudStorage")
+        try FileManager.default.createDirectory(at: cloud, withIntermediateDirectories: false)
+        // The folder, notes, a.txt, Library and CloudStorage.
+        try await counts.reach(5, within: 5)
+        hatch.watch()
+        try Data().write(to: cloud.appendingPathComponent("plan.md"))
+        try await counts.reach(6, within: 5)
+        try FileManager.default.moveItem(at: cloud, to: library.appendingPathComponent("Old"))
+        try await counts.reach(4, within: 5)
+    }
+
+    func testSavingTheIgnoreListBringsANewList() async throws {
+        let (root, _) = try folderWithNotes()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let (hatch, counts) = try await watching(root)
+        let list = root.appendingPathComponent(".config/telescope")
+        try FileManager.default.createDirectory(at: list, withIntermediateDirectories: true)
+        try Data("notes\n".utf8).write(to: list.appendingPathComponent("ignore"))
+        // The folder alone.
+        try await counts.reach(1, within: 5)
+        _ = hatch
+    }
+
+    func testEventsFromAFreedCoreNeverReachTheNextOne() async throws {
+        var old = Hatch(standIn: 100) { _ in }
+        _ = old?.submit("readme")
+        // Its events wait on the main queue meanwhile.
+        usleep(300_000)
+        old = nil
+        var heard: [Hatch.Event] = []
+        let indexed = expectation(description: "indexed")
+        let hatch = try XCTUnwrap(
+            Hatch(standIn: 200) { event in
+                heard.append(event)
+                if case .indexed = event { indexed.fulfill() }
+            })
+        await fulfillment(of: [indexed], timeout: 5)
+        try await Task.sleep(for: .milliseconds(100))
+        XCTAssertEqual(heard, [.indexed(count: 200)])
+        _ = hatch
+    }
+
+    func testDroppedChangesAskForARescanAndTheEndOfAReplayIsSkipped() throws {
+        let paths: [UnsafePointer<CChar>] = ["/a/", "/b/", "/c/"].map { (path: String) in
+            UnsafePointer(strdup(path)!)
+        }
+        defer { paths.forEach { free(UnsafeMutablePointer(mutating: $0)) } }
+        let gather = { (flags: [Int]) in
+            let flags = flags.map { FSEventStreamEventFlags($0) }
+            return paths.withUnsafeBufferPointer { paths in
+                flags.withUnsafeBufferPointer { gatherChanges(3, paths.baseAddress!, $0.baseAddress!) }
+            }
+        }
+        let quiet = gather([kFSEventStreamEventFlagNone, kFSEventStreamEventFlagHistoryDone, 0])
+        XCTAssertEqual(quiet.bytes, Array("/a/\0/c/\0".utf8))
+        XCTAssertFalse(quiet.rescan)
+        for dropped in [
+            kFSEventStreamEventFlagMustScanSubDirs, kFSEventStreamEventFlagUserDropped,
+            kFSEventStreamEventFlagKernelDropped, kFSEventStreamEventFlagEventIdsWrapped,
+        ] {
+            XCTAssertTrue(gather([0, dropped, 0]).rescan)
+        }
     }
 
     func testChangesOutsideTheListAreIgnored() async throws {

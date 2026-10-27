@@ -69,8 +69,8 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
     private(set) var rows: [Row] = []
     /// The list changed while the window was hidden, so the results on screen may be old.
     private(set) var stale = false
-    /// A search run again on a new list, and the file to keep selected when it answers.
-    private var rerun: (ticket: UInt64, keeping: String?)?
+    /// A search run again on a new list, which keeps the selected file when it answers.
+    private var rerun: UInt64 = 0
     /// The ticket the rows on screen answer; 0 before any answer, so an empty list isn't "No Results".
     private var answered: UInt64 = 0
     private var pending: (() -> Void)?
@@ -379,14 +379,14 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
         stale = false
         guard let hatch, indexed, !composing, !field.stringValue.isEmpty else { return }
         newest = hatch.submit(field.stringValue)
-        rerun = (newest, selected?.path)
+        rerun = newest
     }
 
     private func take(_ ticket: UInt64) {
         guard let fresh = hatch?.take(ticket) else { return }
         // A file you picked stays picked when a change moves it up or down the list.
-        let keeping = rerun?.ticket == ticket ? rerun?.keeping : nil
-        rerun = nil
+        let keeping = rerun == ticket ? selected?.path : nil
+        rerun = 0
         rows = fresh
         answered = ticket
         table.reloadData()

@@ -10,7 +10,7 @@ mod walk;
 
 pub use ignore::Ignore;
 pub use index::{EntryId, Index};
-pub use scope::Scope;
+pub use scope::{Scope, Watch};
 pub use search::{Hit, Searcher, Ticket, Tickets};
 pub use stand_in::stand_in;
 pub use store::{OpenError, Opened, Saved, Settings, open_index, open_or_scan, save_index};

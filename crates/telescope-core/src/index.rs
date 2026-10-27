@@ -13,7 +13,8 @@ pub(crate) type NameId = u32;
 pub(crate) const NO_PARENT: EntryId = EntryId::MAX;
 
 /// The `entry_` lists are read by entry number: entry 7's parent folder is `entry_parent[7]`.
-/// A folder is always numbered before anything inside it.
+/// A folder is always numbered before anything inside it, and its children are numbered
+/// side by side, as the scan adds them all at once.
 /// Plain number lists keep memory low and can later be saved to disk as they are.
 #[cfg_attr(test, derive(Debug, PartialEq))]
 pub struct Index {
@@ -66,13 +67,13 @@ impl Index {
         chain.iter().rev().map(|&e| self.name(e)).collect()
     }
 
-    /// Folders are numbered after their parent, so the search starts there.
     pub(crate) fn child_folders(&self, folder: EntryId) -> impl Iterator<Item = EntryId> + '_ {
         let after = self.folders.partition_point(|&entry| entry <= folder);
         self.folders[after..]
             .iter()
             .copied()
-            .filter(move |&entry| self.entry_parent[entry as usize] == folder)
+            .skip_while(move |&entry| self.entry_parent[entry as usize] != folder)
+            .take_while(move |&entry| self.entry_parent[entry as usize] == folder)
     }
 
     /// The folder reached from the root through `names`, one folder at a time.
@@ -89,10 +90,10 @@ impl Index {
         Some(folder)
     }
 
-    /// Everything listed directly inside `folder`.
     pub(crate) fn children(&self, folder: EntryId) -> impl Iterator<Item = EntryId> + '_ {
         (folder + 1..self.len() as EntryId)
-            .filter(move |&entry| self.entry_parent[entry as usize] == folder)
+            .skip_while(move |&entry| self.entry_parent[entry as usize] != folder)
+            .take_while(move |&entry| self.entry_parent[entry as usize] == folder)
     }
 
     pub fn heap_bytes(&self) -> usize {
@@ -280,6 +281,66 @@ mod tests {
         assert!(index.is_dir(docs));
         assert!(!index.is_dir(nested));
         assert_eq!(index.entry_depth, [0, 1, 2, 1]);
+    }
+
+    #[test]
+    fn finds_each_folder_and_what_it_holds() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        // Wide and deep, so the scan's threads number the folders out of order.
+        for a in 0..6 {
+            for b in 0..6 {
+                for c in 0..4 {
+                    let folder = root.join(format!("a{a}/b{b}/c{c}"));
+                    std::fs::create_dir_all(&folder).unwrap();
+                    std::fs::write(folder.join("f.txt"), "").unwrap();
+                }
+                std::fs::write(root.join(format!("a{a}/b{b}.txt")), "").unwrap();
+            }
+        }
+        std::fs::create_dir(root.join("a0/empty")).unwrap();
+        let ignore = crate::Ignore::default();
+        let scan = crate::scan(
+            &root,
+            &root,
+            crate::Clutter::Keep,
+            &ignore,
+            crate::Access::Full,
+        );
+        let index = scan.unwrap().index;
+
+        for folder in index.folders.clone() {
+            let path = index.path(folder);
+            let names: Vec<&str> = path
+                .strip_prefix(&root)
+                .unwrap()
+                .iter()
+                .map(|name| name.to_str().unwrap())
+                .collect();
+            assert_eq!(index.find_folder(names), Some(folder), "{path:?}");
+
+            let every =
+                (0..index.len() as EntryId).filter(|&e| index.entry_parent[e as usize] == folder);
+            assert_eq!(
+                index.children(folder).collect::<Vec<_>>(),
+                every.collect::<Vec<_>>()
+            );
+            let mut listed: Vec<&str> = index.children(folder).map(|e| index.name(e)).collect();
+            let mut read: Vec<String> = std::fs::read_dir(&path)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+                .collect();
+            listed.sort_unstable();
+            read.sort_unstable();
+            assert_eq!(listed, read, "{path:?}");
+            let folders: Vec<EntryId> = index
+                .children(folder)
+                .filter(|&e| index.is_dir(e))
+                .collect();
+            assert_eq!(index.child_folders(folder).collect::<Vec<_>>(), folders);
+        }
+        assert_eq!(index.find_folder(["a0", "nowhere"]), None);
+        assert_eq!(index.find_folder(["a0", "b0.txt"]), None);
     }
 
     #[test]

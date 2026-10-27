@@ -104,7 +104,8 @@ impl Settings {
 
     pub fn scope(&self) -> Scope {
         let rules = Rules::new(&self.home, self.clutter, &self.ignore, self.access);
-        Scope::new(self.root.clone(), rules)
+        let list = (self.clutter == Clutter::Skip).then(|| Ignore::folder(&self.home, self.access));
+        Scope::new(self.root.clone(), rules, list)
     }
 }
 

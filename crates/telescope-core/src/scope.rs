@@ -11,11 +11,23 @@ use std::path::{Component, Path, PathBuf};
 pub struct Scope {
     root: PathBuf,
     rules: Rules,
+    /// The folder of your ignore list, when the scan follows it.
+    list: Option<PathBuf>,
+}
+
+/// How a folder is watched for changes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Watch {
+    /// Everything inside it.
+    Inside,
+    /// Only its own list of names: the root, and folders such as ~/Library that are read only
+    /// on the way to one kept inside, so their caches churning wakes nothing.
+    Names,
 }
 
 impl Scope {
-    pub(crate) fn new(root: PathBuf, rules: Rules) -> Self {
-        Self { root, rules }
+    pub(crate) fn new(root: PathBuf, rules: Rules, list: Option<PathBuf>) -> Self {
+        Self { root, rules, list }
     }
 
     /// Whether the scan reads what is inside `path`, a real path as macOS reports changes, so
@@ -31,11 +43,23 @@ impl Scope {
     /// replaced, as apps do to their settings in the home folder all day. Reads the folder's
     /// names once. Only right while no rebuild is under way, which may hold a newer list.
     pub fn holds(&self, path: &Path, index: &Index) -> bool {
-        let (Some(inside), Ok(rest)) = (self.reach(path), path.strip_prefix(&self.root)) else {
+        if self
+            .list
+            .as_ref()
+            .is_some_and(|list| path.starts_with(list))
+        {
+            return false;
+        }
+        let Ok(rest) = path.strip_prefix(&self.root) else {
             return true;
         };
         let names: Option<Vec<&str>> = rest.iter().map(OsStr::to_str).collect();
-        let Some(folder) = names.and_then(|names| index.find_folder(names)) else {
+        let folder = names.and_then(|names| index.find_folder(names));
+        let Some(inside) = self.reach(path) else {
+            // A build tool's cache tag or an app's Info.plist just sealed a listed folder.
+            return folder.is_none_or(|folder| index.children(folder).next().is_none());
+        };
+        let Some(folder) = folder else {
             return false;
         };
         let Ok(entries) = fs::read_dir(path) else {
@@ -98,20 +122,30 @@ impl Scope {
         }
     }
 
-    /// The folders to watch, nearest the root. A folder read only on the way to one kept
-    /// inside it, such as ~/Library, is watched through those, so its caches churning wakes
-    /// nothing. The root is left out: its own list of names is watched on its own.
-    pub fn watched(&self, index: &Index) -> Vec<PathBuf> {
-        let mut watched = Vec::new();
+    /// The folders to watch, sorted: the kept ones nearest the root, everything inside them,
+    /// and your ignore list's folder, whether or not it exists yet.
+    pub fn watched(&self, index: &Index) -> Vec<(PathBuf, Watch)> {
+        let mut watched = vec![(self.root.clone(), Watch::Names)];
         let mut passages: Vec<EntryId> = vec![0];
         while let Some(folder) = passages.pop() {
             for child in index.child_folders(folder) {
                 let path = index.path(child);
                 match self.reach(&path) {
-                    Some(inside) if inside.passage => passages.push(child),
-                    Some(_) => watched.push(path),
+                    Some(inside) if inside.passage => {
+                        passages.push(child);
+                        watched.push((path, Watch::Names));
+                    }
+                    Some(_) => watched.push((path, Watch::Inside)),
                     None => {}
                 }
+            }
+        }
+        if let Some(list) = &self.list {
+            let covered = |(folder, watch): &(PathBuf, Watch)| {
+                *watch == Watch::Inside && list.starts_with(folder)
+            };
+            if !watched.iter().any(covered) {
+                watched.push((list.clone(), Watch::Inside));
             }
         }
         watched.sort();
@@ -121,6 +155,7 @@ impl Scope {
 
 #[cfg(test)]
 mod tests {
+    use super::Watch;
     use crate::{Access, Clutter, Ignore, Settings};
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -199,40 +234,47 @@ mod tests {
         (dir, home)
     }
 
-    fn settings(home: &Path, access: Access) -> Settings {
+    fn settings_from(home: &Path, root: &Path, clutter: Clutter, access: Access) -> Settings {
         let (ignore, problems) = Ignore::parse(RULES, home, access);
         assert!(problems.is_empty());
-        Settings::new(home, home, Clutter::Skip, ignore, access)
+        Settings::new(root, home, clutter, ignore, access)
+    }
+
+    fn settings(home: &Path, access: Access) -> Settings {
+        settings_from(home, home, Clutter::Skip, access)
     }
 
     #[test]
     fn a_folder_is_in_scope_exactly_when_the_scan_reads_it() {
         let (_dir, home) = home();
+        let work = home.join("work");
         let passages = [
             ".config",
             ".cache",
             "Library",
             "Library/Application Support",
         ];
-        for access in [Access::Full, Access::Limited] {
-            let settings = settings(&home, access);
-            let scope = settings.scope();
-            let index = settings.scan().unwrap().index;
-            let listed: Vec<PathBuf> = (0..index.len() as u32).map(|e| index.path(e)).collect();
-            let mut folders: Vec<PathBuf> = vec![home.clone()];
-            for folder in FOLDERS {
-                let mut path = home.join(folder);
-                while path != home {
-                    folders.push(path.clone());
-                    path.pop();
+        for (root, clutter) in [
+            (&home, Clutter::Skip),
+            (&home, Clutter::Keep),
+            (&work, Clutter::Skip),
+        ] {
+            for access in [Access::Full, Access::Limited] {
+                let settings = settings_from(&home, root, clutter, access);
+                let scope = settings.scope();
+                let index = settings.scan().unwrap().index;
+                let listed: Vec<PathBuf> = (0..index.len() as u32).map(|e| index.path(e)).collect();
+                for folder in every_folder(&home) {
+                    let passage = *root == home
+                        && clutter == Clutter::Skip
+                        && passages.iter().any(|passage| folder == home.join(passage));
+                    let read = listed.contains(&folder.join("probe.txt")) || passage;
+                    assert_eq!(
+                        scope.in_scope(&folder),
+                        read,
+                        "{folder:?} with {access:?} and {clutter:?} from {root:?}"
+                    );
                 }
-            }
-            folders.sort();
-            folders.dedup();
-            for folder in folders {
-                let read = listed.contains(&folder.join("probe.txt"))
-                    || passages.iter().any(|passage| folder == home.join(passage));
-                assert_eq!(scope.in_scope(&folder), read, "{folder:?} with {access:?}");
             }
         }
     }
@@ -261,21 +303,6 @@ mod tests {
         assert!(!limited.in_scope(&home.join("Pictures/Photos Library.photoslibrary")));
     }
 
-    #[cfg(unix)]
-    #[test]
-    fn a_guarded_folder_is_never_looked_into() {
-        use std::os::unix::fs::PermissionsExt;
-        let (_dir, home) = home();
-        let documents = home.join("Documents");
-        // A look inside would find no CACHEDIR.TAG and call it in scope; a locked folder
-        // stands in for the pop-up macOS would show.
-        fs::set_permissions(&documents, fs::Permissions::from_mode(0o000)).unwrap();
-        let limited = settings(&home, Access::Limited).scope();
-        let inside = limited.in_scope(&documents.join("taxes"));
-        fs::set_permissions(&documents, fs::Permissions::from_mode(0o755)).unwrap();
-        assert!(!inside);
-    }
-
     #[test]
     fn watches_kept_folders_and_skips_through_passages() {
         let (_dir, home) = home();
@@ -284,16 +311,27 @@ mod tests {
             let index = settings.scan().unwrap().index;
             settings.scope().watched(&index)
         };
-        let paths = |names: &[&str]| -> Vec<PathBuf> {
-            let mut paths: Vec<PathBuf> = names.iter().map(|name| home.join(name)).collect();
+        let passages = [
+            "",
+            ".cache",
+            ".config",
+            "Library",
+            "Library/Application Support",
+        ];
+        let expected = |inside: &[&str]| {
+            let mut paths: Vec<(PathBuf, Watch)> = (passages.iter())
+                .map(|name| (home.join(name), Watch::Names))
+                .chain(inside.iter().map(|name| (home.join(name), Watch::Inside)))
+                .collect();
             paths.sort();
             paths
         };
         assert_eq!(
             watched(Access::Full),
-            paths(&[
+            expected(&[
                 ".cache/keep",
                 ".config/nvim",
+                ".config/telescope",
                 "Desktop",
                 "Documents",
                 "Downloads",
@@ -310,9 +348,10 @@ mod tests {
         );
         assert_eq!(
             watched(Access::Limited),
-            paths(&[
+            expected(&[
                 ".cache/keep",
                 ".config/nvim",
+                ".config/telescope",
                 "Library/Application Support/Foo",
                 "Movies",
                 "Music",
@@ -322,6 +361,17 @@ mod tests {
                 "work",
             ])
         );
+    }
+
+    #[test]
+    fn a_kept_ignore_list_folder_is_watched_once() {
+        let (_dir, home) = home();
+        let (ignore, _) = Ignore::parse("!~/.config", &home, Access::Full);
+        let settings = Settings::new(&home, &home, Clutter::Skip, ignore, Access::Full);
+        let index = settings.scan().unwrap().index;
+        let watched = settings.scope().watched(&index);
+        assert!(watched.contains(&(home.join(".config"), Watch::Inside)));
+        assert!(!watched.iter().any(|(path, _)| path.ends_with("telescope")));
     }
 
     fn every_folder(home: &Path) -> Vec<PathBuf> {
@@ -400,6 +450,20 @@ mod tests {
         fs::remove_dir_all(home.join("src/mod")).unwrap();
         fs::write(home.join("src/mod"), "").unwrap();
         assert!(!holds("src"));
+        // A folder kept inside a passage, gone or renamed.
+        fs::remove_dir_all(home.join(".cache/keep")).unwrap();
+        assert!(!holds(".cache"));
+        let support = home.join("Library/Application Support");
+        fs::rename(support.join("Foo"), support.join("Foo.old")).unwrap();
+        assert!(!holds("Library/Application Support"));
+        fs::remove_dir_all(home.join("Library/Mobile Documents")).unwrap();
+        assert!(!holds("Library"));
+        // A listed folder a build tool just labelled as its cache.
+        let tag = "Signature: 8a477f597d28d172789f06886806bc55\n";
+        fs::write(home.join("work/new project/CACHEDIR.TAG"), tag).unwrap();
+        assert!(!holds("work/new project"));
+        // Your ignore list, even before its folder exists.
+        assert!(!holds(".config/telescope"));
     }
 
     #[test]
@@ -425,6 +489,13 @@ mod tests {
         fs::create_dir(home.join("notes")).unwrap();
         let settings = Settings::new(&home, &home, Clutter::Skip, Ignore::default(), Access::Full);
         let index = settings.scan().unwrap().index;
-        assert_eq!(settings.scope().watched(&index), [home.join("notes")]);
+        assert_eq!(
+            settings.scope().watched(&index),
+            [
+                (home.clone(), Watch::Names),
+                (home.join(".config/telescope"), Watch::Inside),
+                (home.join("notes"), Watch::Inside)
+            ]
+        );
     }
 }

@@ -32,7 +32,7 @@ final class SearchPanelTests: XCTestCase {
         XCTAssertNil(window.notice)
         XCTAssertEqual(window.panel.frame.height, Metric.field)
         window.recheckAccess()
-        XCTAssertEqual(checks, 1, "the list has every folder until a relaunch")
+        XCTAssertEqual(checks, 1, "with access there is nothing more to check")
     }
 
     func testAccessGrantedWhileRunningBringsInTheGuardedFoldersWithoutARelaunch() async throws {
@@ -88,20 +88,42 @@ final class SearchPanelTests: XCTestCase {
     func testAFileGoneFromTheListMovesTheSelectionToTheTop() async throws {
         let notes = root.appendingPathComponent("notes")
         try FileManager.default.createDirectory(at: notes, withIntermediateDirectories: false)
-        for name in ["budget a.txt", "budget b.txt"] {
+        for name in ["budget a.txt", "budget b.txt", "budget c.txt"] {
             try Data().write(to: notes.appendingPathComponent(name))
         }
         let window = try await opened(access: true)
         window.show()
         defer { window.hide() }
         try await type("budget", in: window)
-        try await until { window.rows.count == 2 }
+        try await until { window.rows.count == 3 }
         down(window)
         let picked = try XCTUnwrap(window.selected?.path)
 
         try FileManager.default.removeItem(atPath: picked)
-        try await until { window.rows.count == 1 }
+        try await until { window.rows.count == 2 }
         XCTAssertEqual(window.selected, window.rows.first)
+    }
+
+    func testAnArrowPressedBeforeTheSearchRunsAgainCounts() async throws {
+        let notes = root.appendingPathComponent("notes")
+        try FileManager.default.createDirectory(at: notes, withIntermediateDirectories: false)
+        for name in ["budget a.txt", "budget b.txt"] {
+            try Data().write(to: notes.appendingPathComponent(name))
+        }
+        let window = try await opened(access: true)
+        try await type("budget", in: window)
+        try await until { window.rows.count == 2 }
+        try Data().write(to: notes.appendingPathComponent("budget c.txt"))
+        try await until { window.stale }
+
+        // Shown, the search runs again; its answer can only arrive after the arrow.
+        window.show()
+        defer { window.hide() }
+        down(window)
+        let picked = try XCTUnwrap(window.selected?.path)
+        XCTAssertEqual(window.rows.firstIndex { $0.path == picked }, 1)
+        try await until { window.rows.count == 3 }
+        XCTAssertEqual(window.selected?.path, picked)
     }
 
     func testAHiddenWindowRunsTheSearchAgainWhenShown() async throws {

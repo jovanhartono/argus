@@ -16,7 +16,9 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
-use telescope_core::{Access, Clutter, Hit, Ignore, Index, Scope, Searcher, Settings, Ticket};
+use telescope_core::{
+    Access, Clutter, Hit, Ignore, Index, Scope, Searcher, Settings, Ticket, Watch,
+};
 
 /// Raise this with any change below, so a window built against an older header refuses to start.
 pub const TL_ABI_VERSION: u32 = 3;
@@ -106,11 +108,27 @@ struct Plan {
     /// A rebuild is under way, so the newest list may already be out of date.
     running: bool,
     full_disk: bool,
+    /// The window's mark on the first change still waiting for a rebuild.
+    asked: Option<u64>,
+    /// Folders changed while a rebuild ran, judged by its list once it is in: otherwise, on a
+    /// busy Mac, each save landing during a slow rebuild would ask for one more, forever.
+    recheck: Option<(Vec<PathBuf>, u64)>,
     stopped: bool,
+}
+
+impl Plan {
+    fn want(&mut self, mark: u64) {
+        self.wanted = true;
+        self.asked = Some(self.asked.map_or(mark, |asked| asked.min(mark)));
+    }
 }
 
 /// The newest list, shared with the worker rather than copied, and the rules it was built by.
 type Newest = Option<(Arc<Scope>, Arc<Index>)>;
+
+/// The folders to watch for changes to the newest list, and the mark of the first change its
+/// rebuild was asked for, or 0 for the first list.
+type Watched = (Vec<(String, Watch)>, u64);
 
 #[derive(Default)]
 struct Live {
@@ -118,8 +136,7 @@ struct Live {
     wake: Condvar,
     /// None for made-up names, or before the first list.
     newest: Mutex<Newest>,
-    /// The folders to watch for changes to the newest list.
-    watched: Mutex<Vec<String>>,
+    watched: Mutex<Watched>,
 }
 
 impl Live {
@@ -129,21 +146,27 @@ impl Live {
     }
 
     /// Keeps the list and its rules, for judging later changes, and hands the list on.
-    fn publish(&self, built: Built) -> Arc<Index> {
+    fn publish(&self, built: Built, mark: u64) -> Arc<Index> {
         let index = Arc::new(built.index);
         let watched = built
             .scope
             .as_ref()
             .map(|scope| scope.watched(&index))
             .unwrap_or_default();
-        *self.watched.lock().unwrap() = watched
-            .iter()
-            .map(|path| path.to_string_lossy().into_owned())
+        let watched = watched
+            .into_iter()
+            .map(|(path, watch)| (path.to_string_lossy().into_owned(), watch))
             .collect();
+        *self.watched.lock().unwrap() = (watched, mark);
         *self.newest.lock().unwrap() = built
             .scope
             .map(|scope| (Arc::new(scope), Arc::clone(&index)));
         index
+    }
+
+    fn misses_a_change_in(&self, paths: &[PathBuf]) -> bool {
+        let newest = self.newest.lock().unwrap().clone();
+        newest.is_some_and(|(scope, index)| paths.iter().any(|path| !scope.holds(path, &index)))
     }
 }
 
@@ -314,34 +337,43 @@ fn work(
     live: &Arc<Live>,
     notify: Notify,
 ) {
-    let stopped_cleanly = panic::catch_unwind(AssertUnwindSafe(|| {
-        let started = Instant::now();
-        let index = match source.build(&notify) {
-            Ok(built) => live.publish(built),
-            Err(error) => {
-                let code = error.raw_os_error().map_or(0, |code| code as u64);
-                notify.send(TL_EVENT_FAILED, code);
-                return;
-            }
-        };
-        notify.send(TL_EVENT_INDEXED, index.len() as u64);
-        let rebuilds = {
-            let live = Arc::clone(live);
-            thread::Builder::new()
-                .name("rebuild".into())
-                .spawn(move || {
-                    rebuild_loop(&live, GAP, started, |full_disk| {
-                        rebuild(&mut source, full_disk, &live, &swaps, &notify);
-                    });
-                })
-                .expect("start the rebuild thread")
-        };
-        serve(index, searcher, inbox, done, &notify);
-        let _ = rebuilds.join();
+    let started = Instant::now();
+    let first = panic::catch_unwind(AssertUnwindSafe(|| {
+        source.build(&notify).map(|built| live.publish(built, 0))
     }));
-    if stopped_cleanly.is_err() {
+    let index = match first {
+        Ok(Ok(index)) => index,
+        failed => {
+            live.plan(|plan| plan.stopped = true);
+            let code = match failed {
+                Ok(Err(error)) => error.raw_os_error().map_or(0, |code| code as u64),
+                _ => 0,
+            };
+            notify.send(TL_EVENT_FAILED, code);
+            return;
+        }
+    };
+    notify.send(TL_EVENT_INDEXED, index.len() as u64);
+    let rebuilds = {
+        let live = Arc::clone(live);
+        thread::Builder::new()
+            .name("rebuild".into())
+            .spawn(move || {
+                rebuild_loop(&live, GAP, started, |full_disk, mark| {
+                    rebuild(&mut source, full_disk, mark, &live, &swaps, &notify);
+                });
+            })
+            .expect("start the rebuild thread")
+    };
+    let served = panic::catch_unwind(AssertUnwindSafe(|| {
+        serve(index, searcher, inbox, done, &notify);
+    }));
+    if served.is_err() {
+        live.plan(|plan| plan.stopped = true);
         notify.send(TL_EVENT_FAILED, 0);
     }
+    // Waited for even after a bug, so it can't call `on_event` once the core is freed.
+    let _ = rebuilds.join();
 }
 
 fn serve(
@@ -376,8 +408,9 @@ fn serve(
 
 /// Calls `rebuild` for each rebuild wanted until the core stops: one at a time, with changes
 /// made meanwhile waiting as one more, each starting at least `gap` after the one before.
-/// `last` is when the first list was started. `rebuild` is told when Full Disk Access came on.
-fn rebuild_loop(live: &Live, gap: Duration, mut last: Instant, mut rebuild: impl FnMut(bool)) {
+/// `last` is when the first list was started. `rebuild` is told when Full Disk Access came on,
+/// and the mark of the first change it reads.
+fn rebuild_loop(live: &Live, gap: Duration, mut last: Instant, mut rebuild: impl FnMut(bool, u64)) {
     let mut plan = live.plan.lock().unwrap();
     loop {
         if plan.stopped {
@@ -395,11 +428,20 @@ fn rebuild_loop(live: &Live, gap: Duration, mut last: Instant, mut rebuild: impl
         plan.wanted = false;
         plan.running = true;
         let full_disk = std::mem::take(&mut plan.full_disk);
+        let mark = plan.asked.take().unwrap_or_default();
         drop(plan);
         last = now;
-        rebuild(full_disk);
+        rebuild(full_disk, mark);
         plan = live.plan.lock().unwrap();
         plan.running = false;
+        if let Some((paths, mark)) = plan.recheck.take() {
+            drop(plan);
+            let missed = live.misses_a_change_in(&paths);
+            plan = live.plan.lock().unwrap();
+            if missed {
+                plan.want(mark);
+            }
+        }
     }
 }
 
@@ -407,6 +449,7 @@ fn rebuild_loop(live: &Live, gap: Duration, mut last: Instant, mut rebuild: impl
 fn rebuild(
     source: &mut Source,
     full_disk: bool,
+    mark: u64,
     live: &Live,
     swaps: &Sender<Job>,
     notify: &Notify,
@@ -415,11 +458,12 @@ fn rebuild(
         *access = Access::Full;
     }
     let started = Instant::now();
-    let built = panic::catch_unwind(AssertUnwindSafe(|| source.build(notify)))
-        .unwrap_or_else(|_| Err(io::Error::other("a bug in the engine")));
+    let built = panic::catch_unwind(AssertUnwindSafe(|| {
+        source.build(notify).map(|built| live.publish(built, mark))
+    }))
+    .unwrap_or_else(|_| Err(io::Error::other("a bug in the engine")));
     match built {
-        Ok(built) => {
-            let index = live.publish(built);
+        Ok(index) => {
             let took = started.elapsed().as_millis().min(u32::MAX.into()) as u32;
             // Fails only once the worker has stopped.
             let _ = swaps.send(Job::Swap { index, took });
@@ -479,8 +523,9 @@ pub unsafe extern "C" fn tl_submit(core: *const TlCore, query: *const u8, len: u
 /// Tells the core that folders changed. `paths` holds `len` bytes: real paths in UTF-8, each
 /// ending in a NUL byte. The list is built again in the background when one is a folder the
 /// list reads whose names it no longer matches, or whatever they are when `rescan` isn't 0,
-/// as when macOS dropped changes; `TL_EVENT_REBUILT` follows. Returns 1 when a rebuild is
-/// coming, else 0. Safe to call from any thread.
+/// as when macOS dropped changes; `TL_EVENT_REBUILT` follows. `mark` is the window's own
+/// count of changes so far, handed back by `tl_watched`. Returns 1 when a new list is
+/// coming, else 0, as once the core has stopped. Safe to call from any thread.
 ///
 /// # Safety
 /// `core` came from `tl_core_new` or `tl_core_new_stand_in`, and `paths` points to `len` bytes
@@ -491,14 +536,19 @@ pub unsafe extern "C" fn tl_changed(
     paths: *const u8,
     len: usize,
     rescan: u32,
+    mark: u64,
 ) -> u32 {
     guard(0, || {
         let core = unsafe { &*core };
         let live = &core.live;
         let running = {
-            let plan = live.plan.lock().unwrap();
+            let mut plan = live.plan.lock().unwrap();
+            if plan.stopped {
+                return 0;
+            }
             // A rebuild not started yet will read every change made before it starts.
             if plan.wanted {
+                plan.want(mark);
                 return 1;
             }
             plan.running
@@ -507,59 +557,89 @@ pub unsafe extern "C" fn tl_changed(
             0 => &[],
             _ => unsafe { std::slice::from_raw_parts(paths, len) },
         };
-        let wanted = rescan != 0 || {
-            let newest = live.newest.lock().unwrap().clone();
-            newest.is_some_and(|(scope, index)| {
-                bytes
-                    .split(|&byte| byte == 0)
-                    .filter(|path| !path.is_empty())
-                    .any(|path| match std::str::from_utf8(path).map(Path::new) {
-                        // The rebuild under way may have read the folder before this change.
-                        Ok(path) if running => scope.in_scope(path),
-                        Ok(path) => !scope.holds(path, &index),
-                        Err(_) => true,
-                    })
-            })
+        let paths: Option<Vec<&Path>> = bytes
+            .split(|&byte| byte == 0)
+            .filter(|path| !path.is_empty())
+            .map(|path| std::str::from_utf8(path).ok().map(Path::new))
+            .collect();
+        let newest = live.newest.lock().unwrap().clone();
+        let wanted = match (paths, newest) {
+            _ if rescan != 0 => true,
+            (_, None) => false,
+            (None, _) => true,
+            (Some(paths), Some((scope, index))) if running => {
+                // The rebuild under way may have read these folders before they changed.
+                let changed: Vec<PathBuf> = paths
+                    .into_iter()
+                    .filter(|path| scope.in_scope(path) || !scope.holds(path, &index))
+                    .map(Path::to_path_buf)
+                    .collect();
+                if changed.is_empty() {
+                    return 0;
+                }
+                let mut plan = live.plan.lock().unwrap();
+                if plan.running {
+                    let (waiting, asked) = plan.recheck.get_or_insert_with(|| (Vec::new(), mark));
+                    *asked = (*asked).min(mark);
+                    for path in changed {
+                        if !waiting.contains(&path) {
+                            waiting.push(path);
+                        }
+                    }
+                } else {
+                    // It ended just now, maybe without reading them.
+                    plan.want(mark);
+                    live.wake.notify_all();
+                }
+                return 1;
+            }
+            (Some(paths), Some((scope, index))) => {
+                paths.iter().any(|path| !scope.holds(path, &index))
+            }
         };
         if wanted {
-            live.plan(|plan| plan.wanted = true);
+            live.plan(|plan| plan.want(mark));
         }
         u32::from(wanted)
     })
 }
 
 /// Builds the list again with the folders macOS guards, once Full Disk Access is switched on
-/// while the core runs. Safe to call from any thread.
+/// while the core runs. `mark` is as for `tl_changed`. Safe to call from any thread.
 ///
 /// # Safety
 /// `core` came from `tl_core_new` or `tl_core_new_stand_in`.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn tl_grant_full_disk(core: *const TlCore) {
+pub unsafe extern "C" fn tl_grant_full_disk(core: *const TlCore, mark: u64) {
     guard((), || {
         let core = unsafe { &*core };
         core.live.plan(|plan| {
             plan.full_disk = true;
-            plan.wanted = true;
+            plan.want(mark);
         });
     })
 }
 
 /// The folders to watch for changes to the newest list, sorted, as rows whose names are full
-/// paths; none before the first list or for made-up names. Free them with `tl_rows_free`.
-/// The home folder itself is never one: watch its own list of names on its own.
+/// paths; none before the first list or for made-up names. Watch everything inside a row with
+/// `is_folder`, and only the list of names of one without, such as the scanned folder itself.
+/// `since` gets the mark of the first change the list's rebuild was asked for, or 0 for the
+/// first list: changes since then may be missing from it. Free the rows with `tl_rows_free`.
 ///
 /// # Safety
-/// `core` came from `tl_core_new` or `tl_core_new_stand_in`, and `out` points to a `TlRows` to fill.
+/// `core` came from `tl_core_new` or `tl_core_new_stand_in`, `out` points to a `TlRows` to
+/// fill, and `since` to a number.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn tl_watched(core: *const TlCore, out: *mut TlRows) -> u32 {
+pub unsafe extern "C" fn tl_watched(core: *const TlCore, out: *mut TlRows, since: *mut u64) -> u32 {
     guard(TL_PANICKED, || {
         let core = unsafe { &*core };
         let watched = core.live.watched.lock().unwrap();
+        let (folders, mark) = &*watched;
         let mut packed = Packed {
-            rows: Vec::with_capacity(watched.len()),
+            rows: Vec::with_capacity(folders.len()),
             text: String::new(),
         };
-        for path in watched.iter() {
+        for (path, watch) in folders {
             let start = packed.text.len() as u32;
             packed.text.push_str(path);
             let end = packed.text.len() as u32;
@@ -568,9 +648,10 @@ pub unsafe extern "C" fn tl_watched(core: *const TlCore, out: *mut TlRows) -> u3
                 name_len: end - start,
                 folder_start: end,
                 folder_len: 0,
-                is_folder: true,
+                is_folder: *watch == Watch::Inside,
             });
         }
+        unsafe { since.write(*mark) };
         drop(watched);
         unsafe { out.write(hand_over(packed)) };
         TL_OK
@@ -761,27 +842,41 @@ mod tests {
         Some(copy(unsafe { rows.assume_init() }))
     }
 
-    fn watched(core: &Core) -> Vec<String> {
+    fn watched(core: &Core) -> (Vec<(String, bool)>, u64) {
         let mut rows = std::mem::MaybeUninit::<TlRows>::uninit();
-        assert_eq!(unsafe { tl_watched(core.0, rows.as_mut_ptr()) }, TL_OK);
-        let rows = copy(unsafe { rows.assume_init() });
-        assert!(
-            rows.iter()
-                .all(|(_, folder, is_folder)| folder.is_empty() && *is_folder)
+        let mut since = u64::MAX;
+        assert_eq!(
+            unsafe { tl_watched(core.0, rows.as_mut_ptr(), &mut since) },
+            TL_OK
         );
-        rows.into_iter().map(|(path, _, _)| path).collect()
+        let rows = copy(unsafe { rows.assume_init() });
+        assert!(rows.iter().all(|(_, folder, _)| folder.is_empty()));
+        let folders = rows
+            .into_iter()
+            .map(|(path, _, inside)| (path, inside))
+            .collect();
+        (folders, since)
+    }
+
+    fn watched_inside(core: &Core) -> Vec<String> {
+        let (folders, _) = watched(core);
+        let inside = folders.into_iter().filter(|(_, inside)| *inside);
+        inside.map(|(path, _)| path).collect()
     }
 
     fn changed(core: &Core, paths: &[&Path], rescan: u32) -> u32 {
+        changed_at(core, paths, rescan, 1)
+    }
+
+    fn changed_at(core: &Core, paths: &[&Path], rescan: u32, mark: u64) -> u32 {
         let mut bytes = Vec::new();
         for path in paths {
             bytes.extend_from_slice(path.to_str().unwrap().as_bytes());
             bytes.push(0);
         }
-        unsafe { tl_changed(core.0, bytes.as_ptr(), bytes.len(), rescan) }
+        unsafe { tl_changed(core.0, bytes.as_ptr(), bytes.len(), rescan, mark) }
     }
 
-    /// Copies the rows out and frees Rust's copy.
     fn copy(rows: TlRows) -> Vec<(String, String, bool)> {
         let text = |start: u32, len: u32| {
             let bytes =
@@ -932,18 +1027,80 @@ mod tests {
     }
 
     #[test]
-    fn problems_with_the_ignore_list_are_told() {
-        let dir = tempfile::tempdir().unwrap();
-        let home = std::fs::canonicalize(dir.path()).unwrap();
-        std::fs::create_dir_all(home.join(".config/telescope")).unwrap();
-        std::fs::write(home.join(".config/telescope/ignore"), "work/old\n").unwrap();
+    fn the_ignore_list_is_read_again_and_each_problem_told_once() {
+        let (_dir, home) = home_with(&["work/old/a.txt", "work/new/b.txt"]);
+        let list = home.join(".config/telescope/ignore");
+        std::fs::create_dir_all(list.parent().unwrap()).unwrap();
+        std::fs::write(&list, "work/old\n").unwrap();
 
         let events = Events::default();
-        let _core = scan(home.to_str().unwrap(), 1, &events);
-        events.wait_for(TL_EVENT_INDEXED, 1);
-        let notes = events.notes.lock().unwrap();
-        assert_eq!(notes.len(), 1);
-        assert!(notes[0].contains("line 1"), "{}", notes[0]);
+        let core = scan(home.to_str().unwrap(), 1, &events);
+        // The home folder, work, both folders in it and their files.
+        events.wait_for(TL_EVENT_INDEXED, 6);
+        let notes = || events.notes.lock().unwrap().clone();
+        assert_eq!(notes().len(), 1);
+        assert!(notes()[0].contains("line 1"), "{}", notes()[0]);
+
+        assert_eq!(changed(&core, &[], 1), 1);
+        assert_eq!(events.wait_for_rebuilt(1), 6);
+        assert_eq!(notes().len(), 1, "the same problem again");
+
+        // Saving the list is a change of its own, and its right line counts at once.
+        std::fs::write(&list, "old\n~\n").unwrap();
+        assert_eq!(changed(&core, &[list.parent().unwrap()], 0), 1);
+        assert_eq!(events.wait_for_rebuilt(2), 4);
+        assert_eq!(notes().len(), 2);
+        assert!(notes()[1].contains("line 2"), "{}", notes()[1]);
+    }
+
+    #[test]
+    fn a_core_that_failed_wants_no_rebuilds() {
+        let dir = tempfile::tempdir().unwrap();
+        let gone = dir.path().join("gone");
+        let events = Events::default();
+        let core = scan(gone.to_str().unwrap(), 1, &events);
+        events.wait_for_event(TL_EVENT_FAILED);
+        assert_eq!(changed(&core, &[], 1), 0);
+        unsafe { tl_grant_full_disk(core.0, 1) };
+        assert_eq!(changed(&core, &[&gone], 0), 0);
+        assert_eq!(watched(&core), (Vec::new(), 0));
+        drop(core);
+        assert_eq!(events.seen.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_bug_while_searching_still_stops_the_rebuild_thread() {
+        let events = Events::default();
+        let notify = Notify {
+            ctx: &events as *const Events as *mut c_void,
+            on_event: record,
+        };
+        // A lock left poisoned by an earlier panic makes the next answer panic.
+        let done: Arc<Done> = Arc::default();
+        let poisoned = Arc::clone(&done);
+        let _ = thread::spawn(move || {
+            let _held = poisoned.lock().unwrap();
+            panic!("a bug in the engine");
+        })
+        .join();
+        let live = Arc::new(Live::default());
+        let searcher = Searcher::with_threads(1);
+        let (jobs, inbox) = mpsc::channel();
+        let ticket = searcher.ticket();
+        let query = "budget".to_owned();
+        jobs.send(Job::Search { ticket, query }).unwrap();
+
+        work(
+            Source::StandIn(2_000),
+            &searcher,
+            &inbox,
+            jobs.clone(),
+            &done,
+            &live,
+            notify,
+        );
+        assert_eq!(Arc::strong_count(&live), 1, "the rebuild thread is gone");
+        assert!(events.seen.lock().unwrap().contains(&(TL_EVENT_FAILED, 0)));
     }
 
     #[test]
@@ -1014,14 +1171,17 @@ mod tests {
     #[test]
     fn the_rebuild_time_rides_in_the_high_half() {
         let events = Events::default();
-        let core = start(100, &events);
+        // Enough names to take a few milliseconds to build.
+        let core = start(200_000, &events);
+        let asked = Instant::now();
         assert_eq!(changed(&core, &[], 1), 1);
         events.wait_for_rebuilt(1);
+        let waited = asked.elapsed().as_millis();
         let seen = events.seen.lock().unwrap();
         let &(_, value) = seen.iter().find(|(e, _)| *e == TL_EVENT_REBUILT).unwrap();
-        assert_eq!(value & u64::from(u32::MAX), 100);
-        // A hundred made-up names take well under a second.
-        assert!(value >> 32 < 1_000, "{} ms", value >> 32);
+        assert_eq!(value & u64::from(u32::MAX), 200_000);
+        let took = u128::from(value >> 32);
+        assert!(took >= 1 && took <= waited, "{took} ms of {waited}");
     }
 
     #[test]
@@ -1030,10 +1190,13 @@ mod tests {
         let core = start(100, &events);
         assert_eq!(changed(&core, &[], 0), 0);
         assert_eq!(changed(&core, &[Path::new("/Users")], 0), 0);
-        assert_eq!(unsafe { tl_changed(core.0, std::ptr::null(), 0, 0) }, 0);
-        assert!(watched(&core).is_empty());
-        assert_eq!(unsafe { tl_changed(core.0, std::ptr::null(), 0, 1) }, 1);
+        assert_eq!(unsafe { tl_changed(core.0, std::ptr::null(), 0, 0, 1) }, 0);
+        assert_eq!(watched(&core), (Vec::new(), 0));
+        assert_eq!(unsafe { tl_changed(core.0, std::ptr::null(), 0, 1, 1) }, 1);
         assert_eq!(events.wait_for_rebuilt(1), 100);
+        // Access changes nothing for them, but costs no more than one more rebuild.
+        unsafe { tl_grant_full_disk(core.0, 1) };
+        assert_eq!(events.wait_for_rebuilt(2), 100);
     }
 
     #[test]
@@ -1043,23 +1206,26 @@ mod tests {
         let core = scan(home.to_str().unwrap(), 1, &events);
         events.wait_for(TL_EVENT_INDEXED, 2);
         let bytes = [0xff, 0];
-        assert_eq!(unsafe { tl_changed(core.0, bytes.as_ptr(), 2, 0) }, 1);
+        assert_eq!(unsafe { tl_changed(core.0, bytes.as_ptr(), 2, 0, 1) }, 1);
         events.wait_for_rebuilt(1);
     }
 
     #[test]
     fn a_change_while_one_is_waiting_needs_no_check() {
-        let (_dir, home) = home_with(&["notes/"]);
-        let events = Events::default();
-        let core = scan(home.to_str().unwrap(), 1, &events);
-        events.wait_for(TL_EVENT_INDEXED, 2);
-        // The first list was started a moment ago, so this one waits out the gap.
-        std::fs::write(home.join("plan.md"), "").unwrap();
-        assert_eq!(changed(&core, &[&home], 0), 1);
-        assert_eq!(changed(&core, &[Path::new("/elsewhere")], 0), 1);
-        events.wait_for_rebuilt(1);
-        std::thread::sleep(GAP + Duration::from_millis(200));
-        assert_eq!(events.rebuilt().len(), 1);
+        // No threads, so the rebuild asked for stays waiting.
+        let core = Core(Box::into_raw(Box::new(TlCore {
+            searcher: Arc::default(),
+            jobs: None,
+            done: Arc::default(),
+            live: Arc::default(),
+            worker: None,
+        })));
+        let live = unsafe { &(*core.0).live };
+        live.plan(|plan| plan.want(5));
+        assert_eq!(changed_at(&core, &[Path::new("/elsewhere")], 0, 7), 1);
+        assert_eq!(live.plan.lock().unwrap().asked, Some(5));
+        assert_eq!(changed_at(&core, &[Path::new("/elsewhere")], 0, 3), 1);
+        assert_eq!(live.plan.lock().unwrap().asked, Some(3));
     }
 
     #[test]
@@ -1069,34 +1235,59 @@ mod tests {
         let core = scan(home.to_str().unwrap(), 1, &events);
         events.wait_for(TL_EVENT_INDEXED, 3);
         let path = |name: &str| home.join(name).to_string_lossy().into_owned();
-        assert_eq!(watched(&core), [path("notes")]);
+        let home_names = (home.to_string_lossy().into_owned(), false);
+        let first = vec![
+            home_names.clone(),
+            (path(".config/telescope"), true),
+            (path("Library"), false),
+            (path("notes"), true),
+        ];
+        assert_eq!(watched(&core), (first.clone(), 0));
 
         std::fs::create_dir(home.join("work")).unwrap();
-        assert_eq!(changed(&core, &[&home], 0), 1);
+        assert_eq!(changed_at(&core, &[&home], 0, 42), 1);
         events.wait_for_rebuilt(1);
-        assert_eq!(watched(&core), [path("notes"), path("work")]);
+        let mut second = first;
+        second.push((path("work"), true));
+        assert_eq!(watched(&core), (second, 42));
     }
 
     #[test]
     fn granting_full_disk_access_brings_in_the_guarded_folders() {
         let (_dir, home) = home_with(&["Documents/budget.pdf"]);
         let documents = home.join("Documents");
+        let list = home
+            .join(".config/telescope")
+            .to_string_lossy()
+            .into_owned();
         let events = Events::default();
         let core = scan(home.to_str().unwrap(), 0, &events);
         events.wait_for(TL_EVENT_INDEXED, 1);
         assert_eq!(changed(&core, &[&documents], 0), 0);
-        assert!(watched(&core).is_empty());
+        assert_eq!(watched_inside(&core), std::slice::from_ref(&list));
 
-        unsafe { tl_grant_full_disk(core.0) };
+        unsafe { tl_grant_full_disk(core.0, 9) };
         assert_eq!(events.wait_for_rebuilt(1), 3);
-        assert_eq!(watched(&core), [documents.to_string_lossy()]);
+        let documents_text = documents.to_string_lossy().into_owned();
+        assert_eq!(watched_inside(&core), [list, documents_text]);
+        assert_eq!(watched(&core).1, 9);
         std::fs::write(documents.join("taxes.pdf"), "").unwrap();
         assert_eq!(changed(&core, &[&documents], 0), 1);
     }
 
     #[test]
+    fn access_granted_before_the_first_list_still_counts() {
+        let (_dir, home) = home_with(&["Documents/budget.pdf"]);
+        let events = Events::default();
+        let core = scan(home.to_str().unwrap(), 0, &events);
+        unsafe { tl_grant_full_disk(core.0, 1) };
+        events.wait_for_event(TL_EVENT_INDEXED);
+        assert_eq!(events.wait_for_rebuilt(1), 3);
+    }
+
+    #[test]
     fn a_file_saved_over_needs_no_rebuild() {
-        let (_dir, home) = home_with(&["notes/budget.txt", ".claude.json"]);
+        let (_dir, home) = home_with(&["notes/budget.txt", "notes/node_modules/", ".claude.json"]);
         let events = Events::default();
         let core = scan(home.to_str().unwrap(), 1, &events);
         events.wait_for(TL_EVENT_INDEXED, 4);
@@ -1106,8 +1297,12 @@ mod tests {
         assert_eq!(changed(&core, &[&home, &home.join("notes")], 0), 0);
 
         // While a rebuild runs, the list on hand may be older than the disk, so any folder
-        // the list reads counts.
+        // the list reads counts, and still only those.
         unsafe { &(*core.0).live }.plan(|plan| plan.running = true);
+        let clutter = [home.join("notes/node_modules"), home.join("Library/Caches")];
+        for folder in &clutter {
+            assert_eq!(changed(&core, &[folder], 0), 0, "{folder:?}");
+        }
         assert_eq!(changed(&core, &[&home.join("notes")], 0), 1);
     }
 
@@ -1142,10 +1337,10 @@ mod tests {
     fn freeing_the_core_cuts_a_waiting_rebuild_short() {
         let events = Events::default();
         let core = start(100, &events);
-        changed(&core, &[], 1);
+        assert_eq!(changed(&core, &[], 1), 1);
         events.wait_for_rebuilt(1);
         // This one waits out the gap after the first.
-        changed(&core, &[], 1);
+        assert_eq!(changed(&core, &[], 1), 1);
         let freeing = Instant::now();
         drop(core);
         assert!(freeing.elapsed() < GAP / 2, "{:?}", freeing.elapsed());
@@ -1226,57 +1421,79 @@ mod tests {
         );
     }
 
-    /// When each rebuild started, and whether it was told of Full Disk Access.
-    type Starts = Arc<Mutex<Vec<(Instant, bool)>>>;
+    /// When each rebuild started, whether it was told of Full Disk Access, and its mark.
+    type Starts = Arc<Mutex<Vec<(Instant, bool, u64)>>>;
 
-    /// Runs `rebuild_loop` on its own thread; each rebuild takes `takes`.
+    struct Rebuilds {
+        starts: Starts,
+        started: Receiver<()>,
+        thread: JoinHandle<()>,
+    }
+
     fn rebuilds(
         live: &Arc<Live>,
         gap: Duration,
         last: Instant,
-        takes: Duration,
-    ) -> (Starts, JoinHandle<()>) {
+        body: impl Fn() + Send + 'static,
+    ) -> Rebuilds {
         let starts = Arc::new(Mutex::new(Vec::new()));
+        let (tell, started) = mpsc::channel();
         let thread = {
             let (live, starts) = (Arc::clone(live), Arc::clone(&starts));
             thread::spawn(move || {
-                rebuild_loop(&live, gap, last, |full_disk| {
-                    starts.lock().unwrap().push((Instant::now(), full_disk));
-                    thread::sleep(takes);
+                rebuild_loop(&live, gap, last, |full_disk, mark| {
+                    starts
+                        .lock()
+                        .unwrap()
+                        .push((Instant::now(), full_disk, mark));
+                    let _ = tell.send(());
+                    body();
                 });
             })
         };
-        (starts, thread)
+        Rebuilds {
+            starts,
+            started,
+            thread,
+        }
     }
 
-    fn stop(live: &Live, thread: JoinHandle<()>) {
-        live.plan(|plan| plan.stopped = true);
-        thread.join().unwrap();
+    impl Rebuilds {
+        fn next_starts(&self) {
+            let started = self.started.recv_timeout(Duration::from_secs(10));
+            assert!(started.is_ok(), "no rebuild within 10 s");
+        }
+
+        fn none_starts_within(&self, wait: Duration) {
+            assert!(
+                self.started.recv_timeout(wait).is_err(),
+                "a rebuild started"
+            );
+        }
+
+        fn stop(self, live: &Live) -> Vec<(Instant, bool, u64)> {
+            live.plan(|plan| plan.stopped = true);
+            self.thread.join().unwrap();
+            self.starts.lock().unwrap().clone()
+        }
     }
 
     #[test]
     fn a_lone_change_rebuilds_at_once() {
         let live = Arc::new(Live::default());
-        let gap = Duration::from_millis(300);
-        let long_ago = Instant::now() - Duration::from_secs(10);
-        let (starts, thread) = rebuilds(&live, gap, long_ago, Duration::ZERO);
-        let asked = Instant::now();
-        live.plan(|plan| plan.wanted = true);
-        thread::sleep(Duration::from_millis(100));
-        let first = starts.lock().unwrap()[0].0;
-        assert!(
-            first - asked < Duration::from_millis(50),
-            "{:?}",
-            first - asked
-        );
+        // A gap of a minute, which a lone change long after the last rebuild doesn't wait for.
+        let gap = Duration::from_secs(60);
+        let long_ago = Instant::now() - gap;
+        let rebuilds = rebuilds(&live, gap, long_ago, || {});
+        live.plan(|plan| plan.want(4));
+        rebuilds.next_starts();
 
         // The next one, straight after, waits out the gap.
-        live.plan(|plan| plan.wanted = true);
-        thread::sleep(gap + Duration::from_millis(100));
-        stop(&live, thread);
-        let starts = starts.lock().unwrap();
-        assert_eq!(starts.len(), 2);
-        assert!(starts[1].0 - starts[0].0 >= gap);
+        live.plan(|plan| plan.want(6));
+        rebuilds.none_starts_within(Duration::from_millis(300));
+        let starts = rebuilds.stop(&live);
+        assert_eq!(starts.len(), 1);
+        assert_eq!(starts[0].2, 4);
     }
 
     #[test]
@@ -1284,73 +1501,142 @@ mod tests {
         let live = Arc::new(Live::default());
         let gap = Duration::from_millis(100);
         let long_ago = Instant::now() - Duration::from_secs(10);
-        let (starts, thread) = rebuilds(&live, gap, long_ago, Duration::from_millis(30));
-        let mut last_change = Instant::now();
+        let takes = Duration::from_millis(30);
+        let rebuilds = rebuilds(&live, gap, long_ago, move || thread::sleep(takes));
+        let first_change = Instant::now();
+        let mut last_change = first_change;
         for _ in 0..50 {
             last_change = Instant::now();
             live.plan(|plan| plan.wanted = true);
             thread::sleep(Duration::from_millis(5));
         }
-        thread::sleep(3 * gap);
-        stop(&live, thread);
+        let asked = Instant::now();
+        let before_last = |starts: &Starts| {
+            let starts = starts.lock().unwrap();
+            starts.last().is_none_or(|start| start.0 < last_change)
+        };
+        while before_last(&rebuilds.starts) {
+            assert!(
+                asked.elapsed() < Duration::from_secs(10),
+                "no rebuild after the last"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        let starts = rebuilds.stop(&live);
 
-        let starts = starts.lock().unwrap();
-        // About 0.25 s of changes: one at once, then one per gap, then the last one waiting.
-        assert!((2..=5).contains(&starts.len()), "{} rebuilds", starts.len());
+        // One at once, at most one per gap while changes keep coming, then the last one.
+        let spread = (last_change - first_change).as_millis() / gap.as_millis();
+        let most = 3 + spread as usize;
+        assert!(
+            (2..=most).contains(&starts.len()),
+            "{} rebuilds",
+            starts.len()
+        );
         for pair in starts.windows(2) {
             assert!(pair[1].0 - pair[0].0 >= gap);
         }
-        assert!(starts.last().unwrap().0 >= last_change);
     }
 
     #[test]
     fn changes_during_a_rebuild_wait_as_one_more() {
         let live = Arc::new(Live::default());
         let long_ago = Instant::now() - Duration::from_secs(10);
-        let (starts, thread) =
-            rebuilds(&live, Duration::ZERO, long_ago, Duration::from_millis(200));
-        live.plan(|plan| plan.wanted = true);
-        thread::sleep(Duration::from_millis(50));
-        for _ in 0..20 {
-            live.plan(|plan| plan.wanted = true);
+        // The first rebuild holds until the changes are all in.
+        let gate = Arc::new(Mutex::new(()));
+        let held = gate.lock().unwrap();
+        let rebuilds = {
+            let gate = Arc::clone(&gate);
+            rebuilds(&live, Duration::ZERO, long_ago, move || {
+                drop(gate.lock());
+            })
+        };
+        live.plan(|plan| plan.want(1));
+        rebuilds.next_starts();
+        for mark in 2..22 {
+            live.plan(|plan| plan.want(mark));
         }
-        thread::sleep(Duration::from_millis(600));
-        stop(&live, thread);
-        assert_eq!(starts.lock().unwrap().len(), 2);
+        drop(held);
+        rebuilds.next_starts();
+        rebuilds.none_starts_within(Duration::from_millis(300));
+        let marks: Vec<u64> = rebuilds.stop(&live).iter().map(|s| s.2).collect();
+        assert_eq!(marks, [1, 2]);
+    }
+
+    #[test]
+    fn a_change_during_a_rebuild_is_judged_by_the_list_it_brings() {
+        let (_dir, home) = home_with(&["notes/budget.txt"]);
+        let notes = home.join("notes");
+        let settings = Settings::new(&home, &home, Clutter::Skip, Ignore::default(), Access::Full);
+        let live = Arc::new(Live::default());
+        let index = settings.scan().unwrap().index;
+        let scope = Some(settings.scope());
+        live.publish(Built { index, scope }, 0);
+        let core = Core(Box::into_raw(Box::new(TlCore {
+            searcher: Arc::default(),
+            jobs: None,
+            done: Arc::default(),
+            live: Arc::clone(&live),
+            worker: None,
+        })));
+        // Each rebuild holds until let go, and leaves the list as it was.
+        let gate = Arc::new(Mutex::new(()));
+        let rebuilds = {
+            let gate = Arc::clone(&gate);
+            let long_ago = Instant::now() - Duration::from_secs(10);
+            rebuilds(&live, Duration::ZERO, long_ago, move || drop(gate.lock()))
+        };
+
+        let held = gate.lock().unwrap();
+        live.plan(|plan| plan.want(1));
+        rebuilds.next_starts();
+        std::fs::write(notes.join("budget.txt"), "edited").unwrap();
+        assert_eq!(changed_at(&core, &[&notes], 0, 2), 1);
+        assert!(!live.plan.lock().unwrap().wanted);
+        drop(held);
+        rebuilds.none_starts_within(Duration::from_millis(300));
+
+        let held = gate.lock().unwrap();
+        live.plan(|plan| plan.want(3));
+        rebuilds.next_starts();
+        std::fs::write(notes.join("plan.md"), "").unwrap();
+        assert_eq!(changed_at(&core, &[&notes, &notes], 0, 5), 1);
+        assert_eq!(changed_at(&core, &[&notes], 0, 4), 1);
+        assert_eq!(
+            live.plan.lock().unwrap().recheck,
+            Some((vec![notes.clone()], 4))
+        );
+        drop(held);
+        rebuilds.next_starts();
+        let marks: Vec<u64> = rebuilds.stop(&live).iter().map(|s| s.2).collect();
+        assert_eq!(marks, [1, 3, 4]);
     }
 
     #[test]
     fn full_disk_access_reaches_one_rebuild() {
         let live = Arc::new(Live::default());
         let long_ago = Instant::now() - Duration::from_secs(10);
-        let (starts, thread) = rebuilds(&live, Duration::ZERO, long_ago, Duration::ZERO);
+        let rebuilds = rebuilds(&live, Duration::ZERO, long_ago, || {});
         live.plan(|plan| {
             plan.full_disk = true;
             plan.wanted = true;
         });
-        thread::sleep(Duration::from_millis(50));
+        rebuilds.next_starts();
         live.plan(|plan| plan.wanted = true);
-        thread::sleep(Duration::from_millis(50));
-        stop(&live, thread);
-        let told: Vec<bool> = starts.lock().unwrap().iter().map(|&(_, f)| f).collect();
+        rebuilds.next_starts();
+        let told: Vec<bool> = rebuilds.stop(&live).iter().map(|s| s.1).collect();
         assert_eq!(told, [true, false]);
     }
 
     #[test]
     fn stopping_wakes_a_rebuild_waiting_out_its_gap() {
         let live = Arc::new(Live::default());
-        let (starts, thread) = rebuilds(
-            &live,
-            Duration::from_secs(60),
-            Instant::now(),
-            Duration::ZERO,
-        );
+        let rebuilds = rebuilds(&live, Duration::from_secs(60), Instant::now(), || {});
         live.plan(|plan| plan.wanted = true);
         thread::sleep(Duration::from_millis(20));
         let stopping = Instant::now();
-        stop(&live, thread);
+        let starts = rebuilds.stop(&live);
         assert!(stopping.elapsed() < Duration::from_secs(1));
-        assert!(starts.lock().unwrap().is_empty());
+        assert!(starts.is_empty());
     }
 
     #[test]
