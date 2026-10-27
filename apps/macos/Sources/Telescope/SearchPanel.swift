@@ -19,6 +19,11 @@ let failures = Logger(subsystem: "io.github.jovanhartono.telescope", category: "
 
 final class Panel: NSPanel {
     override var canBecomeKey: Bool { true }
+
+    /// Esc while Open Settings has the focus; the box handles its own Esc.
+    override func cancelOperation(_ sender: Any?) {
+        (delegate as? SearchPanel)?.hide()
+    }
 }
 
 /// Lays out from the top, so the box stays put while the window grows or shrinks below it.
@@ -26,11 +31,17 @@ final class TopDown: NSView {
     override var isFlipped: Bool { true }
 }
 
+/// Tab reaches it even with Keyboard Navigation off in System Settings: Telescope has no Dock
+/// icon or menu bar, so without this a keyboard user could never grant access.
+final class KeyButton: NSButton {
+    override var acceptsFirstResponder: Bool { true }
+}
+
 @MainActor
 final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTableViewDataSource,
     NSTableViewDelegate
 {
-    private let panel = Panel(
+    let panel = Panel(
         contentRect: NSRect(x: 0, y: 0, width: Metric.width, height: Metric.field),
         styleMask: [.titled, .fullSizeContentView, .nonactivatingPanel],
         backing: .buffered, defer: false)
@@ -40,10 +51,16 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
     private let scroll = NSScrollView()
     private let table = NSTableView()
     private let message = NSTextField(labelWithString: "")
+    private let bar = TopDown()
+    private let barLine = NSBox(frame: NSRect(x: 0, y: 0, width: Metric.width, height: 1))
+    let barText = NSTextField(labelWithString: "")
+    let settings = KeyButton(title: "Open Settings", target: nil, action: nil)
 
     private var hatch: Hatch?
+    private let hasAccess: () -> Bool
+    private(set) var notice: Notice?
     private var indexingSince: TimeInterval = 0
-    private var indexed = false
+    private(set) var indexed = false
     private var problem: String?
     /// The file you picked was moved or deleted after the list was built.
     private var missing: String?
@@ -56,7 +73,8 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
     private var shown = false
     private var icons: [String: NSImage] = [:]
 
-    override init() {
+    init(root: String = NSHomeDirectory(), hasAccess: @escaping () -> Bool = { Hatch.hasFullDiskAccess() }) {
+        self.hasAccess = hasAccess
         super.init()
         build()
         let onEvent: (Hatch.Event) -> Void = { [weak self] event in self?.heard(event) }
@@ -66,9 +84,12 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
         if let count = ProcessInfo.processInfo.environment["TELESCOPE_STAND_IN"].flatMap(UInt64.init) {
             hatch = Hatch(standIn: count, onEvent: onEvent)
         } else {
-            hatch = Hatch(root: NSHomeDirectory(), fullDisk: Hatch.hasFullDiskAccess(), onEvent: onEvent)
+            let access = hasAccess()
+            post(access ? nil : .needsAccess)
+            hatch = Hatch(root: root, fullDisk: access, onEvent: onEvent)
         }
         if hatch == nil { problem = "Search couldn't start. Rebuild Telescope." }
+        fit()
     }
 
     func toggle() {
@@ -86,6 +107,7 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
 
     func show() {
         let pressed = pressedAt()
+        recheckAccess()
         shown = true
         place()
         panel.alphaValue = reduceMotion ? 1 : 0
@@ -175,10 +197,55 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
             x: 16, y: Metric.field + 1 + (Metric.message - 17) / 2, width: Metric.width - 32,
             height: 17)
 
+        barLine.boxType = .separator
+        barText.font = message.font
+        barText.textColor = .secondaryLabelColor
+        barText.lineBreakMode = .byTruncatingTail
+        settings.target = self
+        settings.action = #selector(openSettings(_:))
+        settings.sizeToFit()
+        settings.setFrameOrigin(
+            NSPoint(
+                x: Metric.width - 16 - settings.frame.width,
+                y: 1 + (Metric.message - settings.frame.height) / 2))
+        for view in [barLine, barText, settings] { bar.addSubview(view) }
+        bar.frame = NSRect(x: 0, y: Metric.field, width: Metric.width, height: 1 + Metric.message)
+        bar.isHidden = true
+        field.nextKeyView = settings
+        settings.nextKeyView = field
+
         let content = TopDown()
-        for view in [glass, field, line, scroll, message] { content.addSubview(view) }
+        for view in [glass, field, line, scroll, message, bar] { content.addSubview(view) }
         panel.contentView = content
-        fit()
+    }
+
+    /// Checked on each show while access is missing, so the line changes once it is switched on
+    /// in System Settings and Later is clicked.
+    func recheckAccess() {
+        guard notice == .needsAccess, hasAccess() else { return }
+        post(.needsRelaunch)
+    }
+
+    private func post(_ fresh: Notice?) {
+        notice = fresh
+        bar.isHidden = fresh == nil
+        settings.isHidden = fresh?.opensSettings != true
+        barText.stringValue = fresh?.text ?? ""
+        let textWidth = Metric.width - 32 - (settings.isHidden ? 0 : settings.frame.width + 12)
+        barText.frame = NSRect(x: 16, y: 1 + (Metric.message - 17) / 2, width: textWidth, height: 17)
+        line.frame.origin.y = head
+        message.frame.origin.y = head + 1 + (Metric.message - 17) / 2
+    }
+
+    /// Where the results start. The access line sits right under the box and never moves:
+    /// kept at the bottom, it moved with every resize and doubled the keystroke-to-results time.
+    private var head: CGFloat {
+        Metric.field + (notice == nil ? 0 : 1 + Metric.message)
+    }
+
+    @objc private func openSettings(_ sender: Any?) {
+        hide()
+        NSWorkspace.shared.open(Notice.settings)
     }
 
     /// A fifth of the way down the screen that has the mouse.
@@ -230,9 +297,9 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
         line.isHidden = body == 0
         scroll.isHidden = body == 0 || status != nil
         message.isHidden = body == 0 || status == nil
-        scroll.frame = NSRect(x: 0, y: Metric.field + 1, width: Metric.width, height: body)
+        scroll.frame = NSRect(x: 0, y: head + 1, width: Metric.width, height: body)
 
-        let height = Metric.field + (body > 0 ? 1 + body : 0)
+        let height = head + (body > 0 ? 1 + body : 0)
         var frame = panel.frame
         guard frame.height != height else { return }
         frame.origin.y += frame.height - height
@@ -387,6 +454,9 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
             }
         case #selector(NSResponder.insertNewline(_:)):
             onceAnswered { [weak self] in self?.open(revealing: false) }
+        case #selector(NSResponder.insertTab(_:)), #selector(NSResponder.insertBacktab(_:)):
+            guard notice?.opensSettings == true else { return false }
+            panel.makeFirstResponder(settings)
         default:
             return false
         }
