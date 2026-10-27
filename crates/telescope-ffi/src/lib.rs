@@ -6,22 +6,27 @@
 //! that ticket's rows are ready; the window then copies them out with `tl_take`.
 //! When files change, `tl_changed` asks a second thread to build the list again; the new list
 //! reaches the worker through the same queue as the searches, so each search sees one whole list.
+//! A text search, inside files, runs the same way on a worker of its own, started with the
+//! first one, so a name search never waits behind it: `tl_grep_submit`, then `tl_grep_take`
+//! for each batch of lines found.
 //! `include/telescope.h` repeats everything here for Swift, and a test keeps the two in step.
 
 use std::ffi::{CString, c_void};
 use std::io;
 use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 use telescope_core::{
     Access, Clutter, Hit, Ignore, Index, Scope, Searcher, Settings, Ticket, Watch,
 };
+use telescope_grep::{Found, Grep, Report};
 
 /// Raise this with any change below, so a window built against an older header refuses to start.
-pub const TL_ABI_VERSION: u32 = 3;
+pub const TL_ABI_VERSION: u32 = 4;
 
 pub const TL_OK: u32 = 0;
 /// No rows for that ticket: not ready yet, already taken, or a newer search replaced them.
@@ -41,15 +46,21 @@ pub const TL_EVENT_NOTE: u32 = 4;
 /// A list built again after a change is in use. `value` holds its entry count in the low 32
 /// bits and the milliseconds the rebuild took in the high 32.
 pub const TL_EVENT_REBUILT: u32 = 5;
+/// `value` is the text search ticket whose lines, or whose end, wait for `tl_grep_take`. One
+/// per take: no more come until the window has taken what was waiting.
+pub const TL_EVENT_LINES: u32 = 6;
 
 const ROWS: usize = 50;
+/// Lines a text search shows, across all its folders.
+const LINES: usize = 100;
 
 /// Rebuilds start at least this far apart while files keep changing, so a long download
 /// doesn't keep a core busy. A change is findable within FSEvents' 0.2 s, plus this, plus
 /// one rebuild: about 0.15 s for a home folder.
 const GAP: Duration = Duration::from_millis(500);
 
-/// Runs on a Rust thread, never the window's main thread, and must never wait for it.
+/// Runs on Rust threads, at times several at once, never the window's main thread, and must
+/// never wait for it.
 pub type TlEventFn = unsafe extern "C" fn(ctx: *mut c_void, event: u32, value: u64);
 
 /// One result. Its name and folder are byte ranges in `TlRows::text`.
@@ -76,6 +87,61 @@ struct Packed {
     text: String,
 }
 
+/// One line a text search found. The file's path and the line are byte ranges in
+/// `TlLines::text`; the match is a byte range in the line, counted from its start.
+#[repr(C)]
+pub struct TlLine {
+    pub path_start: u32,
+    pub path_len: u32,
+    pub text_start: u32,
+    pub text_len: u32,
+    pub match_start: u32,
+    pub match_len: u32,
+    pub line: u64,
+}
+
+/// What a text search did with each file it met, as `telescope_grep::Report` explains.
+#[repr(C)]
+pub struct TlReport {
+    pub files_searched: u64,
+    pub lines_found: u64,
+    pub binary: u64,
+    pub too_large: u64,
+    pub cloud_only: u64,
+    pub unreadable: u64,
+}
+
+impl From<Report> for TlReport {
+    fn from(report: Report) -> Self {
+        Self {
+            files_searched: report.files_searched as u64,
+            lines_found: report.lines_found as u64,
+            binary: report.binary as u64,
+            too_large: report.too_large as u64,
+            cloud_only: report.cloud_only as u64,
+            unreadable: report.unreadable as u64,
+        }
+    }
+}
+
+/// The lines found since the last take. Once `done`, the search is over and `report` holds its
+/// counts; before, `report` is all zeros. Hand this back to `tl_lines_free` once.
+#[repr(C)]
+pub struct TlLines {
+    pub lines: *const TlLine,
+    pub count: usize,
+    pub text: *const u8,
+    pub done: bool,
+    pub report: TlReport,
+    owner: *mut c_void,
+}
+
+#[derive(Default)]
+struct Batch {
+    lines: Vec<TlLine>,
+    text: String,
+}
+
 /// The newest finished search, waiting for the window to take it.
 type Done = Mutex<Option<(Ticket, Packed)>>;
 
@@ -86,6 +152,43 @@ pub struct TlCore {
     done: Arc<Done>,
     live: Arc<Live>,
     worker: Option<JoinHandle<()>>,
+    /// None only for a core a test built without threads.
+    text: Option<Text>,
+}
+
+/// What text search needs. Its threads start with the first search, so a window that never
+/// searches inside files never pays for them.
+struct Text {
+    /// As the core was given it, for reading the ignore list.
+    home: PathBuf,
+    full_disk: AtomicBool,
+    notify: Notify,
+    started: OnceLock<TextSearch>,
+}
+
+struct TextSearch {
+    grep: Arc<Grep>,
+    jobs: Sender<Find>,
+    waiting: Arc<Mutex<Waiting>>,
+    worker: JoinHandle<()>,
+}
+
+struct Find {
+    ticket: Ticket,
+    folders: Vec<PathBuf>,
+    query: String,
+    access: Access,
+}
+
+/// What the newest text search found since the window last took some.
+#[derive(Default)]
+struct Waiting {
+    ticket: u64,
+    batch: Batch,
+    /// Set once the search is over.
+    report: Option<Report>,
+    /// Something is waiting, and `TL_EVENT_LINES` said so.
+    told: bool,
 }
 
 enum Job {
@@ -222,6 +325,9 @@ struct Notify {
 
 // SAFETY: the window promises `ctx` stays usable from any thread until `tl_core_free` returns.
 unsafe impl Send for Notify {}
+// SAFETY: as for `Send`; `TlEventFn` tells the window calls may come from several threads at
+// once, as text search threads each report the lines they find.
+unsafe impl Sync for Notify {}
 
 impl Notify {
     fn send(&self, event: u32, value: u64) {
@@ -309,6 +415,16 @@ fn start(ctx: *mut c_void, on_event: Option<TlEventFn>, source: Source) -> *mut 
     let live = Arc::default();
     let (jobs, inbox) = mpsc::channel();
     let notify = Notify { ctx, on_event };
+    let (home, full_disk) = match &source {
+        Source::StandIn(_) => (telescope_core::home(), true),
+        Source::Home { root, access, .. } => (root.clone(), *access == Access::Full),
+    };
+    let text = Text {
+        home,
+        full_disk: AtomicBool::new(full_disk),
+        notify,
+        started: OnceLock::new(),
+    };
     let worker = {
         let (searcher, done, live) = (Arc::clone(&searcher), Arc::clone(&done), Arc::clone(&live));
         let swaps = jobs.clone();
@@ -323,6 +439,7 @@ fn start(ctx: *mut c_void, on_event: Option<TlEventFn>, source: Source) -> *mut 
         done,
         live,
         worker: Some(worker),
+        text: Some(text),
     }))
 }
 
@@ -608,7 +725,8 @@ pub unsafe extern "C" fn tl_changed(
 }
 
 /// Builds the list again with the folders macOS guards, once Full Disk Access is switched on
-/// while the core runs. `mark` is as for `tl_changed`. Safe to call from any thread.
+/// while the core runs, and lets text searches sent from then on read them too. `mark` is as
+/// for `tl_changed`. Safe to call from any thread.
 ///
 /// # Safety
 /// `core` came from `tl_core_new` or `tl_core_new_stand_in`.
@@ -616,6 +734,9 @@ pub unsafe extern "C" fn tl_changed(
 pub unsafe extern "C" fn tl_grant_full_disk(core: *const TlCore, mark: u64) {
     guard((), || {
         let core = unsafe { &*core };
+        if let Some(text) = &core.text {
+            text.full_disk.store(true, Ordering::Relaxed);
+        }
         core.live.plan(|plan| {
             plan.full_disk = true;
             plan.want(mark);
@@ -703,6 +824,277 @@ pub unsafe extern "C" fn tl_rows_free(rows: TlRows) {
     })
 }
 
+impl Text {
+    fn search(&self) -> &TextSearch {
+        self.started.get_or_init(|| {
+            let grep = Arc::new(Grep::default());
+            let waiting = Arc::default();
+            let (jobs, inbox) = mpsc::channel();
+            let worker = {
+                let (grep, waiting) = (Arc::clone(&grep), Arc::clone(&waiting));
+                let (home, notify) = (self.home.clone(), self.notify);
+                thread::Builder::new()
+                    .name("text".into())
+                    .spawn(move || find_loop(&grep, &inbox, &waiting, &home, notify))
+                    .expect("start the text search worker")
+            };
+            TextSearch {
+                grep,
+                jobs,
+                waiting,
+                worker,
+            }
+        })
+    }
+}
+
+fn find_loop(
+    grep: &Grep,
+    inbox: &Receiver<Find>,
+    waiting: &Mutex<Waiting>,
+    home: &Path,
+    notify: Notify,
+) {
+    while let Ok(mut find) = inbox.recv() {
+        // Keys pressed while the last search ran: only the newest one is still wanted, and
+        // skipping the rest saves listing their folders.
+        while let Ok(newer) = inbox.try_recv() {
+            find = newer;
+        }
+        let number = find.ticket.number();
+        {
+            let mut waiting = waiting.lock().unwrap();
+            if grep.newest() != number {
+                continue;
+            }
+            *waiting = Waiting {
+                ticket: number,
+                ..Waiting::default()
+            };
+        }
+        // A bug ends this search alone, with nothing counted, so the window stops waiting.
+        let report = panic::catch_unwind(AssertUnwindSafe(|| {
+            find_in(grep, &find, waiting, home, notify)
+        }))
+        .unwrap_or_else(|_| Some(Report::default()));
+        let mut waiting = waiting.lock().unwrap();
+        if let Some(report) = report
+            && grep.newest() == number
+        {
+            waiting.report = Some(report);
+            tell(waiting, number, notify);
+        }
+    }
+}
+
+/// Lists each folder as the name list would, at the time of the search, then searches it, until
+/// `LINES` lines in all. `None` once a newer search or a cancel took over.
+fn find_in(
+    grep: &Grep,
+    find: &Find,
+    waiting: &Mutex<Waiting>,
+    home: &Path,
+    notify: Notify,
+) -> Option<Report> {
+    let number = find.ticket.number();
+    let home = std::fs::canonicalize(home).unwrap_or_else(|_| home.to_path_buf());
+    // Problems with the list are told by the name list already.
+    let (ignore, _) = Ignore::load(&home, find.access);
+    let mut report = Report::default();
+    for folder in outermost(&find.folders) {
+        let limit = LINES.saturating_sub(report.lines_found);
+        if limit == 0 || grep.newest() != number {
+            break;
+        }
+        let settings = Settings::new(&folder, &home, Clutter::Skip, ignore.clone(), find.access);
+        let Ok(scan) = settings.scan() else {
+            report.unreadable += 1;
+            continue;
+        };
+        let add = |found: Found<'_>| add(waiting, grep, number, &found, notify);
+        report = report + grep.search(&scan.index, &find.query, find.ticket, limit, add)?;
+    }
+    (grep.newest() == number).then_some(report)
+}
+
+/// The folders as real paths, each once, leaving out any inside another.
+fn outermost(folders: &[PathBuf]) -> Vec<PathBuf> {
+    let mut real: Vec<PathBuf> = folders
+        .iter()
+        .map(|folder| std::fs::canonicalize(folder).unwrap_or_else(|_| folder.clone()))
+        .collect();
+    // A folder sorts before everything inside it.
+    real.sort();
+    let mut kept: Vec<PathBuf> = Vec::with_capacity(real.len());
+    for folder in real {
+        if !kept.iter().any(|outer| folder.starts_with(outer)) {
+            kept.push(folder);
+        }
+    }
+    kept
+}
+
+fn add(waiting: &Mutex<Waiting>, grep: &Grep, number: u64, found: &Found<'_>, notify: Notify) {
+    let mut waiting = waiting.lock().unwrap();
+    // Read just as a newer search or a cancel came in.
+    if grep.newest() != number {
+        return;
+    }
+    let batch = &mut waiting.batch;
+    let path_start = batch.text.len() as u32;
+    batch.text.push_str(&found.path.to_string_lossy());
+    let text_start = batch.text.len() as u32;
+    batch.text.push_str(found.text);
+    batch.lines.push(TlLine {
+        path_start,
+        path_len: text_start - path_start,
+        text_start,
+        text_len: found.text.len() as u32,
+        match_start: found.matched.start as u32,
+        match_len: found.matched.len() as u32,
+        line: found.line,
+    });
+    tell(waiting, number, notify);
+}
+
+/// Says lines or the end are waiting, unless the window was told already and hasn't taken them.
+fn tell(mut waiting: MutexGuard<'_, Waiting>, number: u64, notify: Notify) {
+    let told = std::mem::replace(&mut waiting.told, true);
+    drop(waiting);
+    if !told {
+        notify.send(TL_EVENT_LINES, number);
+    }
+}
+
+/// Starts a search for `query` inside the files in `folders` and returns its ticket, or 0 on
+/// failure, as for a folder that isn't UTF-8. Every older text search gives up; name searches
+/// never wait for any. `folders` holds `folders_len` bytes: paths in UTF-8, each ending in a
+/// NUL byte. Each is listed as the name list would be, skipping clutter and the ignore list,
+/// and a folder inside another is searched once; one that can't be listed counts as unreadable.
+/// Upper-case letters in `query` must match exactly; lower-case ones match either case. Up to
+/// 100 lines come in batches, each announced by `TL_EVENT_LINES`, the last with the end.
+///
+/// # Safety
+/// `core` came from `tl_core_new` or `tl_core_new_stand_in`, `folders` points to `folders_len`
+/// bytes (or `folders_len` is 0), and `query` to `query_len` bytes (or `query_len` is 0).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tl_grep_submit(
+    core: *const TlCore,
+    folders: *const u8,
+    folders_len: usize,
+    query: *const u8,
+    query_len: usize,
+) -> u64 {
+    guard(0, || {
+        let core = unsafe { &*core };
+        let Some(text) = &core.text else {
+            return 0;
+        };
+        let folders = match folders_len {
+            0 => &[],
+            _ => unsafe { std::slice::from_raw_parts(folders, folders_len) },
+        };
+        let folders: Result<Vec<PathBuf>, _> = folders
+            .split(|&byte| byte == 0)
+            .filter(|path| !path.is_empty())
+            .map(|path| std::str::from_utf8(path).map(PathBuf::from))
+            .collect();
+        let Ok(folders) = folders else {
+            return 0;
+        };
+        let query = match query_len {
+            0 => &[],
+            _ => unsafe { std::slice::from_raw_parts(query, query_len) },
+        };
+        let query = String::from_utf8_lossy(query).into_owned();
+        let access = if text.full_disk.load(Ordering::Relaxed) {
+            Access::Full
+        } else {
+            Access::Limited
+        };
+        let search = text.search();
+        let ticket = search.grep.ticket();
+        let find = Find {
+            ticket,
+            folders,
+            query,
+            access,
+        };
+        // Fails only if the worker stopped after a bug.
+        if search.jobs.send(find).is_ok() {
+            ticket.number()
+        } else {
+            0
+        }
+    })
+}
+
+/// Hands over the lines `ticket` found since the last take, and its end once it is over, while
+/// no newer text search or cancel exists. `TL_GONE` when nothing is waiting. `out` is written
+/// only when this returns `TL_OK`.
+///
+/// # Safety
+/// `core` came from `tl_core_new` or `tl_core_new_stand_in`, and `out` points to a `TlLines` to
+/// fill.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tl_grep_take(core: *const TlCore, ticket: u64, out: *mut TlLines) -> u32 {
+    guard(TL_PANICKED, || {
+        let core = unsafe { &*core };
+        let Some(search) = core.text.as_ref().and_then(|text| text.started.get()) else {
+            return TL_GONE;
+        };
+        if ticket != search.grep.newest() {
+            return TL_GONE;
+        }
+        let mut waiting = search.waiting.lock().unwrap();
+        if waiting.ticket != ticket || !waiting.told {
+            return TL_GONE;
+        }
+        waiting.told = false;
+        let batch = std::mem::take(&mut waiting.batch);
+        let report = waiting.report.take();
+        drop(waiting);
+        let batch = Box::new(batch);
+        let lines = TlLines {
+            lines: batch.lines.as_ptr(),
+            count: batch.lines.len(),
+            text: batch.text.as_ptr(),
+            done: report.is_some(),
+            report: report.unwrap_or_default().into(),
+            owner: Box::into_raw(batch).cast(),
+        };
+        unsafe { out.write(lines) };
+        TL_OK
+    })
+}
+
+/// Stops the text search under way, if any, and drops what it found: no more lines and no end
+/// come for it, though a `TL_EVENT_LINES` already on its way may still arrive.
+///
+/// # Safety
+/// `core` came from `tl_core_new` or `tl_core_new_stand_in`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tl_grep_cancel(core: *const TlCore) {
+    guard((), || {
+        let core = unsafe { &*core };
+        if let Some(search) = core.text.as_ref().and_then(|text| text.started.get()) {
+            search.grep.ticket();
+            *search.waiting.lock().unwrap() = Waiting::default();
+        }
+    })
+}
+
+/// # Safety
+/// `lines` came from `tl_grep_take` and has not been freed yet, or is all zeros.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tl_lines_free(lines: TlLines) {
+    guard((), || {
+        if !lines.owner.is_null() {
+            drop(unsafe { Box::from_raw(lines.owner.cast::<Batch>()) });
+        }
+    })
+}
+
 /// Stops the core and waits for its threads, so `on_event` never runs once this returns.
 /// Called while a list is being built, it waits for the build to finish: under 0.2 s for a
 /// million made-up names, but a home folder scanned with nothing cached may take longer.
@@ -728,6 +1120,14 @@ impl Drop for TlCore {
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
         }
+        if let Some(search) = self.text.as_mut().and_then(|text| text.started.take()) {
+            let TextSearch {
+                grep, jobs, worker, ..
+            } = search;
+            grep.ticket();
+            drop(jobs);
+            let _ = worker.join();
+        }
     }
 }
 
@@ -742,6 +1142,9 @@ mod tests {
         seen: Mutex<Vec<(u32, u64)>>,
         notes: Mutex<Vec<String>>,
         changed: Condvar,
+        /// While true, a text search thread telling of lines waits in `on_event`.
+        hold_lines: Mutex<bool>,
+        let_go: Condvar,
     }
 
     unsafe extern "C" fn record(ctx: *mut c_void, event: u32, value: u64) {
@@ -757,9 +1160,46 @@ mod tests {
         }
         events.seen.lock().unwrap().push((event, value));
         events.changed.notify_all();
+        if event == TL_EVENT_LINES {
+            let held = events.hold_lines.lock().unwrap();
+            drop(events.let_go.wait_while(held, |held| *held).unwrap());
+        }
     }
 
     impl Events {
+        fn hold_lines(&self, hold: bool) {
+            *self.hold_lines.lock().unwrap() = hold;
+            self.let_go.notify_all();
+        }
+
+        fn count(&self, event: u32, value: u64) -> usize {
+            let seen = self.seen.lock().unwrap();
+            seen.iter().filter(|&&seen| seen == (event, value)).count()
+        }
+
+        /// Waits until `event` with `value` has come `times` times.
+        fn wait_for_times(&self, event: u32, value: u64, times: usize) {
+            let heard = self.heard_within(event, value, times, Duration::from_secs(60));
+            assert!(heard, "event {event} for {value} not {times} times");
+        }
+
+        /// Whether `event` with `value` comes within 10 s, without failing the test, for a
+        /// test that must let a held thread go first.
+        fn heard(&self, event: u32, value: u64) -> bool {
+            self.heard_within(event, value, 1, Duration::from_secs(10))
+        }
+
+        fn heard_within(&self, event: u32, value: u64, times: usize, wait: Duration) -> bool {
+            let seen = self.seen.lock().unwrap();
+            let (_seen, waited) = self
+                .changed
+                .wait_timeout_while(seen, wait, |seen| {
+                    seen.iter().filter(|&&seen| seen == (event, value)).count() < times
+                })
+                .unwrap();
+            !waited.timed_out()
+        }
+
         fn wait_for(&self, event: u32, value: u64) {
             let seen = self.seen.lock().unwrap();
             let (_seen, waited) = self
@@ -1222,6 +1662,7 @@ mod tests {
             done: Arc::default(),
             live: Arc::default(),
             worker: None,
+            text: None,
         })));
         let live = unsafe { &(*core.0).live };
         live.plan(|plan| plan.want(5));
@@ -1424,6 +1865,362 @@ mod tests {
         );
     }
 
+    /// A line as the window would copy it: the file's path, the line number, the line, and
+    /// the part of it that matched.
+    type Line = (String, u64, String, String);
+
+    fn grep(core: &Core, folders: &[&Path], query: &str) -> u64 {
+        let mut bytes = Vec::new();
+        for folder in folders {
+            bytes.extend_from_slice(folder.to_str().unwrap().as_bytes());
+            bytes.push(0);
+        }
+        let (folders, len) = (bytes.as_ptr(), bytes.len());
+        unsafe { tl_grep_submit(core.0, folders, len, query.as_ptr(), query.len()) }
+    }
+
+    /// The lines waiting for `ticket`, and the counts once the search is over.
+    fn take_lines(core: &Core, ticket: u64) -> Option<(Vec<Line>, Option<Report>)> {
+        let mut out = std::mem::MaybeUninit::<TlLines>::uninit();
+        if unsafe { tl_grep_take(core.0, ticket, out.as_mut_ptr()) } != TL_OK {
+            return None;
+        }
+        let lines = unsafe { out.assume_init() };
+        let text = |start: u32, len: u32| {
+            let bytes =
+                unsafe { std::slice::from_raw_parts(lines.text.add(start as usize), len as usize) };
+            String::from_utf8(bytes.to_vec()).unwrap()
+        };
+        let copied = unsafe { std::slice::from_raw_parts(lines.lines, lines.count) }
+            .iter()
+            .map(|line| {
+                let shown = text(line.text_start, line.text_len);
+                let matched =
+                    &shown.as_bytes()[line.match_start as usize..][..line.match_len as usize];
+                let matched = String::from_utf8(matched.to_vec()).unwrap();
+                (
+                    text(line.path_start, line.path_len),
+                    line.line,
+                    shown,
+                    matched,
+                )
+            })
+            .collect();
+        let counts = &lines.report;
+        let report = Report {
+            files_searched: counts.files_searched as usize,
+            lines_found: counts.lines_found as usize,
+            binary: counts.binary as usize,
+            too_large: counts.too_large as usize,
+            cloud_only: counts.cloud_only as usize,
+            unreadable: counts.unreadable as usize,
+        };
+        if !lines.done {
+            assert_eq!(report, Report::default(), "counts before the end");
+        }
+        let report = lines.done.then_some(report);
+        unsafe { tl_lines_free(lines) };
+        Some((copied, report))
+    }
+
+    /// Takes each batch `ticket` announces until its end, and returns the lines sorted.
+    fn grep_all(core: &Core, events: &Events, ticket: u64) -> (Vec<Line>, Report) {
+        grep_rest(core, events, ticket, 0)
+    }
+
+    /// As `grep_all`, once `taken` batches were taken.
+    fn grep_rest(core: &Core, events: &Events, ticket: u64, taken: usize) -> (Vec<Line>, Report) {
+        let mut found = Vec::new();
+        for batch in taken + 1.. {
+            events.wait_for_times(TL_EVENT_LINES, ticket, batch);
+            let (lines, report) = take_lines(core, ticket).expect("a batch for each event");
+            found.extend(lines);
+            if let Some(report) = report {
+                found.sort();
+                return (found, report);
+            }
+        }
+        unreachable!()
+    }
+
+    fn write(path: &Path, text: impl AsRef<[u8]>) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, text).unwrap();
+    }
+
+    #[test]
+    fn a_text_search_comes_back_as_lines_with_its_counts() {
+        let (_dir, home) = home_with(&[]);
+        let notes = home.join("notes");
+        write(
+            &notes.join("plan.md"),
+            "Budget for 2026\nnothing here\n  Café budget ☕  \n",
+        );
+        write(&notes.join("old/budget.txt"), "no match\n");
+        write(&home.join("photo.png"), b"\x89PNG\0budget");
+        write(&home.join("node_modules/budget.js"), "budget\n");
+        let events = Events::default();
+        let core = start(100, &events);
+
+        // A folder inside another, or named twice, is searched once.
+        let ticket = grep(&core, &[&notes, &home, &notes.join("old"), &home], "budget");
+        assert_ne!(ticket, 0);
+        let (lines, report) = grep_all(&core, &events, ticket);
+        let plan = notes.join("plan.md").to_string_lossy().into_owned();
+        let line = |number, shown: &str, matched: &str| {
+            (plan.clone(), number, shown.to_owned(), matched.to_owned())
+        };
+        assert_eq!(
+            lines,
+            [
+                line(1, "Budget for 2026", "Budget"),
+                line(3, "Café budget ☕", "budget"),
+            ]
+        );
+        let expected = Report {
+            files_searched: 2,
+            lines_found: 2,
+            binary: 1,
+            ..Report::default()
+        };
+        assert_eq!(report, expected);
+        assert_eq!(take_lines(&core, ticket), None);
+    }
+
+    #[test]
+    fn a_name_search_returns_while_a_text_search_runs() {
+        let (_dir, home) = home_with(&[]);
+        write(&home.join("a.txt"), "budget\n");
+        write(&home.join("b.txt"), "budget\n");
+        let events = Events::default();
+        let core = start(2_000, &events);
+
+        events.hold_lines(true);
+        let text = grep(&core, &[&home], "budget");
+        // The text search now waits inside `on_event`, halfway through its files.
+        let halfway = events.heard(TL_EVENT_LINES, text);
+        let name = submit(&core, "budget");
+        let answered = events.heard(TL_EVENT_READY, name);
+        let rows = take(&core, name);
+        let so_far = take_lines(&core, text);
+        events.hold_lines(false);
+
+        assert!(halfway && answered);
+        assert!(rows.is_some_and(|rows| !rows.is_empty()));
+        let (first, end) = so_far.unwrap();
+        assert!(!first.is_empty());
+        assert_eq!(end, None, "the text search is still running");
+        let (rest, report) = grep_rest(&core, &events, text, 1);
+        assert_eq!(first.len() + rest.len(), 2);
+        assert_eq!(report.lines_found, 2);
+    }
+
+    #[test]
+    fn a_cancelled_text_search_stops_and_keeps_nothing() {
+        let (_dir, home) = home_with(&[]);
+        for file in ["a", "b", "c", "d", "e"] {
+            write(&home.join(format!("{file}.txt")), "budget\n".repeat(50));
+        }
+        let events = Events::default();
+        let core = start(100, &events);
+        // Harmless before any text search.
+        unsafe { tl_grep_cancel(core.0) };
+        assert_eq!(take_lines(&core, 0), None);
+        assert_eq!(take_lines(&core, 1), None);
+
+        events.hold_lines(true);
+        let cancelled = grep(&core, &[&home], "budget");
+        let halfway = events.heard(TL_EVENT_LINES, cancelled);
+        unsafe { tl_grep_cancel(core.0) };
+        let kept = take_lines(&core, cancelled);
+        events.hold_lines(false);
+        assert!(halfway);
+        assert_eq!(kept, None);
+
+        // The worker takes one search at a time, so this one ends after the cancelled one.
+        let next = grep(&core, &[&home], "budget");
+        let (lines, report) = grep_all(&core, &events, next);
+        assert_eq!((lines.len(), report.lines_found), (LINES, LINES));
+        assert_eq!(
+            events.count(TL_EVENT_LINES, cancelled),
+            1,
+            "nothing after the cancel"
+        );
+        assert_eq!(take_lines(&core, cancelled), None);
+    }
+
+    #[test]
+    fn a_text_search_stops_at_its_lines_across_folders() {
+        let (_dir, home) = home_with(&[]);
+        let (one, two) = (home.join("one"), home.join("two"));
+        write(&one.join("a.txt"), "budget\n".repeat(80));
+        write(&two.join("b.txt"), "budget\n".repeat(80));
+        let events = Events::default();
+        let core = start(100, &events);
+        let ticket = grep(&core, &[&one, &two], "budget");
+        let (lines, report) = grep_all(&core, &events, ticket);
+        assert_eq!((lines.len(), report.lines_found), (LINES, LINES));
+        assert_eq!(report.files_searched, 2);
+    }
+
+    #[test]
+    fn only_the_newest_text_search_answers() {
+        let (_dir, home) = home_with(&[]);
+        write(&home.join("a.txt"), "b\nbu\nbud\nbudg\nbudge\nbudget\n");
+        let events = Events::default();
+        let core = start(100, &events);
+        let typed = ["b", "bu", "bud", "budg", "budge", "budget"];
+        let tickets: Vec<u64> = typed
+            .iter()
+            .map(|query| grep(&core, &[&home], query))
+            .collect();
+        let last = *tickets.last().unwrap();
+        let (lines, _) = grep_all(&core, &events, last);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].1, 6);
+        for &older in &tickets[..tickets.len() - 1] {
+            assert_eq!(take_lines(&core, older), None);
+        }
+    }
+
+    #[test]
+    fn a_text_search_counts_folders_it_cannot_list_and_refuses_bad_paths() {
+        let (_dir, home) = home_with(&[]);
+        write(&home.join("a.txt"), "budget\n");
+        let events = Events::default();
+        let core = start(100, &events);
+
+        let not_utf8 = [0xff, 0];
+        let query = "budget";
+        let refused = unsafe { tl_grep_submit(core.0, not_utf8.as_ptr(), 2, query.as_ptr(), 6) };
+        assert_eq!(refused, 0);
+
+        let gone = home.join("gone");
+        let file = home.join("a.txt");
+        let ticket = grep(&core, &[&gone, &file], "budget");
+        let unreadable = Report {
+            unreadable: 2,
+            ..Report::default()
+        };
+        assert_eq!(grep_all(&core, &events, ticket), (Vec::new(), unreadable));
+
+        // An empty box, or no folders, ends at once with nothing.
+        let empty = grep(&core, &[&home], "");
+        assert_eq!(
+            grep_all(&core, &events, empty),
+            (Vec::new(), Report::default())
+        );
+        let null = std::ptr::null();
+        let nowhere = unsafe { tl_grep_submit(core.0, null, 0, null, 0) };
+        assert_ne!(nowhere, 0);
+        assert_eq!(
+            grep_all(&core, &events, nowhere),
+            (Vec::new(), Report::default())
+        );
+    }
+
+    #[test]
+    fn text_search_reads_guarded_folders_only_with_full_disk_access() {
+        let (_dir, home) = home_with(&[]);
+        write(&home.join("Documents/budget.txt"), "budget\n");
+        let events = Events::default();
+        let core = scan(home.to_str().unwrap(), 0, &events);
+        events.wait_for(TL_EVENT_INDEXED, 1);
+
+        let limited = grep(&core, &[&home], "budget");
+        assert_eq!(grep_all(&core, &events, limited).1.lines_found, 0);
+        unsafe { tl_grant_full_disk(core.0, 1) };
+        let full = grep(&core, &[&home], "budget");
+        assert_eq!(grep_all(&core, &events, full).1.lines_found, 1);
+    }
+
+    #[test]
+    fn freeing_the_core_stops_its_text_search() {
+        let (_dir, home) = home_with(&[]);
+        for file in 0..200 {
+            write(&home.join(format!("{file}.txt")), "budget\n".repeat(10));
+        }
+        let events = Events::default();
+        let core = start(100, &events);
+        grep(&core, &[&home], "no such text");
+        drop(core);
+        let heard = events.seen.lock().unwrap().len();
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(events.seen.lock().unwrap().len(), heard);
+    }
+
+    #[test]
+    fn each_folder_is_searched_once() {
+        let names = ["/a", "/a/b", "/a/b/c", "/ab", "/x", "/a/b2"];
+        let paths: Vec<PathBuf> = names.iter().map(PathBuf::from).collect();
+        // Every set of these folders, each also named twice.
+        for set in 0..1_u32 << names.len() {
+            let chosen: Vec<PathBuf> = (0..names.len())
+                .filter(|bit| set & (1 << bit) != 0)
+                .flat_map(|bit| [paths[bit].clone(), paths[bit].clone()])
+                .rev()
+                .collect();
+            let kept = outermost(&chosen);
+            for folder in &chosen {
+                let outer = kept.iter().filter(|outer| folder.starts_with(outer));
+                assert_eq!(outer.count(), 1, "{folder:?} in {kept:?}");
+            }
+            assert!(kept.iter().all(|folder| chosen.contains(folder)));
+        }
+    }
+
+    /// Name search times while a text search over `TL_GREP_FOLDER` (the home folder unless
+    /// set) keeps running. Run with
+    /// `cargo test --release -p telescope-ffi -- --ignored --nocapture name_search_times`.
+    #[test]
+    #[ignore = "builds a million names and reads a whole folder; slow outside --release"]
+    fn name_search_times_while_text_search_runs() {
+        let folder =
+            std::env::var_os("TL_GREP_FOLDER").map_or_else(telescope_core::home, PathBuf::from);
+        let events = Events::default();
+        let core = start(1_000_000, &events);
+        let queries = [
+            "telescope plan",
+            "budget notes",
+            "readme",
+            "会議 report",
+            "main.rs",
+        ];
+        let mut text = None;
+        let mut text_searches = 0;
+        for busy in [false, true, false, true] {
+            let mut times = Vec::new();
+            for _ in 0..40 {
+                if busy && text.is_none_or(|ticket| events.count(TL_EVENT_LINES, ticket) > 0) {
+                    // Matches nothing, so it reads every file and its one event is its end.
+                    text = Some(grep(&core, &[&folder], "zq no such text qz"));
+                    text_searches += 1;
+                }
+                for query in queries {
+                    let started = Instant::now();
+                    let ticket = submit(&core, query);
+                    events.wait_for(TL_EVENT_READY, ticket);
+                    times.push(started.elapsed());
+                    assert!(take(&core, ticket).is_some());
+                }
+            }
+            if text.take().is_some() {
+                unsafe { tl_grep_cancel(core.0) };
+            }
+            times.sort();
+            let at = |share: usize| times[(times.len() - 1) * share / 100];
+            println!(
+                "{}: p50 {:?}, p95 {:?}, max {:?} over {} name searches",
+                if busy { "text search running" } else { "idle" },
+                at(50),
+                at(95),
+                at(100),
+                times.len()
+            );
+        }
+        println!("{text_searches} text searches over {}", folder.display());
+    }
+
     /// When each rebuild started, whether it was told of Full Disk Access, and its mark.
     type Starts = Arc<Mutex<Vec<(Instant, bool, u64)>>>;
 
@@ -1580,6 +2377,7 @@ mod tests {
             done: Arc::default(),
             live: Arc::clone(&live),
             worker: None,
+            text: None,
         })));
         // Each rebuild holds until let go, and leaves the list as it was.
         let gate = Arc::new(Mutex::new(()));
@@ -1747,7 +2545,7 @@ mod tests {
             .0;
         assert_eq!(rust_params(rust_event), c_params(header_event));
 
-        for name in ["TlRow", "TlRows"] {
+        for name in ["TlRow", "TlRows", "TlLine", "TlReport", "TlLines"] {
             assert!(rust.contains(&format!("#[repr(C)]\npub struct {name} {{")));
             let rust_fields: Vec<String> = block(rust, &format!("pub struct {name} {{"))
                 .map(|line| {

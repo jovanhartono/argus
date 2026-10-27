@@ -7,7 +7,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-static const uint32_t TL_ABI_VERSION = 3;
+static const uint32_t TL_ABI_VERSION = 4;
 
 static const uint32_t TL_OK = 0;
 static const uint32_t TL_GONE = 1;
@@ -18,6 +18,7 @@ static const uint32_t TL_EVENT_READY = 2;
 static const uint32_t TL_EVENT_FAILED = 3;
 static const uint32_t TL_EVENT_NOTE = 4;
 static const uint32_t TL_EVENT_REBUILT = 5;
+static const uint32_t TL_EVENT_LINES = 6;
 
 typedef struct TlCore TlCore;
 
@@ -38,6 +39,34 @@ typedef struct TlRows {
     void *owner;
 } TlRows;
 
+typedef struct TlLine {
+    uint32_t path_start;
+    uint32_t path_len;
+    uint32_t text_start;
+    uint32_t text_len;
+    uint32_t match_start;
+    uint32_t match_len;
+    uint64_t line;
+} TlLine;
+
+typedef struct TlReport {
+    uint64_t files_searched;
+    uint64_t lines_found;
+    uint64_t binary;
+    uint64_t too_large;
+    uint64_t cloud_only;
+    uint64_t unreadable;
+} TlReport;
+
+typedef struct TlLines {
+    const TlLine *lines;
+    size_t count;
+    const uint8_t *text;
+    bool done;
+    TlReport report;
+    void *owner;
+} TlLines;
+
 uint32_t tl_abi_version(void);
 TlCore *tl_core_new(const uint8_t *root, size_t root_len, uint32_t full_disk, void *ctx, TlEventFn on_event);
 TlCore *tl_core_new_stand_in(uint64_t count, void *ctx, TlEventFn on_event);
@@ -47,6 +76,10 @@ void tl_grant_full_disk(const TlCore *core, uint64_t mark);
 uint32_t tl_watched(const TlCore *core, TlRows *out, uint64_t *since);
 uint32_t tl_take(const TlCore *core, uint64_t ticket, TlRows *out);
 void tl_rows_free(TlRows rows);
+uint64_t tl_grep_submit(const TlCore *core, const uint8_t *folders, size_t folders_len, const uint8_t *query, size_t query_len);
+uint32_t tl_grep_take(const TlCore *core, uint64_t ticket, TlLines *out);
+void tl_grep_cancel(const TlCore *core);
+void tl_lines_free(TlLines lines);
 void tl_core_free(TlCore *core);
 
 #endif
