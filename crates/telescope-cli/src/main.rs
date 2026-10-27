@@ -1,18 +1,20 @@
 use std::ffi::OsString;
 use std::io::BufRead;
+use std::num::NonZero;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 use telescope_core::{Access, Clutter, Ignore, Index, Opened, Searcher, Settings};
 use telescope_grep::Grep;
 
 const USAGE: &str = "usage:
-  tl index <folder>                       scan and report the index size
-  tl search <folder>                      scan, then search each line you type
-  tl bench <folder> <queries> [threads]   time every keystroke of each query
-  tl golden <folder> <golden>             rank the expected file of each search
-  tl grep <folder> <text>                 scan, then show lines holding the text
+  tl index <folder>                            scan and report the index size
+  tl search <folder>                           scan, then search each line you type
+  tl bench <folder> <queries> [threads]        time every keystroke of each query
+  tl golden <folder> <golden>                  rank the expected file of each search
+  tl grep <folder> <text>                      scan, then show lines holding the text
+  tl grep-bench <folder> <queries> [threads]   time the first and the last line of each text
 add --all to include hidden folders, ~/Library, the insides of packages like Photos Library,
 and tool downloads and caches like node_modules
 add --load <file> to open a saved index instead of scanning (it scans when the file is missing,
@@ -26,61 +28,124 @@ your own ignore list, ~/.config/telescope/ignore, takes one folder per line
   !~/.config/nvim     bring back a folder Telescope skips, even inside a skipped one
   # a comment";
 
+/// Lines `tl grep` shows, as many as the window would.
+const GREP_LIMIT: usize = 100;
+
+#[derive(Debug, PartialEq)]
 struct Options {
     clutter: Clutter,
     load: Option<PathBuf>,
     save: Option<PathBuf>,
 }
 
+#[derive(Debug, PartialEq)]
+enum Command {
+    Version,
+    Index(PathBuf),
+    Search(PathBuf),
+    Bench {
+        folder: PathBuf,
+        queries: PathBuf,
+        threads: Option<usize>,
+    },
+    Golden {
+        folder: PathBuf,
+        cases: PathBuf,
+    },
+    Grep {
+        folder: PathBuf,
+        text: String,
+    },
+    GrepBench {
+        folder: PathBuf,
+        queries: PathBuf,
+        threads: Option<usize>,
+    },
+}
+
 fn main() -> ExitCode {
-    let mut args: Vec<OsString> = std::env::args_os().skip(1).collect();
+    let Some((command, options)) = parse(std::env::args_os().skip(1).collect()) else {
+        return usage();
+    };
+    let options = &options;
+    match command {
+        Command::Version => {
+            println!("tl {}", env!("CARGO_PKG_VERSION"));
+            ExitCode::SUCCESS
+        }
+        Command::Index(folder) => match load(&folder, options) {
+            Some(_) => ExitCode::SUCCESS,
+            None => ExitCode::FAILURE,
+        },
+        Command::Search(folder) => search(&folder, options),
+        Command::Bench {
+            folder,
+            queries,
+            threads,
+        } => bench(&folder, options, &queries, threads),
+        Command::Golden { folder, cases } => golden(&folder, options, &cases),
+        Command::Grep { folder, text } => grep(&folder, options, &text),
+        Command::GrepBench {
+            folder,
+            queries,
+            threads,
+        } => grep_bench(&folder, options, &queries, threads),
+    }
+}
+
+/// `None` when the line does not fit any command, so usage is shown.
+fn parse(mut args: Vec<OsString>) -> Option<(Command, Options)> {
     let clutter = if args.iter().any(|arg| arg == "--all") {
         Clutter::Keep
     } else {
         Clutter::Skip
     };
     args.retain(|arg| arg != "--all");
-    let (Some(load_file), Some(save_file)) = (take(&mut args, "--load"), take(&mut args, "--save"))
-    else {
-        return usage();
-    };
-    let options = &Options {
-        clutter,
-        load: load_file,
-        save: save_file,
-    };
-    match args.as_slice() {
-        [flag] if flag == "--version" => {
-            println!("tl {}", env!("CARGO_PKG_VERSION"));
-            ExitCode::SUCCESS
-        }
-        [command, folder] if command == "index" => match load(Path::new(folder), options) {
-            Some(_) => ExitCode::SUCCESS,
-            None => ExitCode::FAILURE,
+    let load = take(&mut args, "--load")?;
+    let save = take(&mut args, "--save")?;
+    let command = match args.as_slice() {
+        [flag] if flag == "--version" => Command::Version,
+        [command, folder] if command == "index" => Command::Index(folder.into()),
+        [command, folder] if command == "search" => Command::Search(folder.into()),
+        [command, folder, queries, rest @ ..] if command == "bench" => Command::Bench {
+            folder: folder.into(),
+            queries: queries.into(),
+            threads: threads(rest)?,
         },
-        [command, folder] if command == "search" => search(Path::new(folder), options),
-        [command, folder, queries] if command == "bench" => {
-            bench(Path::new(folder), options, Path::new(queries), None)
-        }
-        [command, folder, queries, threads] if command == "bench" => {
-            match threads.to_str().and_then(|t| t.parse().ok()) {
-                Some(threads) => bench(
-                    Path::new(folder),
-                    options,
-                    Path::new(queries),
-                    Some(threads),
-                ),
-                None => usage(),
-            }
-        }
-        [command, folder, cases] if command == "golden" => {
-            golden(Path::new(folder), options, Path::new(cases))
-        }
-        [command, folder, text] if command == "grep" => match text.to_str() {
-            Some(text) => grep(Path::new(folder), options, text),
-            None => usage(),
+        [command, folder, cases] if command == "golden" => Command::Golden {
+            folder: folder.into(),
+            cases: cases.into(),
         },
-        _ => usage(),
+        [command, folder, text] if command == "grep" => Command::Grep {
+            folder: folder.into(),
+            text: text.to_str()?.to_owned(),
+        },
+        [command, folder, queries, rest @ ..] if command == "grep-bench" => Command::GrepBench {
+            folder: folder.into(),
+            queries: queries.into(),
+            threads: threads(rest)?,
+        },
+        _ => return None,
+    };
+    Some((
+        command,
+        Options {
+            clutter,
+            load,
+            save,
+        },
+    ))
+}
+
+/// The optional thread count after a bench's query file. Zero would mean every core to rayon,
+/// so it is refused rather than read as that.
+fn threads(rest: &[OsString]) -> Option<Option<usize>> {
+    match rest {
+        [] => Some(None),
+        [threads] => Some(Some(
+            threads.to_str()?.parse::<NonZero<usize>>().ok()?.get(),
+        )),
+        _ => None,
     }
 }
 
@@ -212,16 +277,25 @@ fn read(file: &Path) -> Option<String> {
         .ok()
 }
 
+/// One query per line, up to a tab; lines starting with `#` are comments.
+fn queries(text: &str) -> Vec<&str> {
+    text.lines()
+        .filter(|line| !line.starts_with('#'))
+        .map(|line| line.split('\t').next().unwrap_or(line))
+        .filter(|query| !query.trim().is_empty())
+        .collect()
+}
+
+/// The time below which `share` percent of the sorted `times` fall, as `bench` counts it.
+fn percentile(times: &[f64], share: usize) -> f64 {
+    times[(times.len() * share / 100).min(times.len() - 1)]
+}
+
 fn bench(folder: &Path, options: &Options, query_file: &Path, threads: Option<usize>) -> ExitCode {
     let Some(text) = read(query_file) else {
         return ExitCode::FAILURE;
     };
-    let queries: Vec<&str> = text
-        .lines()
-        .filter(|line| !line.starts_with('#'))
-        .map(|line| line.split('\t').next().unwrap_or(line))
-        .filter(|query| !query.trim().is_empty())
-        .collect();
+    let queries = queries(&text);
     if queries.is_empty() {
         eprintln!("tl: no queries in {}", query_file.display());
         return ExitCode::FAILURE;
@@ -349,7 +423,7 @@ fn grep(folder: &Path, options: &Options, text: &str) -> ExitCode {
     let grep = Grep::default();
     let started = Instant::now();
     let first = Mutex::new(None);
-    let report = grep.search(&index, text, grep.ticket(), 100, |found| {
+    let report = grep.search(&index, text, grep.ticket(), GREP_LIMIT, |found| {
         first.lock().unwrap().get_or_insert_with(|| ms(started));
         println!("{}:{}: {}", found.path.display(), found.line, found.text);
     });
@@ -374,6 +448,108 @@ fn grep(folder: &Path, options: &Options, text: &str) -> ExitCode {
         report.binary, report.too_large, report.cloud_only, report.unreadable
     );
     ExitCode::SUCCESS
+}
+
+fn grep_bench(
+    folder: &Path,
+    options: &Options,
+    query_file: &Path,
+    threads: Option<usize>,
+) -> ExitCode {
+    let Some(text) = read(query_file) else {
+        return ExitCode::FAILURE;
+    };
+    let queries = queries(&text);
+    if queries.is_empty() {
+        eprintln!("tl: no queries in {}", query_file.display());
+        return ExitCode::FAILURE;
+    }
+    let Some(index) = load(folder, options) else {
+        return ExitCode::FAILURE;
+    };
+    let indexed_peak = peak_memory();
+    let grep = threads.map_or_else(Grep::default, Grep::with_threads);
+
+    let mut firsts = Vec::with_capacity(queries.len());
+    let mut totals = Vec::with_capacity(queries.len());
+    for query in &queries {
+        let first = OnceLock::new();
+        let started = Instant::now();
+        let report = grep.search(&index, query, grep.ticket(), GREP_LIMIT, |_| {
+            first.get_or_init(|| ms(started));
+        });
+        let total = ms(started);
+        let report = report.unwrap_or_default();
+        let first = first.into_inner();
+        println!(
+            "{query:?}: {} lines in {} files, first {}, all {total:.1} ms",
+            report.lines_found,
+            report.files_searched,
+            first.map_or_else(|| "none".to_string(), |first| format!("{first:.1} ms")),
+        );
+        firsts.extend(first);
+        totals.push((total, *query));
+    }
+
+    println!(
+        "{} searches on {} threads, up to {GREP_LIMIT} lines each",
+        queries.len(),
+        grep.threads()
+    );
+    firsts.sort_by(f64::total_cmp);
+    if firsts.is_empty() {
+        println!("first line: no search found any");
+    } else {
+        println!(
+            "first line: p50 {:.1} ms, p95 {:.1} ms, max {:.1} ms ({} of {} searches found lines)",
+            percentile(&firsts, 50),
+            percentile(&firsts, 95),
+            percentile(&firsts, 100),
+            firsts.len(),
+            queries.len()
+        );
+    }
+    totals.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let total_times: Vec<f64> = totals.iter().map(|(time, _)| *time).collect();
+    println!(
+        "all lines:  p50 {:.1} ms, p95 {:.1} ms, max {:.1} ms",
+        percentile(&total_times, 50),
+        percentile(&total_times, 95),
+        percentile(&total_times, 100)
+    );
+    for (time, query) in totals.iter().rev().take(3) {
+        println!("  slowest: {query:?} {time:.1} ms");
+    }
+    if let (Some(indexed), Some(peak)) = (indexed_peak, peak_memory()) {
+        println!(
+            "peak memory: {:.1} MB with the index loaded, {:.1} MB after the searches",
+            mb(indexed),
+            mb(peak)
+        );
+    }
+    ExitCode::SUCCESS
+}
+
+/// The most memory this process has held, as `footprint` and Activity Monitor count it.
+#[cfg(target_os = "macos")]
+fn peak_memory() -> Option<u64> {
+    let pid = i32::try_from(std::process::id()).ok()?;
+    let mut info = std::mem::MaybeUninit::<libc::rusage_info_v4>::uninit();
+    // SAFETY: RUSAGE_INFO_V4 makes the call write one whole rusage_info_v4, which `info` has
+    // room for, and `info` is read only when the call reports success.
+    unsafe {
+        (libc::proc_pid_rusage(pid, libc::RUSAGE_INFO_V4, info.as_mut_ptr().cast()) == 0)
+            .then(|| info.assume_init().ri_lifetime_max_phys_footprint)
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn peak_memory() -> Option<u64> {
+    None
+}
+
+fn mb(bytes: u64) -> f64 {
+    bytes as f64 / 1_048_576.0
 }
 
 /// What the search box holds after each keystroke: "b", "bu", "bul", ...
@@ -424,5 +600,161 @@ mod tests {
         let mut line = args("index ~ --load a --load b");
         assert_eq!(take(&mut line, "--load"), Some(Some("a".into())));
         assert_eq!(line, args("index ~ --load b"));
+    }
+
+    fn command(line: &str) -> Option<Command> {
+        parse(args(line)).map(|(command, _)| command)
+    }
+
+    fn grep_bench_on(threads: Option<usize>) -> Command {
+        Command::GrepBench {
+            folder: "~".into(),
+            queries: "q.txt".into(),
+            threads,
+        }
+    }
+
+    #[test]
+    fn reads_each_command() {
+        assert_eq!(command("--version"), Some(Command::Version));
+        assert_eq!(command("index ~"), Some(Command::Index("~".into())));
+        assert_eq!(command("search ~"), Some(Command::Search("~".into())));
+        assert_eq!(
+            command("bench ~ q.txt 4"),
+            Some(Command::Bench {
+                folder: "~".into(),
+                queries: "q.txt".into(),
+                threads: Some(4),
+            })
+        );
+        assert_eq!(
+            command("golden ~ g.tsv"),
+            Some(Command::Golden {
+                folder: "~".into(),
+                cases: "g.tsv".into(),
+            })
+        );
+        assert_eq!(
+            command("grep ~ todo"),
+            Some(Command::Grep {
+                folder: "~".into(),
+                text: "todo".into(),
+            })
+        );
+        assert_eq!(command("grep-bench ~ q.txt"), Some(grep_bench_on(None)));
+        assert_eq!(
+            command("grep-bench ~ q.txt 3"),
+            Some(grep_bench_on(Some(3)))
+        );
+    }
+
+    #[test]
+    fn keeps_the_text_to_find_whole() {
+        let line = ["grep", "~", "  fn main() {"].map(OsString::from).to_vec();
+        let (found, _) = parse(line).unwrap();
+        assert_eq!(
+            found,
+            Command::Grep {
+                folder: "~".into(),
+                text: "  fn main() {".into(),
+            }
+        );
+        assert_eq!(
+            command("grep ~ --version"),
+            Some(Command::Grep {
+                folder: "~".into(),
+                text: "--version".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn refuses_lines_that_fit_no_command() {
+        for line in [
+            "",
+            "--version extra",
+            "index",
+            "index ~ extra",
+            "find ~",
+            "grep ~",
+            "grep ~ two words",
+            "grep-bench ~",
+            "grep-bench ~ q.txt 0",
+            "grep-bench ~ q.txt -1",
+            "grep-bench ~ q.txt four",
+            "grep-bench ~ q.txt 4 5",
+            "bench ~ q.txt 0",
+            "grep ~ todo --load",
+            "GREP ~ todo",
+        ] {
+            assert_eq!(command(line), None, "{line:?}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn refuses_text_that_is_not_utf8() {
+        use std::os::unix::ffi::OsStringExt;
+        let line = vec!["grep".into(), "~".into(), OsString::from_vec(vec![0xFF])];
+        assert!(parse(line).is_none());
+    }
+
+    #[test]
+    fn reads_the_flags_anywhere_on_the_line() {
+        let (found, options) = parse(args("--all grep-bench ~ --load a.idx q.txt 2")).unwrap();
+        assert_eq!(found, grep_bench_on(Some(2)));
+        assert_eq!(
+            options,
+            Options {
+                clutter: Clutter::Keep,
+                load: Some("a.idx".into()),
+                save: None,
+            }
+        );
+        let (_, options) = parse(args("grep ~ todo --save b.idx")).unwrap();
+        assert_eq!(
+            options,
+            Options {
+                clutter: Clutter::Skip,
+                load: None,
+                save: Some("b.idx".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn reads_one_query_per_line() {
+        let text = "# a comment\nreadme\n\n   \nfn main\t~/src/main.rs\n\tonly a file\n #not a comment\r\nlast";
+        assert_eq!(
+            queries(text),
+            ["readme", "fn main", " #not a comment", "last"]
+        );
+        assert!(queries("").is_empty());
+        assert!(queries("# only\n# comments\n").is_empty());
+    }
+
+    #[test]
+    fn takes_percentiles_from_sorted_times() {
+        assert_eq!(percentile(&[7.0], 50), 7.0);
+        assert_eq!(percentile(&[7.0], 100), 7.0);
+        let times: Vec<f64> = (1..=20).map(f64::from).collect();
+        assert_eq!(percentile(&times, 0), 1.0);
+        assert_eq!(percentile(&times, 50), 11.0);
+        assert_eq!(percentile(&times, 95), 20.0);
+        assert_eq!(percentile(&times, 100), 20.0);
+        let times: Vec<f64> = (1..=100).map(f64::from).collect();
+        assert_eq!(percentile(&times, 95), 96.0);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn peak_memory_counts_memory_in_use() {
+        let before = peak_memory().unwrap();
+        assert!(before > 0);
+        let held = std::hint::black_box(vec![1u8; 64 << 20]);
+        let after = peak_memory().unwrap();
+        assert!(after >= before.max(held.len() as u64), "{before} {after}");
+        drop(held);
+        assert!(peak_memory().unwrap() >= after);
     }
 }
