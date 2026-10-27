@@ -17,7 +17,8 @@ add --all to include hidden folders, ~/Library, the insides of packages like Pho
 and tool downloads and caches like node_modules
 add --load <file> to open a saved index instead of scanning (it scans when the file is missing,
 damaged or built with other settings, and does not catch up on changes made since it was saved),
-and --save <file> to save the index afterwards
+--changes <file> to then read again each folder listed in it, one real absolute path per line
+as FSEvents reports them, and --save <file> to save the index afterwards
 
 your own ignore list, ~/.config/telescope/ignore, takes one folder per line
 (--all leaves it out too):
@@ -29,6 +30,7 @@ your own ignore list, ~/.config/telescope/ignore, takes one folder per line
 struct Options {
     clutter: Clutter,
     load: Option<PathBuf>,
+    changes: Option<PathBuf>,
     save: Option<PathBuf>,
 }
 
@@ -40,13 +42,17 @@ fn main() -> ExitCode {
         Clutter::Skip
     };
     args.retain(|arg| arg != "--all");
-    let (Some(load_file), Some(save_file)) = (take(&mut args, "--load"), take(&mut args, "--save"))
-    else {
+    let (Some(load_file), Some(changes), Some(save_file)) = (
+        take(&mut args, "--load"),
+        take(&mut args, "--changes"),
+        take(&mut args, "--save"),
+    ) else {
         return usage();
     };
     let options = &Options {
         clutter,
         load: load_file,
+        changes,
         save: save_file,
     };
     match args.as_slice() {
@@ -136,7 +142,7 @@ fn load(folder: &Path, options: &Options) -> Option<Index> {
         }),
     };
     let took = ms(started);
-    let scan = match scan {
+    let mut scan = match scan {
         Ok(scan) => scan,
         Err(error) => {
             eprintln!("tl: cannot scan {}: {error}", folder.display());
@@ -148,11 +154,14 @@ fn load(folder: &Path, options: &Options) -> Option<Index> {
     } else {
         println!("scan time: {:.2} s", took / 1000.0);
     }
+    if let Some(file) = &options.changes {
+        apply_changes(file, &settings, &mut scan.index)?;
+    }
 
     let index = &scan.index;
     println!(
         "{} entries ({} folders), {} distinct names",
-        index.len(),
+        index.entry_count(),
         index.folder_count(),
         index.distinct_names()
     );
@@ -164,7 +173,7 @@ fn load(folder: &Path, options: &Options) -> Option<Index> {
         println!("folders not fully read: {}", scan.unreadable_folders);
     }
     match &options.save {
-        Some(file) if opened_at.is_some() && options.load.as_ref() == Some(file) => {
+        Some(file) if unchanged_since_opened(options, opened_at.is_some()) => {
             println!("opened unchanged from {}, not saved again", file.display());
         }
         Some(file) => {
@@ -184,6 +193,51 @@ fn load(folder: &Path, options: &Options) -> Option<Index> {
         None => {}
     }
     Some(scan.index)
+}
+
+fn apply_changes(file: &Path, settings: &Settings, index: &mut Index) -> Option<()> {
+    let text = read(file)?;
+    let changed = changed_paths(&text);
+    let root = settings.root();
+    let outside = changed
+        .iter()
+        .filter(|path| !path.starts_with(root))
+        .count();
+    if outside > 0 {
+        eprintln!(
+            "tl: skipped {outside} paths not under {}; the list takes real absolute paths",
+            root.display()
+        );
+    }
+    let started = Instant::now();
+    let update = settings.update(index, &changed);
+    println!(
+        "read {} changed folders again in {:.1} ms: {} entries added, {} removed{}",
+        update.folders_read,
+        ms(started),
+        update.added,
+        update.removed,
+        if update.compacted { ", compacted" } else { "" }
+    );
+    if update.unreadable_folders > 0 {
+        println!(
+            "folders not fully read in this update: {}",
+            update.unreadable_folders
+        );
+    }
+    Some(())
+}
+
+/// Blank lines are skipped; `lines` already takes off Windows line ends.
+fn changed_paths(text: &str) -> Vec<&Path> {
+    text.lines()
+        .filter(|line| !line.is_empty())
+        .map(Path::new)
+        .collect()
+}
+
+fn unchanged_since_opened(options: &Options, opened: bool) -> bool {
+    opened && options.changes.is_none() && options.load == options.save
 }
 
 fn search(folder: &Path, options: &Options) -> ExitCode {
@@ -424,5 +478,35 @@ mod tests {
         let mut line = args("index ~ --load a --load b");
         assert_eq!(take(&mut line, "--load"), Some(Some("a".into())));
         assert_eq!(line, args("index ~ --load b"));
+    }
+
+    #[test]
+    fn takes_one_changed_path_per_line_and_skips_blank_ones() {
+        let text = "/home/a b\r\n\r\n/home/c\n\n/home/d";
+        let expected = ["/home/a b", "/home/c", "/home/d"].map(Path::new);
+        assert_eq!(changed_paths(text), expected);
+        assert!(changed_paths("").is_empty());
+    }
+
+    #[test]
+    fn saves_again_unless_opened_from_the_same_file_with_no_changes() {
+        let options = |load: Option<&str>, changes: Option<&str>, save: Option<&str>| Options {
+            clutter: Clutter::Skip,
+            load: load.map(PathBuf::from),
+            changes: changes.map(PathBuf::from),
+            save: save.map(PathBuf::from),
+        };
+        let same = options(Some("i"), None, Some("i"));
+        assert!(unchanged_since_opened(&same, true));
+        // Scanned because the file could not be used.
+        assert!(!unchanged_since_opened(&same, false));
+        assert!(!unchanged_since_opened(
+            &options(Some("i"), Some("c"), Some("i")),
+            true
+        ));
+        assert!(!unchanged_since_opened(
+            &options(Some("i"), None, Some("j")),
+            true
+        ));
     }
 }

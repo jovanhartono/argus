@@ -1,5 +1,7 @@
 //! The file-name index: every file and folder under one root, kept as flat lists.
 
+use crate::update::Runs;
+use crate::walk::Kind;
 use hashbrown::{DefaultHashBuilder, HashTable};
 use rayon::prelude::*;
 use std::hash::BuildHasher;
@@ -14,7 +16,7 @@ pub(crate) const NO_PARENT: EntryId = EntryId::MAX;
 
 /// The `entry_` lists are read by entry number: entry 7's parent folder is `entry_parent[7]`.
 /// A folder is always numbered before anything inside it, and its children are numbered
-/// side by side, as the scan adds them all at once.
+/// side by side, as the scan adds them all at once, until an update adds or removes some.
 /// Plain number lists keep memory low and can later be saved to disk as they are.
 #[cfg_attr(test, derive(Debug, PartialEq))]
 pub struct Index {
@@ -24,21 +26,38 @@ pub struct Index {
     pub(crate) name_starts: Vec<u32>,
     pub(crate) name_letters: Vec<u64>,
     pub(crate) entry_name: Vec<NameId>,
+    /// `NO_PARENT` for the root, and for an entry an update removed, which search skips.
     pub(crate) entry_parent: Vec<EntryId>,
     /// Folders between the entry and the root: 1 for the root's own children.
     pub(crate) entry_depth: Vec<u8>,
     /// Every folder's entry number, smallest first. Most entries are files, so this is
     /// smaller than a yes/no per entry.
     pub(crate) folders: Vec<EntryId>,
+    /// The low half of each folder's inode, by its place in `folders`, so an update notices a
+    /// folder replaced by another of the same name.
+    pub(crate) folder_inodes: Vec<u32>,
+    /// Folders read only on the way to one you brought back, smallest first.
+    pub(crate) passages: Vec<EntryId>,
+    /// Where each folder's children sit, worked out by the first update.
+    pub(crate) runs: Option<Runs>,
+    /// Since the lists were last built: entries removed, the folders among them, and entries
+    /// added, whose names are stored again.
+    pub(crate) removed: usize,
+    pub(crate) removed_folders: usize,
+    pub(crate) added: usize,
+    /// An update added entries since the scan, so a folder's children may sit apart.
+    pub(crate) children_apart: bool,
 }
 
 impl Index {
-    pub fn len(&self) -> usize {
+    /// Places in the lists, entries an update removed included.
+    pub(crate) fn len(&self) -> usize {
         self.entry_name.len()
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.entry_name.is_empty()
+    /// Files and folders search can find, the root included.
+    pub fn entry_count(&self) -> usize {
+        self.len() - self.removed
     }
 
     pub fn distinct_names(&self) -> usize {
@@ -50,7 +69,17 @@ impl Index {
     }
 
     pub fn folder_count(&self) -> usize {
-        self.folders.len()
+        self.folders.len() - self.removed_folders
+    }
+
+    /// Every entry number, removed entries included.
+    pub fn ids(&self) -> std::ops::Range<EntryId> {
+        0..self.len() as EntryId
+    }
+
+    /// Left in place by an update that found it gone; search skips it.
+    pub fn is_removed(&self, entry: EntryId) -> bool {
+        entry != 0 && self.entry_parent[entry as usize] == NO_PARENT
     }
 
     pub fn is_dir(&self, entry: EntryId) -> bool {
@@ -67,13 +96,21 @@ impl Index {
         chain.iter().rev().map(|&e| self.name(e)).collect()
     }
 
+    /// Whether a folder's children may not sit side by side, so finding them reads every
+    /// entry after the folder.
+    fn scattered(&self) -> bool {
+        self.children_apart || self.removed > 0
+    }
+
     pub(crate) fn child_folders(&self, folder: EntryId) -> impl Iterator<Item = EntryId> + '_ {
         let after = self.folders.partition_point(|&entry| entry <= folder);
+        let scattered = self.scattered();
         self.folders[after..]
             .iter()
             .copied()
             .skip_while(move |&entry| self.entry_parent[entry as usize] != folder)
-            .take_while(move |&entry| self.entry_parent[entry as usize] == folder)
+            .take_while(move |&entry| scattered || self.entry_parent[entry as usize] == folder)
+            .filter(move |&entry| self.entry_parent[entry as usize] == folder)
     }
 
     /// The folder reached from the root through `names`, one folder at a time.
@@ -91,9 +128,11 @@ impl Index {
     }
 
     pub(crate) fn children(&self, folder: EntryId) -> impl Iterator<Item = EntryId> + '_ {
+        let scattered = self.scattered();
         (folder + 1..self.len() as EntryId)
             .skip_while(move |&entry| self.entry_parent[entry as usize] != folder)
-            .take_while(move |&entry| self.entry_parent[entry as usize] == folder)
+            .take_while(move |&entry| scattered || self.entry_parent[entry as usize] == folder)
+            .filter(move |&entry| self.entry_parent[entry as usize] == folder)
     }
 
     pub fn heap_bytes(&self) -> usize {
@@ -104,6 +143,9 @@ impl Index {
             + self.entry_parent.capacity() * size_of::<EntryId>()
             + self.entry_depth.capacity()
             + self.folders.capacity() * size_of::<EntryId>()
+            + self.folder_inodes.capacity() * size_of::<u32>()
+            + self.passages.capacity() * size_of::<EntryId>()
+            + self.runs.as_ref().map_or(0, Runs::heap_bytes)
     }
 
     pub(crate) fn name_len(&self, name: NameId) -> u32 {
@@ -114,6 +156,15 @@ impl Index {
         let start = self.name_starts[name as usize] as usize;
         let end = self.name_starts[name as usize + 1] as usize;
         &self.names[start..end]
+    }
+}
+
+/// The check only knows ASCII, so a name like "café" must always get through.
+pub(crate) fn name_fingerprint(text: &str) -> u64 {
+    if text.is_ascii() {
+        letters(text)
+    } else {
+        u64::MAX
     }
 }
 
@@ -165,24 +216,63 @@ impl IndexBuilder {
                 entry_parent: Vec::new(),
                 entry_depth: Vec::new(),
                 folders: Vec::new(),
+                folder_inodes: Vec::new(),
+                passages: Vec::new(),
+                runs: None,
+                removed: 0,
+                removed_folders: 0,
+                added: 0,
+                children_apart: false,
             },
             lookup: HashTable::new(),
             hasher: DefaultHashBuilder::default(),
         }
     }
 
+    /// Room for at most `bytes` of names in `count` distinct names, so storing them never
+    /// doubles a list.
+    pub(crate) fn reserve_names(&mut self, bytes: usize, count: usize) {
+        let Self {
+            index,
+            lookup,
+            hasher,
+        } = self;
+        index.names.reserve_exact(bytes);
+        index.name_starts.reserve_exact(count);
+        lookup.reserve(count, |&id| hasher.hash_one(index.name_text(id)));
+    }
+
     pub(crate) fn push(&mut self, name: &str, parent: EntryId, is_dir: bool) -> EntryId {
+        let kind = if is_dir { Kind::Folder } else { Kind::File };
+        self.push_child(name, parent, kind, 0)
+    }
+
+    pub(crate) fn push_child(
+        &mut self,
+        name: &str,
+        parent: EntryId,
+        kind: Kind,
+        inode: u32,
+    ) -> EntryId {
         let entry = self.index.len() as EntryId;
         let name = self.intern(name);
         self.index.entry_name.push(name);
         self.index.entry_parent.push(parent);
-        if is_dir {
+        if kind != Kind::File {
             self.index.folders.push(entry);
+            self.index.folder_inodes.push(inode);
+        }
+        if kind == Kind::Passage {
+            self.index.passages.push(entry);
         }
         entry
     }
 
-    fn intern(&mut self, name: &str) -> NameId {
+    pub(crate) fn lists(self) -> Index {
+        self.index
+    }
+
+    pub(crate) fn intern(&mut self, name: &str) -> NameId {
         let hash = self.hasher.hash_one(name);
         if let Some(&id) = self
             .lookup
@@ -209,6 +299,8 @@ impl IndexBuilder {
         index.entry_name.shrink_to_fit();
         index.entry_parent.shrink_to_fit();
         index.folders.shrink_to_fit();
+        index.folder_inodes.shrink_to_fit();
+        index.passages.shrink_to_fit();
         index.add_depths_and_letters();
         index
     }
@@ -222,6 +314,8 @@ impl Index {
         entry_name: Vec<NameId>,
         entry_parent: Vec<EntryId>,
         folders: Vec<EntryId>,
+        folder_inodes: Vec<u32>,
+        passages: Vec<EntryId>,
     ) -> Self {
         let mut index = Self {
             names,
@@ -231,12 +325,30 @@ impl Index {
             entry_parent,
             entry_depth: Vec::new(),
             folders,
+            folder_inodes,
+            passages,
+            runs: None,
+            removed: 0,
+            removed_folders: 0,
+            added: 0,
+            children_apart: false,
         };
+        index.removed = index
+            .entry_parent
+            .iter()
+            .skip(1)
+            .filter(|&&parent| parent == NO_PARENT)
+            .count();
+        index.removed_folders = index
+            .folders
+            .iter()
+            .filter(|&&folder| folder != 0 && index.entry_parent[folder as usize] == NO_PARENT)
+            .count();
         index.add_depths_and_letters();
         index
     }
 
-    fn add_depths_and_letters(&mut self) {
+    pub(crate) fn add_depths_and_letters(&mut self) {
         self.entry_depth = Vec::with_capacity(self.len());
         for &parent in &self.entry_parent {
             let depth = match parent {
@@ -247,15 +359,7 @@ impl Index {
         }
         self.name_letters = (0..self.distinct_names())
             .into_par_iter()
-            .map(|name| {
-                let text = self.name_text(name as NameId);
-                // The check only knows ASCII, so a name like "café" must always get through.
-                if text.is_ascii() {
-                    letters(text)
-                } else {
-                    u64::MAX
-                }
-            })
+            .map(|name| name_fingerprint(self.name_text(name as NameId)))
             .collect();
     }
 }
