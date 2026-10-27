@@ -17,5 +17,13 @@ cp apps/macos/Info.plist $app/Contents/
 # KeyboardShortcuts looks for its bundle here, and crashes at launch without it.
 cp -R $bin/*.bundle $app/Contents/Resources/
 
-codesign --force --sign - $app
+# By fingerprint: codesign won't take a certificate nobody vouches for by its name.
+identity=$(security find-identity -p codesigning | awk '/"Telescope Self-Signed"/ { print $2; exit }')
+if [[ -n $identity ]]; then
+  codesign --force --sign $identity $app
+else
+  # Signed for this build only: macOS forgets Telescope's permissions on the next one.
+  echo "No Telescope Self-Signed certificate; run scripts/make-signing-cert.sh to keep permissions" >&2
+  codesign --force --sign - $app
+fi
 echo $app
