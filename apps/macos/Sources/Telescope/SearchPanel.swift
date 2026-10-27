@@ -11,12 +11,11 @@ enum Metric {
     static let message: CGFloat = 48
     static let fade: TimeInterval = 0.12
     static let resize: TimeInterval = 0.15
-    /// How many made-up names the stand-in core holds until M2 reads your disk.
-    static let standIn: UInt64 = 1_000_000
 }
 
 /// Read with `log show --last 5m --predicate 'subsystem == "io.github.jovanhartono.telescope"'`.
 let timing = Logger(subsystem: "io.github.jovanhartono.telescope", category: "timing")
+let failures = Logger(subsystem: "io.github.jovanhartono.telescope", category: "failure")
 
 final class Panel: NSPanel {
     override var canBecomeKey: Bool { true }
@@ -43,6 +42,7 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
     private let message = NSTextField(labelWithString: "")
 
     private var hatch: Hatch?
+    private var indexingSince: TimeInterval = 0
     private var indexed = false
     private var problem: String?
     /// The file you picked was moved or deleted after the list was built.
@@ -59,9 +59,15 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
     override init() {
         super.init()
         build()
-        // TELESCOPE_STAND_IN=0 measures the window's own memory without the made-up list.
-        let count = ProcessInfo.processInfo.environment["TELESCOPE_STAND_IN"].flatMap(UInt64.init)
-        hatch = Hatch(standIn: count ?? Metric.standIn) { [weak self] event in self?.heard(event) }
+        let onEvent: (Hatch.Event) -> Void = { [weak self] event in self?.heard(event) }
+        // TELESCOPE_STAND_IN=1000000 searches made-up names instead of your files, and 0 measures
+        // the window's own memory without any list.
+        indexingSince = ProcessInfo.processInfo.systemUptime
+        if let count = ProcessInfo.processInfo.environment["TELESCOPE_STAND_IN"].flatMap(UInt64.init) {
+            hatch = Hatch(standIn: count, onEvent: onEvent)
+        } else {
+            hatch = Hatch(root: NSHomeDirectory(), fullDisk: Hatch.hasFullDiskAccess(), onEvent: onEvent)
+        }
         if hatch == nil { problem = "Search couldn't start. Rebuild Telescope." }
     }
 
@@ -252,14 +258,21 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
 
     private func heard(_ event: Hatch.Event) {
         switch event {
-        case .indexed:
+        case .indexed(let count):
+            timing.notice("indexed \(count) entries in \(ms(since: self.indexingSince), format: .fixed(precision: 0)) ms")
             indexed = true
             search()
         case .ready(let ticket) where ticket == newest:
             take(ticket)
         case .ready:
             break
+        case .failed(let code) where code != 0:
+            let reason = String(cString: strerror(code))
+            failures.error("home folder scan failed: \(reason, privacy: .public)")
+            problem = "Telescope can't read your home folder: \(reason)."
+            fit()
         case .failed:
+            failures.error("the engine stopped")
             problem = "Search stopped working. Quit and reopen Telescope."
             fit()
         }
