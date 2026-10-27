@@ -2,7 +2,7 @@
 
 A fast, light file and app launcher for macOS and Windows, written in Rust. "Telescope" is a codename.
 
-Status: milestone M1, the Mac search window over a million made-up names. The plan is in [docs/research.html](docs/research.html), and M1's steps are in [docs/m1-window.html](docs/m1-window.html).
+Status: milestone M2, the daily driver, in progress. It moves the Mac app from made-up names to real files that stay up to date as they change. Its steps are in [docs/m2-daily-driver.html](docs/m2-daily-driver.html). The plan is in [docs/research.html](docs/research.html), and the finished M1 window is in [docs/m1-window.html](docs/m1-window.html).
 
 ## Build
 
