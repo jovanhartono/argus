@@ -621,8 +621,7 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
         return cell
     }
 
-    /// Rewrites the rows already on screen and only adds or drops the difference. reloadData
-    /// throws every row away and builds it again, which was most of the wait after a keystroke.
+    /// reloadData throws every row away and builds it again, most of the wait after a keystroke.
     private func refill() {
         table.noteNumberOfRowsChanged()
         table.enumerateAvailableRowViews { view, row in
@@ -635,11 +634,11 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
         let key = row.isFolder ? "/" : (row.name as NSString).pathExtension.lowercased()
         if let cached = icons[key] { return cached }
         let type = row.isFolder ? UTType.folder : (UTType(filenameExtension: key) ?? .data)
-        let icon = NSWorkspace.shared.icon(for: type)
+        let system = NSWorkspace.shared.icon(for: type)
         // Handed the icon itself, a row's image view asks macOS for a stand-in picture each
         // time, most of the time spent filling the rows. Drawn from a copy, it doesn't.
-        let image = NSImage(size: NSSize(width: 32, height: 32), flipped: false) { rect in
-            icon.draw(in: rect)
+        let image = NSImage(size: NSSize(width: 32, height: 32), flipped: false) { @Sendable rect in
+            system.draw(in: rect)
             return true
         }
         icons[key] = image
