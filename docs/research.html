@@ -145,7 +145,7 @@ footer { border-top: 1px solid var(--line); margin-top: 32px; padding-top: 20px;
 <div class="wrap">
 
 <header>
-  <span class="eyebrow">Plan &middot; updated 26 Oct 2026 &middot; measured on your Mac: Apple M1, 8 GB, macOS 26.6</span>
+  <span class="eyebrow">Plan &middot; updated 27 Oct 2026 &middot; measured on your Mac: Apple M1, 8 GB, macOS 26.6</span>
   <h1>Telescope plan</h1>
   <p class="lede">A fast, light launcher that finds any file, folder or app on macOS and Windows as you type.</p>
   <div class="chips">
@@ -255,14 +255,14 @@ footer { border-top: 1px solid var(--line); margin-top: 32px; padding-top: 20px;
     <h3><span class="num">2</span>A phone book of file names</h3>
     <p>Asking the disk "which files match tel?" means opening every one of the 266,968 folders in your home folder. That took 10.7 s on your Mac.</p>
     <p class="analogy">A phone book solves this: write every name down once, then look names up in the book instead of knocking on every door.</p>
-    <p>The book is called the index. By default it skips clutter like ~/Library (but keeps iCloud Drive and other cloud drives), hidden folders, tool downloads and caches like node_modules, and the thousands of pieces inside packages like Photos Library, which Finder shows as one file. On your Mac on 27 Oct 2026 that left 47,933 entries, indexed in 0.15 s. An "index everything" switch covers all 2.44 million. Your own list in ~/.config/telescope/ignore can skip more folders, or bring back one Telescope skips, like ~/.config.</p>
+    <p>The book is called the index. By default it skips clutter like ~/Library (but keeps iCloud Drive and other cloud drives), hidden folders, tool downloads and caches like node_modules, and the thousands of pieces inside packages like Photos Library, which Finder shows as one file. On your Mac on 27 Oct 2026 that left 47,933 entries, indexed in 0.15 s. An "index everything" switch covers all 2.44 million that day; the whole home folder's count changes from day to day (see <a href="#measured">Measured on your Mac</a>). Your own list in ~/.config/telescope/ignore can skip more folders, or bring back one Telescope skips, like ~/.config.</p>
   </div>
 
   <div class="idea">
     <h3><span class="num">3</span>Writing each folder once</h3>
     <p>Storing every file's full path repeats "/Users/you/Documents/" for every file inside that folder. For your Mac that adds up to 491 MB.</p>
     <p class="analogy">An address book can say "same street as #3" instead of writing the street out again.</p>
-    <p>Telescope stores each entry's own name plus the number of the folder it sits in. The names alone take 66 MB for your whole home folder and about 14 MB (estimate) for the default folders. Full paths are rebuilt only for the 50 rows on screen.</p>
+    <p>Telescope stores each entry's own name plus the number of the folder it sits in. The names alone take 66 MB for your whole home folder and about 14 MB (estimate) for the 353k default-folder entries of 25 Oct 2026. With the stricter rules of 27 Oct 2026, the whole index for 47,933 entries measured about 1.2 MB. Full paths are rebuilt only for the 50 rows on screen.</p>
     <figure>
       <div class="fig-wrap">
         <svg viewBox="0 0 960 280" role="img" aria-label="Comparison: full paths repeat the folder part for every file, 491 MB; Telescope stores each name once with the number of its folder, 66 MB.">
@@ -286,7 +286,7 @@ footer { border-top: 1px solid var(--line); margin-top: 32px; padding-top: 20px;
           <text class="s-small" x="504" y="266">To show #7's path, follow the numbers: #7, #6, #2, #1</text>
         </svg>
       </div>
-      <figcaption>Same three files, two ways to store them. Sizes are for the 2.36 million entries in your home folder.</figcaption>
+      <figcaption>Same three files, two ways to store them. Sizes are for the 2.36 million entries in your home folder on 25 Oct 2026.</figcaption>
     </figure>
   </div>
 
@@ -299,7 +299,7 @@ footer { border-top: 1px solid var(--line); margin-top: 32px; padding-top: 20px;
 
   <div class="idea">
     <h3><span class="num">5</span>What happens when you type</h3>
-    <p>Every keystroke has to check up to 2.36 million entries (your whole home folder) within a few milliseconds.</p>
+    <p>Every keystroke has to check up to 2.36 million entries (your whole home folder on 25 Oct 2026) within a few milliseconds.</p>
     <p class="analogy">Think of sorting job applications: a quick scan throws out every CV missing a required skill, and only the rest get read carefully.</p>
     <p>The quick scan is a letter fingerprint: 8 bytes per name recording which letters it contains, so any name missing a typed letter is skipped. The careful read is fuzzy matching. Your 2.36 million entries share only 1.02 million different names, because names like README.md repeat across folders, so each name is matched once. Results are then ranked by match quality, by <span class="term" tabindex="0" data-tip="A score that combines how often and how recently you opened something, so your usual files rise to the top.">frecency</span>, and by how deep the file sits.</p>
     <figure>
@@ -363,16 +363,16 @@ footer { border-top: 1px solid var(--line); margin-top: 32px; padding-top: 20px;
     <h3><span class="num">8</span>Why macOS keeps Telescope's permissions</h3>
     <p>Telescope needs <span class="term" tabindex="0" data-tip="A macOS privacy permission the user grants in System Settings. Without it, some folders are invisible to the app.">Full Disk Access</span> to see some folders. If macOS forgot that after every update, you would grant it again each time.</p>
     <p class="analogy">macOS recognises apps the way a building guard recognises ID cards. By default every build gets a throwaway card that changes each time, so the guard forgets you. One homemade card that never changes keeps you recognised.</p>
-    <p>The card is a code-signing certificate; the throwaway kind is called an ad-hoc signature. The certificate comes with a secret key used to stamp each build, and whoever holds the key can stamp builds that look like yours. Telescope uses one self-signed certificate, valid for 10 years, with the key kept on your Mac. Rebuilds on the same Mac keep their permissions; updates downloaded on other Macs are tested at M2.</p>
+    <p>The card is a code-signing certificate; the throwaway kind is called an ad-hoc signature. The certificate comes with a secret key used to stamp each build, and whoever holds the key can stamp builds that look like yours. Telescope uses one self-signed certificate, valid for 10 years, with the key kept on your Mac. Rebuilds on the same Mac keep their permissions; a downloaded update is tested on your Mac at M2, and another Mac needs a tester.</p>
   </div>
 </section>
 
 <section id="measured">
   <h2>Measured on your Mac</h2>
-  <p class="prose">Every number here was measured on 25 Oct 2026 on your Mac against your own home folder.</p>
+  <p class="prose">Every number here was measured on 25 Oct 2026 on your Mac against your own home folder, unless another date is given. The whole home folder's count changes from day to day as caches and tool downloads come and go: 2.36 million on 25 Oct, 2.7 million on 26 Oct and 2.44 million on 27 Oct 2026.</p>
   <div class="stats">
     <div class="stat"><b>2,355,237</b><span>entries in your home folder; 266,968 are folders and 1,021,914 names are different</span></div>
-    <div class="stat"><b>352,939</b><span>left (15%) after skipping ~/Library, node_modules, .git and hidden folders</span></div>
+    <div class="stat"><b>352,939</b><span>left (15%) after skipping ~/Library, node_modules, .git and hidden folders. The stricter rules of 27 Oct 2026 leave 47,933</span></div>
     <div class="stat"><b>10.7 s / 2.3 s</b><span>to scan the whole home folder vs only the default folders</span></div>
     <div class="stat"><b>6-12 ms</b><span>to fuzzy-match every name per keystroke (8 threads); 2-5 ms for the default folders on 4 slow cores (your Mac's power-saving cores, standing in for a cheap PC)</span></div>
     <div class="stat"><b>0.6-2 s</b><span>per Spotlight search from the command line, and it found only 16 of the 141 files named "telescope"</span></div>
@@ -418,7 +418,7 @@ footer { border-top: 1px solid var(--line); margin-top: 32px; padding-top: 20px;
         <rect class="s-ref" x="260" y="206" width="60" height="20" rx="2"/>
         <text class="s-val" x="328" y="220">~50 est.</text>
 
-        <text class="s-text" x="250" y="254" text-anchor="end">Default folders only (353k)</text>
+        <text class="s-text" x="250" y="254" text-anchor="end">Default folders, 25 Oct (353k)</text>
         <rect class="s-ref" x="260" y="240" width="16.8" height="20" rx="2"/>
         <text class="s-val" x="285" y="254">~14 est.</text>
       </svg>
@@ -505,7 +505,7 @@ footer { border-top: 1px solid var(--line); margin-top: 32px; padding-top: 20px;
         <tr><td class="name">Swift talking to Rust</td><td>About 10 hand-written Rust functions in C style</td><td>UniFFI, a code generator</td><td>7.6 <span class="term" tabindex="0" data-tip="Microseconds: millionths of a second. 1,000 µs make 1 ms.">µs</span> vs 130.5 µs per 50 rows; about 1 MB smaller; the Windows window can reuse it</td></tr>
         <tr><td class="name">Storing names</td><td>Folder numbers in flat lists, each name once</td><td>A list of full paths, SQLite, or tantivy (a Rust search-engine crate)</td><td>66 MB vs 491 MB on your Mac; Vicinae and Spacedrive, two other open-source file tools, moved names out of SQLite</td></tr>
         <tr><td class="name">Saving the index</td><td>Own file format, memory-mapped; two copies saved in turn</td><td>SQLite, JSON</td><td>No loading step; macOS can drop it from memory while hidden; a crash mid-save leaves the other copy intact</td></tr>
-        <tr><td class="name">First scan</td><td>Parallel folder walk, about 40 lines on rayon (the crate that also runs searches), that hands each folder's number to its children</td><td>A path-to-number lookup table; the jwalk and ignore crates</td><td>The lookup table pushed memory to 252 MB while indexing. ignore cannot hand a folder's number to its children; jwalk can, but rayon does it with no extra crate. Measured: 10.7 s and 95 MB at peak for your whole home folder (2.7M entries)</td></tr>
+        <tr><td class="name">First scan</td><td>Parallel folder walk, about 40 lines on rayon (the crate that also runs searches), that hands each folder's number to its children</td><td>A path-to-number lookup table; the jwalk and ignore crates</td><td>The lookup table pushed memory to 252 MB while indexing. ignore cannot hand a folder's number to its children; jwalk can, but rayon does it with no extra crate. Measured: 10.7 s and 95 MB at peak for your whole home folder (2.7M entries on 26 Oct 2026)</td></tr>
         <tr><td class="name">New files on macOS</td><td>FSEvents read directly, remembering the last entry</td><td>notify crate</td><td>notify cannot catch up after a restart, so every launch would rescan for 5-15 s</td></tr>
         <tr><td class="name">New files on Windows</td><td>Normal folder reads plus change notices; Everything when installed</td><td>walkdir + notify</td><td>Everything-level speed without Everything needs admin rights, which also blocks free Microsoft Store signing; an admin helper only after measuring</td></tr>
         <tr><td class="name">Fuzzy matching</td><td>frizbee 0.13 crate, version pinned; nucleo-matcher as a fallback</td><td>nucleo, skim</td><td>2-5 times faster than nucleo on your names; nucleo's last release was Feb 2024</td></tr>
@@ -669,7 +669,7 @@ footer { border-top: 1px solid var(--line); margin-top: 32px; padding-top: 20px;
         <li>Enter opens; Cmd+Enter shows it in Finder.</li>
         <li>Tab searches inside the selected folder.</li>
         <li>Option+Cmd+C copies the path, as in Finder; Cmd+I opens the details pane.</li>
-        <li>Cmd+Y opens <span class="term" tabindex="0" data-tip="The macOS preview you get by pressing Space on a file in Finder.">Quick Look</span>; Space does too while the search box is empty.</li>
+        <li>Cmd+Y opens <span class="term" tabindex="0" data-tip="The macOS preview you get by pressing Space on a file in Finder.">Quick Look</span>. Space was dropped on 27 Oct 2026: an empty search box has no results to preview.</li>
         <li>Search in the current Finder folder has no default key and asks for Finder access the first time you use it.</li>
       </ul>
     </div>
@@ -706,10 +706,10 @@ footer { border-top: 1px solid var(--line); margin-top: 32px; padding-top: 20px;
         <tr><td>Hotkey to visible window</td><td class="n">under 50 ms on your Mac<span class="sub">under 100 ms on a low-end PC</span></td><td>The ready-made window shows in about 0.4 ms; drawing the first frame is the rest. Milestone M1 times only the app's own share, 4 ms</td></tr>
         <tr><td>Keystroke to results</td><td class="n">under 5 ms, default folders<span class="sub">under 30 ms whole home folder; under 50 ms low-end PC</span></td><td>Measured on 4 slow cores: 2-5 ms default folders, 12-31 ms whole home folder</td></tr>
         <tr><td>Results to screen</td><td class="n">under 4 ms on your Mac</td><td>Measured 7.6 µs to hand over 50 rows and 2.7-3.4 ms to draw them</td></tr>
-        <tr><td>Memory while idle</td><td class="n">under 60 MB<span class="sub">aim for 40 MB</span></td><td>Measured 16-18 MB for the window with a stand-in core, plus 12-18 MB of index (estimate)</td></tr>
-        <tr><td>Index memory</td><td class="n">12-18 MB, default folders<span class="sub">75-105 MB whole home folder</span></td><td>Estimate: 66 MB of names, 92 MB with sizes and dates, plus about 8 MB of letter fingerprints. The whole home folder is an opt-in switch</td></tr>
+        <tr><td>Memory while idle</td><td class="n">under 60 MB<span class="sub">aim for 40 MB</span></td><td>Measured 16-18 MB for the window with a stand-in core, plus 12-18 MB of index (estimate for the 353k default folders of 25 Oct 2026; about 1.2 MB measured for 47,933 entries on 27 Oct 2026)</td></tr>
+        <tr><td>Index memory</td><td class="n">12-18 MB, default folders<span class="sub">75-105 MB whole home folder</span></td><td>Estimate for the 353k default folders of 25 Oct 2026; the stricter rules of 27 Oct 2026 leave 47,933 entries, measured at about 1.2 MB. Estimate: 66 MB of names, 92 MB with sizes and dates, plus about 8 MB of letter fingerprints. The whole home folder is an opt-in switch</td></tr>
         <tr><td>Peak memory while indexing</td><td class="n">under 150 MB, whole home folder</td><td>A prototype peaked at 252 MB from temporary lookup tables, which the design leaves out</td></tr>
-        <tr><td>First index</td><td class="n">under 3 s, default folders</td><td>Measured 2.3 s for 353k entries</td></tr>
+        <tr><td>First index</td><td class="n">under 3 s, default folders</td><td>Measured 2.3 s for 353k entries on 25 Oct 2026; 0.15 s for 47,933 entries with the stricter rules of 27 Oct 2026</td></tr>
         <tr><td>Restart to searchable</td><td class="n">under 300 ms</td><td>The saved index is searchable as soon as it is opened, while the indexer catches up in the background. Catching up took 8 ms for a short gap and 4.1 s at worst</td></tr>
         <tr><td>New file findable</td><td class="n">under 1 s</td><td>macOS reported new files 4-12 ms after they were created</td></tr>
         <tr><td>CPU while hidden</td><td class="n">0%</td><td>Wakes only on change notes; no timers, no rescans</td></tr>
@@ -726,10 +726,10 @@ footer { border-top: 1px solid var(--line); margin-top: 32px; padding-top: 20px;
     <table>
       <thead><tr><th>Milestone</th><th>What you get</th><th>Done when</th><th>Likely new to you</th><th>Effort</th></tr></thead>
       <tbody>
-        <tr><td class="name">M0 engine</td><td>A command-line search over your real file list</td><td>On the full 2.36M-entry list: under 100 MB normally and 150 MB at peak; 95% of searches under 15 ms on your Mac (8 threads) and 45 ms on 4 slow cores (was 40 ms, relaxed on 27 Oct 2026); 8 fast searches with all searchers running deliver 2 results or fewer; the expected file is in the top 3 for 16 of your 20 <span class="term" tabindex="0" data-tip="Your list of 20 real searches, each with the file you expect on top. Rerun after every ranking change.">golden set</span> searches</td><td>Rust basics: <span class="term" tabindex="0" data-tip="Rust's build tool and package downloader, like npm.">Cargo</span>, <span class="term" tabindex="0" data-tip="Rust's way to group fields into one type, like a TypeScript interface that holds data.">structs</span>, <span class="term" tabindex="0" data-tip="Rust's growable list, like a JavaScript array.">vectors</span>, <span class="term" tabindex="0" data-tip="Rust's rule for who may use a piece of data and when. The compiler checks it before the program runs; it is what new Rust users struggle with most.">borrowing</span>, threads</td><td class="n">4-8 evenings</td></tr>
+        <tr><td class="name">M0 engine</td><td>A command-line search over your real file list</td><td>On the full 2.36M-entry list (25 Oct 2026): under 100 MB normally and 150 MB at peak; 95% of searches under 15 ms on your Mac (8 threads) and 45 ms on 4 slow cores (was 40 ms, relaxed on 27 Oct 2026); 8 fast searches with all searchers running deliver 2 results or fewer; the expected file is in the top 3 for 16 of your 20 <span class="term" tabindex="0" data-tip="Your list of 20 real searches, each with the file you expect on top. Rerun after every ranking change.">golden set</span> searches</td><td>Rust basics: <span class="term" tabindex="0" data-tip="Rust's build tool and package downloader, like npm.">Cargo</span>, <span class="term" tabindex="0" data-tip="Rust's way to group fields into one type, like a TypeScript interface that holds data.">structs</span>, <span class="term" tabindex="0" data-tip="Rust's growable list, like a JavaScript array.">vectors</span>, <span class="term" tabindex="0" data-tip="Rust's rule for who may use a piece of data and when. The compiler checks it before the program runs; it is what new Rust users struggle with most.">borrowing</span>, threads</td><td class="n">4-8 evenings</td></tr>
         <tr><td class="name">M1 window</td><td>The Spotlight feel: the Swift window over a stand-in core with 1M made-up names</td><td>95% of the time: window drawn within 10 ms of the hotkey (timed inside the app; was 4 ms, relaxed on 27 Oct 2026) and results within 25 ms of a keystroke; 8 fast keystrokes with all searchers running show 2 results or fewer, and the last search always wins; focus returns to your previous app 20 of 20 times; works over full-screen apps; hidden with the stand-in core: under 22 MB and 0% CPU; builds in <span class="term" tabindex="0" data-tip="Swift's strictest setting, which catches threading mistakes before the app runs.">Swift 6 mode</span>; permissions survive 5 rebuilds; a downloaded .dmg opens through Open Anyway in 4 steps or fewer</td><td>Swift, AppKit, Xcode, calling Rust from Swift, code signing</td><td class="n">2-4 weekends<span class="sub">estimate</span></td></tr>
         <tr><td class="name">M2 daily driver</td><td>It replaces opening folders one by one</td><td>You use it 7 days straight; 95% of searches under 30 ms; new files appear within 1 s; Full Disk Access survives an update installed from a downloaded .dmg</td><td>FSEvents, macOS permissions</td><td class="n">3-6 weekends</td></tr>
-        <tr><td class="name">M3 beats Spotlight</td><td>Quality that compounds</td><td>Frecency, Tab into a folder, apps, saved index with a restart under 300 ms, index health view, current-Finder-folder hotkey, Cmd+I details pane; 18 of 20 golden searches</td><td>Ranking, saving and loading the index file</td><td class="n">4-8 weekends</td></tr>
+        <tr><td class="name">M3 beats Spotlight</td><td>Quality that compounds</td><td>Frecency, Tab into a folder, apps, saved index with a restart under 300 ms, index health view, current-Finder-folder hotkey, Cmd+I details pane; an "index everything" switch, external drives and per-folder updates (<a href="https://github.com/jovanhartono/telescope/issues/21">#21</a>, <a href="https://github.com/jovanhartono/telescope/issues/22">#22</a>, <a href="https://github.com/jovanhartono/telescope/issues/23">#23</a>, added 27 Oct 2026); 18 of 20 golden searches</td><td>Ranking, saving and loading the index file</td><td class="n">4-8 weekends</td></tr>
         <tr><td class="name">M4 text search</td><td>Search inside text and code files</td><td>Live search in folders you choose; name results never wait for it; never downloads iCloud files</td><td>Fast file reading</td><td class="n">2-4 weekends</td></tr>
         <tr><td class="name">M5 Windows</td><td>The low-end PC promise</td><td>A Windows window picked by a test build (default Win32), a scanner without admin rights, change notices, Everything support, Start Menu and Store apps, an MSIX package (Windows' modern app package format). On a low-end PC: hotkey under 100 ms, idle under 60 MB, searches under 50 ms</td><td>Windows system calls from Rust</td><td class="n">6-12 weekends<span class="sub">least certain</span></td></tr>
         <tr><td class="name">v2</td><td>Search inside PDF and Office files</td><td>Text reading in a separate helper with a memory cap; optional per-folder index</td><td>PDF and Office file formats</td><td class="n">open-ended</td></tr>
@@ -746,7 +746,7 @@ footer { border-top: 1px solid var(--line); margin-top: 32px; padding-top: 20px;
       <tbody>
         <tr><td>The project stalls, as three Rust launchers did</td><td>High</td><td>Fatal</td><td>A fixed out-of-scope list and a time limit per milestone</td><td>M0 not done after about 8 evenings</td></tr>
         <tr><td>The wrong file comes first: "tele" fuzzy-matches 69,000 names</td><td>High</td><td>High</td><td>Match names, not full paths; bonuses; frecency; golden set</td><td>M0 golden set score</td></tr>
-        <tr><td>The index goes stale; Cardinal lost 237 batches of changes (<a href="https://github.com/cardisoft/cardinal/issues/229">#229</a>)</td><td>High</td><td>Medium-high</td><td>Rescan whenever macOS says notes were lost; resume from the saved logbook entry</td><td>M2: run git clone and npm install while it is open, then compare with a fresh scan</td></tr>
+        <tr><td>The index goes stale; Cardinal lost 237 batches of changes (<a href="https://github.com/cardisoft/cardinal/issues/229">#229</a>)</td><td>High</td><td>Medium-high</td><td>Rescan whenever macOS says notes were lost; M3: resume from the saved logbook entry</td><td>M2: run git clone and npm install while it is open, then compare with a fresh scan</td></tr>
         <tr><td>Six new things at once: Rust, Swift, AppKit, the C hatch, Xcode, code signing</td><td>High</td><td>Medium-high (slower)</td><td>Keep the Swift side thin; SwiftUI for settings; a ready-made hotkey library</td><td>M1, first weekend</td></tr>
         <tr><td>No Windows PC, so the low-end PC promise is untested</td><td>High</td><td>High on Windows</td><td>CI plus testers; a cheap used laptop before M5</td><td>M5 day 1: time a first scan of C:\Users right after a reboot</td></tr>
         <tr><td>The Windows scan is too slow on a hard disk, with no logbook after a restart</td><td>Medium</td><td>High</td><td>Fewer folders, saved index, a quick folder-date check, optional Everything or admin helper</td><td>M5 day 1</td></tr>
@@ -787,7 +787,7 @@ footer { border-top: 1px solid var(--line); margin-top: 32px; padding-top: 20px;
     <div><dt>Mac download</dt><dd>.dmg on GitHub Releases plus a one-command build from source</dd></div>
     <div><dt>Release signing</dt><dd>One 10-year self-signed certificate, used only on your Mac</dd></div>
     <div><dt>Hotkey</dt><dd>Cmd+Shift+Space on macOS; Windows combo picked at M5</dd></div>
-    <div><dt>Quick Look key</dt><dd>Cmd+Y; Space only while the search box is empty</dd></div>
+    <div><dt>Quick Look key</dt><dd>Cmd+Y only (Space dropped on 27 Oct 2026)</dd></div>
     <div><dt>Look</dt><dd>Solid background; blur and Liquid Glass (macOS 26's see-through style) are opt-in settings</dd></div>
     <div><dt>Intel Mac testing</dt><dd>GitHub's Intel machines plus testers, like Windows</dd></div>
     <div><dt>Name</dt><dd>Telescope is a codename; rename before the first public release</dd></div>
@@ -810,10 +810,11 @@ footer { border-top: 1px solid var(--line); margin-top: 32px; padding-top: 20px;
       <thead><tr><th>Not yet proven</th><th>Why it is open</th><th>Settled by</th></tr></thead>
       <tbody>
         <tr><td>Cancelling old searches across all searchers</td><td>The test used a single searcher</td><td class="name">M0, again at M1</td></tr>
-        <tr><td>Keyboard focus, Japanese and Chinese typing, and Quick Look inside the window</td><td>Every test kept the window from taking focus</td><td class="name">M1, by hand<span class="sub">Quick Look moves to M2, when there are real files to preview; Japanese and Chinese typing was dropped on 27 Oct 2026, untested</span></td></tr>
+        <tr><td>Keyboard focus and Japanese and Chinese typing inside the window</td><td>Every test kept the window from taking focus</td><td class="name">M1, by hand<span class="sub">Japanese and Chinese typing was dropped on 27 Oct 2026, untested</span></td></tr>
+        <tr><td>Quick Look inside the window</td><td>Every test kept the window from taking focus, and the M1 list held only made-up names</td><td class="name">M2, by hand</td></tr>
         <tr><td>Whether hotkey presses arrive at all, on any macOS version</td><td>Only registering the hotkey on macOS 26.6 was tested</td><td class="name">M1</td></tr>
         <tr><td>Whether Open Anyway still works on macOS 15.1</td><td>OSNews says 15.1 removed every way around Gatekeeper; Apple says Open Anyway remains</td><td class="name">M1 download test<span class="sub">needs a macOS 15 VM or a tester</span></td></tr>
-        <tr><td>Whether permissions tied to the self-signed certificate survive an update downloaded on another Mac</td><td>Sources only cover rebuilds on the same Mac</td><td class="name">M2</td></tr>
+        <tr><td>Whether permissions tied to the self-signed certificate survive an update downloaded on another Mac</td><td>Sources only cover rebuilds on the same Mac</td><td class="name">A tester<span class="sub">M2's update test runs on your Mac, which holds the certificate</span></td></tr>
         <tr><td>How long a scan without admin rights takes on a cold Windows hard disk</td><td>The estimate is minutes per million files</td><td class="name">M5 day 1</td></tr>
         <tr><td>Whether Windows updates a folder's date on every create, delete and rename</td><td>The Windows catch-up check relies on it</td><td class="name">M5</td></tr>
         <tr><td>Anything on Windows, a real Intel Mac, or a hard disk</td><td>Every number so far is from your Mac</td><td class="name">M5 and testers</td></tr>
@@ -826,9 +827,8 @@ footer { border-top: 1px solid var(--line); margin-top: 32px; padding-top: 20px;
 <section id="next">
   <h2>Next steps</h2>
   <ol class="prose">
-    <li>Write your golden set: 20 real searches, each with the file you expect at the top.</li>
-    <li>M0: build the search engine as a command-line tool against your real file list.</li>
-    <li>M1: the Swift window over a stand-in core.</li>
+    <li>The golden set, M0 and M1 are done. M1 closed on 27 Oct 2026 with <a href="https://github.com/jovanhartono/telescope/releases/tag/v0.1.0">v0.1.0</a>.</li>
+    <li>M2, the daily driver: its steps are in <a href="m2-daily-driver.html">m2-daily-driver.html</a>.</li>
   </ol>
 </section>
 

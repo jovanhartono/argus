@@ -1,0 +1,285 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Telescope Daily Driver</title>
+<style>
+:root {
+  --bg: #f5f5f7; --surface: #ffffff; --ink: #1d1d1f; --muted: #6e6e73; --line: #d2d2d7;
+  --accent: #0066cc; --accent-soft: #e8f0fb; --good: #1d7a4b; --good-soft: #e3f4ea;
+  --warn: #8f5400; --warn-soft: #fbefd9;
+  --font: -apple-system, BlinkMacSystemFont, system-ui, "Segoe UI", sans-serif;
+  --font-mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  color-scheme: light;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #000000; --surface: #1c1c1e; --ink: #f5f5f7; --muted: #98989d; --line: #38383a;
+    --accent: #2997ff; --accent-soft: #10243d; --good: #5ccb91; --good-soft: #12301f;
+    --warn: #f0b35a; --warn-soft: #33260e;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #000000; --surface: #1c1c1e; --ink: #f5f5f7; --muted: #98989d; --line: #38383a;
+  --accent: #2997ff; --accent-soft: #10243d; --good: #5ccb91; --good-soft: #12301f;
+  --warn: #f0b35a; --warn-soft: #33260e;
+  color-scheme: dark;
+}
+*, *::before, *::after { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--ink); font-family: var(--font); font-size: 17px; line-height: 1.55; -webkit-font-smoothing: antialiased; }
+.wrap { max-width: 980px; margin: 0 auto; padding: 56px max(16px, env(safe-area-inset-right, 0px)) 80px max(16px, env(safe-area-inset-left, 0px)); overflow-x: clip; }
+a { color: var(--accent); text-decoration: none; }
+a:hover { text-decoration: underline; }
+a:focus-visible, .term:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 2px; }
+h1, h2 { font-weight: 700; letter-spacing: -0.02em; text-wrap: balance; }
+h1 { font-size: clamp(2.2rem, 6vw, 3.4rem); line-height: 1.05; margin: 6px 0 12px; }
+h2 { font-size: clamp(1.5rem, 3.2vw, 2rem); line-height: 1.15; margin: 0 0 10px; }
+h3 { font-size: 1.05rem; font-weight: 600; margin: 8px 0 0; }
+p { margin: 0 0 12px; }
+.prose { max-width: 66ch; }
+.lede { font-size: 1.2rem; color: var(--muted); max-width: 60ch; }
+.eyebrow { font-size: 0.8rem; font-weight: 600; color: var(--muted); }
+header { display: grid; gap: 4px; padding-bottom: 32px; }
+.chips { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
+.chip { font-size: 0.78rem; font-weight: 500; padding: 3px 11px; border-radius: 999px; white-space: nowrap; background: var(--surface); color: var(--muted); border: 0.5px solid var(--line); }
+.chip.keep { background: var(--good-soft); color: var(--good); border-color: transparent; }
+.chip.open { background: var(--warn-soft); color: var(--warn); border-color: transparent; }
+nav.toc { display: flex; flex-wrap: wrap; gap: 6px 20px; font-size: 0.92rem; padding-top: 16px; }
+section { border-top: 0.5px solid var(--line); padding-block: 48px 12px; display: grid; gap: 18px; }
+section > * { min-width: 0; }
+ul, ol { margin: 0; padding-left: 1.25rem; }
+li { margin-bottom: 6px; }
+li:last-child { margin-bottom: 0; }
+.table-wrap { overflow-x: auto; border-radius: 12px; background: var(--surface); }
+table { border-collapse: collapse; width: 100%; font-size: 0.9rem; line-height: 1.5; }
+.table-wrap table { min-width: 640px; }
+th, td { text-align: left; vertical-align: top; padding: 11px 16px; border-bottom: 0.5px solid var(--line); }
+tr:last-child td { border-bottom: 0; }
+th { font-size: 0.78rem; color: var(--muted); font-weight: 600; white-space: nowrap; }
+td.name { font-weight: 600; white-space: nowrap; }
+td.n { white-space: nowrap; font-variant-numeric: tabular-nums; }
+td .sub { display: block; color: var(--muted); font-size: 0.82rem; }
+.mono { font-family: var(--font-mono); font-size: 0.82rem; }
+kbd { font-family: var(--font); font-size: 0.8rem; padding: 1px 7px; border-radius: 5px; background: var(--surface); border: 0.5px solid var(--line); box-shadow: 0 1px 0 var(--line); white-space: nowrap; }
+figure { margin: 0; display: grid; gap: 12px; }
+figcaption { font-size: 0.88rem; color: var(--muted); max-width: 66ch; }
+footer { border-top: 0.5px solid var(--line); margin-top: 36px; padding-top: 20px; font-size: 0.85rem; color: var(--muted); }
+
+.fig-wrap { overflow-x: auto; background: var(--surface); border-radius: 12px; padding: 16px 12px; }
+.fig-wrap svg { display: block; width: 100%; height: auto; min-width: 640px; }
+.s-text { fill: var(--ink); font-family: var(--font); font-size: 13px; }
+.s-small { fill: var(--muted); font-family: var(--font); font-size: 12px; }
+.s-title { fill: var(--ink); font-family: var(--font); font-size: 13px; font-weight: 600; }
+.s-box { fill: var(--bg); stroke: var(--line); stroke-width: 1; }
+.s-box-hi { fill: var(--accent-soft); stroke: var(--accent); stroke-width: 1; }
+.s-lane { fill: none; stroke: var(--line); stroke-width: 1; stroke-dasharray: 4 5; }
+.s-arrow { stroke: var(--muted); stroke-width: 1.4; fill: none; }
+.s-head { fill: var(--muted); }
+
+.term { border-bottom: 1.5px dotted var(--accent); cursor: help; position: relative; }
+.term:focus { outline: none; }
+.term::after {
+  content: attr(data-tip); position: absolute; bottom: calc(100% + 8px); left: 50%; transform: translateX(-50%);
+  width: max-content; max-width: min(260px, 80vw); background: var(--ink); color: var(--bg);
+  font-size: 0.8rem; line-height: 1.45; font-weight: 400; padding: 0.45rem 0.65rem; border-radius: 8px;
+  opacity: 0; visibility: hidden; transition: opacity 0.15s; pointer-events: none; z-index: 10;
+}
+.term:hover::after, .term:focus::after { opacity: 1; visibility: visible; }
+@media (prefers-reduced-motion: reduce) { .term::after { transition: none; } }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <span class="eyebrow">Milestone M2 · steps and plan · updated 27 Oct 2026</span>
+  <h1>Telescope daily driver</h1>
+  <p class="lede">The steps of milestone M2. The window from M1 stops searching a million made-up names and searches your real files, keeps up as they change, and gets used every day for a week.</p>
+  <div class="chips">
+    <span class="chip keep">Plan settled 27 Oct 2026</span>
+    <span class="chip open">0 of 6 build steps merged</span>
+    <span class="chip">Swift + Rust</span>
+    <span class="chip">Your real files</span>
+  </div>
+  <nav class="toc" aria-label="Sections">
+    <a href="#steps">Steps</a>
+    <a href="#how">A new file</a>
+    <a href="#fda">Full Disk Access</a>
+    <a href="#targets">M2 targets</a>
+    <a href="#decide">Decisions</a>
+    <a href="#later">Moved to M3</a>
+    <a href="#next">Next steps</a>
+  </nav>
+</header>
+
+<main>
+<section id="steps">
+  <h2>Steps</h2>
+  <p class="prose">M2 is done when every check in <a href="#targets">What M2 must prove</a> passes. Each step lands as its own pull request.</p>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>#</th><th>Step</th><th>What you get</th><th>Status</th></tr></thead>
+      <tbody>
+        <tr><td class="n">0</td><td class="name">The plan</td><td>This page, dated numbers in the research plan, and the README pointing here</td><td class="n"><span class="chip keep">Done</span></td></tr>
+        <tr><td class="n">1</td><td class="name">Real index</td><td>The window searches your home folder instead of made-up names: about 48,000 entries once clutter is skipped. The command-line tool scans them in about 0.15 s; this step measures how long the app takes after launch</td><td class="n"><span class="chip">To do</span></td></tr>
+        <tr><td class="n">2</td><td class="name">Permission notice</td><td>One line in the window when Telescope doesn't have <span class="term" tabindex="0" data-tip="A macOS permission that lets an app read every folder, including the ones macOS guards one by one.">Full Disk Access</span> yet, with a button that opens the right page of System Settings</td><td class="n"><span class="chip">To do</span></td></tr>
+        <tr><td class="n">3</td><td class="name">Live updates</td><td>A file you save, rename or delete shows up in results within 1 s; Telescope uses no CPU while nothing changes</td><td class="n"><span class="chip">To do</span></td></tr>
+        <tr><td class="n">4</td><td class="name">Quick Look</td><td><kbd>⌘</kbd> <kbd>Y</kbd> previews the selected file with <span class="term" tabindex="0" data-tip="The macOS preview you get by pressing Space on a file in Finder.">Quick Look</span>, and the preview follows as you move the selection</td><td class="n"><span class="chip">To do</span></td></tr>
+        <tr><td class="n">5</td><td class="name">Measuring</td><td>A script that turns the app's log into each day's search times, and real numbers in the targets table</td><td class="n"><span class="chip">To do</span></td></tr>
+        <tr><td class="n">6</td><td class="name">v0.2.0 prep</td><td>Version 0.2.0 in the app, and README steps for installing, Full Disk Access and starting at login</td><td class="n"><span class="chip">To do</span></td></tr>
+      </tbody>
+    </table>
+  </div>
+  <h3>By hand, on your Mac</h3>
+  <p class="prose">These need your password, your keychain or a week of your time, so no pull request can do them.</p>
+  <ul class="prose">
+    <li>Grant Full Disk Access to the installed v0.1.0 with the + button in System Settings → Privacy &amp; Security → Full Disk Access.</li>
+    <li>Release v0.2.0: build the .dmg, tag it and publish it on GitHub. Signing happens only on your Mac.</li>
+    <li>The update test (<a href="https://github.com/jovanhartono/telescope/issues/13">#13</a>): download v0.2.0 in a browser, install it over v0.1.0, and check that Full Disk Access is still on. Your Mac holds the signing certificate, so this proves it for your Mac only; a Mac without the certificate stays on the plan's <a href="research.html#unverified">still unverified</a> list until a tester tries it.</li>
+    <li>The 7-day run: add Telescope to System Settings → General → <span class="term" tabindex="0" data-tip="The list of apps macOS starts for you when you log in.">Login Items</span>, use it every day, and read each day's search times.</li>
+    <li>Back up the <span class="term" tabindex="0" data-tip="Telescope's ID card. macOS remembers permissions by it, so losing it means every user has to grant Full Disk Access again.">signing certificate</span> as a <span class="term" tabindex="0" data-tip="A single password-protected file holding the certificate and its secret key, so it can be restored on a new Mac.">.p12 file</span>, kept somewhere other than this Mac.</li>
+  </ul>
+</section>
+
+<section id="how">
+  <h2>How a new file reaches the results</h2>
+  <p class="prose">Without this, Telescope only knows the files that existed when it started. Save a PDF a minute later and searching for it finds nothing, which is the first thing that would make you stop trusting it.</p>
+  <p class="prose">Think of a shop's price list. When a supplier rings the doorbell to say a shelf changed, the front desk checks whether it's a shelf the shop sells from. If it is, someone in the back room writes a fresh copy of the whole list while customers keep reading the old one, then swaps the new copy onto the counter in one move.</p>
+  <ul class="prose">
+    <li><strong>The doorbell.</strong> macOS keeps a running log of which folders changed, called <span class="term" tabindex="0" data-tip="macOS's built-in change log for folders. Apps subscribe to it instead of re-reading the disk over and over.">FSEvents</span>. macOS notices a change within about 10 ms, and Telescope asks it to bundle changes for about 0.2 s so a burst of saves arrives as one note. So the Swift side hears “~/Documents changed” about 0.2 s after you save there.</li>
+    <li><strong>The front desk.</strong> Swift passes the folder to the Rust core through one new call in the <span class="term" tabindex="0" data-tip="A handful of plain functions Swift can call into Rust, written in C style because that's the one format both languages understand.">hatch</span>. A Rust <span class="term" tabindex="0" data-tip="A piece of code with a name, like a JavaScript function. This one only answers yes or no and changes nothing.">function</span> called <span class="mono">in_scope</span> answers one question: is this a folder Telescope lists? It uses the same skip rules as the scan, so a change inside ~/Library/Caches or node_modules is ignored and nothing else happens. If macOS says it dropped some notes, which can happen during a huge npm install, Telescope skips the question and rebuilds anyway.</li>
+    <li><strong>The back room.</strong> If the answer is yes, Rust rebuilds the whole list on a <span class="term" tabindex="0" data-tip="A worker that runs alongside the window's own work, so the window never freezes while it's busy.">background thread</span>: about 0.15 s for about 48,000 entries. Searches keep using the old list meanwhile. Only one rebuild runs at a time, and at most one more waits behind it. While files keep changing, as during a long download, rebuilds start at least 0.5 s apart so Telescope doesn't spend all its time rebuilding; step 3 measures and tunes that gap.</li>
+    <li><strong>The swap.</strong> The new list replaces the old one in a single step, and the old one is freed.</li>
+    <li><strong>The counter.</strong> If the window is open, Swift runs your search again and keeps the same file selected. If it's hidden, Swift notes that the results are old and runs the search the next time you open it.</li>
+  </ul>
+  <figure>
+    <div class="fig-wrap">
+      <svg viewBox="0 0 900 300" role="img" aria-label="A new file: macOS sends an FSEvents note to Swift, Swift hands the folder to Rust, Rust's in_scope check ignores clutter or starts a background rebuild, the new list is swapped in, and Swift re-runs the search">
+        <defs><marker id="h" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="s-head" d="M0,0 L10,5 L0,10 z"/></marker></defs>
+        <text class="s-small" x="20" y="22">Swift window, on the main thread</text>
+        <rect class="s-lane" x="10" y="30" width="880" height="80" rx="10"/>
+        <text class="s-small" x="260" y="182">Rust core, on a background thread</text>
+        <rect class="s-lane" x="10" y="190" width="880" height="80" rx="10"/>
+
+        <rect class="s-box" x="24" y="44" width="200" height="52" rx="9"/>
+        <text class="s-title" x="38" y="66">FSEvents note</text>
+        <text class="s-small" x="38" y="84">“~/Documents changed”</text>
+
+        <rect class="s-box" x="60" y="204" width="190" height="52" rx="9"/>
+        <text class="s-title" x="74" y="226">in_scope?</text>
+        <text class="s-small" x="74" y="244">same skip rules as the scan</text>
+
+        <rect class="s-box-hi" x="310" y="204" width="210" height="52" rx="9"/>
+        <text class="s-title" x="324" y="226">Rebuild the whole list</text>
+        <text class="s-small" x="324" y="244">~48,000 entries, ~0.15 s</text>
+
+        <rect class="s-box" x="580" y="204" width="150" height="52" rx="9"/>
+        <text class="s-title" x="594" y="226">Swap it in</text>
+        <text class="s-small" x="594" y="244">old list freed</text>
+
+        <rect class="s-box" x="680" y="44" width="196" height="52" rx="9"/>
+        <text class="s-title" x="694" y="66">Re-run your search</text>
+        <text class="s-small" x="694" y="84">same file stays selected</text>
+
+        <path class="s-arrow" d="M124 96 L150 202" marker-end="url(#h)"/>
+        <text class="s-small" x="146" y="140">changed folders,</text>
+        <text class="s-small" x="146" y="156">through the hatch</text>
+        <line class="s-arrow" x1="250" y1="230" x2="308" y2="230" marker-end="url(#h)"/>
+        <text class="s-small" x="262" y="222">yes</text>
+        <line class="s-arrow" x1="520" y1="230" x2="578" y2="230" marker-end="url(#h)"/>
+        <path class="s-arrow" d="M655 204 L770 98" marker-end="url(#h)"/>
+        <text class="s-small" x="724" y="160">“new list ready”</text>
+        <text class="s-small" x="74" y="288">no: clutter such as ~/Library/Caches is ignored, no work done</text>
+        <text class="s-small" x="330" y="160">searches keep using the old list</text>
+      </svg>
+    </div>
+    <figcaption>A new file in a folder Telescope lists should be findable in under 1 s: about 0.2 s while macOS bundles the note (a gap Telescope chooses), up to 0.5 s more if a rebuild has just finished, about 0.15 s to rebuild, then one search. These are estimates until step 3 measures them.</figcaption>
+  </figure>
+  <p class="prose">Rebuilding everything sounds wasteful, but 0.15 s of background work after a change is cheap, and it can't drift out of step with the disk. Editing just the changed folders in place comes in M3, together with the saved list.</p>
+</section>
+
+<section id="fda">
+  <h2>Full Disk Access</h2>
+  <p class="prose">macOS guards a few folders one by one: Desktop, Documents, Downloads, iCloud Drive, and cloud drives such as Dropbox. The first time an app reads one, macOS stops it and shows a pop-up asking whether to allow it. A search tool reads them in the background, so those pop-ups would appear at random moments, one per folder.</p>
+  <p class="prose">Think of an office building with locked rooms. You can hand out a key for each room as someone knocks, or give one master key at the front desk. Full Disk Access is the master key, and System Settings is the front desk. The part of macOS that keeps track of who holds which key is called <span class="term" tabindex="0" data-tip="Transparency, Consent and Control: the part of macOS that asks “Allow this app to access…?” and remembers your answers.">TCC</span>.</p>
+  <ul class="prose">
+    <li><strong>Checking for the key.</strong> At launch, Telescope tries to open a file that only the master key unlocks and that never triggers a pop-up: macOS's own list of permissions, opened read-only. If that works, it has Full Disk Access.</li>
+    <li><strong>Without the key.</strong> Telescope skips the guarded folders, so no pop-up ever appears, and the window shows one line: it needs Full Disk Access, with an Open Settings button.</li>
+    <li><strong>Quit &amp; Reopen.</strong> After you switch Full Disk Access on, macOS offers to quit and reopen Telescope. An app only gets the new permission when it starts again, and on that start Telescope scans the folders it skipped.</li>
+    <li><strong>Across updates.</strong> macOS remembers the key by the app's signing certificate, which stays the same in every release. A downloaded update still goes through <span class="term" tabindex="0" data-tip="The macOS check on apps downloaded from the internet. Apps Apple hasn't checked need Open Anyway once.">Gatekeeper</span> once (Open Anyway), and the update test (#13) checks that the key survives it on your Mac.</li>
+  </ul>
+</section>
+
+<section id="targets">
+  <h2>What M2 must prove</h2>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Check</th><th>Target</th><th>Measured on your Mac</th></tr></thead>
+      <tbody>
+        <tr><td class="name">Daily use</td><td>7 days in a row</td><td>Not measured yet</td></tr>
+        <tr><td class="name">Keystroke to results</td><td class="n">under 30 ms, 95% of the time<span class="sub">from the app's own log over the 7 days</span></td><td>Not measured yet</td></tr>
+        <tr><td class="name">New file findable</td><td class="n">under 1 s</td><td>Not measured yet</td></tr>
+        <tr><td class="name">No stale results</td><td>After a git clone and an npm install while Telescope runs, the list matches a fresh scan</td><td>Not measured yet</td></tr>
+        <tr><td class="name">Full Disk Access after an update</td><td>Still on after v0.2.0 is installed from a downloaded .dmg</td><td>Not measured yet</td></tr>
+        <tr><td class="name">Idle memory</td><td class="n">under 60 MB</td><td>Not measured yet</td></tr>
+        <tr><td class="name">CPU while hidden</td><td class="n">0%</td><td>Not measured yet</td></tr>
+        <tr><td class="name">First index</td><td class="n">under 3 s, default folders</td><td>Not measured yet</td></tr>
+        <tr><td class="name">App size</td><td class="n">under 6 MB for both chips</td><td>Not measured yet</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<section id="decide">
+  <h2>Decisions</h2>
+  <p class="prose">Settled on 27 Oct 2026.</p>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>#</th><th>Question</th><th>Decided</th><th>Not chosen</th></tr></thead>
+      <tbody>
+        <tr><td class="n">1</td><td>How the list keeps up</td><td>Rebuild the whole list of default folders in the background and swap it in; one rebuild runs and at most one waits, and while files keep changing they start at least 0.5 s apart. About 48,000 entries take about 0.15 s</td><td>Editing only the changed folders in place: needs surgery on the list, so it comes in M3 with the saved list. The <span class="term" tabindex="0" data-tip="A crate is a Rust package, like an npm package. notify is a popular one for watching files.">notify crate</span>: it can't catch up on changes made while Telescope was closed</td></tr>
+        <tr><td class="n">2</td><td>Who listens for changes</td><td>Swift, with Apple's FSEvents calls: one note per changed folder, bundled for about 0.2 s. It passes the folders to Rust through one new hatch call, and Rust's <span class="mono">in_scope</span> check decides whether a rebuild is needed. When macOS says notes were dropped, Rust rebuilds without asking</td><td>Listening from Rust: comes in M3, together with remembering Telescope's place in the FSEvents log so a restart reads only what changed while it was closed</td></tr>
+        <tr><td class="n">3</td><td>Which folders are watched</td><td>The folders Telescope keeps at the top of your home folder, plus iCloud Drive and other cloud drives, worked out again after each rebuild; and a watch on the home folder's own list of folders, not what's inside them, to notice new top-level folders. Writes deep inside ~/Library/Caches reach none of these watches, so CPU stays at 0% while it churns</td><td>One watch on the whole home folder: it wakes all the time</td></tr>
+        <tr><td class="n">4</td><td>Full Disk Access</td><td>Check quietly by opening macOS's permission list read-only. Without access, skip Desktop, Documents, Downloads, iCloud Drive and cloud drives, and show one line with Open Settings. The relaunch after Quit &amp; Reopen rescans</td><td>Letting macOS show a pop-up for each folder; a welcome window</td></tr>
+        <tr><td class="n">5</td><td>The bigger extras</td><td>An “index everything” switch, external drives, per-folder updates and the saved list move to M3. <span class="mono">tl --all</span>, M0's command-line tool run over the whole home folder, stays for speed tests</td><td>Building them in M2</td></tr>
+        <tr><td class="n">6</td><td>How 30 ms is judged</td><td>From the app's own keystroke-to-results log over the 7 days: default folders, all of your Mac's cores</td><td>A test on <span class="term" tabindex="0" data-tip="Your Mac's 4 power-saving cores, standing in for a cheap PC.">4 slow cores</span>: <a href="https://github.com/jovanhartono/telescope/issues/17">#17</a> keeps that for M3</td></tr>
+        <tr><td class="n">7</td><td>Proving Full Disk Access survives an update (<a href="https://github.com/jovanhartono/telescope/issues/13">#13</a>)</td><td>Grant it to the installed v0.1.0 by hand, then install v0.2.0 from a browser download over it. One release, so surprises turn up before the week starts; v0.2.1 only if the week brings fixes. This covers your Mac, which holds the certificate; another Mac needs a tester</td><td>A throwaway release just for the test</td></tr>
+        <tr><td class="n">8</td><td>Starting at login for the week</td><td>Add Telescope to Login Items by hand; the README says how</td><td>Telescope adding itself through <span class="term" tabindex="0" data-tip="Apple's Swift call that lets an app add itself to Login Items.">SMAppService</span></td></tr>
+        <tr><td class="n">9</td><td>Quick Look key</td><td><kbd>⌘</kbd> <kbd>Y</kbd> only</td><td><kbd>Space</kbd> while the box is empty: an empty box has no results to preview, so it would never fire (noted on <a href="https://github.com/jovanhartono/telescope/issues/14">#14</a>)</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<section id="later">
+  <h2>Moved to M3</h2>
+  <p class="prose">Each of these is useful but not needed to use Telescope every day, and each has its own GitHub issue.</p>
+  <ul class="prose">
+    <li><strong>An “index everything” switch</strong> for the whole home folder, about 2.4 million entries instead of 48,000 (<a href="https://github.com/jovanhartono/telescope/issues/21">#21</a>).</li>
+    <li><strong>External drives</strong>, which come and go while Telescope runs (<a href="https://github.com/jovanhartono/telescope/issues/22">#22</a>).</li>
+    <li><strong>Per-folder updates and a bookmark in the FSEvents log</strong> (<a href="https://github.com/jovanhartono/telescope/issues/23">#23</a>). Telescope saves its list and its place in the FSEvents log, so after a restart it reads only what changed while it was closed and edits just those folders, instead of rebuilding everything.</li>
+  </ul>
+</section>
+
+<section id="next">
+  <h2>Next steps</h2>
+  <ol class="prose">
+    <li>Step 1: the real index in the app.</li>
+    <li>Step 2: the Full Disk Access notice.</li>
+    <li>Step 3: live updates.</li>
+    <li>Step 4: Quick Look on <kbd>⌘</kbd> <kbd>Y</kbd>.</li>
+    <li>Step 5: measuring, which fills in the targets table.</li>
+    <li>Step 6: v0.2.0 prep. Then the release, the update test and the 7-day run on your Mac.</li>
+  </ol>
+</section>
+</main>
+
+<footer>
+  Plan settled on 27 Oct 2026. Final targets and the full plan: <a href="research.html">research.html</a>. The window M2 builds on: <a href="m1-window.html">m1-window.html</a>.
+</footer>
+
+</div>
+</body>
+</html>
