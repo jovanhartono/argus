@@ -268,4 +268,28 @@ mod tests {
         assert_eq!(letters("~(+\t\u{7f}"), 1 << 40);
         assert_eq!(letters("é日本"), 0);
     }
+
+    #[test]
+    fn fingerprint_table_matches_the_rule_for_every_byte() {
+        let rule = |byte: u8| -> u64 {
+            match byte.to_ascii_lowercase() {
+                b @ b'a'..=b'z' => 1 << (b - b'a'),
+                b @ b'0'..=b'9' => 1 << (26 + b - b'0'),
+                b'.' => 1 << 36,
+                b'-' => 1 << 37,
+                b'_' => 1 << 38,
+                b' ' => 1 << 39,
+                128.. => 0,
+                _ => 1 << 40,
+            }
+        };
+        for byte in 0..=u8::MAX {
+            let bits = LETTER_BITS[byte as usize];
+            assert_eq!(bits, rule(byte), "byte {byte:#04x}");
+            assert_eq!(bits >> 41, 0, "byte {byte:#04x}");
+            assert_eq!(bits, LETTER_BITS[byte.to_ascii_uppercase() as usize]);
+        }
+        assert_eq!(LETTER_BITS[0x7F], 1 << 40);
+        assert_eq!(LETTER_BITS[0x80], 0);
+    }
 }

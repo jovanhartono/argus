@@ -2,6 +2,7 @@
 //! folders to bring back.
 
 use crate::Access;
+use crate::store::put;
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io;
@@ -97,10 +98,10 @@ impl Ignore {
         let names = [&self.skip_names, &self.keep_names];
         let paths = [&self.skip_paths, &self.keep_paths];
         for list in names {
-            put(out, list.iter().map(OsString::as_os_str));
+            put_list(out, list.iter().map(OsString::as_os_str));
         }
         for list in paths {
-            put(out, list.iter().map(|path| path.as_os_str()));
+            put_list(out, list.iter().map(|path| path.as_os_str()));
         }
     }
 
@@ -155,12 +156,10 @@ fn is_linked(home: &Path) -> bool {
     })
 }
 
-fn put<'a>(out: &mut Vec<u8>, list: impl ExactSizeIterator<Item = &'a OsStr>) {
+fn put_list<'a>(out: &mut Vec<u8>, list: impl ExactSizeIterator<Item = &'a OsStr>) {
     out.extend_from_slice(&(list.len() as u64).to_le_bytes());
     for item in list {
-        let bytes = item.as_encoded_bytes();
-        out.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
-        out.extend_from_slice(bytes);
+        put(out, item.as_encoded_bytes());
     }
 }
 

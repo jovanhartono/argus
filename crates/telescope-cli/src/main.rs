@@ -3,7 +3,7 @@ use std::io::BufRead;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Instant;
-use telescope_core::{Access, Clutter, Ignore, Index, Opened, Scan, Searcher, Settings};
+use telescope_core::{Access, Clutter, Ignore, Index, Opened, Searcher, Settings};
 
 const USAGE: &str = "usage:
   tl index <folder>                       scan and report the index size
@@ -13,7 +13,8 @@ const USAGE: &str = "usage:
 add --all to include hidden folders, ~/Library, the insides of packages like Photos Library,
 and tool downloads and caches like node_modules
 add --load <file> to open a saved index instead of scanning (it scans when the file is missing,
-damaged or built with other settings), and --save <file> to save the index afterwards
+damaged or built with other settings, and does not catch up on changes made since it was saved),
+and --save <file> to save the index afterwards
 
 your own ignore list, ~/.config/telescope/ignore, takes one folder per line
 (--all leaves it out too):
@@ -81,12 +82,13 @@ fn take(args: &mut Vec<OsString>, flag: &str) -> Option<Option<PathBuf>> {
     let Some(at) = args.iter().position(|arg| arg == flag) else {
         return Some(None);
     };
-    if at + 1 == args.len() {
+    let file = args.get(at + 1)?;
+    if file.as_encoded_bytes().starts_with(b"--") {
         return None;
     }
-    let file = args.remove(at + 1);
-    args.remove(at);
-    Some(Some(file.into()))
+    let file = PathBuf::from(file);
+    args.drain(at..=at + 1);
+    Some(Some(file))
 }
 
 fn usage() -> ExitCode {
@@ -110,44 +112,37 @@ fn load(folder: &Path, options: &Options) -> Option<Index> {
         Clutter::Skip => ignore_list(&home),
         Clutter::Keep => Ignore::default(),
     };
-    let mut opened = false;
+    let settings = Settings::new(folder, &home, clutter, ignore, Access::Full);
+    // The command line has no FSEvents of its own, so it keeps the event an opened index had.
+    let mut opened_at = None;
     let scan = match &options.load {
-        None => telescope_core::scan(folder, &home, clutter, &ignore, Access::Full),
-        Some(file) => {
-            telescope_core::open_or_scan(file, folder, &home, clutter, &ignore, Access::Full).map(
-                |found| match found {
-                    Opened::Saved(saved) => {
-                        opened = true;
-                        Scan {
-                            index: saved.index,
-                            unreadable_folders: 0,
-                        }
-                    }
-                    Opened::Scanned { scan, why } => {
-                        eprintln!("tl: cannot open {}: {why}; scanned instead", file.display());
-                        scan
-                    }
-                },
-            )
-        }
+        None => settings.scan(),
+        Some(file) => telescope_core::open_or_scan(file, &settings).map(|found| match found {
+            Opened::Saved(saved) => {
+                opened_at = Some(saved.event_id);
+                saved.scan
+            }
+            Opened::Scanned { scan, why } => {
+                eprintln!("tl: cannot open {}: {why}; scanned instead", file.display());
+                scan
+            }
+        }),
     };
     let took = ms(started);
-    let Scan {
-        index,
-        unreadable_folders,
-    } = match scan {
+    let scan = match scan {
         Ok(scan) => scan,
         Err(error) => {
             eprintln!("tl: cannot scan {}: {error}", folder.display());
             return None;
         }
     };
-    if opened {
+    if opened_at.is_some() {
         println!("open time: {took:.1} ms");
     } else {
         println!("scan time: {:.2} s", took / 1000.0);
     }
 
+    let index = &scan.index;
     println!(
         "{} entries ({} folders), {} distinct names",
         index.len(),
@@ -158,26 +153,30 @@ fn load(folder: &Path, options: &Options) -> Option<Index> {
         "index memory: {:.1} MB",
         index.heap_bytes() as f64 / 1_048_576.0
     );
-    if unreadable_folders > 0 {
-        println!("folders not fully read: {unreadable_folders}");
+    if scan.unreadable_folders > 0 {
+        println!("folders not fully read: {}", scan.unreadable_folders);
     }
-    if let Some(file) = &options.save {
-        let started = Instant::now();
-        let settings = Settings::new(folder, &home, clutter, &ignore, Access::Full);
-        // The command line has no FSEvents bookmark; the app saves its own.
-        match telescope_core::save_index(file, &index, &settings, 0) {
-            Ok(()) => {
-                let size = std::fs::metadata(file).map_or(0, |file| file.len());
-                println!(
-                    "saved {:.1} MB in {:.1} ms",
-                    size as f64 / 1_048_576.0,
-                    ms(started)
-                );
-            }
-            Err(error) => eprintln!("tl: cannot save {}: {error}", file.display()),
+    match &options.save {
+        Some(file) if opened_at.is_some() && options.load.as_ref() == Some(file) => {
+            println!("opened unchanged from {}, not saved again", file.display());
         }
+        Some(file) => {
+            let started = Instant::now();
+            match telescope_core::save_index(file, &scan, &settings, opened_at.unwrap_or(0)) {
+                Ok(()) => {
+                    let size = std::fs::metadata(file).map_or(0, |file| file.len());
+                    println!(
+                        "saved {:.1} MB in {:.1} ms",
+                        size as f64 / 1_048_576.0,
+                        ms(started)
+                    );
+                }
+                Err(error) => eprintln!("tl: cannot save {}: {error}", file.display()),
+            }
+        }
+        None => {}
     }
-    Some(index)
+    Some(scan.index)
 }
 
 fn search(folder: &Path, options: &Options) -> ExitCode {
@@ -349,4 +348,40 @@ fn keystrokes(query: &str) -> Vec<&str> {
 
 fn ms(since: Instant) -> f64 {
     since.elapsed().as_secs_f64() * 1000.0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(line: &str) -> Vec<OsString> {
+        line.split_whitespace().map(OsString::from).collect()
+    }
+
+    #[test]
+    fn takes_a_flag_and_the_file_after_it() {
+        let mut line = args("index ~ --load a.idx --save b.idx");
+        assert_eq!(take(&mut line, "--load"), Some(Some("a.idx".into())));
+        assert_eq!(line, args("index ~ --save b.idx"));
+        assert_eq!(take(&mut line, "--save"), Some(Some("b.idx".into())));
+        assert_eq!(line, args("index ~"));
+        assert_eq!(take(&mut line, "--save"), Some(None));
+        assert_eq!(line, args("index ~"));
+    }
+
+    #[test]
+    fn refuses_a_flag_with_no_file() {
+        let mut line = args("index ~ --load");
+        assert_eq!(take(&mut line, "--load"), None);
+        let mut line = args("index ~ --load --save out.idx");
+        assert_eq!(take(&mut line, "--load"), None);
+        assert_eq!(line, args("index ~ --load --save out.idx"));
+    }
+
+    #[test]
+    fn leaves_a_second_copy_of_the_flag_for_usage_to_refuse() {
+        let mut line = args("index ~ --load a --load b");
+        assert_eq!(take(&mut line, "--load"), Some(Some("a".into())));
+        assert_eq!(line, args("index ~ --load b"));
+    }
 }
