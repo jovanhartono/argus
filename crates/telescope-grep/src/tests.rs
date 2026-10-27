@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::mpsc;
 use std::time::Duration;
-use telescope_core::{Clutter, Ignore};
+use telescope_core::{Access, Clutter, Ignore};
 
 struct Folder {
     _dir: tempfile::TempDir,
@@ -23,7 +23,8 @@ fn folder(files: &[(&str, &[u8])]) -> Folder {
 }
 
 fn index(folder: &Folder) -> Index {
-    telescope_core::scan(&folder.root, Clutter::Skip, &Ignore::default())
+    let root = &folder.root;
+    telescope_core::scan(root, root, Clutter::Skip, &Ignore::default(), Access::Full)
         .unwrap()
         .index
 }
