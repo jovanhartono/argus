@@ -20,7 +20,18 @@ Needs Xcode 16 or later (Swift 6).
 ./scripts/build-mac.sh                       # builds build/Telescope.app
 open build/Telescope.app                     # then press ⌘⇧Space
 swift test --package-path apps/macos
+rustup target add x86_64-apple-darwin        # once, before the first .dmg
+./scripts/make-dmg.sh                        # builds build/Telescope.dmg for Apple and Intel chips
 ```
+
+## Install from the .dmg
+
+Telescope isn't notarized by Apple, so macOS asks you once before it opens:
+
+1. Open `Telescope.dmg` and drag Telescope to Applications.
+2. Open Telescope. macOS says it can't check it for malware; click Done.
+3. Open System Settings → Privacy & Security, scroll down and click Open Anyway.
+4. Click Open Anyway again and enter your Mac password.
 
 ## Licence
 
