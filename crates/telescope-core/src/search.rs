@@ -69,6 +69,24 @@ struct Scratch {
     possible: Vec<AtomicU64>,
     /// One bit per folder already climbed while marking `possible`.
     walked: Vec<AtomicU64>,
+    /// Tests turn the short-word shortcuts off to check they never change what a search finds.
+    #[cfg(test)]
+    no_shortcuts: bool,
+    #[cfg(test)]
+    early_stops: usize,
+}
+
+impl Scratch {
+    #[cfg(test)]
+    fn shortcuts(&self) -> bool {
+        !self.no_shortcuts
+    }
+
+    #[cfg(not(test))]
+    #[expect(clippy::unused_self, reason = "tests can turn the shortcuts off")]
+    fn shortcuts(&self) -> bool {
+        true
+    }
 }
 
 impl Default for Searcher {
@@ -164,7 +182,7 @@ fn run(
     // "38" fits a third of all names, mostly hashes that only scatter its letters. Names where
     // it starts the name or a word go first, and the rest only when those cannot fill the list.
     let ceiling = match words.as_slice() {
-        [word] => plain_ceiling(word, &matcher_config().scoring),
+        [word] if scratch.shortcuts() => plain_ceiling(word, &matcher_config().scoring),
         _ => None,
     };
     let (mut matched, held) = match_names(
@@ -202,29 +220,39 @@ fn run(
     }
     // A word found in a folder above counts as a clean match of that word, so "synergy readme"
     // ranks synergy-core/README.md above a long name that scatters the letters of both words.
-    let letter = u32::from(Config::default().scoring.match_score);
+    let match_score = u32::from(Config::default().scoring.match_score);
     let mut folder_bonus = [0u32; 1 << MAX_WORDS];
     for (mask, bonus) in folder_bonus.iter_mut().enumerate() {
         for (w, word) in words.iter().enumerate() {
             if mask >> w & 1 == 1 {
-                *bonus += letter * word.needle.chars().count() as u32;
+                *bonus += match_score * word.needle.chars().count() as u32;
             }
         }
     }
     if let Some(ceiling) = ceiling {
-        let hits = best(
-            index,
-            scratch,
-            wanted,
-            unwanted,
-            &folder_bonus,
-            limit,
-            stale,
-        )?;
-        // Every entry sits at least one folder deep, which costs a plain name a little more.
-        let plain_best = u32::from(ceiling).saturating_sub(DEPTH_PENALTY);
-        if hits.len() == limit && hits[limit - 1].score > plain_best {
-            return Some(hits);
+        // Most files sit several folders down. With fewer than `limit` names that would beat
+        // every plain name five folders deep, "l59" would read every entry twice, so skip ahead.
+        let deep = u32::from(ceiling) + 4 * DEPTH_PENALTY;
+        let mut winners = scratch.name_score.iter().filter(|&&s| u32::from(s) > deep);
+        if winners.nth(limit - 1).is_some() {
+            let hits = best(
+                index,
+                scratch,
+                wanted,
+                unwanted,
+                &folder_bonus,
+                limit,
+                stale,
+            )?;
+            // Every entry sits at least one folder deep, which costs a plain name a little more.
+            let plain_best = u32::from(ceiling).saturating_sub(DEPTH_PENALTY);
+            if hits.len() == limit && hits[limit - 1].score > plain_best {
+                #[cfg(test)]
+                {
+                    scratch.early_stops += 1;
+                }
+                return Some(hits);
+            }
         }
         matched |= match_names(index, &words, wanted, wanted, Pass::Rest, scratch, stale)?.0;
     }
@@ -362,11 +390,13 @@ fn match_names(
     };
     let typos = |w: usize| u16::from(typo_words >> w & 1);
     let needed: Vec<u64> = words.iter().map(|word| letters(&word.needle)).collect();
+    let shortcuts = scratch.shortcuts();
     let floors: Vec<u16> = (0..words.len())
         .map(|w| held_floor(&words[w], typos(w), &config.scoring))
+        .map(|floor| if shortcuts { floor } else { 0 })
         .collect();
     let one_letters: Vec<Option<OneLetter>> = (0..words.len())
-        .map(|w| OneLetter::new(&words[w], typos(w)))
+        .map(|w| OneLetter::new(&words[w], typos(w)).filter(|_| shortcuts))
         .collect();
     let Scratch {
         name_words,
@@ -428,14 +458,14 @@ fn match_names(
                         if skip {
                             continue;
                         }
-                        if let Some(letter) = one_letters[w]
+                        if let Some(one) = one_letters[w]
                             && have != u64::MAX
                         {
                             bits[n - first] |= 1 << w;
                             matched |= 1 << w;
                             if wanted >> w & 1 == 1 {
                                 let text = || index.name_text(n as NameId);
-                                let score = letter.score(starts(), text, &config.scoring);
+                                let score = one.score(starts(), text, &config.scoring);
                                 scores[n - first] = scores[n - first].saturating_add(score);
                             }
                             continue;
@@ -453,7 +483,6 @@ fn match_names(
                         matched |= 1 << w;
                         if wanted >> w & 1 == 1 {
                             let mut score = found.score;
-                            // Most names matching "38" are hashes that scatter the letters.
                             let how = if score < floors[w] {
                                 Held::No
                             } else {
@@ -560,7 +589,9 @@ impl OneLetter {
     }
 
     /// The score of a name that holds the letter. Only a letter that starts the name or a word
-    /// needs the name read; starting the name earns the most.
+    /// needs the name read; starting the name earns the most. A capital after a lower-case
+    /// letter earns `capitalization_bonus`, which is as much as `delimiter_bonus`, so the name
+    /// is read no further than its first letter.
     fn score<'a>(self, starts: u64, name: impl FnOnce() -> &'a str, scoring: &Scoring) -> u16 {
         if starts & self.bit == 0 {
             return scoring.match_score;
@@ -811,6 +842,13 @@ mod tests {
                 .map(|_| alphabet[self.below(alphabet.len())])
                 .collect()
         }
+
+        /// Mostly short names, with one in eight long enough to cross frizbee's 16, 32 and
+        /// 64-byte blocks the way hashes and long file names do.
+        fn name(&mut self, alphabet: &[&str], short: usize) -> String {
+            let max = if self.below(8) == 0 { 250 } else { short };
+            self.text(alphabet, max)
+        }
     }
 
     #[test]
@@ -820,21 +858,26 @@ mod tests {
             "a", "b", "3", "8", "A", "B", ".", "-", "_", " ", "/", "(", "é", "a", "3",
         ];
         let lower = ["a", "b", "3", "8", ".", "_"];
-        let mut config = Config::default().sort(SortStrategy::IndexAsc);
-        config.scoring.matching_case_bonus = 0;
+        let config = matcher_config();
         let mut checked = 0;
         for _ in 0..3_000 {
-            let typed = match rng.below(4) {
+            let needle = match rng.below(4) {
                 0 => rng.text(&lower, 1).to_uppercase() + &rng.text(&lower, 3),
                 _ => rng.text(&lower, 4),
             };
+            let typed = match rng.below(4) {
+                0 => format!("^{needle}"),
+                1 => format!("{needle}$"),
+                2 => format!("'{needle}"),
+                _ => needle.clone(),
+            };
             let word = Pattern::parse_query(&typed).remove(0).max_typos(Some(0));
-            assert_eq!(word.needle, typed);
+            assert_eq!(word.needle, needle);
             let floor = held_floor(&word, 0, &config.scoring);
-            let haystacks: Vec<String> = (0..40).map(|_| rng.text(&names, 30)).collect();
+            let haystacks: Vec<String> = (0..40).map(|_| rng.name(&names, 30)).collect();
             for found in Matcher::new(word.clone(), &config).match_list(&haystacks) {
                 let name = &haystacks[found.index as usize];
-                if !matches!(held_in(name, &word.needle), Held::No) {
+                if floor > 0 && !matches!(held_in(name, &needle), Held::No) {
                     checked += 1;
                     assert!(found.score >= floor, "{typed:?} in {name:?}");
                 }
@@ -849,13 +892,12 @@ mod tests {
         let names = [
             "a", "b", "c", "3", "A", "B", "C", ".", "-", "_", " ", "(", "~", "a", "c",
         ];
-        let mut config = Config::default().sort(SortStrategy::IndexAsc);
-        config.scoring.matching_case_bonus = 0;
+        let config = matcher_config();
         let mut checked = 0;
         for typed in ["a", "b", "c", "3", "z"] {
             let word = positive(Pattern::parse_query(typed).remove(0)).max_typos(Some(0));
-            let letter = OneLetter::new(&word, 0).unwrap();
-            let haystacks: Vec<String> = (0..20_000).map(|_| rng.text(&names, 12)).collect();
+            let one = OneLetter::new(&word, 0).unwrap();
+            let haystacks: Vec<String> = (0..20_000).map(|_| rng.name(&names, 12)).collect();
             let stripped: Vec<&str> = haystacks
                 .iter()
                 .map(|name| name.strip_prefix('.').unwrap_or(name))
@@ -865,13 +907,51 @@ mod tests {
                 frizbee[found.index as usize] = Some(found.score);
             }
             for (name, expected) in haystacks.iter().zip(frizbee) {
-                let ours = (letters(name) & letter.bit != 0)
-                    .then(|| letter.score(word_starts(name), || name, &config.scoring));
+                let ours = (letters(name) & one.bit != 0)
+                    .then(|| one.score(word_starts(name), || name, &config.scoring));
                 assert_eq!(ours, expected, "{typed:?} in {name:?}");
                 checked += usize::from(ours.is_some());
             }
         }
         assert!(checked > 20_000);
+    }
+
+    /// Frizbee's bonuses depend only on the byte before, so every pair of bytes, at the start,
+    /// after a dot and inside a name, covers every case.
+    #[test]
+    fn one_letter_scores_and_word_starts_match_frizbee_for_every_pair() {
+        let config = matcher_config();
+        let chars: Vec<char> = (' '..='~').chain(['é', '日']).collect();
+        let mut haystacks = Vec::new();
+        for &a in &chars {
+            for &b in &chars {
+                haystacks.extend([format!("{a}{b}"), format!(".{a}{b}"), format!("q{a}{b}")]);
+            }
+        }
+        let stripped: Vec<&str> = haystacks
+            .iter()
+            .map(|name| name.strip_prefix('.').unwrap_or(name))
+            .collect();
+        for typed in ('a'..='z').chain('0'..='9') {
+            let word = positive(Pattern::parse_query(&typed.to_string()).remove(0));
+            let one = OneLetter::new(&word, 0).unwrap();
+            let ceiling = plain_ceiling(&word, &config.scoring).unwrap();
+            let mut frizbee = vec![None; haystacks.len()];
+            for found in Matcher::new(word.clone(), &config).match_list(&stripped) {
+                frizbee[found.index as usize] = Some(found.score);
+            }
+            for (name, expected) in haystacks.iter().zip(frizbee) {
+                let starts = word_starts(name);
+                if starts & one.bit == 0 {
+                    assert!(expected <= Some(ceiling), "{typed:?} in {name:?}");
+                }
+                if name.is_ascii() {
+                    let ours = (letters(name) & one.bit != 0)
+                        .then(|| one.score(starts, || name, &config.scoring));
+                    assert_eq!(ours, expected, "{typed:?} in {name:?}");
+                }
+            }
+        }
     }
 
     #[test]
@@ -881,15 +961,20 @@ mod tests {
             "a", "b", "3", "8", "A", "B", ".", "-", "_", " ", "(", "é", "a", "3", "8",
         ];
         let lower = ["a", "b", "3", "8"];
-        let mut config = Config::default().sort(SortStrategy::IndexAsc);
-        config.scoring.matching_case_bonus = 0;
+        let config = matcher_config();
         let mut checked = 0;
         for _ in 0..2_000 {
             let typed = rng.text(&lower, 3);
-            let word = positive(Pattern::parse_query(&typed).remove(0)).max_typos(Some(0));
+            // A quoted word goes through frizbee's literal scorer instead.
+            let query = if rng.below(2) == 0 {
+                format!("'{typed}")
+            } else {
+                typed.clone()
+            };
+            let word = positive(Pattern::parse_query(&query).remove(0)).max_typos(Some(0));
             let ceiling = plain_ceiling(&word, &config.scoring).unwrap();
             let needed = letters(&typed);
-            let haystacks: Vec<String> = (0..40).map(|_| rng.text(&names, 16)).collect();
+            let haystacks: Vec<String> = (0..40).map(|_| rng.name(&names, 16)).collect();
             let stripped: Vec<&str> = haystacks
                 .iter()
                 .map(|name| name.strip_prefix('.').unwrap_or(name))
@@ -912,14 +997,17 @@ mod tests {
 
     #[test]
     fn plain_ceiling_is_only_for_short_simple_words() {
-        let scoring = Config::default().scoring;
+        let scoring = matcher_config().scoring;
         let word = |text: &str| positive(Pattern::parse_query(text).remove(0));
         assert_eq!(plain_ceiling(&word("c"), &scoring), Some(12));
+        assert_eq!(plain_ceiling(&word("7"), &scoring), Some(12));
         assert_eq!(plain_ceiling(&word("385"), &scoring), Some(36));
+        assert_eq!(plain_ceiling(&word("'cv"), &scoring), Some(24));
         assert_eq!(plain_ceiling(&word("3857"), &scoring), None);
         assert_eq!(plain_ceiling(&word("Cv"), &scoring), None);
         assert_eq!(plain_ceiling(&word("a.b"), &scoring), None);
         assert_eq!(plain_ceiling(&word("^cv"), &scoring), None);
+        assert_eq!(plain_ceiling(&word("cv$"), &scoring), None);
     }
 
     #[test]
@@ -953,6 +1041,113 @@ mod tests {
         }
     }
 
+    /// The search with and without the short-word shortcuts, which must agree.
+    fn with_and_without_shortcuts(index: &Index, query: &str, limit: usize) -> (Vec<Hit>, usize) {
+        let mut fast = Scratch::default();
+        let mut slow = Scratch {
+            no_shortcuts: true,
+            ..Scratch::default()
+        };
+        let hits = run(index, query, limit, &mut fast, &|| false).unwrap();
+        let expected = run(index, query, limit, &mut slow, &|| false).unwrap();
+        assert_eq!(hits, expected, "{query:?} limit {limit}");
+        (hits, fast.early_stops)
+    }
+
+    #[test]
+    fn the_shortcuts_never_change_what_a_search_finds() {
+        let mut rng = Rng(0x5107);
+        let rich = [
+            "3", "8", "c", "a", "b", "x", "C", "A", "-", ".", " ", "é", "_", "3", "c",
+        ];
+        // Only lower case and digits, so a word mostly sits inside a name, not at a word start.
+        let flat = ["3", "8", "c", "a", "b", "x", "q"];
+        let mut early_stops = 0;
+        for round in 0..24 {
+            let parts: &[&str] = if round % 2 == 0 { &rich } else { &flat };
+            let mut builder = IndexBuilder::new();
+            let root = builder.push("/home", NO_PARENT, true);
+            let mut folders = vec![root];
+            for i in 0..300 {
+                let parent = folders[rng.below(folders.len())];
+                let mut name = rng.name(parts, 10);
+                if rng.below(10) == 0 {
+                    name.insert(0, '.');
+                }
+                let entry = builder.push(&name, parent, i % 6 == 0);
+                if i % 6 == 0 {
+                    folders.push(entry);
+                }
+            }
+            let index = builder.finish();
+            for query in [
+                "c", "3", "38", "x8", "38x", "'c", "'38", "^c", "c$", "C", ".c", "c a", "38 c",
+                "a !b", "cab",
+            ] {
+                for limit in [1, 3, 10, 40, 1_000] {
+                    early_stops += with_and_without_shortcuts(&index, query, limit).1;
+                }
+            }
+        }
+        assert!(early_stops > 100, "{early_stops}");
+    }
+
+    #[test]
+    fn a_short_word_inside_names_is_still_found() {
+        let mut builder = IndexBuilder::new();
+        let root = builder.push("/home", NO_PARENT, true);
+        builder.push("a38b.txt", root, false);
+        builder.push("x3y8", root, false);
+        builder.push("bcb", root, false);
+        let index = builder.finish();
+        assert_eq!(paths(&index, "38"), ["/home/a38b.txt", "/home/x3y8"]);
+        assert_eq!(paths(&index, "c"), ["/home/bcb"]);
+    }
+
+    #[test]
+    fn one_letter_never_matches_a_name_with_accents_that_lacks_it() {
+        let mut builder = IndexBuilder::new();
+        let root = builder.push("/home", NO_PARENT, true);
+        builder.push("café.txt", root, false);
+        builder.push("notes.md", root, false);
+        let index = builder.finish();
+        assert!(paths(&index, "z").is_empty());
+        assert_eq!(paths(&index, "c"), ["/home/café.txt"]);
+        let (hits, _) = with_and_without_shortcuts(&index, "c", 10);
+        assert_eq!(hits.len(), 1);
+    }
+
+    #[test]
+    fn a_word_scoring_exactly_the_floor_still_counts_as_held() {
+        let mut builder = IndexBuilder::new();
+        let root = builder.push("/home", NO_PARENT, true);
+        builder.push("é38.pdf", root, false);
+        builder.push("x38.pdf", root, false);
+        builder.push("xdesingx.txt", root, false);
+        builder.push("design.pdf", root, false);
+        let index = builder.finish();
+        // Frizbee gives "38" no bonus after "é", yet it stands alone there.
+        assert_eq!(first(&index, "38"), "/home/é38.pdf");
+        // "desing" held letter for letter blocks the typo that would find design.pdf.
+        assert_eq!(paths(&index, "desing"), ["/home/xdesingx.txt"]);
+    }
+
+    #[test]
+    fn a_short_search_gives_up_partway_when_replaced() {
+        let index = sample();
+        let checks = AtomicU64::new(0);
+        let stale = || checks.fetch_add(1, Ordering::Relaxed) > 0;
+        assert_eq!(run(&index, "re", 10, &mut Scratch::default(), &stale), None);
+        assert_eq!(checks.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn one_letter_relies_on_equal_word_start_bonuses() {
+        let scoring = matcher_config().scoring;
+        assert_eq!(scoring.capitalization_bonus, scoring.delimiter_bonus);
+        assert!(scoring.prefix_bonus >= scoring.delimiter_bonus);
+    }
+
     #[test]
     fn only_plain_lower_case_letters_skip_the_matcher() {
         let word = |text: &str| positive(Pattern::parse_query(text).remove(0));
@@ -967,9 +1162,10 @@ mod tests {
 
     #[test]
     fn held_floor_is_off_for_typos_and_upper_case() {
-        let scoring = Config::default().scoring;
+        let scoring = matcher_config().scoring;
         let word = |text: &str| Pattern::parse_query(text).remove(0);
         assert_eq!(held_floor(&word("38"), 0, &scoring), 24);
+        assert_eq!(held_floor(&word("a.b"), 0, &scoring), 36);
         assert_eq!(held_floor(&word("38"), 1, &scoring), 0);
         assert_eq!(held_floor(&word("Nib"), 0, &scoring), 0);
         assert_eq!(held_floor(&word("café"), 0, &scoring), 0);

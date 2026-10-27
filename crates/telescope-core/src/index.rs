@@ -174,7 +174,8 @@ pub(crate) fn letters(text: &str) -> u64 {
 }
 
 /// The letter fingerprint, and the letters that start the name or a word in it, like the
-/// m, r, f and B in "my-report fooBar.md": the places the fuzzy matcher gives a bonus.
+/// m, r, f and B in "my-report fooBar.md": every place the fuzzy matcher gives a bonus, and
+/// every place a whole word can begin, which is also after a byte like "é" that earns none.
 pub(crate) fn fingerprints(text: &str) -> (u64, u64) {
     let (mut letters, mut starts, mut before) = (0, 0, 0);
     for &byte in text.as_bytes() {
