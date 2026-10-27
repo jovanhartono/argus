@@ -1,4 +1,5 @@
 import AppKit
+import QuickLookUI
 import XCTest
 
 @testable import Telescope
@@ -17,6 +18,16 @@ final class SearchPanelTests: XCTestCase {
 
     override func tearDown() async throws {
         try? FileManager.default.removeItem(at: root)
+        // Every test shares the one preview; a failed test mustn't leave it up for the next.
+        // A close already under way takes about 0.2 s, and a second one would cancel it.
+        if QLPreviewPanel.sharedPreviewPanelExists(), let preview = QLPreviewPanel.shared() {
+            if await !soon({ !preview.isVisible }) {
+                preview.orderOut(nil)
+                _ = await soon { !preview.isVisible }
+            }
+            preview.dataSource = nil
+            preview.delegate = nil
+        }
     }
 
     func testWithoutAccessTheLineAndButtonShowUnderTheBox() async throws {
@@ -170,6 +181,550 @@ final class SearchPanelTests: XCTestCase {
 
         let full = try await opened(access: true)
         XCTAssertFalse(full.control(NSTextField(), textView: NSTextView(), doCommandBy: #selector(NSResponder.insertTab(_:))))
+    }
+
+    func testARowsURLIsItsPathAndKnowsAFolder() {
+        let file = Row(name: "budget.txt", folder: "/Users/me/notes", isFolder: false)
+        XCTAssertEqual(file.url, URL(fileURLWithPath: "/Users/me/notes/budget.txt"))
+        XCTAssertTrue(file.url.isFileURL)
+        XCTAssertFalse(file.url.hasDirectoryPath)
+
+        let folder = Row(name: "notes", folder: "/Users/me", isFolder: true)
+        XCTAssertEqual(folder.url.path, "/Users/me/notes")
+        XCTAssertTrue(folder.url.hasDirectoryPath)
+
+        // The searched folder is listed under its full path.
+        let top = Row(name: "/Users/me", folder: "", isFolder: true)
+        XCTAssertEqual(top.url.path, "/Users/me")
+        XCTAssertTrue(top.url.hasDirectoryPath)
+
+        let disk = Row(name: "/", folder: "", isFolder: true)
+        XCTAssertEqual(disk.url.path, "/")
+    }
+
+    func testNamesURLsTreatAsSpecialKeepTheirPath() {
+        for name in ["100% budget #2?.txt", "budget%20plain.txt", "café 会議.md", "a;b=c&d.txt", ".hidden", "~tilde"] {
+            let row = Row(name: name, folder: "/Users/me/odd folder", isFolder: false)
+            XCTAssertEqual(row.url.path, row.path, name)
+            XCTAssertEqual(row.url.lastPathComponent, name)
+        }
+    }
+
+    func testFilesOnDiskComeBackFromTheirURL() async throws {
+        let names = ["100% budget #2?.txt", "budget café 会議.md", "budget%20plain.txt"]
+        for name in names {
+            try Data().write(to: root.appendingPathComponent(name))
+        }
+        try FileManager.default.createDirectory(
+            at: root.appendingPathComponent("budget folder"), withIntermediateDirectories: false)
+        let window = try await opened(access: true)
+        try await type("budget", in: window)
+        try await until { window.rows.count == names.count + 1 }
+        for row in window.rows {
+            var folder: ObjCBool = false
+            XCTAssertTrue(FileManager.default.fileExists(atPath: row.url.path, isDirectory: &folder), row.name)
+            XCTAssertEqual(folder.boolValue, row.url.hasDirectoryPath, row.name)
+        }
+    }
+
+    func testNothingSelectedHasNothingToPreview() async throws {
+        try Data("budget\n".utf8).write(to: root.appendingPathComponent("budget.txt"))
+        let window = try await opened(access: true)
+        window.show()
+        defer { window.hide() }
+        let preview = QLPreviewPanel.shared()!
+        XCTAssertEqual(window.numberOfPreviewItems(in: preview), 0)
+        XCTAssertNil(window.previewPanel(preview, previewItemAt: 0))
+        window.quickLook(nil)
+        XCTAssertFalse(window.previewing)
+        XCTAssertNil(window.missing)
+
+        // The same window previews once something is picked.
+        try await type("budget", in: window)
+        try await until { window.rows.count == 1 }
+        window.quickLook(nil)
+        try await until { window.previewing }
+    }
+
+    func testThePreviewIsTheSelectedRowAndFollowsTheArrows() async throws {
+        let notes = root.appendingPathComponent("notes")
+        try FileManager.default.createDirectory(at: notes, withIntermediateDirectories: false)
+        for name in ["budget a.txt", "budget b.txt"] {
+            try Data().write(to: notes.appendingPathComponent(name))
+        }
+        let window = try await opened(access: true)
+        try await type("budget", in: window)
+        try await until { window.rows.count == 2 }
+        let preview = QLPreviewPanel.shared()!
+        window.panel.beginPreviewPanelControl(preview)
+        defer { window.panel.endPreviewPanelControl(preview) }
+        XCTAssertTrue(window.panel.acceptsPreviewPanelControl(preview))
+        XCTAssertTrue(preview.dataSource === window)
+        XCTAssertTrue(preview.delegate as AnyObject === window)
+        XCTAssertEqual(preview.level, window.panel.level, "in front of the window, not under it")
+        XCTAssertEqual(preview.collectionBehavior, window.panel.collectionBehavior, "over full-screen apps too")
+
+        XCTAssertEqual(window.numberOfPreviewItems(in: preview), 1)
+        XCTAssertEqual(item(window), window.rows[0].url)
+        down(window)
+        XCTAssertEqual(item(window), window.rows[1].url)
+        down(window)
+        XCTAssertEqual(item(window), window.rows[1].url, "the last row stays picked")
+
+        // The arrows keep working while the preview has the keys; other keys are its own.
+        XCTAssertTrue(window.previewPanel(preview, handle: key("\u{F700}")))
+        XCTAssertEqual(item(window), window.rows[0].url)
+        XCTAssertTrue(window.previewPanel(preview, handle: key("\u{F701}")))
+        XCTAssertEqual(item(window), window.rows[1].url)
+        XCTAssertFalse(window.previewPanel(preview, handle: key(" ")))
+        XCTAssertFalse(window.previewPanel(preview, handle: key("\u{1B}")))
+        XCTAssertEqual(item(window), window.rows[1].url)
+
+        // A key-up would move the row twice; ⌘, ⌥ and ⌃ arrows scroll the preview itself.
+        XCTAssertFalse(window.previewPanel(preview, handle: key("\u{F700}", type: .keyUp)))
+        for flag in [NSEvent.ModifierFlags.command, .option, .control] {
+            XCTAssertFalse(window.previewPanel(preview, handle: key("\u{F700}", flags: [flag, .function, .numericPad])))
+        }
+        XCTAssertEqual(item(window), window.rows[1].url)
+        XCTAssertTrue(window.previewPanel(preview, handle: key("\u{F700}", flags: [.function, .numericPad])))
+        XCTAssertEqual(item(window), window.rows[0].url)
+    }
+
+    func testEndingControlLetsGoOfThePreview() async throws {
+        let window = try await opened(access: true)
+        let preview = QLPreviewPanel.shared()!
+        window.panel.beginPreviewPanelControl(preview)
+        window.panel.endPreviewPanelControl(preview)
+        XCTAssertNil(preview.dataSource)
+        XCTAssertNil(preview.delegate)
+    }
+
+    func testAPreviewClosedWhileTelescopeIsActiveHandsTheKeysBackToTheBox() async throws {
+        let window = try await opened(access: false)
+        window.show()
+        defer { window.hide() }
+        NSApp.activate(ignoringOtherApps: true)
+        let unlocked = await soon { NSApp.isActive && window.panel.isKeyWindow }
+        try XCTSkipUnless(unlocked, "needs an unlocked screen")
+        let preview = QLPreviewPanel.shared()!
+        window.panel.beginPreviewPanelControl(preview)
+        window.panel.makeFirstResponder(window.settings)
+        preview.makeKeyAndOrderFront(nil)
+        try await until { preview.isKeyWindow }
+        await nextTurn()
+        XCTAssertTrue(window.shown, "a click on the preview keeps the window")
+
+        preview.orderOut(nil)
+        try await until { window.panel.isKeyWindow }
+        try await until { window.panel.firstResponder === window.field.currentEditor() }
+        XCTAssertTrue(window.shown)
+    }
+
+    func testFocusLeavingTelescopeWithAPreviewUpHidesBoth() async throws {
+        try Data().write(to: root.appendingPathComponent("budget.txt"))
+        let window = try await opened(access: true)
+        window.show()
+        defer { window.hide() }
+        try await type("budget", in: window)
+        try await until { window.rows.count == 1 }
+        window.quickLook(nil)
+        try await until { window.previewing }
+
+        window.windowDidResignKey(Notification(name: NSWindow.didResignKeyNotification, object: QLPreviewPanel.shared()))
+        XCTAssertTrue(window.shown, "decided once macOS has picked the next key window")
+        // Another test may have left Telescope active; on a locked screen it never is.
+        NSApp.deactivate()
+        try await until { !window.shown }
+        try await until { !window.previewing }
+    }
+
+    func testTheSearchWindowLosingTheKeysWithAPreviewUpWaitsToDecide() async throws {
+        try Data("budget\n".utf8).write(to: root.appendingPathComponent("budget.txt"))
+        let window = try await opened(access: true)
+        window.show()
+        defer { window.hide() }
+        try await type("budget", in: window)
+        try await until { window.rows.count == 1 }
+        window.quickLook(nil)
+        try await until { window.previewing }
+
+        // A click on the preview takes the keys from the search window first.
+        window.windowDidResignKey(Notification(name: NSWindow.didResignKeyNotification, object: window.panel))
+        XCTAssertTrue(window.shown)
+        XCTAssertTrue(window.previewing)
+    }
+
+    func testFocusLeavingTheWindowWithoutAPreviewHidesItAtOnce() async throws {
+        let window = try await opened(access: true)
+        window.show()
+        window.windowDidResignKey(Notification(name: NSWindow.didResignKeyNotification, object: window.panel))
+        XCTAssertFalse(window.shown)
+    }
+
+    /// Hiding with the preview up ends its control, which settles the keys a turn later.
+    func testAHiddenWindowIgnoresTheKeysSettling() async throws {
+        let window = try await opened(access: true)
+        window.show()
+        window.hide()
+        window.panel.makeFirstResponder(window.settings)
+        window.settleKeys()
+        await nextTurn()
+        XCTAssertFalse(window.shown)
+        XCTAssertTrue(window.panel.firstResponder === window.settings, "the box isn't handed the keys")
+        try await until { !window.panel.isVisible }
+        XCTAssertFalse(window.panel.isKeyWindow)
+    }
+
+    func testEscOnOpenSettingsClosesThePreviewFirst() async throws {
+        try Data("budget\n".utf8).write(to: root.appendingPathComponent("budget.txt"))
+        let window = try await opened(access: false)
+        window.show()
+        defer { window.hide() }
+        try await type("budget", in: window)
+        try await until { window.rows.count == 1 }
+        window.quickLook(nil)
+        try await until { window.previewing }
+        window.panel.makeFirstResponder(window.settings)
+
+        window.panel.cancelOperation(nil)
+        try await until { !window.previewing }
+        XCTAssertTrue(window.shown)
+        window.panel.cancelOperation(nil)
+        XCTAssertFalse(window.shown)
+    }
+
+    func testCommandYPressedBeforeTheResultsArriveOpensTheNewTopRow() async throws {
+        let notes = root.appendingPathComponent("notes")
+        try FileManager.default.createDirectory(at: notes, withIntermediateDirectories: false)
+        for name in ["budget a.txt", "report.txt"] {
+            try Data().write(to: notes.appendingPathComponent(name))
+        }
+        let window = try await opened(access: true)
+        window.show()
+        defer { window.hide() }
+        try await type("report", in: window)
+        try await until { window.rows.count == 1 }
+
+        try await type("budget", in: window)
+        window.quickLook(nil)
+        XCTAssertFalse(window.previewing, "waits for the results for what was typed")
+        try await until { window.previewing }
+        XCTAssertEqual(window.rows.map(\.name), ["budget a.txt"])
+        XCTAssertEqual(window.inPreview, window.rows[0].url)
+    }
+
+    func testCommandYThenHidingBeforeTheResultsArriveOpensNothing() async throws {
+        try Data("budget\n".utf8).write(to: root.appendingPathComponent("budget.txt"))
+        let window = try await opened(access: true)
+        window.show()
+        try await type("budget", in: window)
+        window.quickLook(nil)
+        window.hide()
+        try await until { window.rows.count == 1 }
+        await nextTurn()
+        XCTAssertFalse(QLPreviewPanel.shared().isVisible)
+    }
+
+    func testCommandYClosesThePreviewEvenWhileResultsAreOnTheirWay() async throws {
+        let notes = root.appendingPathComponent("notes")
+        try FileManager.default.createDirectory(at: notes, withIntermediateDirectories: false)
+        for name in ["budget a.txt", "budget b.txt"] {
+            try Data("budget\n".utf8).write(to: notes.appendingPathComponent(name))
+        }
+        let window = try await opened(access: true)
+        window.show()
+        defer { window.hide() }
+        try await type("budget", in: window)
+        try await until { window.rows.count == 2 }
+        window.quickLook(nil)
+        try await until { window.previewing }
+
+        // Typing on right after must not drop the close.
+        try await type("budget ", in: window)
+        window.quickLook(nil)
+        try await type("budget", in: window)
+        try await until { !window.previewing }
+        try await until { window.rows.count == 2 }
+        await nextTurn()
+        XCTAssertFalse(window.previewing, "nothing opens it again")
+    }
+
+    func testHalfTypedJapaneseOpensNoPreview() async throws {
+        try Data("budget\n".utf8).write(to: root.appendingPathComponent("budget.txt"))
+        let window = try await opened(access: true)
+        window.show()
+        defer { window.hide() }
+        try await type("budget", in: window)
+        try await until { window.rows.count == 1 }
+        window.panel.makeFirstResponder(window.field)
+        let editor = try XCTUnwrap(window.field.currentEditor() as? NSTextView)
+        editor.setMarkedText("か", selectedRange: NSRange(location: 1, length: 0), replacementRange: NSRange(location: NSNotFound, length: 0))
+        XCTAssertTrue(editor.hasMarkedText())
+        XCTAssertNotNil(window.selected)
+
+        window.quickLook(nil)
+        await nextTurn()
+        XCTAssertFalse(window.previewing)
+        XCTAssertNil(window.missing)
+    }
+
+    func testAClickOnARowMovesThePreview() async throws {
+        let notes = root.appendingPathComponent("notes")
+        try FileManager.default.createDirectory(at: notes, withIntermediateDirectories: false)
+        for name in ["budget a.txt", "budget b.txt", "budget c.txt"] {
+            try Data("budget\n".utf8).write(to: notes.appendingPathComponent(name))
+        }
+        let window = try await opened(access: true)
+        window.show()
+        defer { window.hide() }
+        try await type("budget", in: window)
+        try await until { window.rows.count == 3 }
+        window.quickLook(nil)
+        try await until { window.previewing }
+        XCTAssertEqual(window.inPreview, window.rows[0].url)
+
+        window.table.selectRowIndexes([2], byExtendingSelection: false)
+        XCTAssertEqual(window.inPreview, window.rows[2].url)
+        down(window)
+        XCTAssertEqual(window.inPreview, window.rows[2].url, "the last row stays picked")
+        XCTAssertTrue(window.previewing)
+    }
+
+    func testClearingTheBoxClosesThePreview() async throws {
+        try Data("budget\n".utf8).write(to: root.appendingPathComponent("budget.txt"))
+        let window = try await opened(access: true)
+        window.show()
+        defer { window.hide() }
+        try await type("budget", in: window)
+        try await until { window.rows.count == 1 }
+        window.quickLook(nil)
+        try await until { window.previewing }
+
+        // Clearing asks to close from both the empty list and the cleared selection.
+        try await type("", in: window)
+        XCTAssertFalse(window.previewing)
+        try await until { !QLPreviewPanel.shared().isVisible }
+        XCTAssertTrue(window.shown)
+    }
+
+    func testEscTwiceQuicklyClosesThePreviewThenClearsTheBox() async throws {
+        try Data("budget\n".utf8).write(to: root.appendingPathComponent("budget.txt"))
+        let window = try await opened(access: true)
+        window.show()
+        defer { window.hide() }
+        try await type("budget", in: window)
+        try await until { window.rows.count == 1 }
+        window.quickLook(nil)
+        try await until { window.previewing }
+
+        // The second Esc lands while the preview is still fading out.
+        let esc = #selector(NSResponder.cancelOperation(_:))
+        XCTAssertTrue(window.control(NSTextField(), textView: NSTextView(), doCommandBy: esc))
+        XCTAssertTrue(QLPreviewPanel.shared().isVisible)
+        XCTAssertTrue(window.control(NSTextField(), textView: NSTextView(), doCommandBy: esc))
+        XCTAssertEqual(window.field.stringValue, "")
+        try await until { !QLPreviewPanel.shared().isVisible }
+        await nextTurn()
+        XCTAssertFalse(QLPreviewPanel.shared().isVisible, "stays closed")
+        XCTAssertTrue(window.shown)
+    }
+
+    func testANewListKeepsPreviewingThePickedFile() async throws {
+        let notes = root.appendingPathComponent("notes")
+        try FileManager.default.createDirectory(at: notes, withIntermediateDirectories: false)
+        for name in ["budget a.txt", "budget b.txt"] {
+            try Data("budget\n".utf8).write(to: notes.appendingPathComponent(name))
+        }
+        let window = try await opened(access: true)
+        window.show()
+        defer { window.hide() }
+        try await type("budget", in: window)
+        try await until { window.rows.count == 2 }
+        window.quickLook(nil)
+        try await until { window.previewing }
+        down(window)
+        let picked = try XCTUnwrap(window.selected?.url)
+        XCTAssertEqual(window.inPreview, picked)
+
+        // A shorter name ranks first and moves the picked file down a row.
+        try Data().write(to: notes.appendingPathComponent("budget.txt"))
+        try await until { window.rows.count == 3 }
+        XCTAssertEqual(window.selected?.url, picked)
+        XCTAssertEqual(window.inPreview, picked)
+        XCTAssertTrue(window.previewing)
+    }
+
+    func testReturnOnAFileGoneWhilePreviewingClosesThePreviewAndSaysSo() async throws {
+        let notes = root.appendingPathComponent("notes")
+        try FileManager.default.createDirectory(at: notes, withIntermediateDirectories: false)
+        for name in ["budget a.txt", "budget b.txt"] {
+            try Data("budget\n".utf8).write(to: notes.appendingPathComponent(name))
+        }
+        let window = try await opened(access: true)
+        window.show()
+        defer { window.hide() }
+        try await type("budget", in: window)
+        try await until { window.rows.count == 2 }
+        window.quickLook(nil)
+        try await until { window.previewing }
+        let row = try XCTUnwrap(window.selected)
+
+        try FileManager.default.removeItem(atPath: row.path)
+        XCTAssertTrue(window.control(NSTextField(), textView: NSTextView(), doCommandBy: #selector(NSResponder.insertNewline(_:))))
+        XCTAssertEqual(window.missing, "“\(row.name)” can’t be found.")
+        try await until { !window.previewing }
+        XCTAssertTrue(window.shown)
+
+        down(window)
+        XCTAssertNil(window.missing, "the first arrow brings the list back")
+        XCTAssertEqual(window.selected, row, "on the same row")
+    }
+
+    func testAMadeUpNameSaysItCantBeFoundInsteadOfPreviewing() async throws {
+        setenv("TELESCOPE_STAND_IN", "1000", 1)
+        defer { unsetenv("TELESCOPE_STAND_IN") }
+        let window = try await opened(access: true)
+        window.show()
+        defer { window.hide() }
+        try await type("budget", in: window)
+        try await until { !window.rows.isEmpty }
+        let row = try XCTUnwrap(window.selected)
+        window.quickLook(nil)
+        XCTAssertFalse(window.previewing)
+        XCTAssertEqual(window.missing, "“\(row.name)” can’t be found.")
+        XCTAssertTrue(window.shown)
+
+        down(window)
+        XCTAssertNil(window.missing, "the first arrow brings the list back")
+        XCTAssertEqual(window.selected, row, "on the same row")
+    }
+
+    func testEscAndCommandYCloseThePreviewButKeepTheSearch() async throws {
+        let notes = root.appendingPathComponent("notes")
+        try FileManager.default.createDirectory(at: notes, withIntermediateDirectories: false)
+        for name in ["budget a.txt", "budget b.txt"] {
+            try Data("budget\n".utf8).write(to: notes.appendingPathComponent(name))
+        }
+        let window = try await opened(access: true)
+        window.show()
+        defer { window.hide() }
+        try await type("budget", in: window)
+        try await until { window.rows.count == 2 }
+
+        window.quickLook(nil)
+        try await until { window.previewing }
+        XCTAssertTrue(window.shown)
+
+        // Esc in the box closes the preview first and keeps the search.
+        XCTAssertTrue(window.control(NSTextField(), textView: NSTextView(), doCommandBy: #selector(NSResponder.cancelOperation(_:))))
+        try await until { !window.previewing }
+        XCTAssertEqual(window.field.stringValue, "budget")
+        XCTAssertTrue(window.shown)
+
+        window.quickLook(nil)
+        try await until { window.previewing }
+        window.quickLook(nil)
+        try await until { !window.previewing }
+        XCTAssertTrue(window.shown, "⌘Y again closes only the preview")
+    }
+
+    func testQuickLookFindsTheWindowAndShowsTheSelectedFile() async throws {
+        let notes = root.appendingPathComponent("notes")
+        try FileManager.default.createDirectory(at: notes, withIntermediateDirectories: false)
+        for name in ["budget a.txt", "budget b.txt"] {
+            try Data("budget\n".utf8).write(to: notes.appendingPathComponent(name))
+        }
+        let window = try await opened(access: true)
+        window.show()
+        defer { window.hide() }
+        let unlocked = await soon { window.panel.isKeyWindow }
+        try XCTSkipUnless(unlocked, "needs an unlocked screen")
+        try await type("budget", in: window)
+        try await until { window.rows.count == 2 }
+        window.quickLook(nil)
+        let preview = QLPreviewPanel.shared()!
+        try await until { preview.currentController as AnyObject === window.panel }
+        XCTAssertTrue(window.panel.isKeyWindow, "typing and the arrows stay in the box")
+        try await until { previewed() == window.rows[0].url }
+        down(window)
+        try await until { previewed() == window.rows[1].url }
+    }
+
+    func testThePreviewClosesWhenNothingIsLeftToShow() async throws {
+        try Data("budget\n".utf8).write(to: root.appendingPathComponent("budget.txt"))
+        let window = try await opened(access: true)
+        window.show()
+        defer { window.hide() }
+        try await type("budget", in: window)
+        try await until { window.rows.count == 1 }
+        window.quickLook(nil)
+        try await until { window.previewing }
+
+        try await type("zzzz", in: window)
+        try await until { !window.previewing }
+        XCTAssertTrue(window.rows.isEmpty)
+
+        try await type("budget", in: window)
+        try await until { window.rows.count == 1 }
+        window.quickLook(nil)
+        try await until { window.previewing }
+        window.hide()
+        try await until { !window.previewing }
+    }
+
+    func testAFileGoneWhileShownClosesThePreviewQuietly() async throws {
+        let notes = root.appendingPathComponent("notes")
+        try FileManager.default.createDirectory(at: notes, withIntermediateDirectories: false)
+        for name in ["budget a.txt", "budget b.txt"] {
+            try Data("budget\n".utf8).write(to: notes.appendingPathComponent(name))
+        }
+        let window = try await opened(access: true)
+        window.show()
+        defer { window.hide() }
+        try await type("budget", in: window)
+        try await until { window.rows.count == 2 }
+        window.quickLook(nil)
+        try await until { window.previewing }
+
+        XCTAssertEqual(window.inPreview, window.rows[0].url)
+
+        // Gone before the list catches up, so the next row is still listed. The list stays, as it
+        // does without a preview; ⌘Y on that row is what says it can't be found.
+        try FileManager.default.removeItem(atPath: window.rows[1].path)
+        down(window)
+        try await until { !window.previewing }
+        XCTAssertNil(window.missing)
+        XCTAssertEqual(window.selected, window.rows[1])
+        window.quickLook(nil)
+        XCTAssertEqual(window.missing, "“\(window.rows[1].name)” can’t be found.")
+        XCTAssertFalse(window.previewing)
+    }
+
+    private func item(_ window: SearchPanel) -> URL? {
+        window.previewPanel(QLPreviewPanel.shared(), previewItemAt: 0)?.previewItemURL
+    }
+
+    private func previewed() -> URL? {
+        QLPreviewPanel.shared().currentPreviewItem?.previewItemURL
+    }
+
+    private func key(
+        _ characters: String, type: NSEvent.EventType = .keyDown, flags: NSEvent.ModifierFlags = []
+    ) -> NSEvent {
+        NSEvent.keyEvent(
+            with: type, location: .zero, modifierFlags: flags, timestamp: 0, windowNumber: 0, context: nil,
+            characters: characters, charactersIgnoringModifiers: characters, isARepeat: false, keyCode: 0)!
+    }
+
+    /// Whether `done` comes true within 1 s, for checks that skip rather than fail.
+    private func soon(_ done: () -> Bool) async -> Bool {
+        for _ in 0..<100 where !done() { try? await Task.sleep(for: .milliseconds(10)) }
+        return done()
+    }
+
+    /// Lets every block already queued on the main queue run first.
+    private func nextTurn() async {
+        await withCheckedContinuation { done in DispatchQueue.main.async { done.resume() } }
     }
 
     private func type(_ text: String, in window: SearchPanel) async throws {

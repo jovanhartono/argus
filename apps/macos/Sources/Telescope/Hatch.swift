@@ -9,6 +9,8 @@ struct Row: Equatable {
 
     /// The folder you index is listed under its full path, so its name is the path already.
     var path: String { name.hasPrefix("/") ? name : (folder as NSString).appendingPathComponent(name) }
+
+    var url: URL { URL(fileURLWithPath: path, isDirectory: isFolder) }
 }
 
 /// The only file that touches Rust's pointers. Rows are copied into Swift strings and Rust's
