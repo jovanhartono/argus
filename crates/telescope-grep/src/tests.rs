@@ -330,6 +330,11 @@ fn stops_at_the_limit() {
         // Each thread finishes at most the file it is in, plus one it was about to open.
         let most = (limit.div_ceil(3) + 2 * grep.threads()).min(40);
         assert!(report.files_searched <= most, "{limit}: {report:?}");
+        // Every file holds the text, so a file counted as searched showed a line.
+        assert!(
+            report.files_searched <= report.lines_found,
+            "{limit}: {report:?}"
+        );
     }
     assert_eq!(grep_with(&grep, &folder, "milk", 0).1, Report::default());
 }
@@ -408,11 +413,50 @@ fn a_file_stops_at_the_next_read_once_the_search_is_over() {
             cloud_only: cloud::is_cloud_only,
         };
         let file = File::open(folder.root.join("a.txt")).unwrap();
-        Stoppable { file, job: &job }.read(&mut [0; 16]).unwrap()
+        let mut reader = Stoppable {
+            file,
+            job: &job,
+            stopped: false,
+        };
+        let read = reader.read(&mut [0; 16]).unwrap();
+        assert_eq!(reader.stopped, read == 0);
+        read
     };
     assert_eq!(read(false, 1), 5);
     assert_eq!(read(true, 1), 0);
     assert_eq!(read(false, 0), 0);
+}
+
+#[test]
+fn a_file_the_search_ends_before_a_line_counts_nowhere() {
+    let folder = folder(&[("a.txt", b"milk\n")]);
+    let path = folder.root.join("a.txt");
+    let matcher = Literal::new("milk").unwrap();
+    let file = |stale_from_call: usize, limit: usize| {
+        let calls = AtomicUsize::new(0);
+        let stale = || calls.fetch_add(1, Ordering::Relaxed) >= stale_from_call;
+        let job = Job {
+            matcher: &matcher,
+            limit,
+            delivered: AtomicUsize::new(0),
+            report: Mutex::default(),
+            found: &|_: Found<'_>| {},
+            stale: &stale,
+            cloud_only: cloud::is_cloud_only,
+        };
+        job.file(0, &path, &mut searcher())
+    };
+    let searched = Report {
+        files_searched: 1,
+        lines_found: 1,
+        ..Report::default()
+    };
+    assert_eq!(file(usize::MAX, 10), searched);
+    // Stale at the first read, or after it but before the line is handed over.
+    assert_eq!(file(0, 10), Report::default());
+    assert_eq!(file(1, 10), Report::default());
+    // Other threads already found all the lines.
+    assert_eq!(file(usize::MAX, 0), Report::default());
 }
 
 #[test]
@@ -436,13 +480,17 @@ fn one_search_at_a_time() {
         });
         older_entered.recv().unwrap();
         let ticket = grep.ticket();
+        let (newer_found, newer_found_any) = mpsc::channel();
         let newer = scope.spawn(move || {
             grep.search(index, "milk", ticket, 10, |_| {
                 newer_lines.fetch_add(1, Ordering::Relaxed);
+                let _ = newer_found.send(());
             })
         });
-        // A wrong pass shows within this pause; a right one never depends on it.
-        std::thread::sleep(Duration::from_millis(50));
+        // A wrong pass shows as soon as a line is found, unless the search threads, at
+        // background priority, wait longer than this for a core; a right one never depends on it.
+        let waited = newer_found_any.recv_timeout(Duration::from_millis(250));
+        assert_eq!(waited, Err(mpsc::RecvTimeoutError::Timeout));
         assert_eq!(newer_lines.load(Ordering::Relaxed), 0);
         drop(release);
         assert_eq!(older.join().unwrap(), None);
@@ -530,6 +578,31 @@ fn a_line_with_broken_letters_still_points_at_the_match() {
     line.extend(b"\x80".repeat(300));
     let (text, matched) = excerpt_of(&line, "école");
     assert_eq!(&text[matched], "ÉCOLE");
+}
+
+#[test]
+fn lossy_len_counts_like_from_utf8_lossy() {
+    let stand_in = char::REPLACEMENT_CHARACTER.len_utf8();
+    assert_eq!(lossy_len(b"\xff\xfe"), 2 * stand_in);
+    assert_eq!(lossy_len(b"\xe2\x82"), stand_in);
+    let pieces: [&[u8]; 6] = [
+        b"a",
+        "é".as_bytes(),
+        b"\xff",
+        b"\x80",
+        b"\xe2\x82",
+        b"\xf0\x9f",
+    ];
+    // Every 5-piece run, 6^5 of them.
+    for mut n in 0..pieces.len().pow(5) {
+        let mut bytes = Vec::new();
+        for _ in 0..5 {
+            bytes.extend_from_slice(pieces[n % pieces.len()]);
+            n /= pieces.len();
+        }
+        let lossy = String::from_utf8_lossy(&bytes).len();
+        assert_eq!(lossy_len(&bytes), lossy, "{bytes:x?}");
+    }
 }
 
 /// A fixed-seed xorshift, so a failing case comes back on every run.

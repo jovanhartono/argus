@@ -347,8 +347,10 @@ dependencies = [
 name = "telescope-cli"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "telescope-core",
  "telescope-grep",
+ "tempfile",
 ]
 
 [[package]]
