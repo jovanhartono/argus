@@ -45,11 +45,14 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
     private var hatch: Hatch?
     private var indexed = false
     private var problem: String?
+    /// The file you picked was moved or deleted after the list was built.
+    private var missing: String?
     private var newest: UInt64 = 0
     private var sentAt: [UInt64: CFAbsoluteTime] = [:]
     private var rows: [Row] = []
-    /// The rows on screen answer the text in the box, so an empty list means "No Results".
-    private var answered = false
+    /// The ticket the rows on screen answer; 0 before any answer, so an empty list isn't "No Results".
+    private var answered: UInt64 = 0
+    private var pending: (() -> Void)?
     private var shown = false
     private var icons: [String: NSImage] = [:]
 
@@ -91,6 +94,7 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
     func hide() {
         guard shown else { return }
         shown = false
+        pending = nil
         fade(to: 0) { [weak self] in
             // Shown again while fading out: keep it.
             if self?.shown == false { self?.panel.orderOut(nil) }
@@ -108,6 +112,8 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         panel.backgroundColor = .windowBackgroundColor
         panel.hidesOnDeactivate = false
+        // Panels zoom in and out by default; the fade is the only motion wanted.
+        panel.animationBehavior = .none
         panel.delegate = self
 
         glass.image = NSImage(systemSymbolName: "magnifyingglass", accessibilityDescription: nil)?
@@ -145,6 +151,7 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
         message.font = .systemFont(ofSize: NSFont.systemFontSize)
         message.textColor = .secondaryLabelColor
         message.alignment = .center
+        message.lineBreakMode = .byTruncatingMiddle
         message.frame = NSRect(
             x: 16, y: Metric.field + 1 + (Metric.message - 17) / 2, width: Metric.width - 32,
             height: 17)
@@ -184,7 +191,8 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
         if let problem { return problem }
         if composing { return nil }
         if !indexed { return "Getting ready…" }
-        if answered && rows.isEmpty { return "No Results" }
+        if let missing { return missing }
+        if answered != 0 && rows.isEmpty { return "No Results" }
         return nil
     }
 
@@ -245,12 +253,14 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
     }
 
     private func search() {
+        missing = nil
+        pending = nil
         if field.stringValue.isEmpty {
             // A reply to what was typed before the box was cleared must not fill it again.
             newest = 0
             sentAt = [:]
             rows = []
-            answered = false
+            answered = 0
             table.reloadData()
         }
         guard let hatch, indexed, !composing, !field.stringValue.isEmpty else { return fit() }
@@ -262,7 +272,7 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
     private func take(_ ticket: UInt64) {
         guard let fresh = hatch?.take(ticket) else { return }
         rows = fresh
-        answered = true
+        answered = ticket
         table.reloadData()
         if !rows.isEmpty { select(0) }
         fit()
@@ -270,11 +280,63 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
             timing.notice("results in \(ms(since: sent), format: .fixed(precision: 2)) ms")
         }
         sentAt = sentAt.filter { $0.key > ticket }
+        if let action = pending {
+            pending = nil
+            action()
+        }
+    }
+
+    /// Return pressed a moment after typing acts on the results for what you typed, not on the
+    /// older list still on screen.
+    private func onceAnswered(_ action: @escaping () -> Void) {
+        if newest != answered { pending = action } else { action() }
     }
 
     private func select(_ row: Int) {
         table.selectRowIndexes([row], byExtendingSelection: false)
         table.scrollRowToVisible(row)
+    }
+
+    /// The first arrow after "can't be found" brings the list back, on the same row.
+    private func move(by step: Int) {
+        if missing != nil {
+            missing = nil
+            return fit()
+        }
+        if !rows.isEmpty { select(min(max(table.selectedRow + step, 0), rows.count - 1)) }
+    }
+
+    private var selected: Row? {
+        rows.indices.contains(table.selectedRow) ? rows[table.selectedRow] : nil
+    }
+
+    /// Japanese and Chinese input pick the half-typed word with Return, so nothing opens then.
+    private func open(revealing reveal: Bool) {
+        guard !composing, let row = selected else { return }
+        guard FileManager.default.fileExists(atPath: row.path) else {
+            missing = "“\(row.name)” can’t be found."
+            return fit()
+        }
+        hide()
+        let url = URL(fileURLWithPath: row.path)
+        if reveal {
+            NSWorkspace.shared.activateFileViewerSelecting([url])
+        } else {
+            NSWorkspace.shared.open(url)
+        }
+    }
+
+    @objc func showInFinder(_ sender: Any?) {
+        onceAnswered { [weak self] in self?.open(revealing: true) }
+    }
+
+    @objc func copyPath(_ sender: Any?) {
+        onceAnswered { [weak self] in
+            guard let self, !composing, let row = selected else { return }
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString(row.path, forType: .string)
+            hide()
+        }
     }
 
     func controlTextDidChange(_ note: Notification) {
@@ -284,9 +346,9 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
     func control(_ control: NSControl, textView: NSTextView, doCommandBy selector: Selector) -> Bool {
         switch selector {
         case #selector(NSResponder.moveDown(_:)):
-            if !rows.isEmpty { select(min(table.selectedRow + 1, rows.count - 1)) }
+            move(by: 1)
         case #selector(NSResponder.moveUp(_:)):
-            if !rows.isEmpty { select(max(table.selectedRow - 1, 0)) }
+            move(by: -1)
         case #selector(NSResponder.cancelOperation(_:)):
             // The first Esc clears the box, the second hides the window.
             if field.stringValue.isEmpty {
@@ -296,7 +358,7 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
                 search()
             }
         case #selector(NSResponder.insertNewline(_:)):
-            break  // Opening the selected file comes in step 3.
+            onceAnswered { [weak self] in self?.open(revealing: false) }
         default:
             return false
         }
