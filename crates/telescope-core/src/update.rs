@@ -113,7 +113,7 @@ impl Index {
             }
         }
         if !added.anchors.is_empty() {
-            let walked = walk(added.builder, rules, NO_PARENT, added.walks);
+            let walked = walk(added.builder, rules, NO_PARENT, added.walks, &|| false);
             update.unreadable_folders += walked.unreadable_folders;
             update.added = self.splice(&walked.builder.lists(), &added.anchors);
         }

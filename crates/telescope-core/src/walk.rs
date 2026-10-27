@@ -280,6 +280,8 @@ struct Walk<'r> {
     rules: &'r Rules,
     /// The scan's own root, which is always read in full; `NO_PARENT` when there is none.
     root: EntryId,
+    /// Asked before each folder is read; once it says yes, no more are.
+    stop: &'r (dyn Fn() -> bool + Sync),
 }
 
 pub(crate) struct Shared {
@@ -296,10 +298,27 @@ pub fn scan(
     ignore: &Ignore,
     access: Access,
 ) -> io::Result<Scan> {
-    scan_with(root, &Rules::new(home, clutter, ignore, access))
+    scan_until(root, home, clutter, ignore, access, &|| false)
 }
 
-pub(crate) fn scan_with(root: &Path, rules: &Rules) -> io::Result<Scan> {
+/// As `scan`, but once `stop` says so the folders not read yet are left out, for a scan
+/// nobody wants any more.
+pub fn scan_until(
+    root: &Path,
+    home: &Path,
+    clutter: Clutter,
+    ignore: &Ignore,
+    access: Access,
+    stop: &(dyn Fn() -> bool + Sync),
+) -> io::Result<Scan> {
+    scan_with(root, &Rules::new(home, clutter, ignore, access), stop)
+}
+
+pub(crate) fn scan_with(
+    root: &Path,
+    rules: &Rules,
+    stop: &(dyn Fn() -> bool + Sync),
+) -> io::Result<Scan> {
     // The real path, as macOS reports file changes: /tmp becomes /private/tmp, no "..".
     let root = fs::canonicalize(root)?;
     if rules.is_guarded(&root) {
@@ -310,7 +329,7 @@ pub(crate) fn scan_with(root: &Path, rules: &Rules) -> io::Result<Scan> {
 
     let mut builder = IndexBuilder::new();
     let root_id = builder.push(&root.to_string_lossy(), NO_PARENT, true);
-    let shared = walk(builder, rules, root_id, vec![(root, root_id, false)]);
+    let shared = walk(builder, rules, root_id, vec![(root, root_id, false)], stop);
     Ok(Scan {
         index: shared.builder.finish(),
         unreadable_folders: shared.unreadable_folders,
@@ -324,6 +343,7 @@ pub(crate) fn walk(
     rules: &Rules,
     root: EntryId,
     folders: Vec<(PathBuf, EntryId, bool)>,
+    stop: &(dyn Fn() -> bool + Sync),
 ) -> Shared {
     let walk = Walk {
         shared: Mutex::new(Shared {
@@ -332,6 +352,7 @@ pub(crate) fn walk(
         }),
         rules,
         root,
+        stop,
     };
     rayon::scope(|scope| {
         for (path, folder, passage) in folders {
@@ -494,6 +515,9 @@ fn read_folder<'s>(
     passage: bool,
     walk: &'s Walk<'s>,
 ) {
+    if (walk.stop)() {
+        return;
+    }
     let listing = walk.rules.list(&path, folder == walk.root, passage);
     // The shared lock is taken once per folder, not once per file.
     let mut subfolders = Vec::with_capacity(listing.folders.len());
@@ -612,6 +636,28 @@ mod tests {
         assert_eq!(index.len(), 7);
         assert_eq!(index.distinct_names(), 6);
         assert_eq!(scan.unreadable_folders, 0);
+    }
+
+    #[test]
+    fn a_stopped_scan_reads_no_more_folders() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let dir = tempfile::tempdir().unwrap();
+        let root = &fs::canonicalize(dir.path()).unwrap();
+        fs::create_dir_all(root.join("a/b/c")).unwrap();
+        fs::write(root.join("a/b/c/deep.txt"), "").unwrap();
+        fs::write(root.join("top.txt"), "").unwrap();
+
+        // Stopped once the root is read: its children are listed, nothing inside them.
+        let asked = AtomicUsize::new(0);
+        let stop = || asked.fetch_add(1, Ordering::Relaxed) >= 1;
+        let ignore = Ignore::default();
+        let scan = scan_until(root, root, Clutter::Keep, &ignore, Access::Full, &stop).unwrap();
+        let expected: BTreeSet<PathBuf> = ["a", "top.txt"].iter().map(PathBuf::from).collect();
+        assert_eq!(paths_below(root, &scan.index), expected);
+        assert_eq!(asked.load(Ordering::Relaxed), 2);
+
+        let stopped = scan_until(root, root, Clutter::Keep, &ignore, Access::Full, &|| true);
+        assert_eq!(stopped.unwrap().index.len(), 1);
     }
 
     #[cfg(unix)]

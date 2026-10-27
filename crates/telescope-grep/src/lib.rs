@@ -121,6 +121,12 @@ impl Grep {
         self.tickets.newest()
     }
 
+    /// Runs `work`, and the rayon jobs it starts, on the text search threads, below name search
+    /// and with downloads off, as for listing the folders to search.
+    pub fn install<R: Send>(&self, work: impl FnOnce() -> R + Send) -> R {
+        self.pool.install(work)
+    }
+
     /// Hands each matching line to `found` as soon as it is read, from several threads at
     /// once and in no set order, until `limit` lines. Upper-case letters in `text` must match
     /// exactly; lower-case ones match either case. Returns `None` when a newer ticket arrived
@@ -162,6 +168,11 @@ impl Grep {
         let report = job.report.into_inner().unwrap();
         (!stale()).then_some(report)
     }
+}
+
+/// Whether `text` can be looked for: not empty, and on one line. Other text finds nothing.
+pub fn can_search(text: &str) -> bool {
+    !text.is_empty() && !text.contains('\n')
 }
 
 fn searcher() -> Searcher {
