@@ -49,13 +49,15 @@ final class Hatch {
 
     /// macOS's own list of permissions opens only with Full Disk Access, and trying never shows
     /// a pop-up. Any failure counts as no access, so a doubt never brings up pop-ups.
-    nonisolated static func hasFullDiskAccess() -> Bool {
-        let list = NSHomeDirectory() + "/Library/Application Support/com.apple.TCC/TCC.db"
+    nonisolated static func hasFullDiskAccess(probing list: String = permissionList) -> Bool {
         let file = open(list, O_RDONLY)
         guard file >= 0 else { return false }
         close(file)
         return true
     }
+
+    nonisolated static let permissionList =
+        NSHomeDirectory() + "/Library/Application Support/com.apple.TCC/TCC.db"
 
     deinit {
         tl_core_free(core)

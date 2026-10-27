@@ -32,6 +32,9 @@ Telescope isn't notarized by Apple, so macOS asks you once before it opens:
 2. Open Telescope. macOS says it can't check it for malware; click Done.
 3. Open System Settings → Privacy & Security, scroll down and click Open Anyway.
 4. Click Open Anyway again and enter your Mac password.
+5. Press ⌘⇧Space. Until Telescope has Full Disk Access, it leaves out Desktop, Documents, Downloads and cloud drives, and the window says so. Click Open Settings, switch Telescope on under Full Disk Access, and click Quit & Reopen when macOS asks.
+
+To start Telescope when you log in, open System Settings → General → Login Items & Extensions, click + under Open at Login, and choose Telescope in Applications.
 
 ## Licence
 

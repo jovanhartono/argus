@@ -94,12 +94,12 @@ footer { border-top: 0.5px solid var(--line); margin-top: 36px; padding-top: 20p
 <div class="wrap">
 
 <header>
-  <span class="eyebrow">Milestone M2 · steps and plan · updated 27 Oct 2026</span>
+  <span class="eyebrow">Milestone M2 · steps and plan · updated 28 Oct 2026</span>
   <h1>Telescope daily driver</h1>
   <p class="lede">The steps of milestone M2. The window from M1 stops searching a million made-up names and searches your real files, keeps up as they change, and gets used every day for a week.</p>
   <div class="chips">
     <span class="chip keep">Plan settled 27 Oct 2026</span>
-    <span class="chip open">0 of 6 build steps merged</span>
+    <span class="chip open">2 of 6 build steps merged</span>
     <span class="chip">Swift + Rust</span>
     <span class="chip">Your real files</span>
   </div>
@@ -124,7 +124,7 @@ footer { border-top: 0.5px solid var(--line); margin-top: 36px; padding-top: 20p
       <tbody>
         <tr><td class="n">0</td><td class="name">The plan</td><td>This page, dated numbers in the research plan, and the README pointing here</td><td class="n"><span class="chip keep">Done</span> <a href="https://github.com/jovanhartono/telescope/pull/26">#26</a></td></tr>
         <tr><td class="n">1</td><td class="name">Real index</td><td>The window searches your home folder instead of made-up names: about 48,000 entries once clutter is skipped. The command-line tool scans them in about 0.05 s with files already cached; the app is ready about 0.12 s after launch. Without Full Disk Access it leaves out the folders macOS guards, so no pop-up appears; <code>TELESCOPE_STAND_IN</code> still brings back the made-up names for tests</td><td class="n"><span class="chip keep">Done</span> <a href="https://github.com/jovanhartono/telescope/pull/27">#27</a></td></tr>
-        <tr><td class="n">2</td><td class="name">Permission notice</td><td>One line in the window when Telescope doesn't have <span class="term" tabindex="0" data-tip="A macOS permission that lets an app read every folder, including the ones macOS guards one by one.">Full Disk Access</span> yet, with a button that opens the right page of System Settings</td><td class="n"><span class="chip">To do</span></td></tr>
+        <tr><td class="n">2</td><td class="name">Permission notice</td><td>One line under the search box when Telescope doesn't have <span class="term" tabindex="0" data-tip="A macOS permission that lets an app read every folder, including the ones macOS guards one by one.">Full Disk Access</span> yet, with an Open Settings button that opens the right page of System Settings. <kbd>Tab</kbd> reaches the button, <kbd>Space</kbd> presses it and <kbd>Esc</kbd> closes the window. While the line shows, Telescope checks again each time the window opens, which takes about 0.2 ms; once access is on, the line asks you to press <kbd>⌘</kbd> <kbd>Q</kbd> and open Telescope again, and the checks stop. The line names everything left out: Desktop, Documents, Downloads and cloud drives. The line sits under the box rather than at the bottom: at the bottom it moved with every resize, and the time from keystroke to results doubled from 12 ms to 23 ms typical. Under the box it stays at 12 ms, the same as without the line (28 Oct, load average 4-10)</td><td class="n"><span class="chip keep">Done</span> <a href="https://github.com/jovanhartono/telescope/pull/29">#29</a></td></tr>
         <tr><td class="n">3</td><td class="name">Live updates</td><td>A file you save, rename or delete shows up in results within 1 s; Telescope uses no CPU while nothing changes</td><td class="n"><span class="chip">To do</span></td></tr>
         <tr><td class="n">4</td><td class="name">Quick Look</td><td><kbd>⌘</kbd> <kbd>Y</kbd> previews the selected file with <span class="term" tabindex="0" data-tip="The macOS preview you get by pressing Space on a file in Finder.">Quick Look</span>, and the preview follows as you move the selection</td><td class="n"><span class="chip">To do</span></td></tr>
         <tr><td class="n">5</td><td class="name">Measuring</td><td>A script that turns the app's log into each day's search times, and real numbers in the targets table</td><td class="n"><span class="chip">To do</span></td></tr>
@@ -207,7 +207,7 @@ footer { border-top: 0.5px solid var(--line); margin-top: 36px; padding-top: 20p
   <ul class="prose">
     <li><strong>Checking for the key.</strong> At launch, Telescope tries to open a file that only the master key unlocks and that never triggers a pop-up: macOS's own list of permissions, opened read-only. If that works, it has Full Disk Access.</li>
     <li><strong>Without the key.</strong> Telescope skips the guarded folders, so no pop-up ever appears, and the window shows one line: it needs Full Disk Access, with an Open Settings button.</li>
-    <li><strong>Quit &amp; Reopen.</strong> After you switch Full Disk Access on, macOS offers to quit and reopen Telescope. An app only gets the new permission when it starts again, and on that start Telescope scans the folders it skipped.</li>
+    <li><strong>Quit &amp; Reopen.</strong> After you switch Full Disk Access on, macOS offers to quit and reopen Telescope. Telescope builds its list once, at launch, so the folders it skipped arrive on that start. If you click Later, Telescope notices the next time its window opens and the line asks you to press <kbd>⌘</kbd> <kbd>Q</kbd> and open it again.</li>
     <li><strong>Across updates.</strong> macOS remembers the key by the app's signing certificate, which stays the same in every release. A downloaded update still goes through <span class="term" tabindex="0" data-tip="The macOS check on apps downloaded from the internet. Apps Apple hasn't checked need Open Anyway once.">Gatekeeper</span> once (Open Anyway), and the update test (#13) checks that the key survives it on your Mac.</li>
   </ul>
 </section>
@@ -223,7 +223,7 @@ footer { border-top: 0.5px solid var(--line); margin-top: 36px; padding-top: 20p
         <tr><td class="name">New file findable</td><td class="n">under 1 s</td><td>Not measured yet</td></tr>
         <tr><td class="name">No stale results</td><td>After a git clone and an npm install while Telescope runs, the list matches a fresh scan</td><td>Not measured yet</td></tr>
         <tr><td class="name">Full Disk Access after an update</td><td>Still on after v0.2.0 is installed from a downloaded .dmg</td><td>Not measured yet</td></tr>
-        <tr><td class="name">Idle memory</td><td class="n">under 60 MB</td><td><span class="chip keep">Pass</span> 24 MB hidden with the whole default list, 47,991 entries, after 10 typed searches, and no CPU time in 30 s (28 Oct, step 1). That run was started from Terminal, so it borrowed Terminal's Full Disk Access. Opened normally, the dev build has no Full Disk Access, lists 111 entries and uses 18 MB</td></tr>
+        <tr><td class="name">Idle memory</td><td class="n">under 60 MB</td><td><span class="chip keep">Pass</span> 24 MB hidden with the whole default list, 47,991 entries, after 10 typed searches, and no CPU time in 30 s (28 Oct, step 1). That run was started from Terminal, so it borrowed Terminal's Full Disk Access. Opened normally, the dev build has no Full Disk Access, lists 111 entries and uses 18 MB; 19 MB both with and without the Full Disk Access line, after 10 typed searches (28 Oct, step 2)</td></tr>
         <tr><td class="name">CPU while hidden</td><td class="n">0%</td><td>Not measured yet</td></tr>
         <tr><td class="name">First index</td><td class="n">under 3 s, default folders</td><td><span class="chip open">Partial</span> All default folders, 47,991 entries: 0.05 s with the command-line tool, files already cached. In the app, from starting the scan to search being ready: 128 ms on the first launch of a new build and 114-121 ms when reopened (28 Oct, step 1, load average 2-4, started from Terminal for its Full Disk Access). Without Full Disk Access it lists 111 entries in 43-158 ms, nearly all of it the window finishing its own launch. A first scan after a restart, with nothing cached, isn't measured yet</td></tr>
         <tr><td class="name">App size</td><td class="n">under 6 MB for both chips</td><td>Not measured yet</td></tr>
@@ -266,8 +266,6 @@ footer { border-top: 0.5px solid var(--line); margin-top: 36px; padding-top: 20p
 <section id="next">
   <h2>Next steps</h2>
   <ol class="prose">
-    <li>Step 1: the real index in the app.</li>
-    <li>Step 2: the Full Disk Access notice.</li>
     <li>Step 3: live updates.</li>
     <li>Step 4: Quick Look on <kbd>⌘</kbd> <kbd>Y</kbd>.</li>
     <li>Step 5: measuring, which fills in the targets table.</li>
