@@ -15,6 +15,7 @@ pub(crate) const NO_PARENT: EntryId = EntryId::MAX;
 /// The `entry_` lists are read by entry number: entry 7's parent folder is `entry_parent[7]`.
 /// A folder is always numbered before anything inside it.
 /// Plain number lists keep memory low and can later be saved to disk as they are.
+#[cfg_attr(test, derive(Debug, PartialEq))]
 pub struct Index {
     /// Every distinct name once, back to back.
     pub(crate) names: String,
@@ -88,8 +89,17 @@ impl Index {
 
 /// The letter fingerprint: one bit for each letter, digit or common symbol in `text`.
 pub(crate) fn letters(text: &str) -> u64 {
-    text.bytes().fold(0, |bits, byte| {
-        bits | match byte.to_ascii_lowercase() {
+    text.bytes()
+        .fold(0, |bits, byte| bits | LETTER_BITS[byte as usize])
+}
+
+/// A table look-up per byte is several times faster than working the bit out, which matters
+/// when a saved index of a million names is opened.
+const LETTER_BITS: [u64; 256] = {
+    let mut table = [0; 256];
+    let mut byte: u8 = 0;
+    loop {
+        table[byte as usize] = match byte.to_ascii_lowercase() {
             b @ b'a'..=b'z' => 1 << (b - b'a'),
             b @ b'0'..=b'9' => 1 << (26 + b - b'0'),
             b'.' => 1 << 36,
@@ -98,9 +108,14 @@ pub(crate) fn letters(text: &str) -> u64 {
             b' ' => 1 << 39,
             128.. => 0,
             _ => 1 << 40,
+        };
+        if byte == u8::MAX {
+            break;
         }
-    })
-}
+        byte += 1;
+    }
+    table
+};
 
 pub(crate) struct IndexBuilder {
     index: Index,
@@ -164,18 +179,46 @@ impl IndexBuilder {
         index.entry_name.shrink_to_fit();
         index.entry_parent.shrink_to_fit();
         index.folders.shrink_to_fit();
-        index.entry_depth = Vec::with_capacity(index.len());
-        for &parent in &index.entry_parent {
+        index.add_depths_and_letters();
+        index
+    }
+}
+
+impl Index {
+    /// The lists a saved index keeps; depths and fingerprints are worked out again.
+    pub(crate) fn from_lists(
+        names: String,
+        name_starts: Vec<u32>,
+        entry_name: Vec<NameId>,
+        entry_parent: Vec<EntryId>,
+        folders: Vec<EntryId>,
+    ) -> Self {
+        let mut index = Self {
+            names,
+            name_starts,
+            name_letters: Vec::new(),
+            entry_name,
+            entry_parent,
+            entry_depth: Vec::new(),
+            folders,
+        };
+        index.add_depths_and_letters();
+        index
+    }
+
+    fn add_depths_and_letters(&mut self) {
+        self.entry_depth = Vec::with_capacity(self.len());
+        for &parent in &self.entry_parent {
             let depth = match parent {
                 NO_PARENT => 0,
-                parent => index.entry_depth[parent as usize].saturating_add(1),
+                parent => self.entry_depth[parent as usize].saturating_add(1),
             };
-            index.entry_depth.push(depth);
+            self.entry_depth.push(depth);
         }
-        index.name_letters = (0..index.distinct_names())
+        self.name_letters = (0..self.distinct_names())
             .into_par_iter()
             .map(|name| {
-                let text = index.name_text(name as NameId);
+                let text = self.name_text(name as NameId);
                 // The check only knows ASCII, so a name like "café" must always get through.
                 if text.is_ascii() {
                     letters(text)
@@ -184,7 +227,6 @@ impl IndexBuilder {
                 }
             })
             .collect();
-        index
     }
 }
 
@@ -215,5 +257,15 @@ mod tests {
     fn fingerprint_ignores_case_and_order() {
         assert_eq!(letters("Plan.md"), letters("dm.nalp"));
         assert_eq!(letters("café") & letters("e"), 0);
+    }
+
+    #[test]
+    fn fingerprint_gives_each_kind_of_byte_its_bit() {
+        assert_eq!(letters(""), 0);
+        assert_eq!(letters("aZ"), 1 | 1 << 25);
+        assert_eq!(letters("09"), 1 << 26 | 1 << 35);
+        assert_eq!(letters(".-_ "), 0b1111 << 36);
+        assert_eq!(letters("~(+\t\u{7f}"), 1 << 40);
+        assert_eq!(letters("é日本"), 0);
     }
 }

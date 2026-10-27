@@ -3,7 +3,7 @@ use std::io::BufRead;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Instant;
-use telescope_core::{Access, Clutter, Ignore, Index, Searcher};
+use telescope_core::{Access, Clutter, Ignore, Index, Opened, Scan, Searcher, Settings};
 
 const USAGE: &str = "usage:
   tl index <folder>                       scan and report the index size
@@ -12,6 +12,8 @@ const USAGE: &str = "usage:
   tl golden <folder> <golden>             rank the expected file of each search
 add --all to include hidden folders, ~/Library, the insides of packages like Photos Library,
 and tool downloads and caches like node_modules
+add --load <file> to open a saved index instead of scanning (it scans when the file is missing,
+damaged or built with other settings), and --save <file> to save the index afterwards
 
 your own ignore list, ~/.config/telescope/ignore, takes one folder per line
 (--all leaves it out too):
@@ -19,6 +21,12 @@ your own ignore list, ~/.config/telescope/ignore, takes one folder per line
   ~/Movies/Exports    skip this one folder
   !~/.config/nvim     bring back a folder Telescope skips, even inside a skipped one
   # a comment";
+
+struct Options {
+    clutter: Clutter,
+    load: Option<PathBuf>,
+    save: Option<PathBuf>,
+}
 
 fn main() -> ExitCode {
     let mut args: Vec<OsString> = std::env::args_os().skip(1).collect();
@@ -28,24 +36,33 @@ fn main() -> ExitCode {
         Clutter::Skip
     };
     args.retain(|arg| arg != "--all");
+    let (Some(load_file), Some(save_file)) = (take(&mut args, "--load"), take(&mut args, "--save"))
+    else {
+        return usage();
+    };
+    let options = &Options {
+        clutter,
+        load: load_file,
+        save: save_file,
+    };
     match args.as_slice() {
         [flag] if flag == "--version" => {
             println!("tl {}", env!("CARGO_PKG_VERSION"));
             ExitCode::SUCCESS
         }
-        [command, folder] if command == "index" => match load(Path::new(folder), clutter) {
+        [command, folder] if command == "index" => match load(Path::new(folder), options) {
             Some(_) => ExitCode::SUCCESS,
             None => ExitCode::FAILURE,
         },
-        [command, folder] if command == "search" => search(Path::new(folder), clutter),
+        [command, folder] if command == "search" => search(Path::new(folder), options),
         [command, folder, queries] if command == "bench" => {
-            bench(Path::new(folder), clutter, Path::new(queries), None)
+            bench(Path::new(folder), options, Path::new(queries), None)
         }
         [command, folder, queries, threads] if command == "bench" => {
             match threads.to_str().and_then(|t| t.parse().ok()) {
                 Some(threads) => bench(
                     Path::new(folder),
-                    clutter,
+                    options,
                     Path::new(queries),
                     Some(threads),
                 ),
@@ -53,10 +70,23 @@ fn main() -> ExitCode {
             }
         }
         [command, folder, cases] if command == "golden" => {
-            golden(Path::new(folder), clutter, Path::new(cases))
+            golden(Path::new(folder), options, Path::new(cases))
         }
         _ => usage(),
     }
+}
+
+/// Removes `flag` and the file after it. `None` when the file is missing.
+fn take(args: &mut Vec<OsString>, flag: &str) -> Option<Option<PathBuf>> {
+    let Some(at) = args.iter().position(|arg| arg == flag) else {
+        return Some(None);
+    };
+    if at + 1 == args.len() {
+        return None;
+    }
+    let file = args.remove(at + 1);
+    args.remove(at);
+    Some(Some(file.into()))
 }
 
 fn usage() -> ExitCode {
@@ -72,23 +102,52 @@ fn ignore_list(home: &Path) -> Ignore {
     ignore
 }
 
-fn load(folder: &Path, clutter: Clutter) -> Option<Index> {
+fn load(folder: &Path, options: &Options) -> Option<Index> {
+    let clutter = options.clutter;
     let started = Instant::now();
     let home = telescope_core::home();
     let ignore = match clutter {
         Clutter::Skip => ignore_list(&home),
         Clutter::Keep => Ignore::default(),
     };
-    let scan = match telescope_core::scan(folder, &home, clutter, &ignore, Access::Full) {
+    let mut opened = false;
+    let scan = match &options.load {
+        None => telescope_core::scan(folder, &home, clutter, &ignore, Access::Full),
+        Some(file) => {
+            telescope_core::open_or_scan(file, folder, &home, clutter, &ignore, Access::Full).map(
+                |found| match found {
+                    Opened::Saved(saved) => {
+                        opened = true;
+                        Scan {
+                            index: saved.index,
+                            unreadable_folders: 0,
+                        }
+                    }
+                    Opened::Scanned { scan, why } => {
+                        eprintln!("tl: cannot open {}: {why}; scanned instead", file.display());
+                        scan
+                    }
+                },
+            )
+        }
+    };
+    let took = ms(started);
+    let Scan {
+        index,
+        unreadable_folders,
+    } = match scan {
         Ok(scan) => scan,
         Err(error) => {
             eprintln!("tl: cannot scan {}: {error}", folder.display());
             return None;
         }
     };
-    let seconds = started.elapsed().as_secs_f64();
+    if opened {
+        println!("open time: {took:.1} ms");
+    } else {
+        println!("scan time: {:.2} s", took / 1000.0);
+    }
 
-    let index = scan.index;
     println!(
         "{} entries ({} folders), {} distinct names",
         index.len(),
@@ -99,15 +158,30 @@ fn load(folder: &Path, clutter: Clutter) -> Option<Index> {
         "index memory: {:.1} MB",
         index.heap_bytes() as f64 / 1_048_576.0
     );
-    println!("scan time: {seconds:.2} s");
-    if scan.unreadable_folders > 0 {
-        println!("folders not fully read: {}", scan.unreadable_folders);
+    if unreadable_folders > 0 {
+        println!("folders not fully read: {unreadable_folders}");
+    }
+    if let Some(file) = &options.save {
+        let started = Instant::now();
+        let settings = Settings::new(folder, &home, clutter, &ignore, Access::Full);
+        // The command line has no FSEvents bookmark; the app saves its own.
+        match telescope_core::save_index(file, &index, &settings, 0) {
+            Ok(()) => {
+                let size = std::fs::metadata(file).map_or(0, |file| file.len());
+                println!(
+                    "saved {:.1} MB in {:.1} ms",
+                    size as f64 / 1_048_576.0,
+                    ms(started)
+                );
+            }
+            Err(error) => eprintln!("tl: cannot save {}: {error}", file.display()),
+        }
     }
     Some(index)
 }
 
-fn search(folder: &Path, clutter: Clutter) -> ExitCode {
-    let Some(index) = load(folder, clutter) else {
+fn search(folder: &Path, options: &Options) -> ExitCode {
+    let Some(index) = load(folder, options) else {
         return ExitCode::FAILURE;
     };
     let searcher = Searcher::default();
@@ -132,7 +206,7 @@ fn read(file: &Path) -> Option<String> {
         .ok()
 }
 
-fn bench(folder: &Path, clutter: Clutter, query_file: &Path, threads: Option<usize>) -> ExitCode {
+fn bench(folder: &Path, options: &Options, query_file: &Path, threads: Option<usize>) -> ExitCode {
     let Some(text) = read(query_file) else {
         return ExitCode::FAILURE;
     };
@@ -146,7 +220,7 @@ fn bench(folder: &Path, clutter: Clutter, query_file: &Path, threads: Option<usi
         eprintln!("tl: no queries in {}", query_file.display());
         return ExitCode::FAILURE;
     }
-    let Some(index) = load(folder, clutter) else {
+    let Some(index) = load(folder, options) else {
         return ExitCode::FAILURE;
     };
     let searcher = threads.map_or_else(Searcher::default, Searcher::with_threads);
@@ -209,7 +283,7 @@ fn bench(folder: &Path, clutter: Clutter, query_file: &Path, threads: Option<usi
 }
 
 /// Each line is a search, a tab, and the file you expect near the top.
-fn golden(folder: &Path, clutter: Clutter, case_file: &Path) -> ExitCode {
+fn golden(folder: &Path, options: &Options, case_file: &Path) -> ExitCode {
     let Some(text) = read(case_file) else {
         return ExitCode::FAILURE;
     };
@@ -231,7 +305,7 @@ fn golden(folder: &Path, clutter: Clutter, case_file: &Path) -> ExitCode {
         eprintln!("tl: no searches in {}", case_file.display());
         return ExitCode::FAILURE;
     }
-    let Some(index) = load(folder, clutter) else {
+    let Some(index) = load(folder, options) else {
         return ExitCode::FAILURE;
     };
     let searcher = Searcher::default();
