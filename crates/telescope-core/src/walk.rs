@@ -2,7 +2,7 @@
 
 use crate::Ignore;
 use crate::index::{EntryId, Index, IndexBuilder, NO_PARENT};
-use std::ffi::{OsStr, OsString};
+use std::ffi::OsStr;
 use std::fs;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
@@ -63,16 +63,166 @@ const GUARDED: &[(&str, &[&str])] = &[
 
 type Guarded = Vec<(PathBuf, &'static [&'static str])>;
 
-struct Walk {
-    shared: Mutex<Shared>,
+/// What decides which folders the scan reads, shared with the check on changed folders.
+#[derive(Clone, Debug)]
+pub(crate) struct Rules {
     clutter: Clutter,
     access: Access,
     /// Empty with Full Disk Access.
     guarded: Guarded,
     ignore: Ignore,
-    root: EntryId,
     home: PathBuf,
     library: PathBuf,
+}
+
+/// A folder the scan opens and does not seal.
+#[derive(Clone, Copy)]
+pub(crate) struct Inside {
+    /// Read only on the way to a folder you brought back; nothing else inside is kept.
+    pub(crate) passage: bool,
+    /// ~/Library, where only cloud drives are kept.
+    in_library: bool,
+}
+
+/// Worked out before a folder is read.
+#[derive(Clone, Copy)]
+pub(crate) struct Opening {
+    skip: bool,
+    kept: bool,
+    may_seal: bool,
+    package: bool,
+}
+
+impl Rules {
+    pub(crate) fn new(home: &Path, clutter: Clutter, ignore: &Ignore, access: Access) -> Self {
+        let guarded = match access {
+            Access::Full => Vec::new(),
+            Access::Limited => GUARDED
+                .iter()
+                .map(|&(parent, names)| (home.join(parent), names))
+                .collect(),
+        };
+        Self {
+            clutter,
+            access,
+            guarded,
+            ignore: ignore.clone(),
+            home: home.to_path_buf(),
+            library: home.join("Library"),
+        }
+    }
+
+    pub(crate) fn is_guarded(&self, path: &Path) -> bool {
+        is_guarded(path, &self.guarded)
+    }
+
+    /// `None` when the folder is listed in its parent but never opened. What you scan is
+    /// always read, whatever it is.
+    pub(crate) fn opening(&self, path: &Path, top: bool, passage: bool) -> Option<Opening> {
+        let skip = self.clutter == Clutter::Skip && !top;
+        let name = path.file_name().unwrap_or_default();
+        // A Photos library may be guarded under any name or folder, and a guard beats your list.
+        if self.access == Access::Limited
+            && path
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("photoslibrary"))
+        {
+            return None;
+        }
+        let kept = self.ignore.keeps(path, name);
+        let may_seal = skip && !passage && !kept;
+        let package = may_seal && is_package(path);
+        if package && !self.ignore.leads_to_kept(path) {
+            return None;
+        }
+        Some(Opening {
+            skip,
+            kept,
+            may_seal,
+            package,
+        })
+    }
+
+    /// `None` when the folder is sealed. `has` tells whether the folder holds a name.
+    pub(crate) fn inside(
+        &self,
+        path: &Path,
+        opening: Opening,
+        passage: bool,
+        has: impl Fn(&str) -> bool,
+    ) -> Option<Inside> {
+        let sealed = opening.package || (opening.may_seal && is_sealed(path, has));
+        if sealed && !self.ignore.leads_to_kept(path) {
+            return None;
+        }
+        // Only cloud drives are kept from ~/Library: iCloud Drive, Dropbox, Google Drive, OneDrive.
+        let in_library = opening.skip && !opening.kept && path == self.library;
+        Some(Inside {
+            passage: passage || sealed || in_library,
+            in_library,
+        })
+    }
+
+    /// The guarded folders inside `folder`. Only the few folders in GUARDED hold one, so no
+    /// other folder compares names.
+    pub(crate) fn guarded_in(&self, folder: &Path) -> &[&str] {
+        self.guarded
+            .iter()
+            .find(|(parent, _)| *parent == folder)
+            .map_or(&[][..], |&(_, names)| names)
+    }
+
+    /// Whether `name` is kept from `parent`: `None` when it is dropped, else whether it is a
+    /// passage. `child` is its path when it is a folder, and `guarded` comes from `guarded_in`.
+    pub(crate) fn keeps(
+        &self,
+        parent: &Path,
+        inside: Inside,
+        guarded: &[&str],
+        name: &OsStr,
+        child: Option<&Path>,
+        has: impl Fn(&str) -> bool,
+    ) -> Option<bool> {
+        match child {
+            None if inside.passage => None,
+            None => Some(false),
+            Some(_) if guarded.iter().any(|guarded| name == *guarded) => None,
+            Some(child) => self.keeps_folder(parent, inside, child, name, has),
+        }
+    }
+
+    /// Whether folder `child`, named `name`, is kept from `parent`: `None` when it is
+    /// dropped, else whether it is a passage. `beside` tells whether `parent` holds a name.
+    pub(crate) fn keeps_folder(
+        &self,
+        parent: &Path,
+        inside: Inside,
+        child: &Path,
+        name: &OsStr,
+        beside: impl Fn(&str) -> bool,
+    ) -> Option<bool> {
+        if self.clutter == Clutter::Keep {
+            return Some(false);
+        }
+        let cloud = inside.in_library && (name == "Mobile Documents" || name == "CloudStorage");
+        let wanted = self.ignore.keeps(child, name) || (cloud && !self.ignore.skips(child, name));
+        let dropped = inside.passage
+            || is_clutter(parent, name, &self.home)
+            || is_tool_download(name, beside)
+            || self.ignore.skips(child, name);
+        if !wanted && dropped {
+            // A skipped folder on the way to one you brought back is walked through, keeping
+            // only the way there.
+            return self.ignore.leads_to_kept(child).then_some(true);
+        }
+        Some(false)
+    }
+}
+
+struct Walk {
+    shared: Mutex<Shared>,
+    rules: Rules,
+    root: EntryId,
 }
 
 struct Shared {
@@ -91,14 +241,8 @@ pub fn scan(
 ) -> io::Result<Scan> {
     // The real path, as macOS reports file changes: /tmp becomes /private/tmp, no "..".
     let root = fs::canonicalize(root)?;
-    let guarded: Guarded = match access {
-        Access::Full => Vec::new(),
-        Access::Limited => GUARDED
-            .iter()
-            .map(|&(parent, names)| (home.join(parent), names))
-            .collect(),
-    };
-    if is_guarded(&root, &guarded) {
+    let rules = Rules::new(home, clutter, ignore, access);
+    if rules.is_guarded(&root) {
         return Err(io::ErrorKind::PermissionDenied.into());
     }
     // A root you may not open, or a file, is an error with the system's own number.
@@ -111,13 +255,8 @@ pub fn scan(
             builder,
             unreadable_folders: 0,
         }),
-        clutter,
-        access,
-        guarded,
-        ignore: ignore.clone(),
+        rules,
         root: root_id,
-        library: home.join("Library"),
-        home: home.to_path_buf(),
     };
     rayon::scope(|scope| read_folder(scope, root, root_id, false, &walk));
 
@@ -151,8 +290,7 @@ fn is_clutter(folder: &Path, name: &OsStr, home: &Path) -> bool {
 
 /// Downloads a tool keeps beside its project, known by the project file next to them.
 /// A folder that happens to be called "vendor" is kept.
-fn is_tool_download(name: &OsStr, listing: &[(OsString, bool)]) -> bool {
-    let beside = |file: &str| listing.iter().any(|(name, _)| name == file);
+fn is_tool_download(name: &OsStr, beside: impl Fn(&str) -> bool) -> bool {
     match name.to_str() {
         Some("vendor") => beside("composer.json") || beside("go.mod"),
         Some("Pods") => beside("Podfile"),
@@ -196,8 +334,7 @@ fn is_package(path: &Path) -> bool {
 
 /// Apps, documents saved as folders, and folders a tool labelled as its cache, are listed in
 /// their parent with nothing inside them, like packages.
-fn is_sealed(path: &Path, listing: &[(OsString, bool)]) -> bool {
-    let has = |file: &str| listing.iter().any(|(name, _)| name == file);
+fn is_sealed(path: &Path, has: impl Fn(&str) -> bool) -> bool {
     let extension = path.extension().and_then(OsStr::to_str);
     match extension.map(str::to_ascii_lowercase).as_deref() {
         // Ordinary folders get these names too, like a project called storefront.app.
@@ -228,23 +365,10 @@ fn read_folder<'s>(
     walk: &'s Walk,
 ) {
     let shared = &walk.shared;
-    // What you scan is always read, whatever it is.
-    let skip = walk.clutter == Clutter::Skip && folder != walk.root;
-    let name = path.file_name().unwrap_or_default();
-    // A Photos library may be guarded under any name or folder, and a guard beats your list.
-    if walk.access == Access::Limited
-        && path
-            .extension()
-            .is_some_and(|ext| ext.eq_ignore_ascii_case("photoslibrary"))
-    {
+    let rules = &walk.rules;
+    let Some(opening) = rules.opening(&path, folder == walk.root, passage) else {
         return;
-    }
-    let kept = walk.ignore.keeps(&path, name);
-    let may_seal = skip && !passage && !kept;
-    let package = may_seal && is_package(&path);
-    if package && !walk.ignore.leads_to_kept(&path) {
-        return;
-    }
+    };
     let Ok(entries) = fs::read_dir(&path) else {
         shared.lock().unwrap().unreadable_folders += 1;
         return;
@@ -258,19 +382,11 @@ fn read_folder<'s>(
         let is_dir = entry.file_type().is_ok_and(|kind| kind.is_dir());
         listing.push((entry.file_name(), is_dir));
     }
-    let sealed = package || (may_seal && is_sealed(&path, &listing));
-    if sealed && !walk.ignore.leads_to_kept(&path) {
+    let has = |file: &str| listing.iter().any(|(name, _)| name == file);
+    let Some(inside) = rules.inside(&path, opening, passage, has) else {
         return;
-    }
-    // Only cloud drives are kept from ~/Library: iCloud Drive, Dropbox, Google Drive, OneDrive.
-    let in_library = skip && !kept && path == walk.library;
-    let passage = passage || sealed || in_library;
-    // Only the few folders in GUARDED hold one, so no other folder compares names.
-    let guarded = walk
-        .guarded
-        .iter()
-        .find(|(parent, _)| *parent == path)
-        .map_or(&[][..], |&(_, names)| names);
+    };
+    let guarded = rules.guarded_in(&path);
 
     // Names are gathered first so the shared lock is taken once per folder, not once per file.
     let mut names = String::new();
@@ -278,35 +394,12 @@ fn read_folder<'s>(
     let mut subfolders = Vec::new();
     for (name, is_dir) in &listing {
         let is_dir = *is_dir;
-        if is_dir && guarded.iter().any(|guarded| name == guarded) {
-            continue;
-        }
         let child_path = is_dir.then(|| path.join(name));
-        let mut child_passage = false;
-        if walk.clutter == Clutter::Skip {
-            match &child_path {
-                None if passage => continue,
-                None => {}
-                Some(child) => {
-                    let cloud =
-                        in_library && (name == "Mobile Documents" || name == "CloudStorage");
-                    let wanted = walk.ignore.keeps(child, name)
-                        || (cloud && !walk.ignore.skips(child, name));
-                    let dropped = passage
-                        || is_clutter(&path, name, &walk.home)
-                        || is_tool_download(name, &listing)
-                        || walk.ignore.skips(child, name);
-                    if !wanted && dropped {
-                        // A skipped folder on the way to one you brought back is walked
-                        // through, keeping only the way there.
-                        if !walk.ignore.leads_to_kept(child) {
-                            continue;
-                        }
-                        child_passage = true;
-                    }
-                }
-            }
-        }
+        let Some(child_passage) =
+            rules.keeps(&path, inside, guarded, name, child_path.as_deref(), has)
+        else {
+            continue;
+        };
         names.push_str(&name.to_string_lossy());
         children.push((names.len(), is_dir));
         subfolders.extend(child_path.map(|child| (child, child_passage)));

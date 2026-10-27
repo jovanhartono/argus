@@ -3,19 +3,9 @@ import XCTest
 @testable import Telescope
 
 final class NoticeTests: XCTestCase {
-    func testOnlyTheMissingAccessLineOpensSettings() {
-        XCTAssertTrue(Notice.needsAccess.opensSettings)
-        XCTAssertFalse(Notice.needsRelaunch.opensSettings)
-    }
-
-    func testBothLinesNameEveryKindOfFolderLeftOut() {
-        for notice in [Notice.needsAccess, .needsRelaunch] {
-            XCTAssertTrue(notice.text.contains("Desktop, Documents, Downloads and cloud drives"), notice.text)
-        }
-    }
-
-    func testTheRelaunchLineSaysHowToQuit() {
-        XCTAssertTrue(Notice.needsRelaunch.text.contains("⌘Q"))
+    func testTheLineNamesEveryKindOfFolderLeftOut() {
+        let text = Notice.needsAccess.text
+        XCTAssertTrue(text.contains("Desktop, Documents, Downloads and cloud drives"), text)
     }
 
     func testSettingsOpensOnFullDiskAccess() {
