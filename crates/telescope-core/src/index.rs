@@ -66,6 +66,35 @@ impl Index {
         chain.iter().rev().map(|&e| self.name(e)).collect()
     }
 
+    /// Folders are numbered after their parent, so the search starts there.
+    pub(crate) fn child_folders(&self, folder: EntryId) -> impl Iterator<Item = EntryId> + '_ {
+        let after = self.folders.partition_point(|&entry| entry <= folder);
+        self.folders[after..]
+            .iter()
+            .copied()
+            .filter(move |&entry| self.entry_parent[entry as usize] == folder)
+    }
+
+    /// The folder reached from the root through `names`, one folder at a time.
+    pub(crate) fn find_folder<'a>(
+        &self,
+        names: impl IntoIterator<Item = &'a str>,
+    ) -> Option<EntryId> {
+        let mut folder = 0;
+        for name in names {
+            folder = self
+                .child_folders(folder)
+                .find(|&child| self.name(child) == name)?;
+        }
+        Some(folder)
+    }
+
+    /// Everything listed directly inside `folder`.
+    pub(crate) fn children(&self, folder: EntryId) -> impl Iterator<Item = EntryId> + '_ {
+        (folder + 1..self.len() as EntryId)
+            .filter(move |&entry| self.entry_parent[entry as usize] == folder)
+    }
+
     pub fn heap_bytes(&self) -> usize {
         self.names.capacity()
             + self.name_starts.capacity() * size_of::<u32>()

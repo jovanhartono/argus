@@ -7,7 +7,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-static const uint32_t TL_ABI_VERSION = 2;
+static const uint32_t TL_ABI_VERSION = 3;
 
 static const uint32_t TL_OK = 0;
 static const uint32_t TL_GONE = 1;
@@ -17,6 +17,7 @@ static const uint32_t TL_EVENT_INDEXED = 1;
 static const uint32_t TL_EVENT_READY = 2;
 static const uint32_t TL_EVENT_FAILED = 3;
 static const uint32_t TL_EVENT_NOTE = 4;
+static const uint32_t TL_EVENT_REBUILT = 5;
 
 typedef struct TlCore TlCore;
 
@@ -41,6 +42,9 @@ uint32_t tl_abi_version(void);
 TlCore *tl_core_new(const uint8_t *root, size_t root_len, uint32_t full_disk, void *ctx, TlEventFn on_event);
 TlCore *tl_core_new_stand_in(uint64_t count, void *ctx, TlEventFn on_event);
 uint64_t tl_submit(const TlCore *core, const uint8_t *query, size_t len);
+uint32_t tl_changed(const TlCore *core, const uint8_t *paths, size_t len, uint32_t rescan);
+void tl_grant_full_disk(const TlCore *core);
+uint32_t tl_watched(const TlCore *core, TlRows *out);
 uint32_t tl_take(const TlCore *core, uint64_t ticket, TlRows *out);
 void tl_rows_free(TlRows rows);
 void tl_core_free(TlCore *core);

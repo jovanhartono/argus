@@ -16,6 +16,7 @@ final class HatchTests: XCTestCase {
                     answered = ticket
                     ready.fulfill()
                 case .failed: XCTFail("the core stopped")
+                case .rebuilt: XCTFail("nothing changed")
                 }
             })
         await fulfillment(of: [indexed], timeout: 5)
@@ -49,6 +50,7 @@ final class HatchTests: XCTestCase {
                     indexed.fulfill()
                 case .ready: ready.fulfill()
                 case .failed: XCTFail("the scan failed")
+                case .rebuilt: break
                 }
             })
         await fulfillment(of: [indexed], timeout: 5)
@@ -60,5 +62,90 @@ final class HatchTests: XCTestCase {
         XCTAssertEqual(rows.map(\.name), ["budget 2026.txt"])
         // Rust reports the real path, /private/var/…, which Foundation shortens to /var/….
         XCTAssertTrue(rows.first?.folder.hasSuffix("/\(root.lastPathComponent)/notes") ?? false)
+    }
+
+    func testAFileSavedInAWatchedFolderBringsANewList() async throws {
+        let (root, notes) = try folderWithNotes()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let (hatch, counts) = try await watching(root)
+        try Data().write(to: notes.appendingPathComponent("budget.txt"))
+        // The folder, notes, a.txt and budget.txt.
+        try await counts.reach(4, within: 5)
+        _ = hatch
+    }
+
+    func testAFolderMadeAtTheTopIsNoticedAndWatched() async throws {
+        let (root, _) = try folderWithNotes()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let (hatch, counts) = try await watching(root)
+        let work = root.appendingPathComponent("work")
+        try FileManager.default.createDirectory(at: work, withIntermediateDirectories: false)
+        try await counts.reach(4, within: 5)
+        hatch.watch()
+        try Data().write(to: work.appendingPathComponent("plan.md"))
+        try await counts.reach(5, within: 5)
+    }
+
+    func testChangesOutsideTheListAreIgnored() async throws {
+        let (root, notes) = try folderWithNotes()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let (hatch, counts) = try await watching(root)
+        let modules = notes.appendingPathComponent("node_modules")
+        try FileManager.default.createDirectory(at: modules, withIntermediateDirectories: false)
+        for file in 0..<20 { try Data().write(to: modules.appendingPathComponent("\(file).js")) }
+        // Saved over: the same names as before.
+        try Data("edited".utf8).write(to: notes.appendingPathComponent("a.txt"))
+        try await Task.sleep(for: .seconds(1.5))
+        XCTAssertEqual(counts.heard, 0)
+
+        try Data().write(to: notes.appendingPathComponent("budget.txt"))
+        try await counts.reach(4, within: 5)
+        _ = hatch
+    }
+
+    private func folderWithNotes() throws -> (URL, URL) {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let notes = root.appendingPathComponent("notes")
+        try FileManager.default.createDirectory(at: notes, withIntermediateDirectories: true)
+        try Data().write(to: notes.appendingPathComponent("a.txt"))
+        return (root, notes)
+    }
+
+    private func watching(_ root: URL) async throws -> (Hatch, Counts) {
+        let counts = Counts()
+        let indexed = expectation(description: "indexed")
+        let hatch = try XCTUnwrap(
+            Hatch(root: root.path, fullDisk: true) { event in
+                switch event {
+                case .indexed: indexed.fulfill()
+                case .rebuilt(let count, _): counts.add(count)
+                case .ready: break
+                case .failed: XCTFail("the scan failed")
+                }
+            })
+        await fulfillment(of: [indexed], timeout: 5)
+        hatch.watch()
+        return (hatch, counts)
+    }
+}
+
+/// The entry count of each new list, in order.
+@MainActor
+private final class Counts {
+    private var counts: [UInt64] = []
+    var heard: Int { counts.count }
+
+    func add(_ count: UInt64) { counts.append(count) }
+
+    /// Waits for a new list of `count` entries.
+    func reach(_ count: UInt64, within seconds: Double) async throws {
+        let deadline = ProcessInfo.processInfo.systemUptime + seconds
+        while counts.last != count {
+            guard ProcessInfo.processInfo.systemUptime < deadline else {
+                XCTFail("no list of \(count) within \(seconds) s, only \(counts)")
+                throw CancellationError()
+            }
+            try await Task.sleep(for: .milliseconds(10))
+        }
     }
 }
