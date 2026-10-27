@@ -936,11 +936,13 @@ mod tests {
         write(&root, &["a/new/e.txt", "x/z.txt", "w/v.txt"]);
 
         // The deleted folder's own path, a file's path inside a new folder, and a ".." that
-        // ends the path at the folder before it.
+        // ends the path at the folder before it. Joining would drop the ".." on Windows.
+        let mut dotted = root.clone().into_os_string();
+        dotted.push(format!("{0}x{0}..{0}w", std::path::MAIN_SEPARATOR));
         let changed = [
             root.join("a/b/c"),
             root.join("a/new/e.txt"),
-            root.join("x/../w"),
+            PathBuf::from(dotted),
         ];
         let update = settings.update(&mut index, &changed);
         assert_eq!(update.folders_read, 2);
