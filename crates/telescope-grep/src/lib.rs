@@ -152,7 +152,8 @@ impl Grep {
             cloud_only: self.cloud_only,
         };
         self.pool.install(|| {
-            (0..index.len() as EntryId)
+            index
+                .ids()
                 .into_par_iter()
                 .try_for_each_init(searcher, |searcher, entry| {
                     job.entry(index, entry, searcher)
@@ -191,7 +192,7 @@ impl<F: Fn(Found<'_>) + Sync, S: Fn() -> bool + Sync> Job<'_, F, S> {
         if (self.stale)() || self.done() {
             return None;
         }
-        if !index.is_dir(entry) {
+        if !index.is_dir(entry) && !index.is_removed(entry) {
             let file = self.file(entry, &index.path(entry), searcher);
             let mut report = self.report.lock().unwrap();
             *report = *report + file;

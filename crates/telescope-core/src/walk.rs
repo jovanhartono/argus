@@ -2,7 +2,7 @@
 
 use crate::Ignore;
 use crate::index::{EntryId, Index, IndexBuilder, NO_PARENT};
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
@@ -11,7 +11,8 @@ use std::sync::Mutex;
 pub struct Scan {
     pub index: Index,
     /// Folders not read in full: no permission (Mail without Full Disk Access),
-    /// deleted while the scan ran, or a disk or network error.
+    /// deleted while the scan ran, or a disk or network error. Counted by the scan; each
+    /// update reports its own.
     pub unreadable_folders: usize,
 }
 
@@ -63,7 +64,7 @@ const GUARDED: &[(&str, &[&str])] = &[
 
 type Guarded = Vec<(PathBuf, &'static [&'static str])>;
 
-/// What decides which folders the scan reads, shared with the check on changed folders.
+/// What decides which files and folders a scan keeps, wherever it starts.
 #[derive(Clone, Debug)]
 pub(crate) struct Rules {
     clutter: Clutter,
@@ -94,6 +95,7 @@ pub(crate) struct Opening {
 }
 
 impl Rules {
+    /// `home` is a real path, as `home()` gives it.
     pub(crate) fn new(home: &Path, clutter: Clutter, ignore: &Ignore, access: Access) -> Self {
         let guarded = match access {
             Access::Full => Vec::new(),
@@ -110,6 +112,11 @@ impl Rules {
             home: home.to_path_buf(),
             library: home.join("Library"),
         }
+    }
+
+    /// The folder that holds your ignore list, when the list counts.
+    pub(crate) fn ignore_folder(&self) -> Option<PathBuf> {
+        (self.clutter == Clutter::Skip).then(|| Ignore::folder(&self.home, self.access))
     }
 
     pub(crate) fn is_guarded(&self, path: &Path) -> bool {
@@ -219,15 +226,65 @@ impl Rules {
     }
 }
 
-struct Walk {
+/// What a child is, as the scan keeps it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum Kind {
+    File,
+    Folder,
+    /// A folder the rules skip, read only on the way to one you brought back, so it holds
+    /// only the folders on that way.
+    Passage,
+}
+
+/// A name as read from disk, with the folder's inode for a folder.
+type Found = (OsString, Option<u32>);
+
+/// The low half of a folder's inode number: a folder deleted and replaced by another of the
+/// same name almost always gets another one.
+#[cfg(unix)]
+fn inode(entry: &fs::DirEntry) -> u32 {
+    use std::os::unix::fs::DirEntryExt;
+    entry.ino() as u32
+}
+
+/// Windows lists no inode, so there a folder swapped for another of the same name in one
+/// update goes unnoticed.
+#[cfg(not(unix))]
+fn inode(_: &fs::DirEntry) -> u32 {
+    0
+}
+
+/// One folder's children as the scan keeps them, with their names back to back.
+#[derive(Default)]
+pub(crate) struct Listing {
+    pub(crate) names: String,
+    /// Where each child's name ends in `names`, what it is, and a folder's inode.
+    pub(crate) children: Vec<(usize, Kind, u32)>,
+    /// The path of each child folder, in order.
+    pub(crate) folders: Vec<PathBuf>,
+    /// The folder, or part of it, could not be read.
+    pub(crate) unreadable: bool,
+}
+
+impl Listing {
+    pub(crate) fn iter(&self) -> impl Iterator<Item = (&str, Kind, u32)> {
+        let starts = std::iter::once(0).chain(self.children.iter().map(|&(end, ..)| end));
+        starts
+            .zip(&self.children)
+            .map(|(start, &(end, kind, inode))| (&self.names[start..end], kind, inode))
+    }
+}
+
+struct Walk<'r> {
     shared: Mutex<Shared>,
-    rules: Rules,
+    rules: &'r Rules,
+    /// The scan's own root, which is always read in full; `NO_PARENT` when there is none.
     root: EntryId,
 }
 
-struct Shared {
-    builder: IndexBuilder,
-    unreadable_folders: usize,
+pub(crate) struct Shared {
+    pub(crate) builder: IndexBuilder,
+    pub(crate) unreadable_folders: usize,
 }
 
 /// Symbolic links are listed but never followed. Your ignore list counts only when clutter
@@ -239,9 +296,12 @@ pub fn scan(
     ignore: &Ignore,
     access: Access,
 ) -> io::Result<Scan> {
+    scan_with(root, &Rules::new(home, clutter, ignore, access))
+}
+
+pub(crate) fn scan_with(root: &Path, rules: &Rules) -> io::Result<Scan> {
     // The real path, as macOS reports file changes: /tmp becomes /private/tmp, no "..".
     let root = fs::canonicalize(root)?;
-    let rules = Rules::new(home, clutter, ignore, access);
     if rules.is_guarded(&root) {
         return Err(io::ErrorKind::PermissionDenied.into());
     }
@@ -250,21 +310,36 @@ pub fn scan(
 
     let mut builder = IndexBuilder::new();
     let root_id = builder.push(&root.to_string_lossy(), NO_PARENT, true);
+    let shared = walk(builder, rules, root_id, vec![(root, root_id, false)]);
+    Ok(Scan {
+        index: shared.builder.finish(),
+        unreadable_folders: shared.unreadable_folders,
+    })
+}
+
+/// Reads each `(path, entry, passage)` folder and everything the rules keep inside it into
+/// `builder`, on all cores at once.
+pub(crate) fn walk(
+    builder: IndexBuilder,
+    rules: &Rules,
+    root: EntryId,
+    folders: Vec<(PathBuf, EntryId, bool)>,
+) -> Shared {
     let walk = Walk {
         shared: Mutex::new(Shared {
             builder,
             unreadable_folders: 0,
         }),
         rules,
-        root: root_id,
+        root,
     };
-    rayon::scope(|scope| read_folder(scope, root, root_id, false, &walk));
-
-    let shared = walk.shared.into_inner().unwrap();
-    Ok(Scan {
-        index: shared.builder.finish(),
-        unreadable_folders: shared.unreadable_folders,
-    })
+    rayon::scope(|scope| {
+        for (path, folder, passage) in folders {
+            let walk = &walk;
+            scope.spawn(move |scope| read_folder(scope, path, folder, passage, walk));
+        }
+    });
+    walk.shared.into_inner().unwrap()
 }
 
 /// The real home folder, the way the scan reports paths, or empty when there is none.
@@ -355,69 +430,84 @@ fn is_cache_tag(file: &Path) -> bool {
     read.is_ok() && start == *b"Signature: 8a477f597d28d172789f06886806bc55"
 }
 
+impl Rules {
+    /// What the scan keeps of one folder. `root` is what you scan, always read in full.
+    pub(crate) fn list(&self, path: &Path, root: bool, passage: bool) -> Listing {
+        let mut out = Listing::default();
+        let Some(opening) = self.opening(path, root, passage) else {
+            return out;
+        };
+        let Ok(entries) = fs::read_dir(path) else {
+            out.unreadable = true;
+            return out;
+        };
+        let mut listing: Vec<Found> = Vec::new();
+        for entry in entries {
+            let Ok(entry) = entry else {
+                out.unreadable = true;
+                break;
+            };
+            // Taken for a file, a folder would leave the index with everything in it.
+            let Ok(kind) = entry.file_type() else {
+                out.unreadable = true;
+                continue;
+            };
+            listing.push((entry.file_name(), kind.is_dir().then(|| inode(&entry))));
+        }
+        let has = |file: &str| listing.iter().any(|(name, _)| name == file);
+        let Some(inside) = self.inside(path, opening, passage, has) else {
+            return out;
+        };
+        let guarded = self.guarded_in(path);
+
+        let Listing {
+            names,
+            children,
+            folders,
+            ..
+        } = &mut out;
+        for (name, inode) in &listing {
+            let child_path = inode.is_some().then(|| path.join(name));
+            let Some(child_passage) =
+                self.keeps(path, inside, guarded, name, child_path.as_deref(), has)
+            else {
+                continue;
+            };
+            let kind = match (&child_path, child_passage) {
+                (None, _) => Kind::File,
+                (Some(_), false) => Kind::Folder,
+                (Some(_), true) => Kind::Passage,
+            };
+            names.push_str(&name.to_string_lossy());
+            children.push((names.len(), kind, inode.unwrap_or(0)));
+            folders.extend(child_path);
+        }
+        out
+    }
+}
+
 /// Each job carries its folder's number, so no path-to-number table is needed.
-/// A `passage` folder is one the rules skip, read only on the way to one you brought back.
 fn read_folder<'s>(
     scope: &rayon::Scope<'s>,
     path: PathBuf,
     folder: EntryId,
     passage: bool,
-    walk: &'s Walk,
+    walk: &'s Walk<'s>,
 ) {
-    let shared = &walk.shared;
-    let rules = &walk.rules;
-    let Some(opening) = rules.opening(&path, folder == walk.root, passage) else {
-        return;
-    };
-    let Ok(entries) = fs::read_dir(&path) else {
-        shared.lock().unwrap().unreadable_folders += 1;
-        return;
-    };
-    let mut listing = Vec::new();
-    for entry in entries {
-        let Ok(entry) = entry else {
-            shared.lock().unwrap().unreadable_folders += 1;
-            break;
-        };
-        let is_dir = entry.file_type().is_ok_and(|kind| kind.is_dir());
-        listing.push((entry.file_name(), is_dir));
-    }
-    let has = |file: &str| listing.iter().any(|(name, _)| name == file);
-    let Some(inside) = rules.inside(&path, opening, passage, has) else {
-        return;
-    };
-    let guarded = rules.guarded_in(&path);
-
-    // Names are gathered first so the shared lock is taken once per folder, not once per file.
-    let mut names = String::new();
-    let mut children: Vec<(usize, bool)> = Vec::new();
-    let mut subfolders = Vec::new();
-    for (name, is_dir) in &listing {
-        let is_dir = *is_dir;
-        let child_path = is_dir.then(|| path.join(name));
-        let Some(child_passage) =
-            rules.keeps(&path, inside, guarded, name, child_path.as_deref(), has)
-        else {
-            continue;
-        };
-        names.push_str(&name.to_string_lossy());
-        children.push((names.len(), is_dir));
-        subfolders.extend(child_path.map(|child| (child, child_passage)));
-    }
-
-    let mut subfolder_ids = Vec::with_capacity(subfolders.len());
-    let mut state = shared.lock().unwrap();
-    let mut start = 0;
-    for (end, is_dir) in children {
-        let child = state.builder.push(&names[start..end], folder, is_dir);
-        if is_dir {
-            subfolder_ids.push(child);
+    let listing = walk.rules.list(&path, folder == walk.root, passage);
+    // The shared lock is taken once per folder, not once per file.
+    let mut subfolders = Vec::with_capacity(listing.folders.len());
+    let mut state = walk.shared.lock().unwrap();
+    state.unreadable_folders += usize::from(listing.unreadable);
+    for (name, kind, inode) in listing.iter() {
+        let child = state.builder.push_child(name, folder, kind, inode);
+        if kind != Kind::File {
+            subfolders.push((child, kind == Kind::Passage));
         }
-        start = end;
     }
     drop(state);
 
-    for (child, (child_path, passage)) in subfolder_ids.into_iter().zip(subfolders) {
+    for ((child, passage), child_path) in subfolders.into_iter().zip(listing.folders) {
         scope.spawn(move |scope| read_folder(scope, child_path, child, passage, walk));
     }
 }

@@ -1,6 +1,6 @@
 //! The saved index: one file that opens in milliseconds, so a restart needs no rescan.
 //!
-//! Version 1, every number little-endian:
+//! Version 2, every number little-endian:
 //!
 //! | bytes | what                                                       |
 //! |-------|------------------------------------------------------------|
@@ -9,26 +9,36 @@
 //! | 12    | CRC-32 of the whole file, read with these 4 bytes as zeros |
 //! | 16    | FSEvents event id the index is current to, u64             |
 //! | 24    | folders the scan could not read in full, u32               |
-//! | 28    | sizes, u32 each: settings bytes, name bytes, distinct      |
-//! |       | names, entries, folders                                    |
-//! | 48    | settings, names, name starts, entry names, entry parents,  |
-//! |       | folders; the last four as u32 lists                        |
+//! | 28    | entries added since the lists were last built, low 31 bits |
+//! |       | of a u32; the top bit is set once an update added any      |
+//! | 32    | sizes, u32 each: settings bytes, name bytes, distinct      |
+//! |       | names, entries, folders, passages                          |
+//! | 56    | settings, names, name starts, entry names, entry parents,  |
+//! |       | folders, folder inodes, passages; the last six as u32      |
+//! |       | lists, folder inodes as long as folders                    |
+//!
+//! An entry an update removed keeps its place with `NO_PARENT` as its parent. Version 1 had
+//! no removed or added entries, folder inodes or passages.
 
 use crate::Ignore;
 use crate::index::{EntryId, Index, NO_PARENT, NameId};
 use crate::scope::Scope;
-use crate::walk::{Access, Clutter, Rules, Scan, scan};
+use crate::update::Update;
+use crate::walk::{Access, Clutter, Rules, Scan, scan_with};
 use crc32fast::Hasher;
+use rayon::prelude::*;
 use std::fmt;
 use std::fs::{self, File};
 use std::io::{self, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 const MAGIC: [u8; 8] = *b"TL-INDEX";
-const VERSION: u32 = 1;
-const HEADER: usize = 48;
+const VERSION: u32 = 2;
+const HEADER: usize = 56;
 const CRC: std::ops::Range<usize> = 12..16;
-const SIZES: usize = 28;
+const SIZES: usize = 32;
+/// The added count's bits at byte 28; the top bit says an update added children apart.
+const ADDED: u32 = u32::MAX >> 1;
 /// Lists pass through a buffer this size, so saving or opening never holds a second copy.
 const CHUNK: usize = 256 * 1024;
 
@@ -56,10 +66,7 @@ const fn fnv(mut hash: u64, bytes: &[u8]) -> u64 {
 #[derive(Clone, Debug)]
 pub struct Settings {
     root: PathBuf,
-    home: PathBuf,
-    clutter: Clutter,
-    ignore: Ignore,
-    access: Access,
+    rules: Rules,
     key: Vec<u8>,
 }
 
@@ -84,28 +91,33 @@ impl Settings {
         }
         Self {
             root,
-            home: home.to_path_buf(),
-            clutter,
-            ignore,
-            access,
+            rules: Rules::new(home, clutter, &ignore, access),
             key,
         }
     }
 
     pub fn scan(&self) -> io::Result<Scan> {
-        scan(
-            &self.root,
-            &self.home,
-            self.clutter,
-            &self.ignore,
-            self.access,
-        )
+        scan_with(&self.root, &self.rules)
+    }
+
+    /// The real path of the root, as the index holds it.
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    /// Brings an index built with these settings up to date with the folders that changed,
+    /// as FSEvents reports them: real paths, each a folder whose children changed. A path
+    /// outside `root()` is ignored.
+    pub fn update<P: AsRef<Path>>(&self, index: &mut Index, changed: &[P]) -> Update {
+        index.update(&self.root, &self.rules, changed)
     }
 
     pub fn scope(&self) -> Scope {
-        let rules = Rules::new(&self.home, self.clutter, &self.ignore, self.access);
-        let list = (self.clutter == Clutter::Skip).then(|| Ignore::folder(&self.home, self.access));
-        Scope::new(self.root.clone(), rules, list)
+        Scope::new(
+            self.root.clone(),
+            self.rules.clone(),
+            self.rules.ignore_folder(),
+        )
     }
 }
 
@@ -210,13 +222,17 @@ fn write(
         index.distinct_names(),
         index.len(),
         index.folders.len(),
+        index.passages.len(),
     ];
     let mut head = [0; HEADER];
     head[..8].copy_from_slice(&MAGIC);
     head[8..12].copy_from_slice(&VERSION.to_le_bytes());
     head[16..24].copy_from_slice(&event_id.to_le_bytes());
     let unreadable = u32::try_from(scan.unreadable_folders).unwrap_or(u32::MAX);
-    head[24..SIZES].copy_from_slice(&unreadable.to_le_bytes());
+    head[24..28].copy_from_slice(&unreadable.to_le_bytes());
+    let added = u32::try_from(index.added).map_or(ADDED, |added| added.min(ADDED))
+        | u32::from(index.children_apart) << 31;
+    head[28..SIZES].copy_from_slice(&added.to_le_bytes());
     for (at, size) in head[SIZES..].as_chunks_mut().0.iter_mut().zip(sizes) {
         let size = u32::try_from(size).map_err(|_| io::Error::other("index too large to save"))?;
         *at = size.to_le_bytes();
@@ -237,6 +253,8 @@ fn write(
         &index.entry_name,
         &index.entry_parent,
         &index.folders,
+        &index.folder_inodes,
+        &index.passages,
     ] {
         for chunk in list.chunks(CHUNK / 4) {
             buffer.clear();
@@ -270,10 +288,18 @@ fn read(mut file: impl Read, length: u64, settings: &Settings) -> Result<Saved, 
     let saved_crc = number(CRC.start);
     let event_id = u64::from(number(16)) | u64::from(number(20)) << 32;
     let unreadable_folders = number(24) as usize;
-    let [settings_len, names_len, distinct, entries, folders] =
-        [0, 4, 8, 12, 16].map(|at| u64::from(number(SIZES + at)));
+    let added = (number(28) & ADDED) as usize;
+    let children_apart = number(28) > ADDED;
+    let [
+        settings_len,
+        names_len,
+        distinct,
+        entries,
+        folders,
+        passages,
+    ] = [0, 4, 8, 12, 16, 20].map(|at| u64::from(number(SIZES + at)));
     // Checked before anything is allocated, so a damaged size never asks for gigabytes.
-    let body = settings_len + names_len + 4 * (distinct + 1 + 2 * entries + folders);
+    let body = settings_len + names_len + 4 * (distinct + 1 + 2 * entries + 2 * folders + passages);
     if length != HEADER as u64 + body {
         return Err(OpenError::WrongLength);
     }
@@ -292,15 +318,36 @@ fn read(mut file: impl Read, length: u64, settings: &Settings) -> Result<Saved, 
     let name_starts = reader.numbers(distinct + 1)?;
     let entry_name = reader.numbers(entries)?;
     let entry_parent = reader.numbers(entries)?;
-    let folders = reader.numbers(folders)?;
+    let folder_count = folders;
+    let folders = reader.numbers(folder_count)?;
+    let folder_inodes = reader.numbers(folder_count)?;
+    let passages = reader.numbers(passages)?;
     if reader.crc.finalize() != saved_crc {
         return Err(OpenError::Damaged);
     }
     let names = String::from_utf8(names).map_err(|_| OpenError::Damaged)?;
-    if !is_sound(&names, &name_starts, &entry_name, &entry_parent, &folders) {
+    let sound = is_sound(
+        &names,
+        &name_starts,
+        &entry_name,
+        &entry_parent,
+        &folders,
+        &passages,
+    );
+    if !sound {
         return Err(OpenError::Damaged);
     }
-    let index = Index::from_lists(names, name_starts, entry_name, entry_parent, folders);
+    let mut index = Index::from_lists(
+        names,
+        name_starts,
+        entry_name,
+        entry_parent,
+        folders,
+        folder_inodes,
+        passages,
+    );
+    index.added = added;
+    index.children_apart = children_apart;
     Ok(Saved {
         scan: Scan {
             index,
@@ -339,17 +386,17 @@ impl<R: Read> Reader<R> {
     }
 }
 
-/// Every number points inside its list, so no search can step out of bounds, and every path
-/// walks up to the root. A parent that is a file is let through: no scan writes one, and it
-/// costs only that its children miss their folders' words in a search.
-fn is_sound(
+/// Every number points inside its list, so no search or update can step out of bounds.
+pub(crate) fn is_sound(
     names: &str,
     name_starts: &[u32],
     entry_name: &[NameId],
     entry_parent: &[EntryId],
     folders: &[EntryId],
+    passages: &[EntryId],
 ) -> bool {
     let distinct = name_starts.len() - 1;
+    let ascending = |list: &[EntryId]| list.windows(2).all(|pair| pair[0] < pair[1]);
     name_starts.first() == Some(&0)
         && name_starts.last().map(|&end| end as usize) == Some(names.len())
         && name_starts.windows(2).all(|pair| pair[0] <= pair[1])
@@ -358,15 +405,35 @@ fn is_sound(
             .all(|&start| names.is_char_boundary(start as usize))
         && entry_name.iter().all(|&name| (name as usize) < distinct)
         && entry_parent.first().is_none_or(|&root| root == NO_PARENT)
-        && entry_parent
-            .iter()
-            .enumerate()
-            .skip(1)
-            .all(|(entry, &parent)| (parent as usize) < entry)
-        && folders.windows(2).all(|pair| pair[0] < pair[1])
+        && ascending(folders)
         && folders
             .last()
             .is_none_or(|&last| (last as usize) < entry_parent.len())
+        && ascending(passages)
+        && passages
+            .iter()
+            .all(|passage| folders.binary_search(passage).is_ok())
+        && parents_are_folders_in_the_index(entry_parent, folders)
+}
+
+/// Each entry's parent is an earlier folder that an update has not removed, so every path
+/// walks up to the root and removing a folder reaches everything inside it.
+fn parents_are_folders_in_the_index(entry_parent: &[EntryId], folders: &[EntryId]) -> bool {
+    let mut is_folder = vec![0_u64; entry_parent.len().div_ceil(64)];
+    for &folder in folders {
+        is_folder[folder as usize / 64] |= 1 << (folder % 64);
+    }
+    entry_parent
+        .par_iter()
+        .enumerate()
+        .skip(1)
+        .all(|(entry, &parent)| {
+            let at = parent as usize;
+            parent == NO_PARENT
+                || (at < entry
+                    && is_folder[at / 64] >> (at % 64) & 1 == 1
+                    && (at == 0 || entry_parent[at] != NO_PARENT))
+        })
 }
 
 #[cfg(test)]
@@ -374,6 +441,7 @@ mod tests {
     use super::*;
     use crate::Searcher;
     use crate::index::IndexBuilder;
+    use crate::walk::Kind;
 
     const HOME: &str = "/nowhere";
 
@@ -445,6 +513,13 @@ mod tests {
             entry_parent: parent.to_vec(),
             entry_depth: Vec::new(),
             folders: folders.to_vec(),
+            folder_inodes: vec![0; folders.len()],
+            passages: Vec::new(),
+            runs: None,
+            removed: 0,
+            removed_folders: 0,
+            added: 0,
+            children_apart: false,
         }
     }
 
@@ -485,14 +560,42 @@ mod tests {
             for _ in 0..next(300) {
                 let name: String = (0..next(6)).map(|_| letters[next(letters.len())]).collect();
                 let parent = folders[next(folders.len())];
-                let is_dir = next(3) == 0;
-                let entry = builder.push(&name, parent, is_dir);
+                let kind = [Kind::File, Kind::File, Kind::Folder, Kind::Passage][next(4)];
+                let is_dir = kind != Kind::File;
+                let entry = builder.push_child(&name, parent, kind, next(usize::MAX) as u32);
                 if is_dir {
                     folders.push(entry);
                 }
             }
+            let mut built = builder.finish();
+            // Entries an update removed, each with everything inside it.
+            for _ in 0..next(20) {
+                let entry = 1 + next(built.len());
+                if entry < built.len() {
+                    built.entry_parent[entry] = NO_PARENT;
+                }
+            }
+            for entry in 1..built.len() {
+                let parent = built.entry_parent[entry];
+                if parent != NO_PARENT
+                    && parent != 0
+                    && built.entry_parent[parent as usize] == NO_PARENT
+                {
+                    built.entry_parent[entry] = NO_PARENT;
+                }
+            }
+            let mut index = Index::from_lists(
+                built.names,
+                built.name_starts,
+                built.entry_name,
+                built.entry_parent,
+                built.folders,
+                built.folder_inodes,
+                built.passages,
+            );
+            index.added = next(1000);
             let scan = Scan {
-                index: builder.finish(),
+                index,
                 unreadable_folders: next(1000),
             };
             let event_id = (next(usize::MAX) as u64) << 1;
@@ -537,7 +640,11 @@ mod tests {
 
     #[test]
     fn numbers_are_little_endian_at_fixed_places() {
-        let index = raw("/ab", &[0, 1, 3], &[0, 1], &[NO_PARENT, 0], &[0]);
+        let mut index = raw("/ab", &[0, 1, 3], &[0, 1], &[NO_PARENT, 0], &[0, 1]);
+        index.folder_inodes = vec![0x0102_0304, 5];
+        index.passages = vec![1];
+        index.added = 0x0E0F_1011;
+        index.children_apart = true;
         let settings = keep(Path::new(HOME));
         let scan = Scan {
             index,
@@ -546,22 +653,25 @@ mod tests {
         let bytes = encode(&scan, &settings, 0x0102_0304_0506_0708);
 
         assert_eq!(bytes[..8], *b"TL-INDEX");
-        assert_eq!(bytes[8..12], [1, 0, 0, 0]);
+        assert_eq!(bytes[8..12], [2, 0, 0, 0]);
         let mut zeroed = bytes.clone();
         zeroed[12..16].fill(0);
         assert_eq!(bytes[12..16], crc32fast::hash(&zeroed).to_le_bytes());
         assert_eq!(bytes[16..24], [8, 7, 6, 5, 4, 3, 2, 1]);
         assert_eq!(bytes[24..28], [0x0D, 0x0C, 0x0B, 0x0A]);
-        let sizes = [settings.key.len() as u32, 3, 2, 2, 1];
+        assert_eq!(bytes[28..32], [0x11, 0x10, 0x0F, 0x8E]);
+        let sizes = [settings.key.len() as u32, 3, 2, 2, 2, 1];
         let expected: Vec<u8> = sizes.iter().flat_map(|size| size.to_le_bytes()).collect();
-        assert_eq!(bytes[28..48], expected);
-        assert_eq!(bytes[48..48 + settings.key.len()], settings.key);
-        let lists = &bytes[48 + settings.key.len()..];
+        assert_eq!(bytes[32..56], expected);
+        assert_eq!(bytes[56..56 + settings.key.len()], settings.key);
+        let lists = &bytes[56 + settings.key.len()..];
         assert_eq!(lists[..3], *b"/ab");
         assert_eq!(lists[3..15], [0, 0, 0, 0, 1, 0, 0, 0, 3, 0, 0, 0]);
         assert_eq!(lists[15..23], [0, 0, 0, 0, 1, 0, 0, 0]);
         assert_eq!(lists[23..31], [0xFF, 0xFF, 0xFF, 0xFF, 0, 0, 0, 0]);
-        assert_eq!(lists[31..], [0, 0, 0, 0]);
+        assert_eq!(lists[31..39], [0, 0, 0, 0, 1, 0, 0, 0]);
+        assert_eq!(lists[39..47], [4, 3, 2, 1, 5, 0, 0, 0]);
+        assert_eq!(lists[47..], [1, 0, 0, 0]);
     }
 
     #[test]
@@ -627,7 +737,7 @@ mod tests {
     #[test]
     fn refuses_other_versions_and_other_files() {
         let (dir, settings, bytes) = saved_tree();
-        for version in [0, 2, u32::MAX, u32::from_be_bytes(VERSION.to_le_bytes())] {
+        for version in [0, 1, 3, u32::MAX, u32::from_be_bytes(VERSION.to_le_bytes())] {
             let mut old = bytes.clone();
             old[8..12].copy_from_slice(&version.to_le_bytes());
             let opened = decode(&old, &settings);
@@ -707,7 +817,17 @@ mod tests {
     #[test]
     fn refuses_lists_that_point_outside_themselves() {
         let settings = keep(Path::new(HOME));
-        let sound = raw("/aé", &[0, 1, 4], &[0, 1], &[NO_PARENT, 0], &[0]);
+        let with_passages = |passages: &[u32]| {
+            let mut index = raw("/aé", &[0, 1, 4], &[0, 1], &[NO_PARENT, 0], &[0, 1]);
+            index.passages = passages.to_vec();
+            index
+        };
+        let sound = [
+            raw("/aé", &[0, 1, 4], &[0, 1], &[NO_PARENT, 0], &[0]),
+            // Removed by an update.
+            raw("/aé", &[0, 1, 4], &[0, 1], &[NO_PARENT, NO_PARENT], &[0]),
+            with_passages(&[1]),
+        ];
         let unsound = [
             raw("/aé", &[0, 1, 3], &[0, 1], &[NO_PARENT, 0], &[0]),
             raw("/aé", &[1, 1, 4], &[0, 1], &[NO_PARENT, 0], &[0]),
@@ -716,12 +836,25 @@ mod tests {
             raw("/aé", &[0, 1, 4], &[0, 2], &[NO_PARENT, 0], &[0]),
             raw("/aé", &[0, 1, 4], &[0, 1], &[0, 0], &[0]),
             raw("/aé", &[0, 1, 4], &[0, 1], &[NO_PARENT, 1], &[0]),
-            raw("/aé", &[0, 1, 4], &[0, 1], &[NO_PARENT, NO_PARENT], &[0]),
             raw("/aé", &[0, 1, 4], &[0, 1], &[NO_PARENT, 0], &[0, 0]),
             raw("/aé", &[0, 1, 4], &[0, 1], &[NO_PARENT, 0], &[2]),
             raw("", &[0], &[], &[], &[0]),
+            with_passages(&[1, 1]),
+            with_passages(&[2]),
+            with_passages(&[NO_PARENT]),
+            // A file as a parent, and an entry left inside a removed folder.
+            raw("/abc", &[0, 1, 2, 4], &[0, 1, 2], &[NO_PARENT, 0, 1], &[0]),
+            raw(
+                "/abc",
+                &[0, 1, 2, 4],
+                &[0, 1, 2],
+                &[NO_PARENT, NO_PARENT, 1],
+                &[0, 1],
+            ),
         ];
-        assert!(decode(&encode(&whole(sound), &settings, 0), &settings).is_ok());
+        for index in sound {
+            assert!(decode(&encode(&whole(index), &settings, 0), &settings).is_ok());
+        }
         for (i, index) in unsound.into_iter().enumerate() {
             let opened = decode(&encode(&whole(index), &settings, 0), &settings);
             assert!(matches!(opened, Err(OpenError::Damaged)), "case {i}");
@@ -738,23 +871,13 @@ mod tests {
         assert!(matches!(decode(&bytes, &settings), Err(OpenError::Damaged)));
     }
 
-    #[test]
-    fn a_file_saved_as_a_parent_opens_and_searches_without_harm() {
-        let settings = keep(Path::new(HOME));
-        let index = raw("/abc", &[0, 1, 2, 4], &[0, 1, 2], &[NO_PARENT, 0, 1], &[]);
-        let saved = decode(&encode(&whole(index), &settings, 0), &settings).unwrap();
-        let index = &saved.scan.index;
-        assert_eq!(index.path(2), Path::new("/a/bc"));
-        let searcher = Searcher::with_threads(1);
-        let hits = searcher.search(index, "bc", searcher.ticket(), 10).unwrap();
-        assert!(hits.iter().any(|hit| hit.entry == 2));
-    }
-
     /// Lists damaged so the CRC still holds, as a bug in saving would leave them: either
-    /// refused, or safe to show and search.
+    /// refused, or safe to show, search and update.
     #[test]
     fn damaged_lists_with_a_good_crc_never_panic() {
-        let (_dir, settings, bytes) = saved_tree();
+        let (dir, settings, bytes) = saved_tree();
+        let root = fs::canonicalize(dir.path()).unwrap();
+        let changed = [root.clone(), root.join("src"), root.join("docs/README.md")];
         let names_at = HEADER + settings.key.len();
         let names_len = u32::from_le_bytes(bytes[SIZES + 4..SIZES + 8].try_into().unwrap());
         let lists_at = names_at + names_len as usize;
@@ -787,14 +910,17 @@ mod tests {
                 continue;
             };
             opened += 1;
-            let index = &saved.scan.index;
+            let mut index = saved.scan.index;
             for entry in 0..index.len() as EntryId {
                 let _ = (index.path(entry), index.name(entry), index.is_dir(entry));
             }
             for query in ["a", "re", "md src", "é"] {
-                let hits = searcher.search(index, query, searcher.ticket(), 10);
+                let hits = searcher.search(&index, query, searcher.ticket(), 10);
                 assert!(hits.is_some(), "pass {pass}");
             }
+            settings.update(&mut index, &changed);
+            let hits = searcher.search(&index, "md src", searcher.ticket(), 10);
+            assert!(hits.is_some(), "pass {pass}");
         }
         assert!(opened > 100, "only {opened} damaged indexes opened");
     }
