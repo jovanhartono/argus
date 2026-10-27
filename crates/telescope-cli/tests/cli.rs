@@ -40,6 +40,28 @@ fn a_line_that_fits_no_command_shows_usage_and_fails() {
 }
 
 #[test]
+fn version_prints_the_package_version() {
+    let output = tl(&["--version"]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(
+        stdout(&output),
+        format!("tl {}\n", env!("CARGO_PKG_VERSION"))
+    );
+}
+
+/// Both are bumped by hand for a release, and a mismatch would ship an app and a `tl` that
+/// disagree about which release they are.
+#[test]
+fn the_mac_app_has_the_same_version_as_the_crates() {
+    let plist = include_str!("../../../apps/macos/Info.plist");
+    let key = "<key>CFBundleShortVersionString</key>";
+    let after = &plist[plist.find(key).expect("no CFBundleShortVersionString") + key.len()..];
+    let value = after.trim_start().strip_prefix("<string>").unwrap();
+    let value = &value[..value.find("</string>").unwrap()];
+    assert_eq!(value, env!("CARGO_PKG_VERSION"));
+}
+
+#[test]
 fn grep_shows_each_line_found() {
     let dir = folder();
     let output = tl(&["grep", &path(dir.path(), "files"), "milk", "--all"]);

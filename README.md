@@ -36,6 +36,14 @@ Telescope isn't notarized by Apple, so macOS asks you once before it opens:
 
 To start Telescope when you log in, open System Settings → General → Login Items & Extensions, click + under Open at Login, and choose Telescope in Applications.
 
+## Update to a new release
+
+1. Press ⌘⇧Space, then ⌘Q to quit Telescope.
+2. Open the new `Telescope.dmg`, drag Telescope to Applications and click Replace.
+3. Open Telescope. If macOS asks again, repeat Open Anyway from the install steps.
+
+Every release is signed with the same certificate, so Full Disk Access and Login Items should carry over. This hasn't been checked with a downloaded update yet ([#13](https://github.com/jovanhartono/telescope/issues/13) will record whether Open Anyway comes back and whether Full Disk Access stays on). If the window says it needs Full Disk Access again, remove Telescope from the Full Disk Access list with −, add it back with +, and quit and reopen it.
+
 ## Licence
 
 Licensed under either of [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your option.
