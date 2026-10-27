@@ -441,6 +441,7 @@ mod tests {
             names: names.to_owned(),
             name_starts: starts.to_vec(),
             name_letters: Vec::new(),
+            name_word_starts: Vec::new(),
             entry_name: name.to_vec(),
             entry_parent: parent.to_vec(),
             entry_depth: Vec::new(),
