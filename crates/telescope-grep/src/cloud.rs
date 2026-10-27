@@ -67,6 +67,12 @@ pub(crate) fn never_download() {
     );
 }
 
+#[cfg(all(test, target_os = "macos"))]
+pub(crate) fn downloads_off() -> bool {
+    use policy::*;
+    getiopolicy_np(MATERIALIZE_DATALESS_FILES, SCOPE_THREAD) == MATERIALIZE_OFF
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -103,19 +109,12 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn turns_off_downloads_for_this_thread_only() {
-        use policy::*;
         std::thread::spawn(|| {
             never_download();
-            assert_eq!(
-                getiopolicy_np(MATERIALIZE_DATALESS_FILES, SCOPE_THREAD),
-                MATERIALIZE_OFF
-            );
+            assert!(downloads_off());
         })
         .join()
         .unwrap();
-        assert_ne!(
-            getiopolicy_np(MATERIALIZE_DATALESS_FILES, SCOPE_THREAD),
-            MATERIALIZE_OFF
-        );
+        assert!(!downloads_off());
     }
 }

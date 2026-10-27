@@ -356,13 +356,18 @@ fn grep(folder: &Path, options: &Options, text: &str) -> ExitCode {
     let Some(report) = report else {
         return ExitCode::FAILURE;
     };
+    let first = first
+        .into_inner()
+        .unwrap()
+        .map_or_else(String::new, |first| {
+            format!(", the first after {first:.1} ms")
+        });
     println!(
-        "{} lines in {} files searched in {:.1} ms on {} threads, the first after {:.1} ms",
+        "{} lines in {} files searched in {:.1} ms on {} threads{first}",
         report.lines_found,
         report.files_searched,
         ms(started),
         grep.threads(),
-        first.into_inner().unwrap().unwrap_or(0.0)
     );
     println!(
         "skipped: {} binary, {} too large, {} cloud-only, {} unreadable",

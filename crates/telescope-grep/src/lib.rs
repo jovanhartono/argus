@@ -3,6 +3,7 @@
 
 mod cloud;
 mod literal;
+mod priority;
 
 use grep_matcher::Matcher;
 use grep_searcher::{BinaryDetection, Searcher, SearcherBuilder, Sink, SinkMatch};
@@ -14,9 +15,10 @@ use std::io::{self, Read};
 use std::num::NonZero;
 use std::ops::{Add, Range};
 use std::path::Path;
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use telescope_core::{EntryId, Index};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Mutex, PoisonError};
+pub use telescope_core::Ticket;
+use telescope_core::{EntryId, Index, Tickets};
 
 /// Bigger files are logs, dumps and data, rarely where someone looks for a word.
 pub const MAX_FILE_BYTES: u64 = 8 << 20;
@@ -40,7 +42,9 @@ pub struct Found<'a> {
     pub matched: Range<usize>,
 }
 
-/// What the search did with each file, so skipped files can be shown.
+/// What the search did with each file, so skipped files can be shown. Each file counts once,
+/// and a file that showed lines counts as searched even when a later zero byte or long line
+/// ended it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Report {
     pub files_searched: usize,
@@ -68,18 +72,9 @@ impl Add for Report {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Ticket(u64);
-
-impl Ticket {
-    pub fn number(self) -> u64 {
-        self.0
-    }
-}
-
 pub struct Grep {
     pool: rayon::ThreadPool,
-    newest: AtomicU64,
+    tickets: Tickets,
     /// One search at a time, so a burst of keystrokes never reads several sets of files.
     turn: Mutex<()>,
     cloud_only: fn(&Path, &Metadata) -> bool,
@@ -98,12 +93,15 @@ impl Grep {
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(threads)
             .thread_name(|i| format!("grep-{i}"))
-            .start_handler(|_| cloud::never_download())
+            .start_handler(|_| {
+                cloud::never_download();
+                priority::yield_to_names();
+            })
             .build()
             .expect("start text search threads");
         Self {
             pool,
-            newest: AtomicU64::new(0),
+            tickets: Tickets::default(),
             turn: Mutex::new(()),
             cloud_only: cloud::is_cloud_only,
         }
@@ -115,7 +113,12 @@ impl Grep {
 
     /// Take one per keystroke. Every search holding an older ticket gives up.
     pub fn ticket(&self) -> Ticket {
-        Ticket(self.newest.fetch_add(1, Ordering::Relaxed) + 1)
+        self.tickets.take()
+    }
+
+    /// The number of the last ticket handed out; only its search is still wanted.
+    pub fn newest(&self) -> u64 {
+        self.tickets.newest()
     }
 
     /// Hands each matching line to `found` as soon as it is read, from several threads at
@@ -130,8 +133,9 @@ impl Grep {
         limit: usize,
         found: impl Fn(Found<'_>) + Sync,
     ) -> Option<Report> {
-        let stale = || self.newest.load(Ordering::Relaxed) != ticket.0;
-        let _turn = self.turn.lock().unwrap();
+        let stale = || self.tickets.is_stale(ticket);
+        // A panic in `found` leaves nothing half-done behind the lock, so later searches go on.
+        let _turn = self.turn.lock().unwrap_or_else(PoisonError::into_inner);
         if stale() {
             return None;
         }
@@ -142,20 +146,20 @@ impl Grep {
             matcher: &matcher,
             limit,
             delivered: AtomicUsize::new(0),
+            report: Mutex::default(),
             found: &found,
             stale: &stale,
             cloud_only: self.cloud_only,
         };
         self.pool.install(|| {
-            let report = (0..index.len() as EntryId)
+            (0..index.len() as EntryId)
                 .into_par_iter()
-                .map_init(searcher, |searcher, entry| {
+                .try_for_each_init(searcher, |searcher, entry| {
                     job.entry(index, entry, searcher)
                 })
-                .try_fold(Report::default, |report, file| Some(report + file?))
-                .try_reduce(Report::default, |a, b| Some(a + b))?;
-            (!stale()).then_some(report)
-        })
+        });
+        let report = job.report.into_inner().unwrap();
+        (!stale()).then_some(report)
     }
 }
 
@@ -170,6 +174,8 @@ struct Job<'a, F, S> {
     matcher: &'a Literal,
     limit: usize,
     delivered: AtomicUsize,
+    /// Kept here rather than folded, so files finished while the walk stops still count.
+    report: Mutex<Report>,
     found: &'a F,
     stale: &'a S,
     cloud_only: fn(&Path, &Metadata) -> bool,
@@ -180,15 +186,28 @@ impl<F: Fn(Found<'_>) + Sync, S: Fn() -> bool + Sync> Job<'_, F, S> {
         self.delivered.load(Ordering::Relaxed) >= self.limit
     }
 
-    /// `None` once the search is no longer wanted.
-    fn entry(&self, index: &Index, entry: EntryId, searcher: &mut Searcher) -> Option<Report> {
-        if (self.stale)() {
+    /// `None` stops the walk, once the search is no longer wanted or has all its lines.
+    fn entry(&self, index: &Index, entry: EntryId, searcher: &mut Searcher) -> Option<()> {
+        if (self.stale)() || self.done() {
             return None;
         }
-        if self.done() || index.is_dir(entry) {
-            return Some(Report::default());
+        if !index.is_dir(entry) {
+            let file = self.file(entry, &index.path(entry), searcher);
+            let mut report = self.report.lock().unwrap();
+            *report = *report + file;
         }
-        Some(self.file(entry, &index.path(entry), searcher))
+        Some(())
+    }
+
+    /// Opening failed, or reading did with downloads off: the file may have just been moved to
+    /// the cloud.
+    fn failed(&self, path: &Path) -> Report {
+        let cloud_only = fs::symlink_metadata(path).is_ok_and(|now| (self.cloud_only)(path, &now));
+        Report {
+            cloud_only: usize::from(cloud_only),
+            unreadable: usize::from(!cloud_only),
+            ..Report::default()
+        }
     }
 
     fn file(&self, entry: EntryId, path: &Path, searcher: &mut Searcher) -> Report {
@@ -211,8 +230,7 @@ impl<F: Fn(Found<'_>) + Sync, S: Fn() -> bool + Sync> Job<'_, F, S> {
             return report;
         }
         let Ok(file) = File::open(path) else {
-            report.unreadable = 1;
-            return report;
+            return self.failed(path);
         };
         let mut sink = Lines {
             job: self,
@@ -223,12 +241,13 @@ impl<F: Fn(Found<'_>) + Sync, S: Fn() -> bool + Sync> Job<'_, F, S> {
         };
         let reader = Stoppable { file, job: self };
         match searcher.search_reader(self.matcher, reader, &mut sink) {
+            _ if sink.count > 0 => report.files_searched = 1,
             Ok(()) if sink.binary => report.binary = 1,
             Ok(()) => report.files_searched = 1,
             // The searcher's own errors carry no system code; its only one here is a line
             // too long to hold.
             Err(error) if error.raw_os_error().is_none() => report.too_large = 1,
-            Err(_) => report.unreadable = 1,
+            Err(_) => report = self.failed(path),
         }
         report.lines_found = sink.count;
         report
@@ -287,12 +306,10 @@ impl<F: Fn(Found<'_>) + Sync, S: Fn() -> bool + Sync> Sink for Lines<'_, F, S> {
 
 /// The line without its surrounding spaces, cut to a window around the match when long.
 fn excerpt<'b>(matcher: &Literal, line: &'b [u8]) -> (Cow<'b, str>, Range<usize>) {
+    let untrimmed = line;
+    let lead = line.len() - line.trim_ascii_start().len();
     let line = line.trim_ascii();
-    let found = matcher
-        .find(line)
-        .ok()
-        .flatten()
-        .map_or(0..0, |m| m.start()..m.end());
+    let found = shown_match(matcher, untrimmed, lead..lead + line.len());
     let (mut start, mut end) = (0, line.len());
     if line.len() > MAX_TEXT_BYTES {
         start = found
@@ -301,27 +318,67 @@ fn excerpt<'b>(matcher: &Literal, line: &'b [u8]) -> (Cow<'b, str>, Range<usize>
             .min(line.len() - MAX_TEXT_BYTES);
         end = start + MAX_TEXT_BYTES;
         // Never cut a letter in half. The match starts a letter, so moving right keeps it.
-        while start < found.start && is_inside_letter(line[start]) {
-            start += 1;
+        if let Some(letter) = letter_around(line, start) {
+            start = letter.end.min(found.start);
         }
-        while end > start && end < line.len() && is_inside_letter(line[end]) {
-            end -= 1;
+        if let Some(letter) = letter_around(line, end) {
+            end = letter.start.max(start);
         }
     }
     let text = String::from_utf8_lossy(&line[start..end]);
-    let span = match &text {
-        Cow::Borrowed(text) => {
-            let clamp = |at: usize| at.saturating_sub(start).min(text.len());
-            clamp(found.start)..clamp(found.end)
-        }
-        // Replaced bytes move the match, so it is looked for again.
-        Cow::Owned(text) => matcher
-            .find(text.as_bytes())
-            .ok()
-            .flatten()
-            .map_or(0..0, |m| m.start()..m.end()),
+    let shown = found.start.clamp(start, end)..found.end.clamp(start, end);
+    let before = match &text {
+        Cow::Borrowed(_) => shown.start - start,
+        Cow::Owned(_) => lossy_len(&line[start..shown.start]),
     };
-    (text, span)
+    (text, before..before + shown.len())
+}
+
+/// The first match in `line` that is still there once it is trimmed to `kept`, in trimmed
+/// places: typed text can begin or end with spaces that the shown line drops.
+fn shown_match(matcher: &Literal, line: &[u8], kept: Range<usize>) -> Range<usize> {
+    let mut at = 0;
+    while let Ok(Some(found)) = matcher.find_at(line, at) {
+        let start = found.start().clamp(kept.start, kept.end);
+        let end = found.end().clamp(kept.start, kept.end);
+        if start < end {
+            return start - kept.start..end - kept.start;
+        }
+        if found.start() >= kept.end {
+            break;
+        }
+        at = found.start() + 1;
+    }
+    0..0
+}
+
+/// The length once each run of broken bytes becomes one stand-in letter.
+fn lossy_len(bytes: &[u8]) -> usize {
+    bytes
+        .utf8_chunks()
+        .map(|chunk| {
+            let replaced = !chunk.invalid().is_empty();
+            chunk.valid().len() + usize::from(replaced) * char::REPLACEMENT_CHARACTER.len_utf8()
+        })
+        .sum()
+}
+
+/// The letter that a cut at `at` would split. Stray bytes split nothing, so a run of them
+/// never drags the cut into the match.
+fn letter_around(line: &[u8], at: usize) -> Option<Range<usize>> {
+    if !line.get(at).is_some_and(|&byte| is_inside_letter(byte)) {
+        return None;
+    }
+    let lead = (at.saturating_sub(3)..at)
+        .rev()
+        .find(|&i| !is_inside_letter(line[i]))?;
+    let len = match line[lead] {
+        0xC0..=0xDF => 2,
+        0xE0..=0xEF => 3,
+        0xF0..=0xF7 => 4,
+        _ => return None,
+    };
+    (lead + len > at).then_some(lead..lead + len)
 }
 
 /// A UTF-8 byte that continues a letter rather than starting one.
