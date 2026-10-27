@@ -63,6 +63,7 @@ typedef struct TlLines {
     size_t count;
     const uint8_t *text;
     bool done;
+    bool failed;
     TlReport report;
     void *owner;
 } TlLines;

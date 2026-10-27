@@ -521,6 +521,35 @@ fn search_threads_never_download_and_yield_to_names() {
 }
 
 #[test]
+fn work_installed_runs_its_jobs_on_the_search_threads() {
+    let grep = Grep::with_threads(2);
+    let names = Mutex::new(Vec::new());
+    let on_search_thread = || {
+        let name = std::thread::current().name().map(str::to_owned);
+        names.lock().unwrap().push(name.unwrap_or_default());
+    };
+    grep.install(|| {
+        rayon::scope(|scope| {
+            for _ in 0..8 {
+                scope.spawn(|_| on_search_thread());
+            }
+        });
+    });
+    let names = names.into_inner().unwrap();
+    assert_eq!(names.len(), 8);
+    assert!(
+        names.iter().all(|name| name.starts_with("grep-")),
+        "{names:?}"
+    );
+}
+
+#[test]
+fn only_one_line_of_text_can_be_searched() {
+    assert!(can_search("milk") && can_search(" "));
+    assert!(!can_search("") && !can_search("one\ntwo") && !can_search("\n"));
+}
+
+#[test]
 fn searches_in_a_row_start_fresh() {
     let folder = folder(&[("a.txt", b"milk\n")]);
     let grep = Grep::with_threads(2);

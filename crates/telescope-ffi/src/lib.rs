@@ -125,13 +125,16 @@ impl From<Report> for TlReport {
 }
 
 /// The lines found since the last take. Once `done`, the search is over and `report` holds its
-/// counts; before, `report` is all zeros. Hand this back to `tl_lines_free` once.
+/// counts; before, `report` is all zeros. `failed` comes with `done` when a bug in the engine
+/// ended the search early: then `report` counts only the lines found. Hand this back to
+/// `tl_lines_free` once.
 #[repr(C)]
 pub struct TlLines {
     pub lines: *const TlLine,
     pub count: usize,
     pub text: *const u8,
     pub done: bool,
+    pub failed: bool,
     pub report: TlReport,
     owner: *mut c_void,
 }
@@ -185,8 +188,11 @@ struct Find {
 struct Waiting {
     ticket: u64,
     batch: Batch,
+    /// Lines found so far, taken or not.
+    found: usize,
     /// Set once the search is over.
     report: Option<Report>,
+    failed: bool,
     /// Something is waiting, and `TL_EVENT_LINES` said so.
     told: bool,
 }
@@ -387,7 +393,8 @@ pub unsafe extern "C" fn tl_core_new(
 }
 
 /// Starts a core over `count` made-up names, built in the background. Searches sent before
-/// `TL_EVENT_INDEXED` wait for it. Returns null on failure, without `on_event`, or for a
+/// `TL_EVENT_INDEXED` wait for it. Text searches read real folders, leaving those macOS guards
+/// unread until `tl_grant_full_disk`. Returns null on failure, without `on_event`, or for a
 /// `count` too big to number, since entry numbers are 32-bit.
 ///
 /// # Safety
@@ -416,7 +423,8 @@ fn start(ctx: *mut c_void, on_event: Option<TlEventFn>, source: Source) -> *mut 
     let (jobs, inbox) = mpsc::channel();
     let notify = Notify { ctx, on_event };
     let (home, full_disk) = match &source {
-        Source::StandIn(_) => (telescope_core::home(), true),
+        // Real folders all the same, so no pop-ups before `tl_grant_full_disk`.
+        Source::StandIn(_) => (telescope_core::home(), false),
         Source::Home { root, access, .. } => (root.clone(), *access == Access::Full),
     };
     let text = Text {
@@ -835,7 +843,11 @@ impl Text {
                 let (home, notify) = (self.home.clone(), self.notify);
                 thread::Builder::new()
                     .name("text".into())
-                    .spawn(move || find_loop(&grep, &inbox, &waiting, &home, notify))
+                    .spawn(move || {
+                        find_loop(&grep, &inbox, &waiting, notify, |find| {
+                            find_in(&grep, find, &waiting, &home, notify)
+                        });
+                    })
                     .expect("start the text search worker")
             };
             TextSearch {
@@ -848,12 +860,13 @@ impl Text {
     }
 }
 
+/// Runs each wanted search with `find_in`, which gives `None` once it is no longer wanted.
 fn find_loop(
     grep: &Grep,
     inbox: &Receiver<Find>,
     waiting: &Mutex<Waiting>,
-    home: &Path,
     notify: Notify,
+    find_in: impl Fn(&Find) -> Option<Report>,
 ) {
     while let Ok(mut find) = inbox.recv() {
         // Keys pressed while the last search ran: only the newest one is still wanted, and
@@ -872,15 +885,20 @@ fn find_loop(
                 ..Waiting::default()
             };
         }
-        // A bug ends this search alone, with nothing counted, so the window stops waiting.
-        let report = panic::catch_unwind(AssertUnwindSafe(|| {
-            find_in(grep, &find, waiting, home, notify)
-        }))
-        .unwrap_or_else(|_| Some(Report::default()));
+        let report = panic::catch_unwind(AssertUnwindSafe(|| find_in(&find)));
         let mut waiting = waiting.lock().unwrap();
-        if let Some(report) = report
-            && grep.newest() == number
-        {
+        if grep.newest() != number {
+            continue;
+        }
+        // A bug ends this search alone, so the window stops waiting and can say why.
+        let report = report.unwrap_or_else(|_| {
+            waiting.failed = true;
+            Some(Report {
+                lines_found: waiting.found,
+                ..Report::default()
+            })
+        });
+        if let Some(report) = report {
             waiting.report = Some(report);
             tell(waiting, number, notify);
         }
@@ -896,25 +914,36 @@ fn find_in(
     home: &Path,
     notify: Notify,
 ) -> Option<Report> {
+    if !telescope_grep::can_search(&find.query) {
+        return Some(Report::default());
+    }
     let number = find.ticket.number();
+    let stale = || grep.newest() != number;
     let home = std::fs::canonicalize(home).unwrap_or_else(|_| home.to_path_buf());
     // Problems with the list are told by the name list already.
     let (ignore, _) = Ignore::load(&home, find.access);
     let mut report = Report::default();
     for folder in outermost(&find.folders) {
         let limit = LINES.saturating_sub(report.lines_found);
-        if limit == 0 || grep.newest() != number {
+        if limit == 0 || stale() {
             break;
         }
-        let settings = Settings::new(&folder, &home, Clutter::Skip, ignore.clone(), find.access);
-        let Ok(scan) = settings.scan() else {
+        // Listing a home folder takes all cores for about 0.1 s: on the text search threads, it
+        // leaves name searches alone, and a newer keystroke stops it.
+        let scan = grep.install(|| {
+            telescope_core::scan_until(&folder, &home, Clutter::Skip, &ignore, find.access, &stale)
+        });
+        if stale() {
+            return None;
+        }
+        let Ok(scan) = scan else {
             report.unreadable += 1;
             continue;
         };
         let add = |found: Found<'_>| add(waiting, grep, number, &found, notify);
         report = report + grep.search(&scan.index, &find.query, find.ticket, limit, add)?;
     }
-    (grep.newest() == number).then_some(report)
+    (!stale()).then_some(report)
 }
 
 /// The folders as real paths, each once, leaving out any inside another.
@@ -940,6 +969,7 @@ fn add(waiting: &Mutex<Waiting>, grep: &Grep, number: u64, found: &Found<'_>, no
     if grep.newest() != number {
         return;
     }
+    waiting.found += 1;
     let batch = &mut waiting.batch;
     let path_start = batch.text.len() as u32;
     batch.text.push_str(&found.path.to_string_lossy());
@@ -967,10 +997,11 @@ fn tell(mut waiting: MutexGuard<'_, Waiting>, number: u64, notify: Notify) {
 }
 
 /// Starts a search for `query` inside the files in `folders` and returns its ticket, or 0 on
-/// failure, as for a folder that isn't UTF-8. Every older text search gives up; name searches
-/// never wait for any. `folders` holds `folders_len` bytes: paths in UTF-8, each ending in a
-/// NUL byte. Each is listed as the name list would be, skipping clutter and the ignore list,
-/// and a folder inside another is searched once; one that can't be listed counts as unreadable.
+/// failure, as for a folder that isn't UTF-8, leaving the search under way alone. Otherwise
+/// every older text search gives up; name searches never wait for any. `folders` holds
+/// `folders_len` bytes: paths in UTF-8, each ending in a NUL byte. Each is listed as the name
+/// list would be, skipping clutter and the ignore list, and a folder inside another is
+/// searched once; one that can't be listed counts as unreadable.
 /// Upper-case letters in `query` must match exactly; lower-case ones match either case. Up to
 /// 100 lines come in batches, each announced by `TL_EVENT_LINES`, the last with the end.
 ///
@@ -1053,6 +1084,7 @@ pub unsafe extern "C" fn tl_grep_take(core: *const TlCore, ticket: u64, out: *mu
         waiting.told = false;
         let batch = std::mem::take(&mut waiting.batch);
         let report = waiting.report.take();
+        let failed = waiting.failed;
         drop(waiting);
         let batch = Box::new(batch);
         let lines = TlLines {
@@ -1060,6 +1092,7 @@ pub unsafe extern "C" fn tl_grep_take(core: *const TlCore, ticket: u64, out: *mu
             count: batch.lines.len(),
             text: batch.text.as_ptr(),
             done: report.is_some(),
+            failed,
             report: report.unwrap_or_default().into(),
             owner: Box::into_raw(batch).cast(),
         };
@@ -1097,7 +1130,8 @@ pub unsafe extern "C" fn tl_lines_free(lines: TlLines) {
 
 /// Stops the core and waits for its threads, so `on_event` never runs once this returns.
 /// Called while a list is being built, it waits for the build to finish: under 0.2 s for a
-/// million made-up names, but a home folder scanned with nothing cached may take longer.
+/// million made-up names, but a home folder scanned with nothing cached may take longer. A
+/// text search stops after the folder or file it is reading.
 ///
 /// # Safety
 /// `core` came from `tl_core_new` or `tl_core_new_stand_in` and is freed once, never from
@@ -1948,6 +1982,42 @@ mod tests {
         std::fs::write(path, text).unwrap();
     }
 
+    /// A core over `home`, so its text searches read that folder's ignore list, never yours.
+    fn text_core(home: &Path, full_disk: u32, events: &Events) -> Core {
+        let core = scan(home.to_str().unwrap(), full_disk, events);
+        events.wait_for_event(TL_EVENT_INDEXED);
+        core
+    }
+
+    #[test]
+    fn a_report_keeps_each_count_in_its_field() {
+        let report = TlReport::from(Report {
+            files_searched: 1,
+            lines_found: 2,
+            binary: 3,
+            too_large: 4,
+            cloud_only: 5,
+            unreadable: 6,
+        });
+        let counts = [
+            report.files_searched,
+            report.lines_found,
+            report.binary,
+            report.too_large,
+            report.cloud_only,
+            report.unreadable,
+        ];
+        assert_eq!(counts, [1, 2, 3, 4, 5, 6]);
+    }
+
+    #[test]
+    fn freeing_nothing_taken_is_harmless() {
+        unsafe {
+            tl_lines_free(std::mem::zeroed());
+            tl_rows_free(std::mem::zeroed());
+        }
+    }
+
     #[test]
     fn a_text_search_comes_back_as_lines_with_its_counts() {
         let (_dir, home) = home_with(&[]);
@@ -1960,7 +2030,7 @@ mod tests {
         write(&home.join("photo.png"), b"\x89PNG\0budget");
         write(&home.join("node_modules/budget.js"), "budget\n");
         let events = Events::default();
-        let core = start(100, &events);
+        let core = text_core(&home, 1, &events);
 
         // A folder inside another, or named twice, is searched once.
         let ticket = grep(&core, &[&notes, &home, &notes.join("old"), &home], "budget");
@@ -1988,24 +2058,57 @@ mod tests {
     }
 
     #[test]
+    fn a_text_search_follows_the_ignore_list() {
+        let (_dir, home) = home_with(&[]);
+        write(&home.join(".config/telescope/ignore"), "secret\n");
+        write(&home.join("secret/a.txt"), "budget\n");
+        write(&home.join("a.txt"), "budget\n");
+        let events = Events::default();
+        let core = text_core(&home, 1, &events);
+        let ticket = grep(&core, &[&home], "budget");
+        let (lines, _) = grep_all(&core, &events, ticket);
+        let shown: Vec<&str> = lines.iter().map(|line| line.0.as_str()).collect();
+        assert_eq!(shown, [home.join("a.txt").to_str().unwrap()]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_folder_named_by_a_link_is_searched_once_by_its_real_path() {
+        let (_dir, home) = home_with(&[]);
+        let notes = home.join("notes");
+        write(&notes.join("a.txt"), "budget\n");
+        std::os::unix::fs::symlink(&notes, home.join("link")).unwrap();
+        let events = Events::default();
+        let core = text_core(&home, 1, &events);
+        let ticket = grep(&core, &[&home.join("link"), &notes], "budget");
+        let (lines, report) = grep_all(&core, &events, ticket);
+        let shown: Vec<&str> = lines.iter().map(|line| line.0.as_str()).collect();
+        assert_eq!(shown, [notes.join("a.txt").to_str().unwrap()]);
+        assert_eq!(report.files_searched, 1);
+    }
+
+    #[test]
     fn a_name_search_returns_while_a_text_search_runs() {
         let (_dir, home) = home_with(&[]);
         write(&home.join("a.txt"), "budget\n");
         write(&home.join("b.txt"), "budget\n");
         let events = Events::default();
-        let core = start(2_000, &events);
+        let core = text_core(&home, 1, &events);
 
         events.hold_lines(true);
         let text = grep(&core, &[&home], "budget");
         // The text search now waits inside `on_event`, halfway through its files.
         let halfway = events.heard(TL_EVENT_LINES, text);
-        let name = submit(&core, "budget");
+        let name = submit(&core, "txt");
         let answered = events.heard(TL_EVENT_READY, name);
         let rows = take(&core, name);
+        // However many lines wait, the window is told once until it takes them.
+        let told = events.count(TL_EVENT_LINES, text);
         let so_far = take_lines(&core, text);
         events.hold_lines(false);
 
         assert!(halfway && answered);
+        assert_eq!(told, 1);
         assert!(rows.is_some_and(|rows| !rows.is_empty()));
         let (first, end) = so_far.unwrap();
         assert!(!first.is_empty());
@@ -2022,7 +2125,7 @@ mod tests {
             write(&home.join(format!("{file}.txt")), "budget\n".repeat(50));
         }
         let events = Events::default();
-        let core = start(100, &events);
+        let core = text_core(&home, 1, &events);
         // Harmless before any text search.
         unsafe { tl_grep_cancel(core.0) };
         assert_eq!(take_lines(&core, 0), None);
@@ -2056,7 +2159,7 @@ mod tests {
         write(&one.join("a.txt"), "budget\n".repeat(80));
         write(&two.join("b.txt"), "budget\n".repeat(80));
         let events = Events::default();
-        let core = start(100, &events);
+        let core = text_core(&home, 1, &events);
         let ticket = grep(&core, &[&one, &two], "budget");
         let (lines, report) = grep_all(&core, &events, ticket);
         assert_eq!((lines.len(), report.lines_found), (LINES, LINES));
@@ -2064,39 +2167,75 @@ mod tests {
     }
 
     #[test]
+    fn a_folder_after_the_last_line_is_never_listed() {
+        let (_dir, home) = home_with(&[]);
+        let one = home.join("one");
+        write(&one.join("a.txt"), "budget\n".repeat(LINES));
+        let events = Events::default();
+        let core = text_core(&home, 1, &events);
+        // Listed, the missing folder would count as unreadable.
+        let ticket = grep(&core, &[&one, &home.join("two")], "budget");
+        let full = Report {
+            files_searched: 1,
+            lines_found: LINES,
+            ..Report::default()
+        };
+        assert_eq!(grep_all(&core, &events, ticket).1, full);
+    }
+
+    #[test]
     fn only_the_newest_text_search_answers() {
         let (_dir, home) = home_with(&[]);
         write(&home.join("a.txt"), "b\nbu\nbud\nbudg\nbudge\nbudget\n");
         let events = Events::default();
-        let core = start(100, &events);
-        let typed = ["b", "bu", "bud", "budg", "budge", "budget"];
+        let core = text_core(&home, 1, &events);
+        // The first search waits at its first line while the rest are typed.
+        events.hold_lines(true);
+        let first = grep(&core, &[&home], "b");
+        let held = events.heard(TL_EVENT_LINES, first);
+        let typed = ["bu", "bud", "budg", "budge", "budget"];
         let tickets: Vec<u64> = typed
             .iter()
             .map(|query| grep(&core, &[&home], query))
             .collect();
+        events.hold_lines(false);
+        assert!(held);
+
         let last = *tickets.last().unwrap();
         let (lines, _) = grep_all(&core, &events, last);
         assert_eq!(lines.len(), 1);
         assert_eq!(lines[0].1, 6);
-        for &older in &tickets[..tickets.len() - 1] {
-            assert_eq!(take_lines(&core, older), None);
+        // Those typed while the first ran were skipped unread.
+        for &skipped in &tickets[..tickets.len() - 1] {
+            assert_eq!(events.count(TL_EVENT_LINES, skipped), 0);
         }
+        assert_eq!(events.count(TL_EVENT_LINES, first), 1);
     }
 
     #[test]
     fn a_text_search_counts_folders_it_cannot_list_and_refuses_bad_paths() {
         let (_dir, home) = home_with(&[]);
-        write(&home.join("a.txt"), "budget\n");
+        let notes = home.join("notes");
+        write(&notes.join("a.txt"), "budget\n");
         let events = Events::default();
-        let core = start(100, &events);
+        let core = text_core(&home, 1, &events);
 
-        let not_utf8 = [0xff, 0];
+        // One bad path refuses the whole list, and leaves the search under way alone.
+        events.hold_lines(true);
+        let running = grep(&core, &[&notes], "budget");
+        let held = events.heard(TL_EVENT_LINES, running);
+        let mut folders = notes.to_str().unwrap().as_bytes().to_vec();
+        folders.extend_from_slice(&[0, 0xff, 0]);
         let query = "budget";
-        let refused = unsafe { tl_grep_submit(core.0, not_utf8.as_ptr(), 2, query.as_ptr(), 6) };
+        let refused =
+            unsafe { tl_grep_submit(core.0, folders.as_ptr(), folders.len(), query.as_ptr(), 6) };
+        events.hold_lines(false);
+        assert!(held);
         assert_eq!(refused, 0);
+        assert_eq!(grep_all(&core, &events, running).1.lines_found, 1);
 
         let gone = home.join("gone");
-        let file = home.join("a.txt");
+        let file = notes.join("a.txt");
         let ticket = grep(&core, &[&gone, &file], "budget");
         let unreadable = Report {
             unreadable: 2,
@@ -2104,12 +2243,22 @@ mod tests {
         };
         assert_eq!(grep_all(&core, &events, ticket), (Vec::new(), unreadable));
 
-        // An empty box, or no folders, ends at once with nothing.
-        let empty = grep(&core, &[&home], "");
-        assert_eq!(
-            grep_all(&core, &events, empty),
-            (Vec::new(), Report::default())
-        );
+        let ticket = grep(&core, &[&notes, &gone], "budget");
+        let both = Report {
+            files_searched: 1,
+            lines_found: 1,
+            unreadable: 1,
+            ..Report::default()
+        };
+        let (lines, report) = grep_all(&core, &events, ticket);
+        assert_eq!((lines.len(), report), (1, both));
+
+        // An empty box, two lines, or no folders, end at once with nothing, listing nothing.
+        for query in ["", "budget\nbudget"] {
+            let ticket = grep(&core, &[&gone], query);
+            let ended = grep_all(&core, &events, ticket);
+            assert_eq!(ended, (Vec::new(), Report::default()), "{query:?}");
+        }
         let null = std::ptr::null();
         let nowhere = unsafe { tl_grep_submit(core.0, null, 0, null, 0) };
         assert_ne!(nowhere, 0);
@@ -2117,41 +2266,161 @@ mod tests {
             grep_all(&core, &events, nowhere),
             (Vec::new(), Report::default())
         );
+        // Text that isn't UTF-8 is read as Swift would show it.
+        let folder = format!("{}\0", notes.to_str().unwrap());
+        let broken =
+            unsafe { tl_grep_submit(core.0, folder.as_ptr(), folder.len(), [0xff].as_ptr(), 1) };
+        assert_ne!(broken, 0);
+        assert_eq!(grep_all(&core, &events, broken).1.files_searched, 1);
     }
 
     #[test]
     fn text_search_reads_guarded_folders_only_with_full_disk_access() {
         let (_dir, home) = home_with(&[]);
-        write(&home.join("Documents/budget.txt"), "budget\n");
+        let documents = home.join("Documents");
+        write(&documents.join("budget.txt"), "budget\n");
         let events = Events::default();
         let core = scan(home.to_str().unwrap(), 0, &events);
         events.wait_for(TL_EVENT_INDEXED, 1);
 
         let limited = grep(&core, &[&home], "budget");
         assert_eq!(grep_all(&core, &events, limited).1.lines_found, 0);
+        // Named directly, a guarded folder still stays unread.
+        let named = grep(&core, &[&documents, &documents.join("work")], "budget");
+        let unread = Report {
+            unreadable: 1,
+            ..Report::default()
+        };
+        assert_eq!(grep_all(&core, &events, named), (Vec::new(), unread));
         unsafe { tl_grant_full_disk(core.0, 1) };
         let full = grep(&core, &[&home], "budget");
         assert_eq!(grep_all(&core, &events, full).1.lines_found, 1);
     }
 
     #[test]
+    fn a_stand_in_core_reads_guarded_folders_only_once_granted() {
+        let events = Events::default();
+        let core = start(100, &events);
+        let text = unsafe { &*core.0 }.text.as_ref().unwrap();
+        assert!(!text.full_disk.load(Ordering::Relaxed));
+        unsafe { tl_grant_full_disk(core.0, 1) };
+        assert!(text.full_disk.load(Ordering::Relaxed));
+    }
+
+    #[test]
     fn freeing_the_core_stops_its_text_search() {
         let (_dir, home) = home_with(&[]);
-        for file in 0..200 {
+        for file in 0..50 {
             write(&home.join(format!("{file}.txt")), "budget\n".repeat(10));
         }
         let events = Events::default();
-        let core = start(100, &events);
-        grep(&core, &[&home], "no such text");
-        drop(core);
+        let core = text_core(&home, 1, &events);
+        events.hold_lines(true);
+        let ticket = grep(&core, &[&home], "budget");
+        let held = events.heard(TL_EVENT_LINES, ticket);
+        let search = unsafe { &*core.0 }.text.as_ref().unwrap().started.get();
+        let grep = Arc::clone(&search.unwrap().grep);
+        let core = std::mem::ManuallyDrop::new(core).0 as usize;
+        let freeing = std::thread::spawn(move || unsafe { tl_core_free(core as *mut TlCore) });
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while grep.newest() == ticket && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let waited = !freeing.is_finished();
+        events.hold_lines(false);
+        freeing.join().unwrap();
+        assert!(held && waited, "free waits for the text search");
+        // It gave up at once: no more lines and no end, then or later.
+        assert_eq!(events.count(TL_EVENT_LINES, ticket), 1);
         let heard = events.seen.lock().unwrap().len();
         std::thread::sleep(Duration::from_millis(50));
         assert_eq!(events.seen.lock().unwrap().len(), heard);
     }
 
     #[test]
+    fn a_bug_ends_only_its_own_text_search() {
+        let events = Events::default();
+        let ctx = &events as *const Events as *mut c_void;
+        let notify = Notify {
+            ctx,
+            on_event: record,
+        };
+        let (grep, waiting) = (Grep::with_threads(1), Mutex::new(Waiting::default()));
+        let (grep, waiting) = (&grep, &waiting);
+        let finder = |find: &Find| {
+            if find.query == "broken" {
+                let line = Found {
+                    entry: 1,
+                    path: Path::new("a.txt"),
+                    line: 1,
+                    text: "broken",
+                    matched: 0..6,
+                };
+                add(waiting, grep, find.ticket.number(), &line, notify);
+                add(waiting, grep, find.ticket.number(), &line, notify);
+                panic!("a bug in a text search");
+            }
+            Some(Report {
+                files_searched: 1,
+                ..Report::default()
+            })
+        };
+        let ended = |number: u64| {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while Instant::now() < deadline {
+                let waiting = waiting.lock().unwrap();
+                if let Some(report) = waiting.report
+                    && waiting.ticket == number
+                {
+                    return (waiting.batch.lines.len(), report, waiting.failed);
+                }
+                drop(waiting);
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            panic!("search {number} never ended");
+        };
+        let (jobs, inbox) = mpsc::channel();
+        std::thread::scope(|scope| {
+            // Owned here, so a failed check closes the queue and the loop ends.
+            let jobs = jobs;
+            scope.spawn(move || find_loop(grep, &inbox, waiting, notify, finder));
+            let send = |query: &str| {
+                let ticket = grep.ticket();
+                let (folders, query) = (Vec::new(), query.to_owned());
+                let access = Access::Full;
+                let find = Find {
+                    ticket,
+                    folders,
+                    query,
+                    access,
+                };
+                jobs.send(find).unwrap();
+                ticket.number()
+            };
+            let broken = send("broken");
+            let found_two = Report {
+                lines_found: 2,
+                ..Report::default()
+            };
+            assert_eq!(ended(broken), (2, found_two, true));
+            assert_eq!(events.count(TL_EVENT_LINES, broken), 1);
+
+            let next = send("fine");
+            let searched = Report {
+                files_searched: 1,
+                ..Report::default()
+            };
+            assert_eq!(ended(next), (0, searched, false));
+            assert_eq!(events.count(TL_EVENT_LINES, next), 1);
+        });
+    }
+
+    #[test]
     fn each_folder_is_searched_once() {
-        let names = ["/a", "/a/b", "/a/b/c", "/ab", "/x", "/a/b2"];
+        // Names that sort before "/" byte by byte must not split a folder from its insides.
+        let names = [
+            "/a", "/a/b", "/a/b/c", "/ab", "/x", "/a/b2", "/a-b", "/a.b", "/a b",
+        ];
         let paths: Vec<PathBuf> = names.iter().map(PathBuf::from).collect();
         // Every set of these folders, each also named twice.
         for set in 0..1_u32 << names.len() {
@@ -2170,10 +2439,11 @@ mod tests {
     }
 
     /// Name search times while a text search over `TL_GREP_FOLDER` (the home folder unless
-    /// set) keeps running. Run with
+    /// set, without the guarded folders) starts again with each keystroke, 100 ms apart, as
+    /// live typing does. Run with
     /// `cargo test --release -p telescope-ffi -- --ignored --nocapture name_search_times`.
     #[test]
-    #[ignore = "builds a million names and reads a whole folder; slow outside --release"]
+    #[ignore = "builds a million names and lists a whole folder; slow outside --release"]
     fn name_search_times_while_text_search_runs() {
         let folder =
             std::env::var_os("TL_GREP_FOLDER").map_or_else(telescope_core::home, PathBuf::from);
@@ -2186,15 +2456,13 @@ mod tests {
             "会議 report",
             "main.rs",
         ];
-        let mut text = None;
-        let mut text_searches = 0;
         for busy in [false, true, false, true] {
             let mut times = Vec::new();
-            for _ in 0..40 {
-                if busy && text.is_none_or(|ticket| events.count(TL_EVENT_LINES, ticket) > 0) {
-                    // Matches nothing, so it reads every file and its one event is its end.
-                    text = Some(grep(&core, &[&folder], "zq no such text qz"));
-                    text_searches += 1;
+            for key in 0..60 {
+                let pressed = Instant::now();
+                if busy {
+                    // Matches nothing, so each search would list and read the whole folder.
+                    grep(&core, &[&folder], &format!("zq{key} no such text"));
                 }
                 for query in queries {
                     let started = Instant::now();
@@ -2203,22 +2471,26 @@ mod tests {
                     times.push(started.elapsed());
                     assert!(take(&core, ticket).is_some());
                 }
+                std::thread::sleep(Duration::from_millis(100).saturating_sub(pressed.elapsed()));
             }
-            if text.take().is_some() {
-                unsafe { tl_grep_cancel(core.0) };
-            }
+            unsafe { tl_grep_cancel(core.0) };
+            std::thread::sleep(Duration::from_millis(500));
             times.sort();
             let at = |share: usize| times[(times.len() - 1) * share / 100];
             println!(
                 "{}: p50 {:?}, p95 {:?}, max {:?} over {} name searches",
-                if busy { "text search running" } else { "idle" },
+                if busy {
+                    "text search per keystroke"
+                } else {
+                    "idle"
+                },
                 at(50),
                 at(95),
                 at(100),
                 times.len()
             );
         }
-        println!("{text_searches} text searches over {}", folder.display());
+        println!("text searches over {}", folder.display());
     }
 
     /// When each rebuild started, whether it was told of Full Disk Access, and its mark.

@@ -28,7 +28,7 @@ pub(crate) enum Literal {
 impl Literal {
     /// `None` for empty text, or text that runs over two lines.
     pub(crate) fn new(text: &str) -> Option<Self> {
-        if text.is_empty() || text.contains('\n') {
+        if !crate::can_search(text) {
             return None;
         }
         let any_case = text.chars().any(has_case) && !text.chars().any(char::is_uppercase);

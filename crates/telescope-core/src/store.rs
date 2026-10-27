@@ -97,7 +97,7 @@ impl Settings {
     }
 
     pub fn scan(&self) -> io::Result<Scan> {
-        scan_with(&self.root, &self.rules)
+        scan_with(&self.root, &self.rules, &|| false)
     }
 
     /// The real path of the root, as the index holds it.
