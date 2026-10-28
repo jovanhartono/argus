@@ -6,7 +6,8 @@ use std::process::ExitCode;
 use std::sync::OnceLock;
 use std::time::Instant;
 use telescope_core::{
-    Access, Apps, Clutter, Hit, Ignore, Index, Item, Opened, Searcher, Settings, Within,
+    Access, Apps, Boosts, Clutter, Frecency, Hit, Ignore, Index, Item, Opened, Searcher, Settings,
+    Within, unix_now,
 };
 use telescope_grep::Grep;
 
@@ -20,6 +21,7 @@ const USAGE: &str = "usage:
   tl golden <folder> <golden>                  rank the expected file of each search
   tl grep <folder> <text>                      scan, then show lines holding the text
   tl grep-bench <folder> <queries> [threads]   time the first and the last line of each text
+  tl open-record <path> --frecency <file>      count one open of a file or folder in a list
 on a Mac, searches also find the apps in /Applications, /System/Applications and ~/Applications
 add --all to include hidden folders, ~/Library, the insides of packages like Photos Library,
 and tool downloads and caches like node_modules
@@ -27,6 +29,9 @@ add --load <file> to open a saved index instead of scanning (it scans when the f
 damaged or built with other settings, and does not catch up on changes made since it was saved),
 --changes <file> to then read again each folder listed in it, one real absolute path per line
 as FSEvents reports them, and --save <file> to save the index afterwards
+add --frecency <file> to search, bench and golden to rank files opened often and lately higher,
+by the opens tl open-record kept in it, a list apart from the Mac app's, which writes over its
+own from memory
 add --in <folder> to search and bench to search only inside that folder of the index
 put -- before text that starts with --, like: tl grep ~ -- --all
 
@@ -48,6 +53,7 @@ struct Options {
     load: Option<PathBuf>,
     changes: Option<PathBuf>,
     save: Option<PathBuf>,
+    frecency: Option<PathBuf>,
     within: Option<PathBuf>,
 }
 
@@ -73,6 +79,10 @@ enum Command {
         folder: PathBuf,
         queries: PathBuf,
         threads: Option<usize>,
+    },
+    OpenRecord {
+        path: PathBuf,
+        list: PathBuf,
     },
 }
 
@@ -109,6 +119,7 @@ fn main() -> ExitCode {
             queries,
             threads,
         } => grep_bench(&folder, options, &queries, threads),
+        Command::OpenRecord { path, list } => open_record(&path, &list),
     }
 }
 
@@ -127,6 +138,7 @@ fn parse(mut args: Vec<OsString>) -> Option<(Command, Options)> {
     let load = take(&mut args, "--load")?;
     let changes = take(&mut args, "--changes")?;
     let save = take(&mut args, "--save")?;
+    let frecency = take(&mut args, "--frecency")?;
     let within = take(&mut args, "--in")?;
     args.extend(after_dashes);
     let command = match args.as_slice() {
@@ -155,6 +167,10 @@ fn parse(mut args: Vec<OsString>) -> Option<(Command, Options)> {
             queries: queries.into(),
             threads: threads(rest)?,
         },
+        [command, path] if command == "open-record" => Command::OpenRecord {
+            path: path.into(),
+            list: frecency.clone()?,
+        },
         _ => return None,
     };
     // `tl grep ~ todo --in ~/work` would quietly grep all of ~.
@@ -168,6 +184,7 @@ fn parse(mut args: Vec<OsString>) -> Option<(Command, Options)> {
             load,
             changes,
             save,
+            frecency,
             within,
         },
     ))
@@ -382,29 +399,104 @@ fn search(folder: &Path, options: &Options) -> ExitCode {
         return ExitCode::FAILURE;
     };
     let apps = apps();
+    let boosts = boosts(&index, &apps, options);
     let Some(within) = within(&index, options) else {
         return ExitCode::FAILURE;
     };
+    let within = within.as_ref();
     let searcher = Searcher::default();
     eprintln!("type a search and press Enter; Ctrl-D quits");
     for line in std::io::stdin().lock().lines() {
         let Ok(query) = line else { break };
         let started = Instant::now();
+        let ticket = searcher.ticket();
         let hits = searcher
-            .search_in(
-                &index,
-                &apps,
-                within.as_ref(),
-                &query,
-                searcher.ticket(),
-                10,
-            )
+            .search_with(&index, &apps, within, &query, ticket, 10, &boosts)
             .unwrap_or_default();
         println!("{query:?} in {:.1} ms", ms(started));
         for hit in hits {
             println!("{:>8}  {}", hit.score, path(&index, &apps, &hit).display());
         }
     }
+    ExitCode::SUCCESS
+}
+
+fn boosts(index: &Index, apps: &Apps, options: &Options) -> Boosts {
+    let Some(file) = &options.frecency else {
+        return Boosts::default();
+    };
+    let frecency = Frecency::open(file).unwrap_or_else(|why| {
+        eprintln!("tl: cannot open {}: {why}", file.display());
+        Frecency::default()
+    });
+    let started = Instant::now();
+    let boosts = frecency.boosts(index, apps, unix_now());
+    println!(
+        "frecency: {} of {} files opened are in the index or the apps, found in {:.1} ms",
+        boosts.len(),
+        frecency.len(),
+        ms(started)
+    );
+    boosts
+}
+
+/// The path as the scan lists it: its folders resolved, but a link itself, not where it points.
+fn real_path(path: &Path) -> std::io::Result<PathBuf> {
+    std::fs::symlink_metadata(path)?;
+    match (path.parent(), path.file_name()) {
+        (Some(parent), Some(name)) => {
+            let parent = if parent.as_os_str().is_empty() {
+                Path::new(".")
+            } else {
+                parent
+            };
+            Ok(std::fs::canonicalize(parent)?.join(name))
+        }
+        _ => std::fs::canonicalize(path),
+    }
+}
+
+fn open_record(path: &Path, file: &Path) -> ExitCode {
+    let path = match real_path(path) {
+        Ok(path) => path,
+        Err(error) => {
+            eprintln!("tl: cannot find {}: {error}", path.display());
+            return ExitCode::FAILURE;
+        }
+    };
+    let mut frecency = match Frecency::open(file) {
+        Ok(frecency) => frecency,
+        Err(why) if why.is_damaged() => {
+            eprintln!(
+                "tl: cannot open {}: {why}; starting a new list",
+                file.display()
+            );
+            Frecency::default()
+        }
+        Err(why) => {
+            eprintln!("tl: cannot open {}: {why}; left as it is", file.display());
+            return ExitCode::FAILURE;
+        }
+    };
+    let now = unix_now();
+    if !frecency.record(&path, now) {
+        eprintln!(
+            "tl: cannot count {}: not UTF-8, or longer than 4096 bytes",
+            path.display()
+        );
+        return ExitCode::FAILURE;
+    }
+    if let Err(error) = frecency.save(file) {
+        eprintln!("tl: cannot save {}: {error}", file.display());
+        return ExitCode::FAILURE;
+    }
+    println!(
+        "{}: score {:.2}, one of {} files opened in {}",
+        path.display(),
+        frecency.score(&path, now),
+        frecency.len(),
+        file.display()
+    );
     ExitCode::SUCCESS
 }
 
@@ -442,6 +534,7 @@ fn bench(folder: &Path, options: &Options, query_file: &Path, threads: Option<us
         return ExitCode::FAILURE;
     };
     let apps = apps();
+    let boosts = boosts(&index, &apps, options);
     let Some(within) = within(&index, options) else {
         return ExitCode::FAILURE;
     };
@@ -452,7 +545,8 @@ fn bench(folder: &Path, options: &Options, query_file: &Path, threads: Option<us
     for query in &queries {
         for typed in keystrokes(query) {
             let started = Instant::now();
-            searcher.search_in(&index, &apps, within, typed, searcher.ticket(), 50);
+            let ticket = searcher.ticket();
+            searcher.search_with(&index, &apps, within, typed, ticket, 50, &boosts);
             times.push((ms(started), typed));
         }
     }
@@ -486,9 +580,10 @@ fn bench(folder: &Path, options: &Options, query_file: &Path, threads: Option<us
                 .map(|i| {
                     let query = typed[i.min(typed.len() - 1)];
                     let ticket = searcher.ticket();
-                    let (searcher, index, apps) = (&searcher, &index, &apps);
+                    let (searcher, index, apps, boosts) = (&searcher, &index, &apps, &boosts);
                     scope.spawn(move || {
-                        let hits = searcher.search_in(index, apps, within, query, ticket, 50);
+                        let hits =
+                            searcher.search_with(index, apps, within, query, ticket, 50, boosts);
                         hits.is_some()
                     })
                 })
@@ -535,12 +630,14 @@ fn golden(folder: &Path, options: &Options, case_file: &Path) -> ExitCode {
         return ExitCode::FAILURE;
     };
     let apps = apps();
+    let boosts = boosts(&index, &apps, options);
     let searcher = Searcher::default();
 
     let mut in_top_3 = 0;
     for (query, expected) in &cases {
+        let ticket = searcher.ticket();
         let hits = searcher
-            .search(&index, &apps, query, searcher.ticket(), 100)
+            .search_with(&index, &apps, None, query, ticket, 100, &boosts)
             .unwrap_or_default();
         let rank = rank(&index, &apps, &hits, expected);
         let place = match rank {
@@ -814,6 +911,13 @@ mod tests {
             command("grep-bench ~ q.txt 3"),
             Some(grep_bench_on(Some(3)))
         );
+        assert_eq!(
+            command("open-record ~/a.pdf --frecency f"),
+            Some(Command::OpenRecord {
+                path: "~/a.pdf".into(),
+                list: "f".into()
+            })
+        );
     }
 
     #[test]
@@ -834,7 +938,7 @@ mod tests {
             })
         };
         assert_eq!(command("grep ~ --version"), grep_for("--version"));
-        for flag in ["--all", "--load", "--changes", "--save", "--"] {
+        for flag in ["--all", "--load", "--changes", "--save", "--frecency", "--"] {
             assert_eq!(command(&format!("grep ~ -- {flag}")), grep_for(flag));
         }
         assert_eq!(command("grep -- ~ --all"), grep_for("--all"));
@@ -883,6 +987,11 @@ mod tests {
             "bench ~ q.txt 0",
             "grep ~ todo --load",
             "GREP ~ todo",
+            "open-record",
+            "open-record a",
+            "open-record a b --frecency f",
+            "open-record a --frecency",
+            "golden ~ g.tsv --frecency a --frecency b",
         ] {
             assert_eq!(command(line), None, "{line:?}");
         }
@@ -912,10 +1021,12 @@ mod tests {
                 load: Some("a.idx".into()),
                 changes: None,
                 save: None,
+                frecency: None,
                 within: None,
             }
         );
-        let (_, options) = parse(args("grep ~ todo --save b.idx --changes c.txt")).unwrap();
+        let line = "grep ~ todo --save b.idx --changes c.txt --frecency f";
+        let (_, options) = parse(args(line)).unwrap();
         assert_eq!(
             options,
             Options {
@@ -923,6 +1034,7 @@ mod tests {
                 load: None,
                 changes: Some("c.txt".into()),
                 save: Some("b.idx".into()),
+                frecency: Some("f".into()),
                 within: None,
             }
         );
@@ -1044,6 +1156,7 @@ mod tests {
             load: load.map(PathBuf::from),
             changes: changes.map(PathBuf::from),
             save: save.map(PathBuf::from),
+            frecency: None,
             within: None,
         };
         let same = options(Some("i"), None, Some("i"));

@@ -1,6 +1,7 @@
-//! Telescope's search engine: the file-name index, the fuzzy matcher and ranking.
+//! Telescope's search engine: the file-name index, the fuzzy matcher, ranking and frecency.
 
 mod apps;
+mod frecency;
 mod ignore;
 mod index;
 mod pages;
@@ -13,6 +14,7 @@ mod walk;
 mod within;
 
 pub use apps::{AppId, Apps};
+pub use frecency::{Boosts, Frecency, FrecencyError, unix_now};
 pub use ignore::Ignore;
 pub use index::{EntryId, Index};
 pub use pages::Pages;
