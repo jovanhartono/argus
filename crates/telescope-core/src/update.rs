@@ -1,7 +1,7 @@
 //! Keeping the index current: each changed folder is read again and the lists are patched in
 //! place, so a change costs a few folder reads instead of a rescan.
 
-use crate::index::{EntryId, Index, IndexBuilder, NO_PARENT, NameId, name_fingerprint};
+use crate::index::{EntryId, Index, IndexBuilder, NO_PARENT, NameId, name_fingerprints};
 use crate::walk::{Kind, Listing, Rules, walk};
 use rayon::prelude::*;
 use std::cmp::Ordering;
@@ -334,11 +334,13 @@ impl Index {
         let names = new.distinct_names() - 1;
         grow(&mut self.name_starts, names);
         grow(&mut self.name_letters, names);
+        grow(&mut self.name_word_starts, names);
         for name in 1..=names {
             self.name_starts
                 .push(bytes_base + new.name_starts[name + 1]);
-            self.name_letters
-                .push(name_fingerprint(new.name_text(name as NameId)));
+            let (letters, starts) = name_fingerprints(new.name_text(name as NameId));
+            self.name_letters.push(letters);
+            self.name_word_starts.push(starts);
         }
 
         let entries = new.len() - anchors.len();
@@ -423,6 +425,7 @@ impl Index {
     /// rebuild never holds two copies of them.
     fn compact(&mut self) {
         self.name_letters = Vec::new();
+        self.name_word_starts = Vec::new();
         self.entry_depth = Vec::new();
         self.runs = None;
         let mut names = IndexBuilder::new();
@@ -556,10 +559,11 @@ mod tests {
         ));
         assert_eq!(index.folder_inodes.len(), index.folders.len());
         assert_eq!(index.entry_depth.len(), index.len());
-        let letters: Vec<u64> = (0..index.distinct_names())
-            .map(|name| name_fingerprint(index.name_text(name as NameId)))
-            .collect();
+        let (letters, starts): (Vec<u64>, Vec<u64>) = (0..index.distinct_names())
+            .map(|name| name_fingerprints(index.name_text(name as NameId)))
+            .unzip();
         assert_eq!(index.name_letters, letters);
+        assert_eq!(index.name_word_starts, starts);
     }
 
     /// What deciding whether a change needs a new list reads: each folder's children, and
@@ -1274,11 +1278,15 @@ mod tests {
     }
 
     /// Each list's length and room.
-    fn lists(index: &Index) -> [(usize, usize); 8] {
+    fn lists(index: &Index) -> [(usize, usize); 9] {
         [
             (index.names.len(), index.names.capacity()),
             (index.name_starts.len(), index.name_starts.capacity()),
             (index.name_letters.len(), index.name_letters.capacity()),
+            (
+                index.name_word_starts.len(),
+                index.name_word_starts.capacity(),
+            ),
             (index.entry_name.len(), index.entry_name.capacity()),
             (index.entry_parent.len(), index.entry_parent.capacity()),
             (index.entry_depth.len(), index.entry_depth.capacity()),
@@ -1308,7 +1316,7 @@ mod tests {
         }
         write(&root, &["d1/newer.txt"]);
         assert_eq!(settings.update(&mut index, &[root.join("d1")]).added, 1);
-        let capacities = |lists: [(usize, usize); 8]| lists.map(|(_, capacity)| capacity);
+        let capacities = |lists: [(usize, usize); 9]| lists.map(|(_, capacity)| capacity);
         assert_eq!(capacities(lists(&index)), capacities(grown));
     }
 

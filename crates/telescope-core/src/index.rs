@@ -25,6 +25,7 @@ pub struct Index {
     /// Where each distinct name starts in `names`, plus one final end position.
     pub(crate) name_starts: Vec<u32>,
     pub(crate) name_letters: Vec<u64>,
+    pub(crate) name_word_starts: Vec<u64>,
     pub(crate) entry_name: Vec<NameId>,
     /// `NO_PARENT` for the root, and for an entry an update removed, which search skips.
     pub(crate) entry_parent: Vec<EntryId>,
@@ -139,6 +140,7 @@ impl Index {
         self.names.capacity()
             + self.name_starts.capacity() * size_of::<u32>()
             + self.name_letters.capacity() * size_of::<u64>()
+            + self.name_word_starts.capacity() * size_of::<u64>()
             + self.entry_name.capacity() * size_of::<NameId>()
             + self.entry_parent.capacity() * size_of::<EntryId>()
             + self.entry_depth.capacity()
@@ -159,19 +161,33 @@ impl Index {
     }
 }
 
-/// The check only knows ASCII, so a name like "café" must always get through.
-pub(crate) fn name_fingerprint(text: &str) -> u64 {
-    if text.is_ascii() {
-        letters(text)
-    } else {
-        u64::MAX
-    }
+/// A name's letter fingerprint and word starts. The letter check only knows ASCII, so a name
+/// like "café" must always get through.
+pub(crate) fn name_fingerprints(text: &str) -> (u64, u64) {
+    let (letters, starts) = fingerprints(text);
+    (if text.is_ascii() { letters } else { u64::MAX }, starts)
 }
 
 /// The letter fingerprint: one bit for each letter, digit or common symbol in `text`.
 pub(crate) fn letters(text: &str) -> u64 {
-    text.bytes()
-        .fold(0, |bits, byte| bits | LETTER_BITS[byte as usize])
+    fingerprints(text).0
+}
+
+/// The letter fingerprint, and the letters that start the name or a word in it, like the
+/// m, r, f and B in "my-report fooBar.md": every place the fuzzy matcher gives a bonus, and
+/// every place a whole word can begin, which is also after a byte like "é" that earns none.
+pub(crate) fn fingerprints(text: &str) -> (u64, u64) {
+    let (mut letters, mut starts, mut before) = (0, 0, 0);
+    for &byte in text.as_bytes() {
+        letters |= LETTER_BITS[byte as usize];
+        starts |= START_BITS[before][byte as usize];
+        before = KIND[byte as usize];
+    }
+    (letters, starts)
+}
+
+pub(crate) fn letter(byte: u8) -> u64 {
+    LETTER_BITS[byte as usize]
 }
 
 /// A table look-up per byte is several times faster than working the bit out, which matters
@@ -198,6 +214,51 @@ const LETTER_BITS: [u64; 256] = {
     table
 };
 
+/// What a byte is, for the one after it: 0 not a letter or digit, 1 lower case, 2 the rest.
+const KIND: [usize; 256] = {
+    let mut table = [0; 256];
+    let mut byte: u8 = 0;
+    loop {
+        table[byte as usize] = if byte.is_ascii_lowercase() {
+            1
+        } else if byte.is_ascii_alphanumeric() {
+            2
+        } else {
+            0
+        };
+        if byte == u8::MAX {
+            break;
+        }
+        byte += 1;
+    }
+    table
+};
+
+/// The bit a byte adds to the word starts, by the kind of byte before it: a letter or digit
+/// after a symbol, and a capital after a lower-case letter.
+const START_BITS: [[u64; 256]; 3] = {
+    let mut table = [[0; 256]; 3];
+    let mut byte: u8 = 0;
+    loop {
+        if byte.is_ascii_alphanumeric() {
+            table[0][byte as usize] = LETTER_BITS[byte as usize];
+        }
+        if byte.is_ascii_uppercase() {
+            table[1][byte as usize] = LETTER_BITS[byte as usize];
+        }
+        if byte == u8::MAX {
+            break;
+        }
+        byte += 1;
+    }
+    table
+};
+
+#[cfg(test)]
+pub(crate) fn word_starts(name: &str) -> u64 {
+    fingerprints(name).1
+}
+
 pub(crate) struct IndexBuilder {
     index: Index,
     /// Name numbers, found by the hash of the name they point to. Only needed while building.
@@ -212,6 +273,7 @@ impl IndexBuilder {
                 names: String::new(),
                 name_starts: vec![0],
                 name_letters: Vec::new(),
+                name_word_starts: Vec::new(),
                 entry_name: Vec::new(),
                 entry_parent: Vec::new(),
                 entry_depth: Vec::new(),
@@ -321,6 +383,7 @@ impl Index {
             names,
             name_starts,
             name_letters: Vec::new(),
+            name_word_starts: Vec::new(),
             entry_name,
             entry_parent,
             entry_depth: Vec::new(),
@@ -357,10 +420,16 @@ impl Index {
             };
             self.entry_depth.push(depth);
         }
-        self.name_letters = (0..self.distinct_names())
-            .into_par_iter()
-            .map(|name| name_fingerprint(self.name_text(name as NameId)))
-            .collect();
+        let mut letters = vec![0; self.distinct_names()];
+        let mut starts = vec![0; self.distinct_names()];
+        letters
+            .par_iter_mut()
+            .zip(&mut starts)
+            .enumerate()
+            .for_each(|(name, (letters, starts))| {
+                (*letters, *starts) = name_fingerprints(self.name_text(name as NameId));
+            });
+        (self.name_letters, self.name_word_starts) = (letters, starts);
     }
 }
 
@@ -485,5 +554,45 @@ mod tests {
         }
         assert_eq!(LETTER_BITS[0x7F], 1 << 40);
         assert_eq!(LETTER_BITS[0x80], 0);
+    }
+
+    #[test]
+    fn word_starts_are_the_first_letter_and_those_after_symbols_and_capitals() {
+        assert_eq!(word_starts("my-report fooBar.md"), letters("mrfbm"));
+        assert_eq!(word_starts(".zshrc"), letters("z"));
+        assert_eq!(word_starts("..x"), letters("x"));
+        assert_eq!(word_starts("ABC_1"), letters("a1"));
+        assert_eq!(word_starts("a.."), letters("a"));
+        assert_eq!(word_starts("é38"), letters("3"));
+        assert_eq!(word_starts("."), 0);
+        assert_eq!(word_starts(""), 0);
+    }
+
+    #[test]
+    fn word_starts_follow_the_rule_for_every_pair_of_characters() {
+        let rule = |name: &str| {
+            let name = name.strip_prefix('.').unwrap_or(name).as_bytes();
+            let mut bits = match name.first() {
+                Some(&byte) if byte.is_ascii_alphanumeric() => letter(byte),
+                _ => 0,
+            };
+            for pair in name.windows(2) {
+                let [before, byte] = [pair[0], pair[1]];
+                if (!before.is_ascii_alphanumeric() && byte.is_ascii_alphanumeric())
+                    || (before.is_ascii_lowercase() && byte.is_ascii_uppercase())
+                {
+                    bits |= letter(byte);
+                }
+            }
+            bits
+        };
+        let chars: Vec<char> = (' '..='~').chain(['é', '日']).collect();
+        for &a in &chars {
+            for &b in &chars {
+                for name in [format!("{a}{b}"), format!(".{a}{b}x"), format!("q{a}{b}")] {
+                    assert_eq!(word_starts(&name), rule(&name), "{name:?}");
+                }
+            }
+        }
     }
 }
