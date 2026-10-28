@@ -234,8 +234,12 @@ fn skips_files_over_the_size_cap() {
     let folder = folder(&[("at.txt", &at_cap), ("over.txt", &over_cap)]);
     let (lines, report) = grep(&folder, "milk");
     assert!(lines.iter().all(|line| line.starts_with("at.txt:")));
-    assert_eq!(report.too_large, 1);
-    assert_eq!(report.files_searched, 1);
+    // The whole report shows where over.txt went when this fails on Windows (#51).
+    assert_eq!(
+        (report.too_large, report.files_searched),
+        (1, 1),
+        "{report:?}"
+    );
 }
 
 #[test]
