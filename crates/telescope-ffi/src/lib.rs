@@ -17,7 +17,7 @@ use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 use telescope_core::{
@@ -597,14 +597,14 @@ fn serve(
     let apps = Apps::default();
     // Each opened file's entry is found once per list or run of opens, never per search, on a
     // copy so `tl_opened` never waits for it.
+    // Timed by the wall clock: `Instant` stands still while the Mac sleeps, and scores fade
+    // through a three-week sleep all the same.
     let rank = |index: &Index| {
-        let frecency = opens.lock().unwrap().frecency.clone();
-        (
-            searcher.boosts(&frecency, index, &apps, unix_now()),
-            Instant::now(),
-        )
+        let frecency = lock(opens).frecency.clone();
+        let now = unix_now();
+        (searcher.boosts(&frecency, index, &apps, now), now)
     };
-    let (mut boosts, mut ranked): (Boosts, Instant) = rank(&index);
+    let (mut boosts, mut ranked): (Boosts, u64) = rank(&index);
     let mut stale = false;
     loop {
         let job = match inbox.try_recv() {
@@ -640,7 +640,7 @@ fn serve(
             }
             Job::Search { ticket, query } => (ticket, query),
         };
-        if stale || ranked.elapsed() > rerank {
+        if stale || unix_now().abs_diff(ranked) >= rerank.as_secs() {
             (boosts, ranked) = rank(&index);
             stale = false;
         }
@@ -1021,7 +1021,7 @@ pub unsafe extern "C" fn tl_frecency_open(core: *const TlCore, file: *const u8, 
         let Ok(file) = std::str::from_utf8(bytes).map(PathBuf::from) else {
             return 0;
         };
-        let _turn = core.live.saves.lock().unwrap();
+        let _turn = lock(&core.live.saves);
         let (frecency, file) = match Frecency::open(&file) {
             Ok(frecency) => (frecency, Some(file)),
             Err(why) => {
@@ -1036,7 +1036,7 @@ pub unsafe extern "C" fn tl_frecency_open(core: *const TlCore, file: *const u8, 
             }
         };
         let count = frecency.len() as u32;
-        *core.live.opens.lock().unwrap() = Opens { frecency, file };
+        *lock(&core.live.opens) = Opens { frecency, file };
         core.send(Job::Opened);
         count
     })
@@ -1063,8 +1063,8 @@ pub unsafe extern "C" fn tl_opened(core: *const TlCore, path: *const u8, len: us
         let Ok(path) = std::str::from_utf8(bytes) else {
             return 0;
         };
-        let _turn = core.live.saves.lock().unwrap();
-        let mut opens = core.live.opens.lock().unwrap();
+        let _turn = lock(&core.live.saves);
+        let mut opens = lock(&core.live.opens);
         if !opens.frecency.record(Path::new(path), unix_now()) {
             return 0;
         }
@@ -1082,6 +1082,12 @@ pub unsafe extern "C" fn tl_opened(core: *const TlCore, path: *const u8, len: us
         }
         1
     })
+}
+
+/// The opened-files locks are taken past a panic `guard` caught, so one bad open never stops
+/// every later open and the search worker with it.
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 impl Text {

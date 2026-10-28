@@ -25,7 +25,7 @@ use std::f64::consts::LN_2;
 use std::fmt;
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
-use std::path::{Component, Path};
+use std::path::{Component, Path, PathBuf};
 use std::sync::{Mutex, PoisonError};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -129,9 +129,18 @@ fn add_open(at: f64, now: f64) -> f64 {
 }
 
 fn boost(score: f64) -> u32 {
+    // A list is pruned only on an open, so one left alone still holds files it has forgotten.
+    if score < (-FORGET_AFTER / HALF_LIFE).exp2() {
+        return 0;
+    }
     (BOOST_PER_DOUBLING * score.ln_1p() / LN_2)
         .min(MOST_BOOST)
         .round() as u32
+}
+
+/// One spelling per path, so "/a/b/" and "/a//b" count as opens of "/a/b".
+fn tidy(path: &Path) -> PathBuf {
+    path.components().collect()
 }
 
 impl Frecency {
@@ -145,7 +154,8 @@ impl Frecency {
 
     /// The score of `path` at `now`: 1 for one open just then, 0 for a file never opened.
     pub fn score(&self, path: &Path, now: u64) -> f64 {
-        path.to_str()
+        tidy(path)
+            .to_str()
             .and_then(|path| self.at.get(path))
             .map_or(0.0, |&at| score(at, now))
     }
@@ -154,6 +164,7 @@ impl Frecency {
     /// and, past 1024 files, the weakest other than `path`. False for a path that is not
     /// UTF-8, which no index holds, or one longer than 4096 bytes.
     pub fn record(&mut self, path: &Path, now: u64) -> bool {
+        let path = tidy(path);
         let Some(path) = path
             .to_str()
             .filter(|path| !path.is_empty() && path.len() <= LONGEST_PATH)
@@ -253,12 +264,13 @@ impl Frecency {
         if !MAGIC.starts_with(&bytes[..bytes.len().min(MAGIC.len())]) {
             return Err(FrecencyError::NotAList);
         }
-        if bytes.len() < HEADER || bytes.len() > MOST_BYTES {
-            return Err(FrecencyError::WrongLength);
-        }
+        // Before the length, so a newer build's longer list is never taken for a damaged one.
         let version = number(8)?;
         if version != VERSION {
             return Err(FrecencyError::Version(version));
+        }
+        if bytes.len() < HEADER || bytes.len() > MOST_BYTES {
+            return Err(FrecencyError::WrongLength);
         }
         let count = number(16)? as usize;
         if count > MOST_FILES {
@@ -534,6 +546,8 @@ mod tests {
     #[test]
     fn a_boost_grows_by_a_letter_per_doubling_up_to_four() {
         assert_eq!(boost(0.0), 0);
+        // Under 1/16 a file is forgotten, though rounding would still give it a point.
+        assert_eq!(boost(0.035), 0);
         assert_eq!(boost(1.0 / 16.0), 1);
         assert_eq!(boost(1.0), 12);
         assert_eq!(boost(3.0), 24);
@@ -558,6 +572,18 @@ mod tests {
         list.record(Path::new("/home/new.md"), NOW + 120 * DAY + 1);
         assert_eq!(list.score(old, NOW), 0.0);
         assert_eq!(list.len(), 1);
+    }
+
+    /// A folder may come with a slash at the end, as a file URL's path keeps one.
+    #[test]
+    fn spellings_of_one_path_count_as_one_file() {
+        let mut list = Frecency::default();
+        for spelling in ["/home/proj", "/home/proj/", "/home//proj", "/home/./proj"] {
+            assert!(list.record(Path::new(spelling), NOW));
+        }
+        assert_eq!(list.len(), 1);
+        assert!(close(list.score(Path::new("/home/proj/"), NOW), 4.0));
+        assert!(!list.record(Path::new(""), NOW));
     }
 
     #[test]
@@ -842,8 +868,12 @@ mod tests {
         bytes[8] = 2;
         assert!(matches!(opened(&bytes), Err(FrecencyError::Version(2))));
         let mut huge = MAGIC.to_vec();
+        huge.extend_from_slice(&VERSION.to_le_bytes());
         huge.resize(MOST_BYTES + 1, 0);
         assert!(matches!(opened(&huge), Err(FrecencyError::WrongLength)));
+        // A newer build's list may be longer, and is still left as it is.
+        huge[8] = 2;
+        assert!(matches!(opened(&huge), Err(FrecencyError::Version(2))));
         huge[0] = b'x';
         assert!(matches!(opened(&huge), Err(FrecencyError::NotAList)));
         assert!(matches!(
@@ -974,13 +1004,15 @@ mod tests {
         assert_eq!(list.boosts(&empty, &apps, NOW), boosts);
     }
 
-    /// A list is pruned only when a file is opened, so one left alone for a year still holds
-    /// its files, and they must boost nothing.
+    /// A list is pruned only when a file is opened, so one left alone still holds files whose
+    /// score fell under 1/16, and they must boost nothing.
     #[test]
-    fn a_list_left_for_a_year_boosts_nothing() {
+    fn a_list_left_alone_boosts_nothing_it_has_forgotten() {
         let index = tree();
         let list = opened(&[("/home/docs/README.md", &[NOW, NOW, NOW])]);
-        assert_eq!(boosts_of(&list, &index, NOW + 180 * DAY).len(), 1);
+        // Three opens fall to 3/32 after five months and to 3/64 after six.
+        assert_eq!(boosts_of(&list, &index, NOW + 150 * DAY).len(), 1);
+        assert!(boosts_of(&list, &index, NOW + 180 * DAY).is_empty());
         assert!(boosts_of(&list, &index, NOW + 365 * DAY).is_empty());
         assert_eq!(list.len(), 1);
     }
