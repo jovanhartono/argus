@@ -27,8 +27,9 @@ add --all to include hidden folders, ~/Library, the insides of packages like Pho
 and tool downloads and caches like node_modules
 add --load <file> to open a saved index instead of scanning (it scans when the file is missing,
 damaged or built with other settings, and does not catch up on changes made since it was saved),
---changes <file> to then read again each folder listed in it, one real absolute path per line
-as FSEvents reports them, and --save <file> to save the index afterwards
+--volume <folder> to then add a mounted drive as the window would, --changes <file> to then
+read again each folder listed in it, one real absolute path per line as FSEvents reports them,
+and --save <file> to save the index afterwards
 add --frecency <file> to search, bench and golden to rank files opened often and lately higher,
 by the opens tl open-record kept in it, a list apart from the Mac app's, which writes over its
 own from memory
@@ -51,6 +52,7 @@ const MAX_THREADS: usize = 256;
 struct Options {
     clutter: Clutter,
     load: Option<PathBuf>,
+    volume: Option<PathBuf>,
     changes: Option<PathBuf>,
     save: Option<PathBuf>,
     frecency: Option<PathBuf>,
@@ -136,6 +138,7 @@ fn parse(mut args: Vec<OsString>) -> Option<(Command, Options)> {
     };
     args.retain(|arg| arg != "--all");
     let load = take(&mut args, "--load")?;
+    let volume = take(&mut args, "--volume")?;
     let changes = take(&mut args, "--changes")?;
     let save = take(&mut args, "--save")?;
     let frecency = take(&mut args, "--frecency")?;
@@ -182,6 +185,7 @@ fn parse(mut args: Vec<OsString>) -> Option<(Command, Options)> {
         Options {
             clutter,
             load,
+            volume,
             changes,
             save,
             frecency,
@@ -268,6 +272,9 @@ fn load(folder: &Path, options: &Options) -> Option<Index> {
     } else {
         println!("scan time: {:.2} s", took / 1000.0);
     }
+    if let Some(volume) = &options.volume {
+        scan.unreadable_folders += add_volume(volume, &settings, &mut scan.index)?;
+    }
     if let Some(file) = &options.changes {
         apply_changes(file, &settings, &mut scan.index)?;
     }
@@ -302,17 +309,47 @@ fn load(folder: &Path, options: &Options) -> Option<Index> {
     Some(scan.index)
 }
 
+/// Takes any folder, unlike the window, so a test drive can be a folder anywhere. Returns how
+/// many of its folders could not be read in full.
+fn add_volume(volume: &Path, settings: &Settings, index: &mut Index) -> Option<usize> {
+    // An index saved with the volume, opened again to try more changes on it.
+    let real = std::fs::canonicalize(volume).unwrap_or_default();
+    if index.volumes().any(|held| held == real) {
+        println!("{} is already in the index", volume.display());
+        return Some(0);
+    }
+    let before = index.heap_bytes();
+    let started = Instant::now();
+    match settings.add_volume(index, volume) {
+        Ok(update) => {
+            println!(
+                "added {} in {:.1} ms: {} entries, {:+.1} MB",
+                volume.display(),
+                ms(started),
+                update.added,
+                (index.heap_bytes() as f64 - before as f64) / 1024.0 / 1024.0
+            );
+            Some(update.unreadable_folders)
+        }
+        Err(error) => {
+            eprintln!("tl: cannot add {}: {error}", volume.display());
+            None
+        }
+    }
+}
+
 fn apply_changes(file: &Path, settings: &Settings, index: &mut Index) -> Option<()> {
     let text = read(file)?;
     let changed = changed_paths(&text);
     let root = settings.root();
     let outside = changed
         .iter()
-        .filter(|path| !path.starts_with(root))
+        .filter(|path| !path.starts_with(root) && !index.volumes().any(|v| path.starts_with(v)))
         .count();
     if outside > 0 {
         eprintln!(
-            "tl: skipped {outside} paths not under {}; the list takes real absolute paths",
+            "tl: skipped {outside} paths not under {} or a volume; the list takes real absolute \
+             paths",
             root.display()
         );
     }
@@ -344,7 +381,7 @@ fn changed_paths(text: &str) -> Vec<&Path> {
 }
 
 fn unchanged_since_opened(options: &Options, opened: bool) -> bool {
-    opened && options.changes.is_none() && options.load == options.save
+    opened && options.volume.is_none() && options.changes.is_none() && options.load == options.save
 }
 
 /// The apps a window would show beside the files, on a Mac.
@@ -861,6 +898,7 @@ mod tests {
         assert_eq!(command("grep ~ --load a.idx --load"), None);
         assert_eq!(command("grep ~ todo --save a --save b"), None);
         assert_eq!(command("index ~ --changes a --changes b"), None);
+        assert_eq!(command("index ~ --volume a --volume b"), None);
     }
 
     fn command(line: &str) -> Option<Command> {
@@ -938,7 +976,15 @@ mod tests {
             })
         };
         assert_eq!(command("grep ~ --version"), grep_for("--version"));
-        for flag in ["--all", "--load", "--changes", "--save", "--frecency", "--"] {
+        for flag in [
+            "--all",
+            "--load",
+            "--volume",
+            "--changes",
+            "--save",
+            "--frecency",
+            "--",
+        ] {
             assert_eq!(command(&format!("grep ~ -- {flag}")), grep_for(flag));
         }
         assert_eq!(command("grep -- ~ --all"), grep_for("--all"));
@@ -1019,19 +1065,21 @@ mod tests {
             Options {
                 clutter: Clutter::Keep,
                 load: Some("a.idx".into()),
+                volume: None,
                 changes: None,
                 save: None,
                 frecency: None,
                 within: None,
             }
         );
-        let line = "grep ~ todo --save b.idx --changes c.txt --frecency f";
+        let line = "grep ~ todo --save b.idx --volume /Volumes/Photos --changes c.txt --frecency f";
         let (_, options) = parse(args(line)).unwrap();
         assert_eq!(
             options,
             Options {
                 clutter: Clutter::Skip,
                 load: None,
+                volume: Some("/Volumes/Photos".into()),
                 changes: Some("c.txt".into()),
                 save: Some("b.idx".into()),
                 frecency: Some("f".into()),
@@ -1154,6 +1202,7 @@ mod tests {
         let options = |load: Option<&str>, changes: Option<&str>, save: Option<&str>| Options {
             clutter: Clutter::Skip,
             load: load.map(PathBuf::from),
+            volume: None,
             changes: changes.map(PathBuf::from),
             save: save.map(PathBuf::from),
             frecency: None,
@@ -1171,6 +1220,11 @@ mod tests {
             &options(Some("i"), None, Some("j")),
             true
         ));
+        let with_volume = Options {
+            volume: Some("/Volumes/Photos".into()),
+            ..same
+        };
+        assert!(!unchanged_since_opened(&with_volume, true));
     }
 
     #[cfg(unix)]

@@ -10,6 +10,8 @@ use std::path::{Component, Path, PathBuf};
 #[derive(Clone, Debug)]
 pub struct Scope {
     root: PathBuf,
+    /// Each read whole by the same rules, like the root.
+    volumes: Vec<PathBuf>,
     rules: Rules,
     /// The folder of your ignore list, when the scan follows it.
     list: Option<PathBuf>,
@@ -26,8 +28,26 @@ pub enum Watch {
 }
 
 impl Scope {
-    pub(crate) fn new(root: PathBuf, rules: Rules, list: Option<PathBuf>) -> Self {
-        Self { root, rules, list }
+    pub(crate) fn new(
+        root: PathBuf,
+        volumes: Vec<PathBuf>,
+        rules: Rules,
+        list: Option<PathBuf>,
+    ) -> Self {
+        Self {
+            root,
+            volumes,
+            rules,
+            list,
+        }
+    }
+
+    /// The root or volume `path` is in.
+    fn top(&self, path: &Path) -> Option<&Path> {
+        std::iter::once(&self.root)
+            .chain(&self.volumes)
+            .find(|top| path.starts_with(top))
+            .map(PathBuf::as_path)
     }
 
     /// Whether the scan reads what is inside `path`, a real path as macOS reports changes, so
@@ -50,11 +70,15 @@ impl Scope {
         {
             return false;
         }
-        let Ok(rest) = path.strip_prefix(&self.root) else {
+        let Some(top) = self.top(path) else {
             return true;
         };
+        let rest = path.strip_prefix(top).unwrap_or(path);
         let names: Option<Vec<&str>> = rest.iter().map(OsStr::to_str).collect();
-        let folder = names.and_then(|names| index.find_folder(names));
+        let root = index.root_at(top);
+        let folder = names
+            .zip(root)
+            .and_then(|(names, root)| index.find_folder(root, names));
         let Some(inside) = self.reach(path) else {
             // A build tool's cache tag or an app's Info.plist just sealed a listed folder.
             return folder.is_none_or(|folder| index.children(folder).next().is_none());
@@ -96,12 +120,13 @@ impl Scope {
     }
 
     fn reach(&self, path: &Path) -> Option<Inside> {
-        let rest = path.strip_prefix(&self.root).ok()?;
+        let top = self.top(path)?;
+        let rest = path.strip_prefix(top).ok()?;
         if self.rules.is_guarded(path) {
             return None;
         }
         let mut names = rest.components();
-        let mut folder = self.root.clone();
+        let mut folder = top.to_path_buf();
         let mut top = true;
         let mut passage = false;
         loop {
@@ -123,9 +148,13 @@ impl Scope {
     }
 
     /// The folders to watch, sorted: the kept ones nearest the root, everything inside them,
-    /// and your ignore list's folder, whether or not it exists yet.
+    /// each volume whole, and your ignore list's folder, whether or not it exists yet. A
+    /// volume is watched only through FSEvents, which keeps no file of it open, so it can be
+    /// ejected while it is watched.
     pub fn watched(&self, index: &Index) -> Vec<(PathBuf, Watch)> {
         let mut watched = vec![(self.root.clone(), Watch::Names)];
+        let volumes = self.volumes.iter();
+        watched.extend(volumes.map(|volume| (volume.clone(), Watch::Inside)));
         let mut passages: Vec<EntryId> = vec![0];
         while let Some(folder) = passages.pop() {
             for child in index.child_folders(folder) {
@@ -261,8 +290,8 @@ mod tests {
         ] {
             for access in [Access::Full, Access::Limited] {
                 let settings = settings_from(&home, root, clutter, access);
-                let scope = settings.scope();
                 let index = settings.scan().unwrap().index;
+                let scope = settings.scope(&index);
                 let listed: Vec<PathBuf> = (0..index.len() as u32).map(|e| index.path(e)).collect();
                 for folder in every_folder(&home) {
                     let passage = *root == home
@@ -280,10 +309,46 @@ mod tests {
     }
 
     #[test]
+    fn a_volume_is_judged_by_the_same_rules_from_its_own_top() {
+        let (_volume_dir, volume) = home();
+        let (_dir, home) = home();
+        let settings = settings(&home, Access::Full);
+        let mut index = settings.scan().unwrap().index;
+        settings.add_volume(&mut index, &volume).unwrap();
+        let scope = settings.scope(&index);
+        let listed: Vec<PathBuf> = (0..index.len() as u32).map(|e| index.path(e)).collect();
+        for folder in every_folder(&volume) {
+            let read = listed.contains(&folder.join("probe.txt"));
+            assert_eq!(scope.in_scope(&folder), read, "{folder:?}");
+            assert!(scope.holds(&folder, &index), "{folder:?}");
+        }
+        assert!(!scope.in_scope(&volume.join("work/node_modules/react")));
+        assert!(!scope.in_scope(&volume.join(".config/nvim")));
+
+        let watched = scope.watched(&index);
+        assert!(watched.contains(&(volume.clone(), Watch::Inside)));
+        let below = |(path, _): &(PathBuf, Watch)| path.starts_with(&volume) && *path != volume;
+        assert!(!watched.iter().any(below));
+
+        let holiday = volume.join("Pictures/holiday");
+        fs::write(holiday.join("probe.txt"), "saved over").unwrap();
+        assert!(scope.holds(&holiday, &index));
+        fs::write(holiday.join("beach.jpg"), "").unwrap();
+        assert!(!scope.holds(&holiday, &index));
+        fs::remove_file(holiday.join("beach.jpg")).unwrap();
+        // Rules from an older list, once the volume is gone from the newest.
+        settings.remove_volume(&mut index, &volume).unwrap();
+        assert!(!scope.holds(&holiday, &index));
+    }
+
+    #[test]
     fn spot_checks_of_what_counts() {
         let (_dir, home) = home();
-        let full = settings(&home, Access::Full).scope();
-        let limited = settings(&home, Access::Limited).scope();
+        let scope = |access| {
+            let settings = settings(&home, access);
+            settings.scope(&settings.scan().unwrap().index)
+        };
+        let (full, limited) = (scope(Access::Full), scope(Access::Limited));
         for scope in [&full, &limited] {
             assert!(scope.in_scope(&home));
             assert!(scope.in_scope(&home.join("work/new project/src")));
@@ -309,7 +374,7 @@ mod tests {
         let watched = |access| {
             let settings = settings(&home, access);
             let index = settings.scan().unwrap().index;
-            settings.scope().watched(&index)
+            settings.scope(&index).watched(&index)
         };
         let passages = [
             "",
@@ -369,7 +434,7 @@ mod tests {
         let (ignore, _) = Ignore::parse("!~/.config", &home, Access::Full);
         let settings = Settings::new(&home, &home, Clutter::Skip, ignore, Access::Full);
         let index = settings.scan().unwrap().index;
-        let watched = settings.scope().watched(&index);
+        let watched = settings.scope(&index).watched(&index);
         assert!(watched.contains(&(home.join(".config"), Watch::Inside)));
         assert!(!watched.iter().any(|(path, _)| path.ends_with("telescope")));
     }
@@ -394,7 +459,7 @@ mod tests {
         for access in [Access::Full, Access::Limited] {
             let settings = settings(&home, access);
             let index = settings.scan().unwrap().index;
-            let scope = settings.scope();
+            let scope = settings.scope(&index);
             for folder in every_folder(&home) {
                 assert!(scope.holds(&folder, &index), "{folder:?} with {access:?}");
             }
@@ -411,7 +476,7 @@ mod tests {
         let (_dir, home) = home();
         let settings = settings(&home, Access::Full);
         let index = settings.scan().unwrap().index;
-        let scope = settings.scope();
+        let scope = settings.scope(&index);
         let holds = |folder: &str| scope.holds(&home.join(folder), &index);
 
         // Saved over, or a settings file replaced beside it: the same names.
@@ -473,7 +538,7 @@ mod tests {
         let (_dir, home) = home();
         let settings = settings(&home, Access::Limited);
         let index = settings.scan().unwrap().index;
-        let scope = settings.scope();
+        let scope = settings.scope(&index);
         fs::write(home.join("Documents/taxes/2026.pdf"), "").unwrap();
         assert!(scope.holds(&home.join("Documents/taxes"), &index));
         // Documents isn't listed in the home folder at all, so it stays out unchanged.
@@ -492,7 +557,7 @@ mod tests {
         let settings = Settings::new(&home, &home, Clutter::Skip, Ignore::default(), Access::Full);
         let index = settings.scan().unwrap().index;
         assert_eq!(
-            settings.scope().watched(&index),
+            settings.scope(&index).watched(&index),
             [
                 (home.clone(), Watch::Names),
                 (home.join(".config/telescope"), Watch::Inside),

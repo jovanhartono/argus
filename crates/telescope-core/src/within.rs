@@ -84,7 +84,10 @@ impl Within {
 impl Index {
     /// The folder at `path`, a full path as `Index::path` gives it.
     pub(crate) fn folder_at(&self, path: &Path) -> Option<EntryId> {
-        let below = path.strip_prefix(self.name(0)).ok()?;
+        let (root, below) = self.roots.iter().find_map(|&root| {
+            let below = path.strip_prefix(self.name(root)).ok()?;
+            Some((root, below))
+        })?;
         let names: Option<Vec<&str>> = below
             .components()
             .map(|part| match part {
@@ -92,7 +95,7 @@ impl Index {
                 _ => None,
             })
             .collect();
-        self.find_folder(names?)
+        self.find_folder(root, names?)
     }
 }
 
@@ -159,6 +162,28 @@ mod tests {
         assert_eq!(at("/home/meme"), None);
         assert_eq!(at("work"), None);
         assert_eq!(at(""), None);
+    }
+
+    #[test]
+    fn finds_a_folder_on_a_volume_and_holds_only_what_is_on_it() {
+        let mut builder = IndexBuilder::new();
+        let home = builder.push("/home/me", NO_PARENT, true);
+        let work = builder.push("work", home, true);
+        builder.push("plan.md", work, false);
+        let volume = builder.push("/Volumes/Photos", NO_PARENT, true);
+        let shoot = builder.push("work", volume, true);
+        builder.push("beach.jpg", shoot, false);
+        let index = builder.finish();
+        let at = |path: &str| index.folder_at(Path::new(path));
+        assert_eq!(at("/Volumes/Photos"), Some(volume));
+        assert_eq!(at("/Volumes/Photos/work"), Some(shoot));
+        assert_eq!(at("/home/me/work"), Some(work));
+        assert_eq!(at("/Volumes/Photos/missing"), None);
+        assert_eq!(at("/Volumes"), None);
+        for folder in index.folders.clone() {
+            assert_eq!(inside(&index, folder), climbed(&index, folder), "{folder}");
+        }
+        assert_eq!(inside(&index, home), [work, work + 1]);
     }
 
     #[test]
