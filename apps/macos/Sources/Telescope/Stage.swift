@@ -21,6 +21,10 @@ protocol Stage: AnyObject {
     /// In its own app, or launched when it is an app.
     func open(_ url: URL)
     func showInFinder(_ url: URL)
+    /// Asks for folders with the open panel, as a sheet on `window`; `done` gets none when cancelled.
+    func chooseFolders(on window: NSWindow, _ done: @escaping @MainActor ([URL]) -> Void)
+    /// Gives the keys back to the app you were in, if Telescope took them for the open panel.
+    func handBack()
 }
 
 @MainActor
@@ -72,5 +76,30 @@ final class Screen: Stage {
 
     func showInFinder(_ url: URL) {
         NSWorkspace.shared.activateFileViewerSelecting([url])
+    }
+
+    private var lent = false
+
+    func chooseFolders(on window: NSWindow, _ done: @escaping @MainActor ([URL]) -> Void) {
+        let choose = NSOpenPanel()
+        choose.canChooseFiles = false
+        choose.canChooseDirectories = true
+        choose.allowsMultipleSelection = true
+        choose.prompt = "Add"
+        choose.message = "Telescope will also search the text inside the files in these folders."
+        // The open panel takes no typing while another app is active.
+        if !NSApp.isActive {
+            lent = true
+            NSApp.activate(ignoringOtherApps: true)
+        }
+        choose.beginSheetModal(for: window) { response in
+            MainActor.assumeIsolated { done(response == .OK ? choose.urls : []) }
+        }
+    }
+
+    func handBack() {
+        guard lent else { return }
+        lent = false
+        if NSApp.isActive && NSApp.keyWindow == nil { NSApp.deactivate() }
     }
 }

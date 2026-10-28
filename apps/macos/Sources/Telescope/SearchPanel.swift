@@ -8,6 +8,7 @@ enum Metric {
     static let width: CGFloat = 680
     static let field: CGFloat = 56
     static let row: CGFloat = 48
+    static let header: CGFloat = 28
     static let visibleRows = 8
     static let inset: CGFloat = 8
     static let message: CGFloat = 48
@@ -129,6 +130,22 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
     private var newest: UInt64 = 0
     private var sentAt: [UInt64: TimeInterval] = [:]
     private(set) var rows: [Row] = []
+    let textFolders: TextFolders
+    private(set) var hits: [TextHit] = []
+    private(set) var textTicket: UInt64 = 0
+    private var textAsked: TextAsk?
+    /// The search for those lines ran to the end while the window showed, and no file changed
+    /// since it started. Editing a file's text brings no new list, so each show reads again.
+    private var textWhole = false
+    /// A search run again for the same words leaves the old lines up until its own come, so the
+    /// window doesn't shrink and grow back.
+    private var replacing = false
+    private var filesChangedAt: TimeInterval = 0
+    /// When the key behind the text search under way went down; nil for a search run again.
+    private var textTypedAt: TimeInterval?
+    private var textStartedAt: TimeInterval = 0
+    private var textDue = false
+    private var shownHeader: Int?
     /// The list changed while the window was hidden, so the results on screen may be old.
     private(set) var stale = false
     /// A search run again on a new list, which keeps the selected file when it answers.
@@ -146,12 +163,15 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
     private let appFolders: [String]
 
     /// With `saved`, the list kept in that file at the last launch shows at once. With `opens`,
-    /// what you open ranks higher, kept in that file. The apps in `apps` are found by name.
+    /// what you open ranks higher, kept in that file. The apps in `apps` are found by name, and
+    /// words inside the files in `textFolders`.
     init(
         root: String = NSHomeDirectory(), saved: String? = nil, opens: String? = nil, apps: [String] = [],
+        textFolders: TextFolders = TextFolders(),
         hasAccess: @escaping () -> Bool = { Hatch.hasFullDiskAccess() }, stage: any Stage = Screen(),
         finder: @escaping @Sendable () -> FinderFolder = FinderFolder.ask
     ) {
+        self.textFolders = textFolders
         self.hasAccess = hasAccess
         self.stage = stage
         self.finder = finder
@@ -203,6 +223,7 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
         showDetails()
         shown = true
         place()
+        if answered == newest { startText(textAsk(), typedAt: nil) }
         panel.alphaValue = reduceMotion ? 1 : 0
         stage.bringForward(panel)
         stage.makeKey(panel)
@@ -222,6 +243,8 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
         guard shown else { return }
         shown = false
         pending = nil
+        stopText()
+        textWhole = false
         closePreview()
         // A word left half-typed when you click away is kept as typed, so searching isn't
         // blocked once you're back.
@@ -286,7 +309,7 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
                     recheckAccess()
                     return !lacksAccess
                 },
-                rebuild: { [weak self] in self?.hatch?.rebuild() }, stage: stage)
+                rebuild: { [weak self] in self?.hatch?.rebuild() }, stage: stage, folders: textFolders)
         }
         health?.show()
     }
@@ -446,21 +469,41 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
         (panel.fieldEditor(false, for: field) as? NSTextView)?.hasMarkedText() ?? false
     }
 
-    private var status: String? {
+    var status: String? {
         if let problem { return problem }
         if composing { return nil }
         if !indexed { return "Getting ready…" }
         if let missing { return missing }
-        if answered != 0 && rows.isEmpty { return "No Results" }
+        if answered != 0 && rows.isEmpty && hits.isEmpty {
+            return textTicket == 0 && !textDue ? "No Results" : "Searching inside files…"
+        }
         return nil
     }
 
     private func bodyHeight(_ status: String?, _ detailing: Bool) -> CGFloat {
         if field.stringValue.isEmpty { return 0 }
         if status != nil { return Metric.message }
-        if rows.isEmpty { return 0 }
-        let list = CGFloat(min(rows.count, Metric.visibleRows)) * Metric.row + 2 * Metric.inset
+        if listed == 0 { return 0 }
+        var list = CGFloat(min(listed, Metric.visibleRows)) * Metric.row + 2 * Metric.inset
+        if let header, header < Metric.visibleRows { list -= Metric.row - Metric.header }
         return detailing ? max(list, Metric.details) : list
+    }
+
+    var listed: Int {
+        rows.count + (hits.isEmpty ? 0 : 1 + hits.count)
+    }
+
+    var header: Int? {
+        hits.isEmpty ? nil : rows.count
+    }
+
+    private func hit(at index: Int) -> TextHit? {
+        let at = index - rows.count - 1
+        return hits.indices.contains(at) ? hits[at] : nil
+    }
+
+    private var top: Int? {
+        rows.isEmpty ? (hits.isEmpty ? nil : rows.count + 1) : 0
     }
 
     var detailing: Bool {
@@ -535,6 +578,8 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
         case .rebuilt(let count, let took):
             timing.notice("rebuilt \(count) entries in \(took) ms after a change")
             hatch?.watch()
+            filesChangedAt = ProcessInfo.processInfo.systemUptime
+            textWhole = false
             if shown { runAgain() } else { stale = true }
             health?.refresh()
         case .reranked:
@@ -542,6 +587,10 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
         case .ready(let ticket) where ticket == newest:
             take(ticket)
         case .ready:
+            break
+        case .lines(let ticket) where ticket == textTicket:
+            takeText(ticket)
+        case .lines:
             break
         case .failed(let code) where code != 0:
             let reason = String(cString: strerror(code))
@@ -558,11 +607,14 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
     private func search(typedAt typed: TimeInterval = ProcessInfo.processInfo.systemUptime) {
         missing = nil
         pending = nil
+        // Each key stops the text search at once; the next starts once the names are drawn.
+        stopText()
         if field.stringValue.isEmpty {
             // A reply to what was typed before the box was cleared must not fill it again.
             newest = 0
             sentAt = [:]
             rows = []
+            dropLines()
             answered = 0
             refill()
             follow()
@@ -641,17 +693,28 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
         guard let fresh = hatch?.take(ticket) else { return }
         // A file you picked stays picked when a change moves it up or down the list.
         let keeping = rerun == ticket ? selected?.path : nil
+        let keepingLine = rerun == ticket ? table.selectedRow - rows.count - 1 : -1
         rerun = 0
+        let ask = textAsk()
+        // Lines found for what was typed before go with its names.
+        if ask != textAsked { dropLines() }
         rows = fresh
         answered = ticket
         refill()
-        if !rows.isEmpty { select(rows.firstIndex { $0.path == keeping } ?? 0) }
+        if hits.indices.contains(keepingLine) {
+            select(rows.count + 1 + keepingLine)
+        } else if let top {
+            select(rows.firstIndex { $0.path == keeping } ?? top)
+        }
         // Picking the same row again tells the table nothing, yet it may hold another file now.
         showDetails()
         follow()
-        fit()
         let typed = sentAt.removeValue(forKey: ticket)
         sentAt = sentAt.filter { $0.key > ticket }
+        // Started after the names' first frame, which it would slow by 0.3-0.5 ms; that frame
+        // already says "Searching inside files…", not "No Results".
+        textDue = shown && needsText(ask)
+        fit()
         if let action = pending {
             pending = nil
             action()
@@ -659,6 +722,93 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
             // The rows grow into view over the 0.15 s resize; this times their first frame.
             panel.displayIfNeeded()
             timing.notice("results drawn \(ms(since: typed), format: .fixed(precision: 2)) ms after the keystroke")
+        }
+        startText(ask, typedAt: typed)
+    }
+
+    private func needsText(_ ask: TextAsk?) -> Bool {
+        ask != nil && (ask != textAsked || !textWhole && textTicket == 0)
+    }
+
+    /// What a text search for the box would look for, or nil when no chosen folder is reached.
+    private func textAsk() -> TextAsk? {
+        guard !field.stringValue.isEmpty, !composing else { return nil }
+        let folders = textFolders.reached(within: scopes.last?.path)
+        return folders.isEmpty ? nil : TextAsk(query: field.stringValue, folders: folders)
+    }
+
+    /// Only while the window shows. The same words are read again once the last search for them
+    /// was stopped by hiding, failed, or saw a file change; never while one runs, so files that
+    /// keep changing can't keep restarting it.
+    private func startText(_ ask: TextAsk?, typedAt typed: TimeInterval?) {
+        textDue = false
+        guard shown, let hatch else { return }
+        if ask != textAsked {
+            let had = !hits.isEmpty
+            dropLines()
+            if had { refill() }
+        }
+        guard let ask, needsText(ask) else { return fit() }
+        replacing = !hits.isEmpty
+        textAsked = ask
+        textTypedAt = typed
+        textStartedAt = ProcessInfo.processInfo.systemUptime
+        textTicket = hatch.searchText(ask.query, in: ask.folders)
+        if textTicket == 0 {
+            textAsked = nil
+            replacing = false
+        }
+        fit()
+    }
+
+    private func dropLines() {
+        hits = []
+        textAsked = nil
+        textWhole = false
+        replacing = false
+    }
+
+    private func stopText() {
+        guard textTicket != 0 else { return }
+        hatch?.cancelText()
+        textTicket = 0
+    }
+
+    private func takeText(_ ticket: UInt64) {
+        guard let batch = hatch?.takeText(ticket) else { return }
+        let replaced = replacing && (!batch.hits.isEmpty || batch.done)
+        let picked = replaced ? hit(at: table.selectedRow) : nil
+        if replaced {
+            replacing = false
+            hits = []
+        }
+        let first = hits.isEmpty && !batch.hits.isEmpty
+        if replaced || !batch.hits.isEmpty {
+            hits += batch.hits
+            refill()
+            if let picked, let at = hits.firstIndex(where: { $0.path == picked.path && $0.line == picked.line }) {
+                select(rows.count + 1 + at)
+            } else if table.selectedRow < 0, let top {
+                select(top)
+            }
+            if replaced {
+                showDetails()
+                follow()
+            }
+        }
+        if batch.done {
+            textTicket = 0
+            textWhole = !batch.failed && filesChangedAt < textStartedAt
+            if batch.failed { failures.error("a text search stopped early") }
+            let took = ms(since: textStartedAt)
+            timing.notice(
+                "text search found \(self.hits.count) lines in \(batch.filesSearched) files in \(took, format: .fixed(precision: 1)) ms"
+            )
+        }
+        fit()
+        if first, let typed = textTypedAt {
+            panel.displayIfNeeded()
+            timing.notice("first text line drawn \(ms(since: typed), format: .fixed(precision: 2)) ms after the keystroke")
         }
     }
 
@@ -679,17 +829,21 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
             missing = nil
             return fit()
         }
-        guard !rows.isEmpty else { return }
+        guard listed > 0 else { return }
         let pressed = pressedAt()
         let before = table.selectedRow
-        select(min(max(before + step, 0), rows.count - 1))
+        var next = min(max(before + step, 0), listed - 1)
+        if next == header { next = (0..<listed).contains(next + step) ? next + step : before }
+        guard next >= 0 else { return }
+        select(next)
         guard detailing, table.selectedRow != before else { return }
         panel.displayIfNeeded()
         timing.notice("details drawn \(ms(since: pressed), format: .fixed(precision: 2)) ms after the arrow key")
     }
 
+    /// A line found inside a file stands for its file.
     var selected: Row? {
-        rows.indices.contains(table.selectedRow) ? rows[table.selectedRow] : nil
+        rows.indices.contains(table.selectedRow) ? rows[table.selectedRow] : hit(at: table.selectedRow)?.file
     }
 
     private func found(_ row: Row) -> Bool {
@@ -855,11 +1009,17 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
     /// A click below the last row or a ⌘-click keeps the pick, so Return, ⌘Y and the pane still
     /// have a file.
     func tableView(_ tableView: NSTableView, selectionIndexesForProposedSelection proposed: IndexSet) -> IndexSet {
-        proposed.isEmpty ? tableView.selectedRowIndexes : proposed
+        var proposed = proposed
+        if let header { proposed.remove(header) }
+        return proposed.isEmpty ? tableView.selectedRowIndexes : proposed
     }
 
     func numberOfRows(in tableView: NSTableView) -> Int {
-        rows.count
+        listed
+    }
+
+    func tableView(_ tableView: NSTableView, heightOfRow row: Int) -> CGFloat {
+        row == header ? Metric.header : Metric.row
     }
 
     func tableView(_ tableView: NSTableView, rowViewForRow row: Int) -> NSTableRowView? {
@@ -868,16 +1028,33 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
 
     func tableView(_ tableView: NSTableView, viewFor column: NSTableColumn?, row: Int) -> NSView? {
         let cell = tableView.makeView(withIdentifier: ResultCell.id, owner: nil) as? ResultCell ?? ResultCell()
-        cell.show(rows[row], icon: icon(for: rows[row]))
+        show(row, in: cell)
         return cell
+    }
+
+    private func show(_ row: Int, in cell: ResultCell) {
+        if rows.indices.contains(row) {
+            cell.show(rows[row], icon: icon(for: rows[row]))
+        } else if row == header {
+            cell.showHeader("Inside Files")
+        } else if let hit = hit(at: row) {
+            cell.show(hit, icon: icon(for: hit.file))
+        }
     }
 
     /// reloadData throws every row away and builds it again, most of the wait after a keystroke.
     private func refill() {
         table.noteNumberOfRowsChanged()
+        // The table keeps the old heights through noteNumberOfRowsChanged, so the title's old
+        // row would stay short.
+        if shownHeader != header {
+            let moved = IndexSet([shownHeader, header].compactMap { $0 }.filter { $0 < listed })
+            shownHeader = header
+            table.noteHeightOfRows(withIndexesChanged: moved)
+        }
         table.enumerateAvailableRowViews { view, row in
-            guard let cell = view.view(atColumn: 0) as? ResultCell, rows.indices.contains(row) else { return }
-            cell.show(rows[row], icon: icon(for: rows[row]))
+            guard let cell = view.view(atColumn: 0) as? ResultCell, row < listed else { return }
+            show(row, in: cell)
         }
     }
 
