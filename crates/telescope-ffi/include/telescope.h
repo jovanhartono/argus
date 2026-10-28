@@ -7,7 +7,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-static const uint32_t TL_ABI_VERSION = 9;
+static const uint32_t TL_ABI_VERSION = 10;
 
 static const uint32_t TL_OK = 0;
 static const uint32_t TL_GONE = 1;
@@ -20,6 +20,7 @@ static const uint32_t TL_EVENT_NOTE = 4;
 static const uint32_t TL_EVENT_REBUILT = 5;
 static const uint32_t TL_EVENT_LINES = 6;
 static const uint32_t TL_EVENT_OPENED = 7;
+static const uint32_t TL_EVENT_RERANKED = 8;
 
 typedef struct TlCore TlCore;
 
@@ -31,6 +32,7 @@ typedef struct TlRow {
     uint32_t folder_start;
     uint32_t folder_len;
     bool is_folder;
+    bool is_app;
 } TlRow;
 
 typedef struct TlRows {
@@ -81,6 +83,7 @@ uint32_t tl_abi_version(void);
 TlCore *tl_core_new(const uint8_t *root, size_t root_len, uint32_t full_disk, uint32_t everything, const TlSaved *saved, void *ctx, TlEventFn on_event);
 TlCore *tl_core_new_stand_in(uint64_t count, void *ctx, TlEventFn on_event);
 uint64_t tl_submit(const TlCore *core, const uint8_t *query, size_t len, const uint8_t *folder, size_t folder_len);
+uint32_t tl_apps(const TlCore *core, const uint8_t *folders, size_t len);
 uint32_t tl_changed(const TlCore *core, const uint8_t *paths, size_t len, uint32_t rescan, uint64_t mark);
 void tl_grant_full_disk(const TlCore *core, uint64_t mark);
 uint32_t tl_index_everything(const TlCore *core, uint32_t on, uint64_t mark);

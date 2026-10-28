@@ -16,6 +16,8 @@ final class OffStage: Stage {
     private(set) var closes = 0
     private(set) var reloads = 0
     private(set) var fading = false
+    private(set) var opened: [URL] = []
+    private(set) var shownInFinder: [URL] = []
 
     func isKey(_ window: NSWindow) -> Bool {
         key === window
@@ -57,5 +59,13 @@ final class OffStage: Stage {
 
     func reloadPreview() {
         reloads += 1
+    }
+
+    func open(_ url: URL) {
+        opened.append(url)
+    }
+
+    func showInFinder(_ url: URL) {
+        shownInFinder.append(url)
     }
 }

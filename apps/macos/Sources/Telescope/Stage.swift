@@ -2,8 +2,8 @@ import AppKit
 import QuickLookUI
 
 /// Everything that reaches the screen or the keyboard: the search window coming forward and
-/// taking the keys, and Quick Look. Tests pass a stand-in, so a test run never takes the screen
-/// from whoever is using the Mac.
+/// taking the keys, Quick Look, and the file, app or Finder window a result opens. Tests pass a
+/// stand-in, so a test run never takes the screen from whoever is using the Mac.
 @MainActor
 protocol Stage: AnyObject {
     /// Telescope is the active app, as after a click on the preview.
@@ -18,6 +18,9 @@ protocol Stage: AnyObject {
     func openPreview()
     func closePreview()
     func reloadPreview()
+    /// In its own app, or launched when it is an app.
+    func open(_ url: URL)
+    func showInFinder(_ url: URL)
 }
 
 @MainActor
@@ -61,5 +64,13 @@ final class Screen: Stage {
 
     func reloadPreview() {
         QLPreviewPanel.shared().reloadData()
+    }
+
+    func open(_ url: URL) {
+        NSWorkspace.shared.open(url)
+    }
+
+    func showInFinder(_ url: URL) {
+        NSWorkspace.shared.activateFileViewerSelecting([url])
     }
 }

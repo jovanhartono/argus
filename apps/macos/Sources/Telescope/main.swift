@@ -10,7 +10,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var window: SearchPanel?
 
     func applicationDidFinishLaunching(_ note: Notification) {
-        let window = SearchPanel(saved: Hatch.savedList)
+        let window = SearchPanel(saved: Hatch.savedList, opens: Hatch.openedList, apps: Hatch.appFolders)
         window.warmUp()
         KeyboardShortcuts.onKeyDown(for: .toggleWindow) { window.toggle() }
         self.window = window

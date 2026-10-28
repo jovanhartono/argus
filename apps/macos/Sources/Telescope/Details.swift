@@ -18,13 +18,15 @@ struct Details: Equatable {
         let keys: Set<URLResourceKey> = [
             .contentTypeKey, .localizedTypeDescriptionKey, .fileSizeKey, .creationDateKey, .contentModificationDateKey,
         ]
-        guard let values = try? row.url.resourceValues(forKeys: keys) else {
-            let guess = row.isFolder ? UTType.folder : UTType(filenameExtension: (row.name as NSString).pathExtension)
+        guard let values = try? row.real.resourceValues(forKeys: keys) else {
+            let guess =
+                row.isApp ? .applicationBundle
+                : row.isFolder ? UTType.folder : UTType(filenameExtension: (row.name as NSString).pathExtension)
             return Details(type: guess ?? .data, size: nil, created: nil, modified: nil, found: false)
         }
         return Details(
             type: values.contentType ?? (row.isFolder ? .folder : .data), kind: values.localizedTypeDescription,
-            size: row.isFolder ? nil : values.fileSize.map(Int64.init),
+            size: row.isFolder || row.isApp ? nil : values.fileSize.map(Int64.init),
             created: values.creationDate, modified: values.contentModificationDate, found: true)
     }
 }
@@ -152,7 +154,7 @@ final class DetailsPane: NSView {
             thumbnailed = nil
         }
         cancelThumbnail()
-        if details.found { thumbnail(of: row.url, scale: scale) }
+        if details.found { thumbnail(of: row.real, scale: scale) }
     }
 
     /// Given up before it landed, the thumbnail is asked for again when the same file shows next.
@@ -174,12 +176,13 @@ final class DetailsPane: NSView {
         waiting = url
         let asked = ProcessInfo.processInfo.systemUptime
         thumbnailing = Task { [weak self] in
-            let image = await bestThumbnail(of: url, scale: scale)
+            let drawn = await quickLookPicture(of: url, side: Metric.thumb, scale: scale, .all)
             // Checked on the main thread, where a newer pick has already cancelled this task.
             guard let self, !Task.isCancelled else { return }
             waiting = nil
-            guard let image else { return }
-            picture.image = image
+            guard let drawn else { return }
+            picture.image = NSImage(
+                cgImage: drawn, size: NSSize(width: CGFloat(drawn.width) / scale, height: CGFloat(drawn.height) / scale))
             thumbnailed = url
             let took = (ProcessInfo.processInfo.systemUptime - asked) * 1000
             timing.notice("thumbnail shown \(took, format: .fixed(precision: 2)) ms after the selection")
@@ -193,11 +196,13 @@ final class DetailsPane: NSView {
 
 /// Quick Look draws off the main thread; only the finished picture comes back. Cancelling the
 /// task tells Quick Look to stop.
-private nonisolated func bestThumbnail(of url: URL, scale: CGFloat) async -> NSImage? {
+nonisolated func quickLookPicture(
+    of url: URL, side: CGFloat, scale: CGFloat, _ types: QLThumbnailGenerator.Request.RepresentationTypes
+) async -> CGImage? {
     nonisolated(unsafe) let request = QLThumbnailGenerator.Request(
-        fileAt: url, size: CGSize(width: Metric.thumb, height: Metric.thumb), scale: scale, representationTypes: .all)
+        fileAt: url, size: CGSize(width: side, height: side), scale: scale, representationTypes: types)
     return await withTaskCancellationHandler {
-        try? await QLThumbnailGenerator.shared.generateBestRepresentation(for: request).nsImage
+        try? await QLThumbnailGenerator.shared.generateBestRepresentation(for: request).cgImage
     } onCancel: {
         QLThumbnailGenerator.shared.cancel(request)
     }
