@@ -12,6 +12,9 @@ enum Metric {
     static let message: CGFloat = 48
     static let fade: TimeInterval = 0.12
     static let resize: TimeInterval = 0.15
+    static let pane: CGFloat = 260
+    static let thumb: CGFloat = 128
+    static let details: CGFloat = 286
 }
 
 /// Read with `log show --last 5m --predicate 'subsystem == "io.github.jovanhartono.telescope"'`.
@@ -80,6 +83,9 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
     private let barLine = NSBox(frame: NSRect(x: 0, y: 0, width: Metric.width, height: 1))
     let barText = NSTextField(labelWithString: "")
     let settings = KeyButton(title: "Open Settings", target: nil, action: nil)
+    let pane = DetailsPane()
+    /// ⌘I's switch, kept while the window hides; the pane itself shows only beside a picked row.
+    private(set) var detailsOn = false
 
     private var hatch: Hatch?
     private let hasAccess: () -> Bool
@@ -141,6 +147,8 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
         let pressed = pressedAt()
         recheckAccess()
         if stale { runAgain() }
+        // A file saved while the window was hidden shows its new size and date.
+        showDetails()
         shown = true
         place()
         panel.alphaValue = reduceMotion ? 1 : 0
@@ -205,6 +213,7 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
         field.delegate = self
 
         line.boxType = .separator
+        line.autoresizingMask = [.width]
 
         let column = NSTableColumn(identifier: ResultCell.id)
         column.resizingMask = .autoresizingMask
@@ -232,6 +241,7 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
             height: 17)
 
         barLine.boxType = .separator
+        barLine.autoresizingMask = [.width]
         barText.font = message.font
         barText.textColor = .secondaryLabelColor
         barText.lineBreakMode = .byTruncatingTail
@@ -244,12 +254,14 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
                 y: 1 + (Metric.message - settings.frame.height) / 2))
         for view in [barLine, barText, settings] { bar.addSubview(view) }
         bar.frame = NSRect(x: 0, y: Metric.field, width: Metric.width, height: 1 + Metric.message)
+        bar.autoresizingMask = [.width]
         bar.isHidden = true
+        pane.isHidden = true
         field.nextKeyView = settings
         settings.nextKeyView = field
 
         let content = TopDown()
-        for view in [glass, field, line, scroll, message, bar] { content.addSubview(view) }
+        for view in [glass, field, line, scroll, message, bar, pane] { content.addSubview(view) }
         panel.contentView = content
     }
 
@@ -292,7 +304,8 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
         let height = panel.frame.height
         let top = visible.maxY - visible.height * 0.2
         let frame = NSRect(
-            x: visible.midX - Metric.width / 2, y: top - height, width: Metric.width, height: height)
+            x: min(visible.midX - Metric.width / 2, visible.maxX - width), y: top - height, width: width,
+            height: height)
         // Going through the animator stops a resize still running from before the window hid.
         NSAnimationContext.runAnimationGroup { context in
             context.duration = 0
@@ -322,10 +335,21 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
         if field.stringValue.isEmpty { return 0 }
         if status != nil { return Metric.message }
         if rows.isEmpty { return 0 }
-        return CGFloat(min(rows.count, Metric.visibleRows)) * Metric.row + 2 * Metric.inset
+        let list = CGFloat(min(rows.count, Metric.visibleRows)) * Metric.row + 2 * Metric.inset
+        return detailing ? max(list, Metric.details) : list
     }
 
-    /// The box alone while it is empty; it grows downward to fit up to 8 rows.
+    /// The pane shows only beside a picked result.
+    var detailing: Bool {
+        detailsOn && selected != nil && status == nil && !field.stringValue.isEmpty
+    }
+
+    private var width: CGFloat {
+        Metric.width + (detailing ? 1 + Metric.pane : 0)
+    }
+
+    /// The box alone while it is empty; it grows downward to fit up to 8 rows, and to the right
+    /// while the details pane is on.
     private func fit() {
         let body = bodyHeight
         let status = self.status
@@ -334,12 +358,19 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
         scroll.isHidden = body == 0 || status != nil
         message.isHidden = body == 0 || status == nil
         scroll.frame = NSRect(x: 0, y: head + 1, width: Metric.width, height: body)
+        pane.isHidden = !detailing
+        if detailing { pane.frame = NSRect(x: Metric.width, y: head + 1, width: 1 + Metric.pane, height: body) }
 
         let height = head + (body > 0 ? 1 + body : 0)
         var frame = panel.frame
-        guard frame.height != height else { return }
+        guard frame.height != height || frame.width != width else { return }
         frame.origin.y += frame.height - height
         frame.size.height = height
+        frame.size.width = width
+        // Kept on the screen when it grows near the right edge.
+        if let visible = panel.screen?.visibleFrame, frame.maxX > visible.maxX {
+            frame.origin.x = max(visible.minX, visible.maxX - width)
+        }
         guard shown, !reduceMotion else {
             panel.setFrame(frame, display: true)
             return
@@ -452,7 +483,13 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
             missing = nil
             return fit()
         }
-        if !rows.isEmpty { select(min(max(table.selectedRow + step, 0), rows.count - 1)) }
+        guard !rows.isEmpty else { return }
+        let pressed = pressedAt()
+        let before = table.selectedRow
+        select(min(max(before + step, 0), rows.count - 1))
+        guard detailing, table.selectedRow != before else { return }
+        panel.displayIfNeeded()
+        timing.notice("details drawn \(ms(since: pressed), format: .fixed(precision: 2)) ms after the arrow key")
     }
 
     var selected: Row? {
@@ -507,6 +544,17 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
             preview.updateController()
             preview.orderFront(nil)
         }
+    }
+
+    @objc func toggleDetails(_ sender: Any?) {
+        detailsOn.toggle()
+        if detailsOn { showDetails() } else { pane.stopThumbnail() }
+        fit()
+    }
+
+    private func showDetails() {
+        guard detailsOn else { return }
+        pane.show(selected, scale: panel.backingScaleFactor)
     }
 
     var previewing: Bool {
@@ -604,6 +652,7 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
 
     /// Arrows, a click on a row, and a new list all land here.
     func tableViewSelectionDidChange(_ note: Notification) {
+        showDetails()
         follow()
     }
 
