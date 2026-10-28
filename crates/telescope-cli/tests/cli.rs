@@ -1,6 +1,7 @@
 use std::fs;
+use std::io::Write;
 use std::path::Path;
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 
 fn tl(args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_tl"))
@@ -59,6 +60,58 @@ fn the_mac_app_has_the_same_version_as_the_crates() {
     let value = after.trim_start().strip_prefix("<string>").unwrap();
     let value = &value[..value.find("</string>").unwrap()];
     assert_eq!(value, env!("CARGO_PKG_VERSION"));
+}
+
+/// `tl search <dir> --in <within> --all`, run from `dir`, typing `a.txt`.
+fn search_in(dir: &Path, within: &str) -> Output {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_tl"))
+        .args(["search", &path(dir, ""), "--in", within, "--all"])
+        .current_dir(dir)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(b"a.txt\n").unwrap();
+    child.wait_with_output().unwrap()
+}
+
+#[test]
+fn search_in_a_folder_finds_only_what_is_inside_it() {
+    let dir = folder();
+    fs::create_dir(dir.path().join("other")).unwrap();
+    fs::write(dir.path().join("other/a.txt"), "").unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(dir.path().join("files"), dir.path().join("link")).unwrap();
+    let inside = format!("{}\n", Path::new("files").join("a.txt").display());
+    let mut ways = vec![path(dir.path(), "files"), "files".to_owned()];
+    if cfg!(unix) {
+        ways.push("link".to_owned());
+    }
+    for within in ways {
+        let output = search_in(dir.path(), &within);
+        assert!(output.status.success(), "{within}: {}", stderr(&output));
+        let out = stdout(&output);
+        assert!(out.contains(&inside), "{within}: {out}");
+        assert!(!out.contains("other"), "{within}: {out}");
+    }
+
+    for within in [path(dir.path(), "nowhere"), path(dir.path(), "files/a.txt")] {
+        let output = search_in(dir.path(), &within);
+        assert_eq!(output.status.code(), Some(1), "{within}");
+        assert!(stderr(&output).contains("is not a folder in the index"));
+    }
+
+    let queries = path(dir.path(), "queries.txt");
+    let within = path(dir.path(), "files");
+    let root = path(dir.path(), "");
+    let output = tl(&["bench", &root, &queries, "1", "--in", &within, "--all"]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(stdout(&output).contains("inside "), "{}", stdout(&output));
+
+    let output = tl(&["grep", &root, "milk", "--in", &within, "--all"]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(stderr(&output).starts_with("usage:"));
 }
 
 #[test]
