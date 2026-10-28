@@ -19,6 +19,8 @@ struct Row: Equatable {
 final class Hatch {
     enum Event: Equatable {
         case indexed(count: UInt64)
+        /// The list saved at the last launch is in use, in place of a first scan.
+        case opened(count: UInt64)
         case ready(ticket: UInt64)
         /// `code` is the scan's errno, or 0 when the engine hit a bug.
         case failed(code: Int32)
@@ -38,31 +40,65 @@ final class Hatch {
     nonisolated(unsafe) private var names: [String: Names] = [:]
     private var watching: [String] = []
     /// Taken before the first scan starts, so a change made during it still counts.
-    private let started = FSEventsGetCurrentEventId()
+    private let started: FSEventStreamEventId
 
     /// Scans `root` as a home folder in the background. Without Full Disk Access, the folders
-    /// macOS guards with a pop-up each are left out, so none appears.
-    convenience init?(root: String, fullDisk: Bool, onEvent: @escaping (Event) -> Void) {
+    /// macOS guards with a pop-up each are left out, so none appears. With `saved`, the list
+    /// kept in that file at the last launch opens instead, and each new list is kept there.
+    convenience init?(root: String, fullDisk: Bool, saved: String? = nil, onEvent: @escaping (Event) -> Void) {
         var root = root
-        self.init(onEvent: onEvent) { tag, callback in
-            root.withUTF8 { tl_core_new($0.baseAddress, $0.count, fullDisk ? 1 : 0, 0, tag, callback) }
+        // A volume FSEvents keeps no log for can't catch up after a relaunch, so nothing is saved.
+        let journal = saved == nil ? nil : Hatch.journal(of: root)
+        self.init(onEvent: onEvent) { tag, callback, now in
+            root.withUTF8 { root in
+                guard var file = saved, var journal else {
+                    return tl_core_new(root.baseAddress, root.count, fullDisk ? 1 : 0, 0, nil, tag, callback)
+                }
+                return file.withUTF8 { file in
+                    journal.withUTF8 { journal in
+                        var saved = TlSaved(
+                            file: file.baseAddress, file_len: file.count, journal: journal.baseAddress,
+                            journal_len: journal.count, now: now)
+                        return tl_core_new(root.baseAddress, root.count, fullDisk ? 1 : 0, 0, &saved, tag, callback)
+                    }
+                }
+            }
         }
     }
 
     convenience init?(standIn count: UInt64, onEvent: @escaping (Event) -> Void) {
-        self.init(onEvent: onEvent) { tl_core_new_stand_in(count, $0, $1) }
+        self.init(onEvent: onEvent) { tag, callback, _ in tl_core_new_stand_in(count, tag, callback) }
     }
 
     /// Nil when the Rust core was built from a different header, or failed to start.
     private init?(
-        onEvent: @escaping (Event) -> Void, start: (UnsafeMutableRawPointer?, TlEventFn) -> OpaquePointer?
+        onEvent: @escaping (Event) -> Void,
+        start: (UnsafeMutableRawPointer?, TlEventFn, FSEventStreamEventId) -> OpaquePointer?
     ) {
         Hatch.generation += 1
         let tag = UnsafeMutableRawPointer(bitPattern: Hatch.generation)
-        guard tl_abi_version() == TL_ABI_VERSION, let core = withCallback({ start(tag, $0) }) else { return nil }
+        let started = FSEventsGetCurrentEventId()
+        guard tl_abi_version() == TL_ABI_VERSION, let core = withCallback({ start(tag, $0, started) }) else {
+            return nil
+        }
         // Events reach the main thread after this line runs, so none are missed.
         Hatch.listener = onEvent
         self.core = core
+        self.started = started
+    }
+
+    /// Where the list is kept between launches.
+    nonisolated static let savedList = FileManager.default
+        .urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        .appendingPathComponent("io.github.jovanhartono.telescope/index").path
+
+    /// macOS's name for the FSEvents log of the volume `path` is on, or nil when it keeps none.
+    nonisolated static func journal(of path: String) -> String? {
+        var info = stat()
+        guard stat(path, &info) == 0, let log = FSEventsCopyUUIDForDevice(info.st_dev) else {
+            return nil
+        }
+        return CFUUIDCreateString(nil, log) as String?
     }
 
     /// macOS's own list of permissions opens only with Full Disk Access, and trying never shows
@@ -173,6 +209,7 @@ final class Hatch {
         guard tag == generation else { return }
         switch event {
         case TL_EVENT_INDEXED: listener?(.indexed(count: value))
+        case TL_EVENT_OPENED: listener?(.opened(count: value))
         case TL_EVENT_READY: listener?(.ready(ticket: value))
         case TL_EVENT_FAILED: listener?(.failed(code: Int32(truncatingIfNeeded: value)))
         case TL_EVENT_REBUILT: listener?(.rebuilt(count: value & 0xFFFF_FFFF, ms: value >> 32))
@@ -202,18 +239,22 @@ private let rescanFlags = FSEventStreamEventFlags(
     kFSEventStreamEventFlagMustScanSubDirs | kFSEventStreamEventFlagUserDropped
         | kFSEventStreamEventFlagKernelDropped | kFSEventStreamEventFlagEventIdsWrapped)
 
-/// The changed folders as one buffer of NUL-ended paths, and whether macOS lost track of some.
+/// The changed folders as one buffer of NUL-ended paths, whether macOS lost track of some, and
+/// the newest event's id.
 nonisolated func gatherChanges(
-    _ count: Int, _ paths: UnsafePointer<UnsafePointer<CChar>>, _ flags: UnsafePointer<FSEventStreamEventFlags>
-) -> (bytes: [UInt8], rescan: Bool) {
+    _ count: Int, _ paths: UnsafePointer<UnsafePointer<CChar>>, _ flags: UnsafePointer<FSEventStreamEventFlags>,
+    _ ids: UnsafePointer<FSEventStreamEventId>
+) -> (bytes: [UInt8], rescan: Bool, newest: FSEventStreamEventId) {
     var bytes: [UInt8] = []
     var rescan = false
+    var newest: FSEventStreamEventId = 0
     for event in 0..<count {
         if flags[event] & FSEventStreamEventFlags(kFSEventStreamEventFlagHistoryDone) != 0 { continue }
         if flags[event] & rescanFlags != 0 { rescan = true }
+        newest = max(newest, ids[event])
         bytes.append(contentsOf: UnsafeRawBufferPointer(start: paths[event], count: strlen(paths[event]) + 1))
     }
-    return (bytes, rescan)
+    return (bytes, rescan, newest)
 }
 
 /// Runs on `changes`.
@@ -223,9 +264,12 @@ private nonisolated func changed(
     _ ids: UnsafePointer<FSEventStreamEventId>
 ) {
     guard let info else { return }
-    let (bytes, rescan) = gatherChanges(count, paths.assumingMemoryBound(to: UnsafePointer<CChar>.self), flags)
+    let (bytes, rescan, newest) = gatherChanges(
+        count, paths.assumingMemoryBound(to: UnsafePointer<CChar>.self), flags, ids)
     guard rescan || !bytes.isEmpty else { return }
-    tl_changed(OpaquePointer(info), bytes, bytes.count, rescan ? 1 : 0, FSEventsGetCurrentEventId())
+    // The event's own id, not the id now: an event not yet delivered may sit in between, and
+    // the list saved after this change must still replay it at the next launch.
+    tl_changed(OpaquePointer(info), bytes, bytes.count, rescan ? 1 : 0, newest)
 }
 
 /// Tells a folder apart from one made later under the same path.
@@ -257,7 +301,8 @@ private nonisolated func watchingNames(
     let source = DispatchSource.makeFileSystemObjectSource(fileDescriptor: file, eventMask: .write, queue: queue)
     nonisolated(unsafe) let core = core
     let path = Array(folder.utf8) + [0]
-    let check: @Sendable () -> Void = { _ = tl_changed(core, path, path.count, 0, FSEventsGetCurrentEventId()) }
+    // Not an FSEvents event, so it has no id of its own.
+    let check: @Sendable () -> Void = { _ = tl_changed(core, path, path.count, 0, 0) }
     source.setEventHandler(handler: check)
     source.setCancelHandler { close(file) }
     source.resume()

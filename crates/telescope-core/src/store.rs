@@ -100,6 +100,13 @@ impl Settings {
         }
     }
 
+    /// Ties a saved index to one FSEvents log, as macOS names it: once the log is wiped, the
+    /// event id an index was saved at means nothing, so the index no longer opens.
+    pub fn with_journal(mut self, journal: &[u8]) -> Self {
+        put(&mut self.key, journal);
+        self
+    }
+
     pub fn scan(&self) -> io::Result<Scan> {
         scan_with(&self.root, &self.rules, &|| false)
     }
@@ -242,10 +249,16 @@ pub fn open_or_scan(file: &Path, settings: &Settings) -> io::Result<Opened> {
 /// Written beside `file` and renamed over it, so a crash mid-save leaves the old file whole.
 /// The temporary name holds the process number and is only ever a new file, so two apps
 /// saving at once never share it and an existing file of that name is left alone.
-pub fn save_index(file: &Path, scan: &Scan, settings: &Settings, event_id: u64) -> io::Result<()> {
+pub fn save_index(
+    file: &Path,
+    index: &Index,
+    unreadable_folders: usize,
+    settings: &Settings,
+    event_id: u64,
+) -> io::Result<()> {
     let temp = file.with_added_extension(format!("{}.tmp", std::process::id()));
     let mut out = BufWriter::with_capacity(CHUNK, File::create_new(&temp)?);
-    let saved = write(&mut out, scan, settings, event_id)
+    let saved = write(&mut out, index, unreadable_folders, settings, event_id)
         .and_then(|()| out.into_inner().map_err(io::IntoInnerError::into_error))
         .and_then(|file| file.sync_all())
         .and_then(|()| fs::rename(&temp, file));
@@ -257,11 +270,11 @@ pub fn save_index(file: &Path, scan: &Scan, settings: &Settings, event_id: u64) 
 
 fn write(
     out: &mut (impl Write + Seek),
-    scan: &Scan,
+    index: &Index,
+    unreadable_folders: usize,
     settings: &Settings,
     event_id: u64,
 ) -> io::Result<()> {
-    let index = &scan.index;
     let sizes = [
         settings.key.len(),
         index.names.len(),
@@ -276,7 +289,7 @@ fn write(
     head[..8].copy_from_slice(&MAGIC);
     head[8..12].copy_from_slice(&VERSION.to_le_bytes());
     head[16..24].copy_from_slice(&event_id.to_le_bytes());
-    let unreadable = u32::try_from(scan.unreadable_folders).unwrap_or(u32::MAX);
+    let unreadable = u32::try_from(unreadable_folders).unwrap_or(u32::MAX);
     head[24..28].copy_from_slice(&unreadable.to_le_bytes());
     let added = u32::try_from(index.added).map_or(ADDED, |added| added.min(ADDED))
         | u32::from(index.children_apart) << 31;
@@ -542,7 +555,14 @@ mod tests {
     /// The bytes `save_index` writes, kept in memory.
     fn encode(scan: &Scan, settings: &Settings, event_id: u64) -> Vec<u8> {
         let mut out = io::Cursor::new(Vec::new());
-        write(&mut out, scan, settings, event_id).unwrap();
+        write(
+            &mut out,
+            &scan.index,
+            scan.unreadable_folders,
+            settings,
+            event_id,
+        )
+        .unwrap();
         out.into_inner()
     }
 
@@ -632,7 +652,7 @@ mod tests {
         let settings = keep(dir.path());
         let mut scanned = settings.scan().unwrap();
         scanned.unreadable_folders = 12;
-        save_index(&file, &scanned, &settings, u64::MAX - 1).unwrap();
+        save_index(&file, &scanned.index, 12, &settings, u64::MAX - 1).unwrap();
 
         let saved = open_index(&file, &settings).unwrap();
         assert_eq!(saved.scan.index, scanned.index);
@@ -938,7 +958,7 @@ mod tests {
 
         let saves = tempfile::tempdir().unwrap();
         let file = saves.path().join("index");
-        save_index(&file, &scan, &older, 1).unwrap();
+        save_index(&file, &scan.index, 0, &older, 1).unwrap();
         let Opened::Scanned { scan: fresh, why } = open_or_scan(&file, &current).unwrap() else {
             panic!("opened a list an older release saved");
         };
@@ -1225,7 +1245,7 @@ mod tests {
         };
         assert!(matches!(why, OpenError::Io(e) if e.kind() == io::ErrorKind::NotFound));
 
-        save_index(&file, &scan, &all, 3).unwrap();
+        save_index(&file, &scan.index, 0, &all, 3).unwrap();
         let Opened::Saved(saved) = open_or_scan(&file, &all).unwrap() else {
             panic!("rescanned a good file");
         };
@@ -1263,19 +1283,40 @@ mod tests {
     }
 
     #[test]
+    fn opens_only_under_the_journal_it_was_saved_under() {
+        let dir = tree();
+        let file = dir.path().join("index");
+        let settings = keep(dir.path());
+        let scan = settings.scan().unwrap();
+        let journal = settings.clone().with_journal(b"5F2A0C1E");
+        save_index(&file, &scan.index, 0, &journal, 7).unwrap();
+        assert_eq!(open_index(&file, &journal).unwrap().event_id, 7);
+        assert_eq!(journal, settings.clone().with_journal(b"5F2A0C1E"));
+        for other in [
+            settings.clone(),
+            settings.clone().with_journal(b"5F2A0C1F"),
+            settings.clone().with_journal(b""),
+            journal.clone().with_journal(b"5F2A0C1E"),
+        ] {
+            let opened = open_index(&file, &other);
+            assert!(matches!(opened, Err(OpenError::OtherSettings)));
+        }
+    }
+
+    #[test]
     fn replaces_the_old_file_and_leaves_no_temporary_one() {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("index");
-        let scan = whole(raw("/", &[0, 1], &[0], &[(0, NO_FOLDER)], &[0]));
+        let index = raw("/", &[0, 1], &[0], &[(0, NO_FOLDER)], &[0]);
         let settings = keep(dir.path());
-        save_index(&file, &scan, &settings, 1).unwrap();
-        save_index(&file, &scan, &settings, 2).unwrap();
+        save_index(&file, &index, 0, &settings, 1).unwrap();
+        save_index(&file, &index, 0, &settings, 2).unwrap();
         assert_eq!(open_index(&file, &settings).unwrap().event_id, 2);
         let left: Vec<_> = fs::read_dir(dir.path()).unwrap().collect();
         assert_eq!(left.len(), 1);
 
         let nowhere = dir.path().join("missing").join("index");
-        assert!(save_index(&nowhere, &scan, &settings, 1).is_err());
+        assert!(save_index(&nowhere, &index, 0, &settings, 1).is_err());
         assert!(!dir.path().join("missing").exists());
     }
 
@@ -1285,9 +1326,9 @@ mod tests {
         let file = dir.path().join("index");
         fs::create_dir(&file).unwrap();
         fs::write(file.join("inside"), "mine").unwrap();
-        let scan = whole(raw("/", &[0, 1], &[0], &[(0, NO_FOLDER)], &[0]));
+        let index = raw("/", &[0, 1], &[0], &[(0, NO_FOLDER)], &[0]);
 
-        assert!(save_index(&file, &scan, &keep(dir.path()), 1).is_err());
+        assert!(save_index(&file, &index, 0, &keep(dir.path()), 1).is_err());
         let left: Vec<_> = fs::read_dir(dir.path()).unwrap().collect();
         assert_eq!(left.len(), 1, "{left:?}");
         assert_eq!(fs::read_to_string(file.join("inside")).unwrap(), "mine");
@@ -1299,9 +1340,9 @@ mod tests {
         let file = dir.path().join("index");
         let temp = file.with_added_extension(format!("{}.tmp", std::process::id()));
         fs::write(&temp, "mine").unwrap();
-        let scan = whole(raw("/", &[0, 1], &[0], &[(0, NO_FOLDER)], &[0]));
+        let index = raw("/", &[0, 1], &[0], &[(0, NO_FOLDER)], &[0]);
 
-        let saved = save_index(&file, &scan, &keep(dir.path()), 1);
+        let saved = save_index(&file, &index, 0, &keep(dir.path()), 1);
         assert_eq!(saved.unwrap_err().kind(), io::ErrorKind::AlreadyExists);
         assert_eq!(fs::read_to_string(&temp).unwrap(), "mine");
         assert!(!file.exists());
