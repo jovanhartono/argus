@@ -2,7 +2,8 @@
 
 use crate::apps::{AppId, Apps};
 use crate::frecency::{Boosts, Frecency};
-use crate::index::{EntryId, Index, NO_PARENT, NameId, letter, letters};
+use crate::index::{ALL_LETTERS, EntryId, Index, NameId, letter, letters, symbols};
+use crate::siblings::NO_FOLDER;
 use crate::within::Within;
 use frizbee::{Config, Match, Matcher, Matching, Pattern, Scoring, SortStrategy};
 use rayon::prelude::*;
@@ -11,6 +12,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Each chunk is one job, and each job first checks that its search is still wanted.
 const NAME_CHUNK: usize = 16_384;
+/// Names handed to the fuzzy matcher at once. Its lists stay small enough that the memory macOS
+/// keeps after a search is a few hundred KB, not megabytes.
+const MATCH_BATCH: usize = 1024;
 const ENTRY_CHUNK: usize = 65_536;
 /// One byte holds which words a name matched.
 const MAX_WORDS: usize = 8;
@@ -85,10 +89,11 @@ pub struct Searcher {
 struct Scratch {
     name_words: Vec<u8>,
     name_score: Vec<u16>,
+    /// The words in each folder's path, by its place in `Index::folders`.
     folder_words: Vec<u8>,
     /// One bit per distinct name a result could still need, for matching common words last.
     possible: Vec<AtomicU64>,
-    /// One bit per folder already climbed while marking `possible`.
+    /// One bit per folder, by place, already climbed while marking `possible`.
     walked: Vec<AtomicU64>,
     app_words: Vec<u8>,
     app_held: Vec<u8>,
@@ -387,12 +392,12 @@ fn run(
                     .filter_map(|(entry, boost)| {
                         let at = entry as usize;
                         let name = *index.entry_name.get(at)?;
-                        if within.is_some_and(|within| !within.holds(index.entry_parent[at])) {
+                        if within.is_some_and(|within| !within.holds(index.parent(entry))) {
                             return None;
                         }
                         let plain = needed & !index.name_letters[name as usize] == 0
-                            && index.name_word_starts[name as usize] & needed == 0;
-                        let depth = DEPTH_PENALTY * u32::from(index.entry_depth[at]);
+                            && index.word_starts(name as usize) & needed == 0;
+                        let depth = DEPTH_PENALTY * u32::from(index.depth(entry));
                         let could = plain && ceiling.saturating_sub(depth) + boost >= weakest;
                         could.then_some((entry, name, boost))
                     })
@@ -469,14 +474,13 @@ fn best(
         folder_words,
         ..
     } = scratch;
+    let siblings = &index.siblings;
     let entries = within.map_or(0..index.len(), |within| within.entries.clone());
     let start = entries.start;
-    let chunks: Vec<Vec<Hit>> = index.entry_name[entries.clone()]
+    let chunks: Vec<Vec<Hit>> = index.entry_name[entries]
         .par_chunks(ENTRY_CHUNK)
-        .zip(index.entry_parent[entries.clone()].par_chunks(ENTRY_CHUNK))
-        .zip(index.entry_depth[entries].par_chunks(ENTRY_CHUNK))
         .enumerate()
-        .map(|(chunk, ((names, parents), depths))| {
+        .map(|(chunk, names)| {
             if stale() {
                 return None;
             }
@@ -485,30 +489,35 @@ fn best(
             // Once `limit` hits are kept, anything ranking below the weakest is skipped,
             // so a one-letter search does not collect two million hits to keep 50.
             let mut weakest: Option<Hit> = None;
-            let entries = names.iter().zip(parents).zip(depths).enumerate();
-            for (i, ((&name, &parent), &depth)) in entries {
+            let mut runs = siblings.cursor(first as EntryId);
+            for (entry, &name) in (first as EntryId..).zip(names) {
                 let own = name_words[name as usize];
-                if own & wanted == 0 || parent == NO_PARENT {
+                if own & wanted == 0 {
                     continue;
                 }
-                if within.is_some_and(|within| !within.holds(parent)) {
+                let run = runs.run(entry);
+                let folder = siblings.folders[run];
+                if folder == NO_FOLDER {
+                    continue;
+                }
+                if within.is_some_and(|within| !within.holds(index.folders[folder as usize])) {
                     continue;
                 }
                 let mut path = own;
                 if use_folders {
-                    path |= folder_words[parent as usize];
+                    path |= folder_words[folder as usize];
                 }
                 if path & wanted != wanted || path & unwanted != 0 {
                     continue;
                 }
                 let score = (u32::from(name_score[name as usize])
                     + folder_bonus[usize::from(wanted & !own)])
-                .saturating_sub(DEPTH_PENALTY * u32::from(depth));
+                .saturating_sub(DEPTH_PENALTY * u32::from(siblings.depths[run]));
                 if weakest.is_some_and(|weakest| score < weakest.score) {
                     continue;
                 }
                 let hit = Hit {
-                    item: Item::Entry((first + i) as EntryId),
+                    item: Item::Entry(entry),
                     score,
                     name_len: index.name_len(name),
                 };
@@ -569,29 +578,32 @@ fn push_boosted(
 ) {
     let use_folders = uses_folders(wanted, unwanted);
     for (entry, boost) in boosted {
-        let at = entry as usize;
         // Boosts worked out for an older list may point past this one.
-        let (Some(&name), Some(&parent)) = (index.entry_name.get(at), index.entry_parent.get(at))
-        else {
+        let Some(&name) = index.entry_name.get(entry as usize) else {
             continue;
         };
         let own = scratch.name_words[name as usize];
-        if own & wanted == 0 || parent == NO_PARENT {
+        if own & wanted == 0 {
             continue;
         }
-        if within.is_some_and(|within| !within.holds(parent)) {
+        let run = index.siblings.run_of(entry);
+        let folder = index.siblings.folders[run];
+        if folder == NO_FOLDER {
+            continue;
+        }
+        if within.is_some_and(|within| !within.holds(index.folders[folder as usize])) {
             continue;
         }
         let mut path = own;
         if use_folders {
-            path |= scratch.folder_words[parent as usize];
+            path |= scratch.folder_words[folder as usize];
         }
         if path & wanted != wanted || path & unwanted != 0 {
             continue;
         }
         let score = (u32::from(scratch.name_score[name as usize])
             + folder_bonus[usize::from(wanted & !own)])
-        .saturating_sub(DEPTH_PENALTY * u32::from(index.entry_depth[at]));
+        .saturating_sub(DEPTH_PENALTY * u32::from(index.siblings.depths[run]));
         hits.push(Hit {
             item: Item::Entry(entry),
             score: score.saturating_add(boost),
@@ -762,6 +774,7 @@ fn match_names(
     };
     let typos = |w: usize| u16::from(typo_words >> w & 1);
     let needed: Vec<u64> = words.iter().map(|word| letters(&word.needle)).collect();
+    let needed_symbols: Vec<u8> = words.iter().map(|word| symbols(&word.needle)).collect();
     let shortcuts = scratch.shortcuts();
     let floors: Vec<u16> = (0..words.len())
         .map(|w| held_floor(&words[w], typos(w), &config.scoring))
@@ -809,62 +822,74 @@ fn match_names(
                     if active >> w & 1 == 0 {
                         continue;
                     }
-                    ids.clear();
-                    texts.clear();
                     // "zshrc" should find .zshrc as readily as zshrc.bak; typing ".zsh" keeps the dot.
                     let keep_dot = words[w].needle.starts_with('.');
-                    for n in first..first + bits.len() {
-                        if only_possible && !is_marked(possible, n) {
-                            continue;
+                    let end = first + bits.len();
+                    for batch in (first..end).step_by(MATCH_BATCH) {
+                        ids.clear();
+                        texts.clear();
+                        for n in batch..end.min(batch + MATCH_BATCH) {
+                            if only_possible && !is_marked(possible, n) {
+                                continue;
+                            }
+                            if names.is_some_and(|names| {
+                                (names[n / 64] >> (n % 64) & 1 == 1) == outside
+                            }) {
+                                continue;
+                            }
+                            let have = index.name_letters[n];
+                            let missing = (needed[w] & !have).count_ones();
+                            if missing > u32::from(typos(w)) {
+                                continue;
+                            }
+                            if needed_symbols[w] != 0 {
+                                let have = index.name_symbols[n];
+                                let symbols = (needed_symbols[w] & !have).count_ones();
+                                if missing + symbols > u32::from(typos(w)) {
+                                    continue;
+                                }
+                            }
+                            let starts = || index.word_starts(n);
+                            let plain = || starts() & needed[w] == 0;
+                            let skip = match pass {
+                                Pass::Strong => plain(),
+                                Pass::Rest => !plain(),
+                                Pass::Everywhere { .. } | Pass::Possible | Pass::Outside => false,
+                            };
+                            if skip {
+                                continue;
+                            }
+                            if let Some(one) = one_letters[w]
+                                && have & ALL_LETTERS != ALL_LETTERS
+                            {
+                                bits[n - first] |= 1 << w;
+                                matched |= 1 << w;
+                                if wanted >> w & 1 == 1 {
+                                    let text = || index.name_text(n as NameId);
+                                    let score = one.score(starts(), text, &config.scoring);
+                                    scores[n - first] = scores[n - first].saturating_add(score);
+                                }
+                                continue;
+                            }
+                            let text = index.name_text(n as NameId);
+                            ids.push(n - first);
+                            texts.push(match text.strip_prefix('.') {
+                                Some(hidden) if !keep_dot => hidden,
+                                _ => text,
+                            });
                         }
-                        if names
-                            .is_some_and(|names| (names[n / 64] >> (n % 64) & 1 == 1) == outside)
-                        {
-                            continue;
-                        }
-                        let have = index.name_letters[n];
-                        if (needed[w] & !have).count_ones() > u32::from(typos(w)) {
-                            continue;
-                        }
-                        let starts = || index.name_word_starts[n];
-                        let plain = || starts() & needed[w] == 0;
-                        let skip = match pass {
-                            Pass::Strong => plain(),
-                            Pass::Rest => !plain(),
-                            Pass::Everywhere { .. } | Pass::Possible | Pass::Outside => false,
-                        };
-                        if skip {
-                            continue;
-                        }
-                        if let Some(one) = one_letters[w]
-                            && have != u64::MAX
-                        {
-                            bits[n - first] |= 1 << w;
+                        for found in matcher.match_list(texts) {
+                            let n = ids[found.index as usize];
+                            bits[n] |= 1 << w;
                             matched |= 1 << w;
                             if wanted >> w & 1 == 1 {
-                                let text = || index.name_text(n as NameId);
-                                let score = one.score(starts(), text, &config.scoring);
-                                scores[n - first] = scores[n - first].saturating_add(score);
+                                let text = texts[found.index as usize];
+                                let needle = &words[w].needle;
+                                let (score, holds) =
+                                    points(found, text, needle, floors[w], &config.scoring);
+                                held |= u8::from(holds) << w;
+                                scores[n] = scores[n].saturating_add(score);
                             }
-                            continue;
-                        }
-                        let text = index.name_text(n as NameId);
-                        ids.push(n - first);
-                        texts.push(match text.strip_prefix('.') {
-                            Some(hidden) if !keep_dot => hidden,
-                            _ => text,
-                        });
-                    }
-                    for found in matcher.match_list(texts) {
-                        let n = ids[found.index as usize];
-                        bits[n] |= 1 << w;
-                        matched |= 1 << w;
-                        if wanted >> w & 1 == 1 {
-                            let text = texts[found.index as usize];
-                            let (score, holds) =
-                                points(found, text, &words[w].needle, floors[w], &config.scoring);
-                            held |= u8::from(holds) << w;
-                            scores[n] = scores[n].saturating_add(score);
                         }
                     }
                 }
@@ -1033,30 +1058,39 @@ fn mark_possible(
         ..
     } = scratch;
     reset(possible, index.distinct_names());
-    reset(walked, index.len());
+    reset(walked, index.folders.len());
     let (possible, walked) = (&*possible, &*walked);
+    let siblings = &index.siblings;
     let entries = within.map_or(0..index.len(), |within| within.entries.clone());
-    index.entry_name[entries.clone()]
+    let start = entries.start;
+    index.entry_name[entries]
         .par_chunks(ENTRY_CHUNK)
-        .zip(index.entry_parent[entries].par_chunks(ENTRY_CHUNK))
-        .try_for_each(|(names, parents)| {
+        .enumerate()
+        .try_for_each(|(chunk, names)| {
             if stale() {
                 return None;
             }
-            for (&name, &parent) in names.iter().zip(parents) {
-                if parent == NO_PARENT || within.is_some_and(|within| !within.holds(parent)) {
+            let first = start + chunk * ENTRY_CHUNK;
+            for (entries, folder) in index.runs_in(first..first + names.len()) {
+                if folder == NO_FOLDER
+                    || within.is_some_and(|within| !within.holds(index.folders[folder as usize]))
+                {
                     continue;
                 }
-                let path = name_words[name as usize] | folder_words[parent as usize];
-                if path & rare != rare || path & unwanted != 0 {
-                    continue;
-                }
-                mark(possible, name as usize);
-                let mut folder = parent;
-                // A folder someone already walked through has its own folders above marked.
-                while folder != NO_PARENT && !mark(walked, folder as usize) {
-                    mark(possible, index.entry_name[folder as usize] as usize);
-                    folder = index.entry_parent[folder as usize];
+                let above = folder_words[folder as usize];
+                for &name in &names[entries.start - first..entries.end - first] {
+                    let path = name_words[name as usize] | above;
+                    if path & rare != rare || path & unwanted != 0 {
+                        continue;
+                    }
+                    mark(possible, name as usize);
+                    let mut slot = folder;
+                    // A folder someone already walked through has its own folders above marked.
+                    while slot != NO_FOLDER && !mark(walked, slot as usize) {
+                        let folder = index.folders[slot as usize];
+                        mark(possible, index.entry_name[folder as usize] as usize);
+                        slot = siblings.folder_parents[slot as usize];
+                    }
                 }
             }
             Some(())
@@ -1091,16 +1125,15 @@ fn words_above(
         ..
     } = scratch;
     folder_words.clear();
-    folder_words.resize(index.len(), 0);
-    for (i, &folder) in index.folders.iter().enumerate() {
-        if i % ENTRY_CHUNK == 0 && stale() {
+    folder_words.resize(index.folders.len(), 0);
+    let parents = &index.siblings.folder_parents;
+    for (slot, (&folder, &parent)) in index.folders.iter().zip(parents).enumerate() {
+        if slot % ENTRY_CHUNK == 0 && stale() {
             return None;
         }
-        let folder = folder as usize;
-        let parent = index.entry_parent[folder];
-        if parent != NO_PARENT {
-            let own = name_words[index.entry_name[folder] as usize];
-            folder_words[folder] = own | folder_words[parent as usize];
+        if parent != NO_FOLDER {
+            let own = name_words[index.entry_name[folder as usize] as usize];
+            folder_words[slot] = own | folder_words[parent as usize];
         }
     }
     Some(())
@@ -1126,8 +1159,8 @@ fn keep_best(hits: &mut Vec<Hit>, limit: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::index::{IndexBuilder, word_starts};
-    use std::path::Path;
+    use crate::index::{IndexBuilder, NO_PARENT, word_starts};
+    use std::path::{Path, PathBuf};
 
     #[test]
     fn a_common_word_still_counts_in_any_folder_above() {
@@ -1254,14 +1287,52 @@ mod tests {
     }
 
     #[test]
+    fn the_letter_and_symbol_check_never_drops_a_name_frizbee_matches() {
+        let mut rng = Rng(0x5a7b);
+        let parts = [
+            "a", "b", "3", "A", ".", "-", "_", " ", "~", "(", "é", "日", "a", ".", "-", "_",
+        ];
+        let typed = ["a", "b", "3", "B", ".", "-", "_", "~", "("];
+        let config = matcher_config();
+        let mut checked = 0;
+        for _ in 0..3_000 {
+            let needle = rng.text(&typed, 5);
+            let typos = rng.below(2) as u16;
+            let Some(word) = Pattern::parse_query(&needle).pop() else {
+                continue;
+            };
+            let word = positive(word).max_typos(Some(typos));
+            let keep_dot = word.needle.starts_with('.');
+            let (needed, needed_symbols) = (letters(&word.needle), symbols(&word.needle));
+            let names: Vec<String> = (0..40).map(|_| rng.name(&parts, 12)).collect();
+            let texts: Vec<&str> = names
+                .iter()
+                .map(|name| match name.strip_prefix('.') {
+                    Some(hidden) if !keep_dot => hidden,
+                    _ => name,
+                })
+                .collect();
+            for found in Matcher::new(word.clone(), &config).match_list(&texts) {
+                let name = &names[found.index as usize];
+                let (have, _, have_symbols) = crate::index::name_fingerprint(name);
+                let missing =
+                    (needed & !have).count_ones() + (needed_symbols & !have_symbols).count_ones();
+                assert!(missing <= u32::from(typos), "{needle:?} in {name:?}");
+                checked += usize::from(needed_symbols != 0);
+            }
+        }
+        assert!(checked > 1_000, "{checked}");
+    }
+
+    #[test]
     fn one_letter_scores_match_frizbee() {
         let mut rng = Rng(0xc0ffee);
         let names = [
-            "a", "b", "c", "3", "A", "B", "C", ".", "-", "_", " ", "(", "~", "a", "c",
+            "a", "b", "c", "3", "A", "B", "C", ".", "-", "_", " ", "(", "~", "a", "c", "2",
         ];
         let config = matcher_config();
         let mut checked = 0;
-        for typed in ["a", "b", "c", "3", "z"] {
+        for typed in ["a", "b", "c", "3", "2", "z"] {
             let word = positive(Pattern::parse_query(typed).remove(0)).max_typos(Some(0));
             let one = OneLetter::new(&word, 0).unwrap();
             let haystacks: Vec<String> = (0..20_000).map(|_| rng.name(&names, 12)).collect();
@@ -1491,12 +1562,12 @@ mod tests {
     }
 
     fn is_inside(index: &Index, entry: EntryId, folder: EntryId) -> bool {
-        let mut at = index.entry_parent[entry as usize];
+        let mut at = index.parent(entry);
         while at != NO_PARENT {
             if at == folder {
                 return true;
             }
-            at = index.entry_parent[at as usize];
+            at = index.parent(at);
         }
         false
     }
@@ -1743,6 +1814,149 @@ mod tests {
         assert_eq!(paths(plans, "plans old"), ["/home/plans/old"]);
         assert!(paths(plans, "").is_empty());
         assert!(paths(file, "plan").is_empty());
+    }
+
+    #[test]
+    fn names_on_both_sides_of_each_batch_edge_are_found() {
+        let mut builder = IndexBuilder::new();
+        let root = builder.push("/home", NO_PARENT, true);
+        let count = 3 * MATCH_BATCH + 7;
+        for i in 0..count {
+            builder.push(&format!("n{i}q"), root, false);
+            builder.push(&format!("other{i}"), root, false);
+        }
+        let index = builder.finish();
+        let searcher = Searcher::with_threads(2);
+        let hits = searcher
+            .search(&index, &Apps::default(), "nq", searcher.ticket(), 4 * count)
+            .unwrap();
+        let mut found: Vec<&str> = hits
+            .iter()
+            .filter_map(|hit| hit.entry())
+            .map(|e| index.name(e))
+            .collect();
+        found.sort_unstable();
+        let mut expected: Vec<String> = (0..count).map(|i| format!("n{i}q")).collect();
+        expected.sort_unstable();
+        assert_eq!(found, expected);
+    }
+
+    #[test]
+    fn a_word_held_in_an_early_batch_turns_off_typos_for_the_later_ones() {
+        let mut builder = IndexBuilder::new();
+        let root = builder.push("/home", NO_PARENT, true);
+        builder.push("plan.md", root, false);
+        for i in 0..2 * MATCH_BATCH {
+            builder.push(&format!("other{i}"), root, false);
+        }
+        builder.push("plam.md", root, false);
+        let index = builder.finish();
+        assert_eq!(paths(&index, "plan"), ["/home/plan.md"]);
+
+        // Each name scores across batches as it does alone.
+        let searcher = Searcher::with_threads(1);
+        for query in ["plan", "pl md", "other1"] {
+            let hits = searcher
+                .search(
+                    &index,
+                    &Apps::default(),
+                    query,
+                    searcher.ticket(),
+                    index.len(),
+                )
+                .unwrap();
+            for hit in hits {
+                let name = index.name(hit.entry().unwrap());
+                let mut alone = IndexBuilder::new();
+                let root = alone.push("/home", NO_PARENT, true);
+                alone.push(name, root, false);
+                let alone = alone.finish();
+                let hits = searcher.search(&alone, &Apps::default(), query, searcher.ticket(), 2);
+                assert_eq!(hits.unwrap()[0].score, hit.score, "{query:?} in {name:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn runs_across_chunk_edges_find_what_runs_in_one_chunk_find() {
+        // One tree, as (parent, name, folder) with parents first: two folders below the root,
+        // "big" holding 70,000 entries, so its children cross entry 65,536 in a scan's order.
+        let mut tree = vec![(0, "/home".to_string(), true)];
+        tree.push((0, "big".to_string(), true));
+        tree.push((0, "small".to_string(), true));
+        for i in 0..70_000 {
+            let name = format!("f{}x{}", i % 500, if i % 7 == 0 { "-old" } else { "" });
+            tree.push((1, name, i % 1000 == 0));
+        }
+        for i in 0..2000 {
+            tree.push((2, format!("f{}y", i % 300), false));
+        }
+        for folder in (3..70_003).step_by(1000) {
+            for name in ["inner", "f12x", "plan"] {
+                tree.push((folder, name.to_string(), false));
+            }
+        }
+        let depth = |mut node: usize| {
+            let mut depth = 0;
+            while node != 0 {
+                (node, depth) = (tree[node].0, depth + 1);
+            }
+            depth
+        };
+        let build = |order: &[usize]| {
+            let mut builder = IndexBuilder::new();
+            let mut entry = vec![NO_PARENT; tree.len()];
+            for &node in order {
+                let (parent, name, is_dir) = &tree[node];
+                let parent = if node == 0 { NO_PARENT } else { entry[*parent] };
+                entry[node] = builder.push(name, parent, *is_dir);
+            }
+            builder.finish()
+        };
+        let scanned = build(&(0..tree.len()).collect::<Vec<_>>());
+        assert!(scanned.siblings.len() < 100);
+        // The same tree with each depth's entries shuffled, so every folder's children are
+        // spread over many runs.
+        let mut rng = Rng(0xc4a1);
+        let mut order: Vec<usize> = (0..tree.len()).collect();
+        for at in (1..order.len()).rev() {
+            order.swap(at, rng.below(at + 1));
+        }
+        order.sort_by_key(|&node| depth(node));
+        let shuffled = build(&order);
+        assert!(shuffled.siblings.len() > 3000);
+
+        let found = |index: &Index, query: &str| {
+            let mut scratch = Scratch::default();
+            let hits = run(
+                index,
+                &Apps::default(),
+                query,
+                index.len(),
+                None,
+                &Boosts::default(),
+                &mut scratch,
+                &|| false,
+            );
+            let mut hits: Vec<(PathBuf, u32)> = (hits.unwrap().iter())
+                .map(|hit| (index.path(hit.entry().unwrap()), hit.score))
+                .collect();
+            hits.sort();
+            hits
+        };
+        for query in [
+            "f12x",
+            "big f12",
+            "f1 !old",
+            "small f2",
+            "f3 x",
+            "inner big",
+            "f1 !big",
+        ] {
+            let hits = found(&scanned, query);
+            assert!(!hits.is_empty(), "{query:?}");
+            assert_eq!(hits, found(&shuffled, query), "{query:?}");
+        }
     }
 
     #[test]
