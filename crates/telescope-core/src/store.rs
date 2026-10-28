@@ -947,12 +947,13 @@ mod tests {
             for entry in 0..index.len() as EntryId {
                 let _ = (index.path(entry), index.name(entry), index.is_dir(entry));
             }
+            let apps = crate::Apps::default();
             for query in ["a", "re", "md src", "é"] {
-                let hits = searcher.search(&index, query, searcher.ticket(), 10);
+                let hits = searcher.search(&index, &apps, query, searcher.ticket(), 10);
                 assert!(hits.is_some(), "pass {pass}");
             }
             settings.update(&mut index, &changed);
-            let hits = searcher.search(&index, "md src", searcher.ticket(), 10);
+            let hits = searcher.search(&index, &apps, "md src", searcher.ticket(), 10);
             assert!(hits.is_some(), "pass {pass}");
         }
         assert!(opened > 100, "only {opened} damaged indexes opened");

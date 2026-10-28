@@ -643,11 +643,11 @@ mod tests {
 
     fn search(index: &Index, query: &str) -> Vec<PathBuf> {
         let searcher = Searcher::with_threads(1);
-        let hits = searcher.search(index, query, searcher.ticket(), 10);
+        let hits = searcher.search(index, &crate::Apps::default(), query, searcher.ticket(), 10);
         let mut found: Vec<PathBuf> = hits
             .unwrap()
             .iter()
-            .map(|hit| index.path(hit.entry))
+            .map(|hit| index.path(hit.entry().unwrap()))
             .collect();
         found.sort();
         found

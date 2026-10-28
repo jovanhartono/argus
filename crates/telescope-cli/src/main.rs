@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::OnceLock;
 use std::time::Instant;
-use telescope_core::{Access, Clutter, Ignore, Index, Opened, Searcher, Settings};
+use telescope_core::{Access, Apps, Clutter, Hit, Ignore, Index, Item, Opened, Searcher, Settings};
 use telescope_grep::Grep;
 
 #[global_allocator]
@@ -18,6 +18,7 @@ const USAGE: &str = "usage:
   tl golden <folder> <golden>                  rank the expected file of each search
   tl grep <folder> <text>                      scan, then show lines holding the text
   tl grep-bench <folder> <queries> [threads]   time the first and the last line of each text
+on a Mac, searches also find the apps in /Applications, /System/Applications and ~/Applications
 add --all to include hidden folders, ~/Library, the insides of packages like Photos Library,
 and tool downloads and caches like node_modules
 add --load <file> to open a saved index instead of scanning (it scans when the file is missing,
@@ -319,21 +320,53 @@ fn unchanged_since_opened(options: &Options, opened: bool) -> bool {
     opened && options.changes.is_none() && options.load == options.save
 }
 
+/// The apps a window would show beside the files, on a Mac.
+fn apps() -> Apps {
+    let started = Instant::now();
+    let apps = Apps::scan(&telescope_core::home());
+    println!(
+        "{} apps read in {:.1} ms, {:.1} KB",
+        apps.len(),
+        ms(started),
+        apps.heap_bytes() as f64 / 1024.0
+    );
+    apps
+}
+
+fn path(index: &Index, apps: &Apps, hit: &Hit) -> PathBuf {
+    match hit.item {
+        Item::Entry(entry) => index.path(entry),
+        Item::App(app) => apps.path(app),
+    }
+}
+
+/// Where the expected path sits among the hits. An app's path may be a link, like Safari's,
+/// and the expected one is real.
+fn rank(index: &Index, apps: &Apps, hits: &[Hit], expected: &Path) -> Option<usize> {
+    hits.iter().position(|hit| {
+        let path = path(index, apps, hit);
+        path == expected
+            || (matches!(hit.item, Item::App(_))
+                && std::fs::canonicalize(&path).is_ok_and(|real| real == expected))
+    })
+}
+
 fn search(folder: &Path, options: &Options) -> ExitCode {
     let Some(index) = load(folder, options) else {
         return ExitCode::FAILURE;
     };
+    let apps = apps();
     let searcher = Searcher::default();
     eprintln!("type a search and press Enter; Ctrl-D quits");
     for line in std::io::stdin().lock().lines() {
         let Ok(query) = line else { break };
         let started = Instant::now();
         let hits = searcher
-            .search(&index, &query, searcher.ticket(), 10)
+            .search(&index, &apps, &query, searcher.ticket(), 10)
             .unwrap_or_default();
         println!("{query:?} in {:.1} ms", ms(started));
         for hit in hits {
-            println!("{:>8}  {}", hit.score, index.path(hit.entry).display());
+            println!("{:>8}  {}", hit.score, path(&index, &apps, &hit).display());
         }
     }
     ExitCode::SUCCESS
@@ -372,13 +405,14 @@ fn bench(folder: &Path, options: &Options, query_file: &Path, threads: Option<us
     let Some(index) = load(folder, options) else {
         return ExitCode::FAILURE;
     };
+    let apps = apps();
     let searcher = threads.map_or_else(Searcher::default, Searcher::with_threads);
 
     let mut times: Vec<(f64, &str)> = Vec::new();
     for query in &queries {
         for typed in keystrokes(query) {
             let started = Instant::now();
-            searcher.search(&index, typed, searcher.ticket(), 50);
+            searcher.search(&index, &apps, typed, searcher.ticket(), 50);
             times.push((ms(started), typed));
         }
     }
@@ -412,8 +446,8 @@ fn bench(folder: &Path, options: &Options, query_file: &Path, threads: Option<us
                 .map(|i| {
                     let query = typed[i.min(typed.len() - 1)];
                     let ticket = searcher.ticket();
-                    let (searcher, index) = (&searcher, &index);
-                    scope.spawn(move || searcher.search(index, query, ticket, 50).is_some())
+                    let (searcher, index, apps) = (&searcher, &index, &apps);
+                    scope.spawn(move || searcher.search(index, apps, query, ticket, 50).is_some())
                 })
                 .collect();
             running
@@ -457,16 +491,15 @@ fn golden(folder: &Path, options: &Options, case_file: &Path) -> ExitCode {
     let Some(index) = load(folder, options) else {
         return ExitCode::FAILURE;
     };
+    let apps = apps();
     let searcher = Searcher::default();
 
     let mut in_top_3 = 0;
     for (query, expected) in &cases {
         let hits = searcher
-            .search(&index, query, searcher.ticket(), 100)
+            .search(&index, &apps, query, searcher.ticket(), 100)
             .unwrap_or_default();
-        let rank = hits
-            .iter()
-            .position(|hit| index.path(hit.entry) == *expected);
+        let rank = rank(&index, &apps, &hits, expected);
         let place = match rank {
             Some(rank) => (rank + 1).to_string(),
             None if expected.exists() => "-".to_string(),
@@ -477,7 +510,7 @@ fn golden(folder: &Path, options: &Options, case_file: &Path) -> ExitCode {
             in_top_3 += 1;
         } else {
             for hit in hits.iter().take(3) {
-                println!("{:>10}  {}", hit.score, index.path(hit.entry).display());
+                println!("{:>10}  {}", hit.score, path(&index, &apps, hit).display());
             }
         }
     }
@@ -964,5 +997,33 @@ mod tests {
             &options(Some("i"), None, Some("j")),
             true
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ranks_an_app_reached_through_a_link_by_its_real_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        for folder in ["sealed/Safari.app", "Apps", "files"] {
+            std::fs::create_dir_all(root.join(folder)).unwrap();
+        }
+        std::os::unix::fs::symlink(root.join("sealed/Safari.app"), root.join("Apps/Safari.app"))
+            .unwrap();
+        std::fs::write(root.join("files/safari notes.txt"), "").unwrap();
+        let apps = Apps::scan_folders(vec![root.join("Apps")]);
+        let files = root.join("files");
+        let ignore = Ignore::default();
+        let index = telescope_core::scan(&files, &files, Clutter::Skip, &ignore, Access::Full)
+            .unwrap()
+            .index;
+        let searcher = Searcher::with_threads(1);
+        let hits = searcher
+            .search(&index, &apps, "safari", searcher.ticket(), 10)
+            .unwrap();
+        let at = |expected: &str| rank(&index, &apps, &hits, &root.join(expected));
+        assert_eq!(at("sealed/Safari.app"), Some(0));
+        assert_eq!(at("Apps/Safari.app"), Some(0));
+        assert_eq!(at("files/safari notes.txt"), Some(1));
+        assert_eq!(at("files/other.txt"), None);
     }
 }
