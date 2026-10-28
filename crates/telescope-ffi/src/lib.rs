@@ -186,7 +186,9 @@ pub struct TlLines {
 /// `scan_ms` how long reading it took; `scanned_at` is 0 while the list in use is the one saved
 /// at the last launch, patched or not. `changed_at` is when the newest list after the first came
 /// into use, or 0 for none yet. Times are Unix seconds. `busy` is set while a new list is being
-/// built or waits to be.
+/// built or waits to be. `behind` is set once a rebuild failed, so the list misses a change
+/// until a whole new list reads it. `stopped` is set once the core stopped, as after
+/// `TL_EVENT_FAILED`, and no list will come.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 #[repr(C)]
 pub struct TlHealth {
@@ -195,6 +197,8 @@ pub struct TlHealth {
     pub scan_ms: u64,
     pub changed_at: u64,
     pub busy: bool,
+    pub behind: bool,
+    pub stopped: bool,
 }
 
 #[derive(Default)]
@@ -303,6 +307,8 @@ struct Plan {
     wanted: bool,
     /// A rebuild is under way, so the newest list may already be out of date.
     running: bool,
+    /// The list of the rebuild under way is in use; only its checks of late changes remain.
+    listed: bool,
     full_disk: bool,
     /// The window's mark on the first change still waiting for a rebuild.
     asked: Option<u64>,
@@ -364,9 +370,13 @@ impl Plan {
             && self.failed.is_none()
     }
 
-    /// A new list is being built or waits to be.
+    /// A new list is being built or waits to be. Unlike `idle`, a rebuild whose list is in
+    /// use counts as done, as the window hears of that list before the rebuild ends.
     fn busy(&self) -> bool {
-        self.wanted || self.running || self.patching || self.everything != self.everything_listed
+        self.wanted
+            || (self.running && !self.listed)
+            || self.patching
+            || self.everything != self.everything_listed
     }
 
     /// The setting for the list about to be built, which brings any switch waiting.
@@ -1338,6 +1348,7 @@ fn rebuild_loop(live: &Live, clock: &impl Clock, mut last: Instant, mut rebuild:
         }
         plan.wanted = false;
         plan.running = true;
+        plan.listed = false;
         let full_disk = std::mem::take(&mut plan.full_disk);
         let mark = [plan.asked.take(), plan.switched, plan.patched.take()];
         let mark = mark.into_iter().flatten().min().unwrap_or_default();
@@ -1394,6 +1405,7 @@ fn rebuild(source: &mut Source, pass: Pass, live: &Live, swaps: &Sender<Job>, no
                 if whole {
                     plan.failed = None;
                 }
+                plan.listed = true;
                 plan.failed.is_some()
             };
             if !missing {
@@ -1885,14 +1897,39 @@ pub unsafe extern "C" fn tl_watched(core: *const TlCore, out: *mut TlRows, since
 pub unsafe extern "C" fn tl_health(core: *const TlCore, out: *mut TlHealth) -> u32 {
     guard(TL_PANICKED, || {
         let core = unsafe { &*core };
-        let (stopped, busy) = {
+        let (stopped, busy, behind) = {
             let plan = core.live.plan.lock().unwrap();
-            (plan.stopped, plan.busy())
+            (plan.stopped, plan.busy(), plan.failed.is_some())
         };
         let mut health = *lock(&core.live.health);
-        health.busy = (health.busy && !stopped) || busy;
+        health.busy = !stopped && (health.busy || busy);
+        health.behind = behind;
+        health.stopped = stopped;
         unsafe { out.write(health) };
         TL_OK
+    })
+}
+
+/// 1 when the newest list holds the folder at `path`, a full real path of `len` bytes, so a
+/// search inside it can find something, else 0, as before the first list or for made-up names.
+/// Never waits for a scan or a search. Safe to call from any thread.
+///
+/// # Safety
+/// `core` came from `tl_core_new` or `tl_core_new_stand_in`, and `path` points to `len`
+/// readable bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tl_holds_folder(core: *const TlCore, path: *const u8, len: usize) -> u32 {
+    guard(0, || {
+        let core = unsafe { &*core };
+        let bytes = match len {
+            0 => &[],
+            _ => unsafe { std::slice::from_raw_parts(path, len) },
+        };
+        let Ok(path) = std::str::from_utf8(bytes) else {
+            return 0;
+        };
+        let newest = core.live.newest.lock().unwrap().clone();
+        newest.is_some_and(|(_, index)| index.holds_folder(Path::new(path))) as u32
     })
 }
 
@@ -2372,6 +2409,7 @@ impl Drop for TlCore {
 mod tests {
     use super::*;
     use std::sync::Condvar;
+    use std::sync::atomic::AtomicPtr;
     use std::time::{Duration, Instant};
 
     #[derive(Default)]
@@ -3145,12 +3183,13 @@ mod tests {
         let events = Events::default();
         let core = scan(gone.to_str().unwrap(), 1, &events);
         events.wait_for_event(TL_EVENT_FAILED);
-        assert_eq!(
-            health(&core),
-            TlHealth::default(),
-            "no list, and none coming"
-        );
+        let stopped = TlHealth {
+            stopped: true,
+            ..TlHealth::default()
+        };
+        assert_eq!(health(&core), stopped, "no list, and none coming");
         assert_eq!(changed(&core, &[], 1), 0);
+        assert_eq!(health(&core), stopped, "Rebuild does nothing");
         unsafe { tl_grant_full_disk(core.0, 1) };
         assert_eq!(changed(&core, &[&gone], 0), 0);
         assert_eq!(watched(&core), (Vec::new(), 0));
@@ -3381,14 +3420,122 @@ mod tests {
         );
         assert!((first.scanned_at..=unix_now()).contains(&patched.changed_at));
 
-        // A whole new list, as the window's Rebuild button asks for one.
+        // A whole new list, as the window's Rebuild button asks for one. Times are whole
+        // seconds, so they are cleared first to see the rebuild set them.
+        {
+            let mut held = lock(&unsafe { &(*core.0).live }.health);
+            (held.scanned_at, held.changed_at) = (0, 0);
+        }
         assert_eq!(unsafe { tl_changed(core.0, std::ptr::null(), 0, 1, 0) }, 1);
         events.wait_for_rebuilt(2);
         let rebuilt = health(&core);
         assert_eq!(rebuilt.entries, 4);
-        assert!(rebuilt.scanned_at >= patched.changed_at, "{rebuilt:?}");
-        assert!(rebuilt.changed_at >= patched.changed_at, "{rebuilt:?}");
-        wait_until("the rebuild thread to settle", || !health(&core).busy);
+        assert!(
+            (first.scanned_at..=unix_now()).contains(&rebuilt.scanned_at),
+            "{rebuilt:?}"
+        );
+        assert!(
+            (first.scanned_at..=unix_now()).contains(&rebuilt.changed_at),
+            "{rebuilt:?}"
+        );
+        assert!(!rebuilt.behind && !rebuilt.stopped);
+    }
+
+    /// The window reads the health as soon as it hears of a new list, while the rebuild
+    /// thread may still be checking late changes.
+    #[test]
+    fn health_is_not_busy_by_the_time_the_window_hears_of_a_new_list() {
+        struct Heard {
+            core: AtomicPtr<TlCore>,
+            busy: Mutex<Vec<bool>>,
+        }
+        unsafe extern "C" fn on_event(ctx: *mut c_void, event: u32, _: u64) {
+            let heard = unsafe { &*(ctx as *const Heard) };
+            let core = heard.core.load(Ordering::Acquire);
+            if event == TL_EVENT_REBUILT && !core.is_null() {
+                let mut out = TlHealth::default();
+                unsafe { tl_health(core, &mut out) };
+                heard.busy.lock().unwrap().push(out.busy);
+            }
+        }
+        let heard = Heard {
+            core: AtomicPtr::default(),
+            busy: Mutex::default(),
+        };
+        let ctx = &heard as *const Heard as *mut c_void;
+        let live = Live {
+            gap: Duration::ZERO,
+            ..Live::default()
+        };
+        let core = Core(super::start(
+            ctx,
+            Some(on_event),
+            Source::StandIn(100),
+            false,
+            None,
+            live,
+        ));
+        heard.core.store(core.0, Ordering::Release);
+        wait_until("the first list", || health(&core).entries == 100);
+        // The gap is a few microseconds, so it takes many rounds to land in it.
+        for rebuilds in 1..=100 {
+            assert_eq!(changed(&core, &[], 1), 1);
+            wait_until("the rebuild heard", || {
+                heard.busy.lock().unwrap().len() == rebuilds
+            });
+            wait_until("the rebuild to end", || {
+                !unsafe { &(*core.0).live }.plan.lock().unwrap().running
+            });
+        }
+        assert_eq!(*heard.busy.lock().unwrap(), [false; 100]);
+    }
+
+    fn holds(core: &Core, path: &Path) -> bool {
+        let bytes = path.as_os_str().as_encoded_bytes();
+        unsafe { tl_holds_folder(core.0, bytes.as_ptr(), bytes.len()) == 1 }
+    }
+
+    #[test]
+    fn only_folders_the_newest_list_holds_are_held() {
+        let (_dir, home) = home_with(&["notes/a.txt", "Library/Caches/com.example/cache.db"]);
+        let events = Events::default();
+        let core = scan(home.to_str().unwrap(), 1, &events);
+        events.wait_for_event(TL_EVENT_INDEXED);
+        assert!(holds(&core, &home));
+        assert!(holds(&core, &home.join("notes")));
+        for left_out in [
+            home.join("notes/a.txt"),
+            home.join("Library/Caches"),
+            home.join("gone"),
+            home.with_extension("beside"),
+            PathBuf::from("/"),
+            PathBuf::from("notes"),
+            PathBuf::new(),
+        ] {
+            assert!(!holds(&core, &left_out), "{left_out:?}");
+        }
+        assert_eq!(
+            unsafe { tl_holds_folder(core.0, b"\xff".as_ptr(), 1) },
+            0,
+            "not UTF-8"
+        );
+        assert_eq!(unsafe { tl_holds_folder(core.0, std::ptr::null(), 0) }, 0);
+
+        // A folder made since comes in with the next list.
+        std::fs::create_dir(home.join("new")).unwrap();
+        assert!(!holds(&core, &home.join("new")));
+        assert_eq!(changed(&core, &[&home], 0), 1);
+        events.wait_for_rebuilt(1);
+        assert!(holds(&core, &home.join("new")));
+
+        let events = Events::default();
+        let ctx = &events as *const Events as *mut c_void;
+        let made_up = Core(unsafe { tl_core_new_stand_in(100, ctx, Some(record)) });
+        events.wait_for(TL_EVENT_INDEXED, 100);
+        assert!(
+            !holds(&made_up, Path::new("/")),
+            "made-up names have no folders on disk"
+        );
     }
 
     #[test]
@@ -4282,6 +4429,12 @@ mod tests {
         let live = unsafe { &(*core.0).live };
         wait_until("the rebuild to end", || !live.plan.lock().unwrap().running);
         assert_eq!(live.plan.lock().unwrap().failed, Some(60));
+        let behind = health(&core);
+        assert!(
+            behind.behind && !behind.busy && !behind.stopped,
+            "{behind:?}"
+        );
+        assert_eq!(behind.entries, 5, "the list in use is kept");
 
         // A change elsewhere brings the whole list, with the change it missed.
         let notes = home.join("notes");
@@ -4291,6 +4444,7 @@ mod tests {
         assert_eq!(found(&core, &events, "new"), ["new.md"]);
         wait_until("the save", || saved_event(&file) == Some(70));
         assert_eq!(live.plan.lock().unwrap().failed, None);
+        assert!(!health(&core).behind);
     }
 
     #[test]
@@ -5900,11 +6054,21 @@ mod tests {
             failed: Some(1),
             ..Plan::default()
         };
-        assert!(!failed.busy(), "a failed rebuild waits for the next change");
+        assert!(
+            !failed.busy() && !failed.idle(),
+            "a failed rebuild waits for the next change; tl_health tells it apart"
+        );
         assert!(
             !Plan::new(true, false).busy(),
             "keeping everything from the start"
         );
+        let listed = Plan {
+            running: true,
+            listed: true,
+            ..Plan::default()
+        };
+        assert!(!listed.busy(), "its list is in use");
+        assert!(!listed.idle(), "late changes are still being checked");
     }
 
     #[test]

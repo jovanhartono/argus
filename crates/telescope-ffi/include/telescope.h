@@ -85,6 +85,8 @@ typedef struct TlHealth {
     uint64_t scan_ms;
     uint64_t changed_at;
     bool busy;
+    bool behind;
+    bool stopped;
 } TlHealth;
 
 uint32_t tl_abi_version(void);
@@ -99,6 +101,7 @@ uint32_t tl_volume_added(const TlCore *core, const uint8_t *path, size_t len, ui
 uint32_t tl_volume_removed(const TlCore *core, const uint8_t *path, size_t len, uint64_t mark);
 uint32_t tl_watched(const TlCore *core, TlRows *out, uint64_t *since);
 uint32_t tl_health(const TlCore *core, TlHealth *out);
+uint32_t tl_holds_folder(const TlCore *core, const uint8_t *path, size_t len);
 uint32_t tl_take(const TlCore *core, uint64_t ticket, TlRows *out);
 void tl_rows_free(TlRows rows);
 uint32_t tl_frecency_open(const TlCore *core, const uint8_t *file, size_t len);
