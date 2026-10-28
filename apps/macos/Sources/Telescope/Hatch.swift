@@ -190,6 +190,28 @@ final class Hatch {
         tl_grant_full_disk(core, FSEventsGetCurrentEventId())
     }
 
+    /// Never waits for a scan or a search.
+    func health() -> Health {
+        var out = TlHealth()
+        guard tl_health(core, &out) == TL_OK else { return Health(stopped: true) }
+        let date = { (seconds: UInt64) in seconds == 0 ? nil : Date(timeIntervalSince1970: TimeInterval(seconds)) }
+        return Health(
+            entries: out.entries, scannedAt: date(out.scanned_at), scanMs: out.scan_ms, changedAt: date(out.changed_at),
+            busy: out.busy, behind: out.behind, stopped: out.stopped)
+    }
+
+    /// Whether a search inside the folder at `path` can find anything. Never waits for a scan
+    /// or a search.
+    func holds(folder path: String) -> Bool {
+        var path = path
+        return path.withUTF8 { tl_holds_folder(core, $0.baseAddress, $0.count) } == 1
+    }
+
+    /// Reads the whole folder again, as after a change macOS lost track of.
+    func rebuild() {
+        _ = tl_changed(core, nil, 0, 1, 0)
+    }
+
     /// Watches the folders the newest list reads. Called after each new list, as the folders
     /// may change.
     func watch() {

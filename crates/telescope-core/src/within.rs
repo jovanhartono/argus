@@ -96,6 +96,11 @@ impl Index {
             .collect();
         self.find_folder(root, names?)
     }
+
+    /// Whether a search inside the folder at `path`, a full path, can find anything.
+    pub fn holds_folder(&self, path: &Path) -> bool {
+        self.folder_at(path).is_some()
+    }
 }
 
 #[cfg(test)]

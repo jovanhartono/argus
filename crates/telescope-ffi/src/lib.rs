@@ -36,7 +36,7 @@ use telescope_grep::{Found, Grep, Report};
 static PAGES: Pages = Pages;
 
 /// Raise this with any change below, so a window built against an older header refuses to start.
-pub const TL_ABI_VERSION: u32 = 10;
+pub const TL_ABI_VERSION: u32 = 11;
 
 pub const TL_OK: u32 = 0;
 /// No rows for that ticket: not ready yet, already taken, or a newer search replaced them.
@@ -181,6 +181,26 @@ pub struct TlLines {
     owner: *mut c_void,
 }
 
+/// How the list in use is doing, for the window's health view. `entries` is 0 before the first
+/// list. `scanned_at` is when the newest list read from the whole folder came into use, and
+/// `scan_ms` how long reading it took; `scanned_at` is 0 while the list in use is the one saved
+/// at the last launch, patched or not. `changed_at` is when the newest list after the first came
+/// into use, or 0 for none yet. Times are Unix seconds. `busy` is set while a new list is being
+/// built or waits to be. `behind` is set once a rebuild failed, so the list misses a change
+/// until a whole new list reads it. `stopped` is set once the core stopped, as after
+/// `TL_EVENT_FAILED`, and no list will come.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[repr(C)]
+pub struct TlHealth {
+    pub entries: u64,
+    pub scanned_at: u64,
+    pub scan_ms: u64,
+    pub changed_at: u64,
+    pub busy: bool,
+    pub behind: bool,
+    pub stopped: bool,
+}
+
 #[derive(Default)]
 struct Batch {
     lines: Vec<TlLine>,
@@ -287,6 +307,8 @@ struct Plan {
     wanted: bool,
     /// A rebuild is under way, so the newest list may already be out of date.
     running: bool,
+    /// The list of the rebuild under way is in use; only its checks of late changes remain.
+    listed: bool,
     full_disk: bool,
     /// The window's mark on the first change still waiting for a rebuild.
     asked: Option<u64>,
@@ -346,6 +368,15 @@ impl Plan {
             && self.everything == self.everything_listed
             && self.recheck.is_none()
             && self.failed.is_none()
+    }
+
+    /// A new list is being built or waits to be. Unlike `idle`, a rebuild whose list is in
+    /// use counts as done, as the window hears of that list before the rebuild ends.
+    fn busy(&self) -> bool {
+        self.wanted
+            || (self.running && !self.listed)
+            || self.patching
+            || self.everything != self.everything_listed
     }
 
     /// The setting for the list about to be built, which brings any switch waiting.
@@ -469,6 +500,8 @@ struct Live {
     resave: Duration,
     saving: Mutex<Saving>,
     save: Condvar,
+    /// Its `busy` covers only the first list; the plan tells of later ones.
+    health: Mutex<TlHealth>,
 }
 
 impl Default for Live {
@@ -487,6 +520,7 @@ impl Default for Live {
             resave: RESAVE,
             saving: Mutex::default(),
             save: Condvar::new(),
+            health: Mutex::default(),
         }
     }
 }
@@ -541,6 +575,22 @@ impl Live {
             .scope
             .map(|scope| (Arc::new(scope), Arc::clone(&index)));
         index
+    }
+
+    /// Notes a new list coming into use for `tl_health`: read from the whole folder when it
+    /// `took` that long, and after the first one when `later`.
+    fn note_list(&self, entries: usize, took: Option<Duration>, later: bool) {
+        let now = unix_now();
+        let mut health = lock(&self.health);
+        health.entries = entries as u64;
+        health.busy = false;
+        if let Some(took) = took {
+            health.scanned_at = now;
+            health.scan_ms = took.as_millis().try_into().unwrap_or(u64::MAX);
+        }
+        if later {
+            health.changed_at = now;
+        }
     }
 
     fn keep(&self, index: &Arc<Index>, source: &Source, event_id: u64) {
@@ -997,6 +1047,11 @@ fn start(
             file: resume.as_ref().map(|(file, _)| file.clone()),
             ..Saving::default()
         }),
+        // Until the first list is in use.
+        health: Mutex::new(TlHealth {
+            busy: true,
+            ..TlHealth::default()
+        }),
         ..live
     });
     let text = Text {
@@ -1101,6 +1156,11 @@ fn work(
     } else {
         TL_EVENT_INDEXED
     };
+    live.note_list(
+        index.entry_count(),
+        (!opened).then(|| started.elapsed()),
+        false,
+    );
     notify.send(event, index.entry_count() as u64);
     let rebuilds = {
         let live = Arc::clone(live);
@@ -1288,6 +1348,7 @@ fn rebuild_loop(live: &Live, clock: &impl Clock, mut last: Instant, mut rebuild:
         }
         plan.wanted = false;
         plan.running = true;
+        plan.listed = false;
         let full_disk = std::mem::take(&mut plan.full_disk);
         let mark = [plan.asked.take(), plan.switched, plan.patched.take()];
         let mark = mark.into_iter().flatten().min().unwrap_or_default();
@@ -1336,12 +1397,15 @@ fn rebuild(source: &mut Source, pass: Pass, live: &Live, swaps: &Sender<Job>, no
     .unwrap_or_else(|_| Err(io::Error::other("a bug in the engine")));
     match built {
         Ok(Some(index)) => {
-            let took = started.elapsed().as_millis().min(u32::MAX.into()) as u32;
+            let elapsed = started.elapsed();
+            live.note_list(index.entry_count(), whole.then_some(elapsed), true);
+            let took = elapsed.as_millis().min(u32::MAX.into()) as u32;
             let missing = {
                 let mut plan = live.plan.lock().unwrap();
                 if whole {
                     plan.failed = None;
                 }
+                plan.listed = true;
                 plan.failed.is_some()
             };
             if !missing {
@@ -1822,6 +1886,53 @@ pub unsafe extern "C" fn tl_watched(core: *const TlCore, out: *mut TlRows, since
     })
 }
 
+/// Fills `out` with how the list in use is doing, as `TlHealth` explains, and returns `TL_OK`.
+/// Never waits for a scan or a search, so the window may call it on each show. Ask for a whole
+/// new list with `tl_changed` and a `rescan` that isn't 0. Safe to call from any thread.
+///
+/// # Safety
+/// `core` came from `tl_core_new` or `tl_core_new_stand_in`, and `out` points to a `TlHealth`
+/// to fill.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tl_health(core: *const TlCore, out: *mut TlHealth) -> u32 {
+    guard(TL_PANICKED, || {
+        let core = unsafe { &*core };
+        let (stopped, busy, behind) = {
+            let plan = core.live.plan.lock().unwrap();
+            (plan.stopped, plan.busy(), plan.failed.is_some())
+        };
+        let mut health = *lock(&core.live.health);
+        health.busy = !stopped && (health.busy || busy);
+        health.behind = behind;
+        health.stopped = stopped;
+        unsafe { out.write(health) };
+        TL_OK
+    })
+}
+
+/// 1 when the newest list holds the folder at `path`, a full real path of `len` bytes, so a
+/// search inside it can find something, else 0, as before the first list or for made-up names.
+/// Never waits for a scan or a search. Safe to call from any thread.
+///
+/// # Safety
+/// `core` came from `tl_core_new` or `tl_core_new_stand_in`, and `path` points to `len`
+/// readable bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tl_holds_folder(core: *const TlCore, path: *const u8, len: usize) -> u32 {
+    guard(0, || {
+        let core = unsafe { &*core };
+        let bytes = match len {
+            0 => &[],
+            _ => unsafe { std::slice::from_raw_parts(path, len) },
+        };
+        let Ok(path) = std::str::from_utf8(bytes) else {
+            return 0;
+        };
+        let newest = core.live.newest.lock().unwrap().clone();
+        newest.is_some_and(|(_, index)| index.holds_folder(Path::new(path))) as u32
+    })
+}
+
 fn hand_over(packed: Packed) -> TlRows {
     let packed = Box::new(packed);
     TlRows {
@@ -2298,6 +2409,7 @@ impl Drop for TlCore {
 mod tests {
     use super::*;
     use std::sync::Condvar;
+    use std::sync::atomic::AtomicPtr;
     use std::time::{Duration, Instant};
 
     #[derive(Default)]
@@ -3071,7 +3183,13 @@ mod tests {
         let events = Events::default();
         let core = scan(gone.to_str().unwrap(), 1, &events);
         events.wait_for_event(TL_EVENT_FAILED);
+        let stopped = TlHealth {
+            stopped: true,
+            ..TlHealth::default()
+        };
+        assert_eq!(health(&core), stopped, "no list, and none coming");
         assert_eq!(changed(&core, &[], 1), 0);
+        assert_eq!(health(&core), stopped, "Rebuild does nothing");
         unsafe { tl_grant_full_disk(core.0, 1) };
         assert_eq!(changed(&core, &[&gone], 0), 0);
         assert_eq!(watched(&core), (Vec::new(), 0));
@@ -3263,6 +3381,198 @@ mod tests {
         assert_eq!(value & u64::from(u32::MAX), 200_000);
         let took = u128::from(value >> 32);
         assert!(took >= 1 && took <= waited, "{took} ms of {waited}");
+    }
+
+    fn health(core: &Core) -> TlHealth {
+        let mut out = TlHealth {
+            entries: u64::MAX,
+            ..TlHealth::default()
+        };
+        assert_eq!(unsafe { tl_health(core.0, &mut out) }, TL_OK);
+        out
+    }
+
+    #[test]
+    fn health_tells_the_first_scan_then_each_change_and_rebuild() {
+        let (_dir, home) = home_with(&["notes/a.txt"]);
+        let before = unix_now();
+        let events = Events::default();
+        let core = scan(home.to_str().unwrap(), 1, &events);
+        events.wait_for(TL_EVENT_INDEXED, 3);
+        let first = health(&core);
+        assert_eq!(first.entries, 3);
+        assert!(
+            (before..=unix_now()).contains(&first.scanned_at),
+            "{first:?}"
+        );
+        assert_eq!(first.changed_at, 0, "nothing changed yet");
+        assert!(!first.busy);
+
+        // Read again in place: a change, not a scan.
+        std::fs::write(home.join("notes/b.txt"), "").unwrap();
+        assert_eq!(changed(&core, &[&home.join("notes")], 0), 1);
+        events.wait_for_rebuilt(1);
+        let patched = health(&core);
+        assert_eq!(patched.entries, 4);
+        assert_eq!(
+            (patched.scanned_at, patched.scan_ms),
+            (first.scanned_at, first.scan_ms)
+        );
+        assert!((first.scanned_at..=unix_now()).contains(&patched.changed_at));
+
+        // A whole new list, as the window's Rebuild button asks for one. Times are whole
+        // seconds, so they are cleared first to see the rebuild set them.
+        {
+            let mut held = lock(&unsafe { &(*core.0).live }.health);
+            (held.scanned_at, held.changed_at) = (0, 0);
+        }
+        assert_eq!(unsafe { tl_changed(core.0, std::ptr::null(), 0, 1, 0) }, 1);
+        events.wait_for_rebuilt(2);
+        let rebuilt = health(&core);
+        assert_eq!(rebuilt.entries, 4);
+        assert!(
+            (first.scanned_at..=unix_now()).contains(&rebuilt.scanned_at),
+            "{rebuilt:?}"
+        );
+        assert!(
+            (first.scanned_at..=unix_now()).contains(&rebuilt.changed_at),
+            "{rebuilt:?}"
+        );
+        assert!(!rebuilt.behind && !rebuilt.stopped);
+    }
+
+    /// The window reads the health as soon as it hears of a new list, while the rebuild
+    /// thread may still be checking late changes.
+    #[test]
+    fn health_is_not_busy_by_the_time_the_window_hears_of_a_new_list() {
+        struct Heard {
+            core: AtomicPtr<TlCore>,
+            busy: Mutex<Vec<bool>>,
+        }
+        unsafe extern "C" fn on_event(ctx: *mut c_void, event: u32, _: u64) {
+            let heard = unsafe { &*(ctx as *const Heard) };
+            let core = heard.core.load(Ordering::Acquire);
+            if event == TL_EVENT_REBUILT && !core.is_null() {
+                let mut out = TlHealth::default();
+                unsafe { tl_health(core, &mut out) };
+                heard.busy.lock().unwrap().push(out.busy);
+            }
+        }
+        let heard = Heard {
+            core: AtomicPtr::default(),
+            busy: Mutex::default(),
+        };
+        let ctx = &heard as *const Heard as *mut c_void;
+        let live = Live {
+            gap: Duration::ZERO,
+            ..Live::default()
+        };
+        let core = Core(super::start(
+            ctx,
+            Some(on_event),
+            Source::StandIn(100),
+            false,
+            None,
+            live,
+        ));
+        heard.core.store(core.0, Ordering::Release);
+        wait_until("the first list", || health(&core).entries == 100);
+        // The gap is a few microseconds, so it takes many rounds to land in it.
+        for rebuilds in 1..=100 {
+            assert_eq!(changed(&core, &[], 1), 1);
+            wait_until("the rebuild heard", || {
+                heard.busy.lock().unwrap().len() == rebuilds
+            });
+            wait_until("the rebuild to end", || {
+                !unsafe { &(*core.0).live }.plan.lock().unwrap().running
+            });
+        }
+        assert_eq!(*heard.busy.lock().unwrap(), [false; 100]);
+    }
+
+    fn holds(core: &Core, path: &Path) -> bool {
+        let bytes = path.as_os_str().as_encoded_bytes();
+        unsafe { tl_holds_folder(core.0, bytes.as_ptr(), bytes.len()) == 1 }
+    }
+
+    #[test]
+    fn only_folders_the_newest_list_holds_are_held() {
+        let (_dir, home) = home_with(&["notes/a.txt", "Library/Caches/com.example/cache.db"]);
+        let events = Events::default();
+        let core = scan(home.to_str().unwrap(), 1, &events);
+        events.wait_for_event(TL_EVENT_INDEXED);
+        assert!(holds(&core, &home));
+        assert!(holds(&core, &home.join("notes")));
+        for left_out in [
+            home.join("notes/a.txt"),
+            home.join("Library/Caches"),
+            home.join("gone"),
+            home.with_extension("beside"),
+            PathBuf::from("/"),
+            PathBuf::from("notes"),
+            PathBuf::new(),
+        ] {
+            assert!(!holds(&core, &left_out), "{left_out:?}");
+        }
+        assert_eq!(
+            unsafe { tl_holds_folder(core.0, b"\xff".as_ptr(), 1) },
+            0,
+            "not UTF-8"
+        );
+        assert_eq!(unsafe { tl_holds_folder(core.0, std::ptr::null(), 0) }, 0);
+
+        // A folder made since comes in with the next list.
+        std::fs::create_dir(home.join("new")).unwrap();
+        assert!(!holds(&core, &home.join("new")));
+        assert_eq!(changed(&core, &[&home], 0), 1);
+        events.wait_for_rebuilt(1);
+        assert!(holds(&core, &home.join("new")));
+
+        let events = Events::default();
+        let ctx = &events as *const Events as *mut c_void;
+        let made_up = Core(unsafe { tl_core_new_stand_in(100, ctx, Some(record)) });
+        events.wait_for(TL_EVENT_INDEXED, 100);
+        assert!(
+            !holds(&made_up, Path::new("/")),
+            "made-up names have no folders on disk"
+        );
+    }
+
+    #[test]
+    fn health_times_the_scan_and_is_busy_until_the_first_list() {
+        let events = Events::default();
+        let ctx = &events as *const Events as *mut c_void;
+        // Enough names to take a few milliseconds to build.
+        let asked = Instant::now();
+        let core = Core(unsafe { tl_core_new_stand_in(500_000, ctx, Some(record)) });
+        let early = health(&core);
+        assert!(early.busy, "{early:?}");
+        assert_eq!((early.entries, early.scanned_at), (0, 0));
+        events.wait_for(TL_EVENT_INDEXED, 500_000);
+        let waited = asked.elapsed().as_millis() as u64;
+        let ready = health(&core);
+        assert!(!ready.busy);
+        assert_eq!(ready.entries, 500_000);
+        assert!(
+            ready.scan_ms >= 1 && ready.scan_ms <= waited,
+            "{ready:?} of {waited}"
+        );
+    }
+
+    #[test]
+    fn health_stays_busy_while_a_rebuild_waits_out_the_gap() {
+        let events = Events::default();
+        let ctx = &events as *const Events as *mut c_void;
+        let live = Live {
+            gap: Duration::from_secs(3600),
+            ..Live::default()
+        };
+        let source = Source::StandIn(100);
+        let core = Core(super::start(ctx, Some(record), source, false, None, live));
+        events.wait_for(TL_EVENT_INDEXED, 100);
+        assert!(!health(&core).busy);
+        assert_eq!(changed(&core, &[], 1), 1);
+        assert!(health(&core).busy, "waits an hour after the first list");
     }
 
     #[test]
@@ -3911,6 +4221,11 @@ mod tests {
         let core = saving_core(&home, &file, b"5F2A", 60, &events);
         events.wait_for(TL_EVENT_OPENED, 5);
         assert_eq!(events.count(TL_EVENT_INDEXED, 5), 0);
+        let opened = health(&core);
+        assert_eq!(
+            (opened.entries, opened.scanned_at, opened.changed_at),
+            (5, 0, 0)
+        );
         assert_eq!(
             watched(&core).1,
             50,
@@ -3922,6 +4237,13 @@ mod tests {
         std::fs::write(notes.join("todo.md"), "").unwrap();
         assert_eq!(changed_at(&core, &[&notes], 0, 55), 1);
         assert_eq!(events.wait_for_rebuilt(1), 6);
+        let patched = health(&core);
+        assert_eq!(
+            (patched.entries, patched.scanned_at),
+            (6, 0),
+            "still the saved list"
+        );
+        assert_ne!(patched.changed_at, 0);
         wait_until("the save after a change", || saved_event(&file) == Some(55));
         // Saved over, so nothing to read again, and no new list to save within the hour.
         std::fs::write(notes.join("todo.md"), "edited").unwrap();
@@ -3944,6 +4266,7 @@ mod tests {
         events.wait_for(TL_EVENT_OPENED, 6);
         assert_eq!(watched(&core).1, 0);
         assert_eq!(events.wait_for_rebuilt(1), 6);
+        assert_ne!(health(&core).scanned_at, 0, "read from the folder again");
         wait_until("the save after a new list", || {
             saved_event(&file) == Some(40)
         });
@@ -4106,6 +4429,12 @@ mod tests {
         let live = unsafe { &(*core.0).live };
         wait_until("the rebuild to end", || !live.plan.lock().unwrap().running);
         assert_eq!(live.plan.lock().unwrap().failed, Some(60));
+        let behind = health(&core);
+        assert!(
+            behind.behind && !behind.busy && !behind.stopped,
+            "{behind:?}"
+        );
+        assert_eq!(behind.entries, 5, "the list in use is kept");
 
         // A change elsewhere brings the whole list, with the change it missed.
         let notes = home.join("notes");
@@ -4115,6 +4444,7 @@ mod tests {
         assert_eq!(found(&core, &events, "new"), ["new.md"]);
         wait_until("the save", || saved_event(&file) == Some(70));
         assert_eq!(live.plan.lock().unwrap().failed, None);
+        assert!(!health(&core).behind);
     }
 
     #[test]
@@ -5707,6 +6037,41 @@ mod tests {
     }
 
     #[test]
+    fn a_plan_is_busy_only_while_a_list_is_on_its_way() {
+        assert!(!Plan::default().busy());
+        let busy: [fn(&mut Plan); 4] = [
+            |plan| plan.want(1),
+            |plan| plan.running = true,
+            |plan| plan.patch(1),
+            |plan| plan.everything = true,
+        ];
+        for (at, make) in busy.iter().enumerate() {
+            let mut plan = Plan::default();
+            make(&mut plan);
+            assert!(plan.busy(), "{at}");
+        }
+        let failed = Plan {
+            failed: Some(1),
+            ..Plan::default()
+        };
+        assert!(
+            !failed.busy() && !failed.idle(),
+            "a failed rebuild waits for the next change; tl_health tells it apart"
+        );
+        assert!(
+            !Plan::new(true, false).busy(),
+            "keeping everything from the start"
+        );
+        let listed = Plan {
+            running: true,
+            listed: true,
+            ..Plan::default()
+        };
+        assert!(!listed.busy(), "its list is in use");
+        assert!(!listed.idle(), "late changes are still being checked");
+    }
+
+    #[test]
     fn only_a_plan_with_nothing_waiting_or_running_is_idle() {
         assert!(Plan::default().idle());
         let busy: [fn(&mut Plan); 6] = [
@@ -6090,7 +6455,7 @@ mod tests {
         assert_eq!(rust_params(rust_event), c_params(header_event));
 
         for name in [
-            "TlRow", "TlRows", "TlSaved", "TlLine", "TlReport", "TlLines",
+            "TlRow", "TlRows", "TlSaved", "TlLine", "TlReport", "TlLines", "TlHealth",
         ] {
             assert!(rust.contains(&format!("#[repr(C)]\npub struct {name} {{")));
             let rust_fields: Vec<String> = block(rust, &format!("pub struct {name} {{"))

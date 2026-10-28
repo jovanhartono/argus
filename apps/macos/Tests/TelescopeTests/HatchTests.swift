@@ -32,6 +32,42 @@ final class HatchTests: XCTestCase {
         XCTAssertNil(hatch.take(ticket), "rows are handed over once")
     }
 
+    func testHealthTellsTheFirstListThenARebuildAsked() async throws {
+        let indexed = expectation(description: "indexed")
+        let rebuilt = expectation(description: "rebuilt")
+        let hatch = try XCTUnwrap(
+            Hatch(standIn: 10_000) { event in
+                switch event {
+                case .indexed: indexed.fulfill()
+                case .rebuilt(let count, _):
+                    XCTAssertEqual(count, 10_000)
+                    rebuilt.fulfill()
+                case .failed: XCTFail("the core stopped")
+                case .ready, .opened, .reranked: XCTFail("nothing searched, saved or opened")
+                }
+            })
+        let started = Date(timeIntervalSince1970: Date().timeIntervalSince1970.rounded(.down))
+        await fulfillment(of: [indexed], timeout: 5)
+        let first = hatch.health()
+        XCTAssertEqual(first.entries, 10_000)
+        let scanned = try XCTUnwrap(first.scannedAt)
+        XCTAssertGreaterThanOrEqual(scanned, started)
+        XCTAssertLessThanOrEqual(scanned, Date())
+        XCTAssertNil(first.changedAt, "no list after the first yet")
+        XCTAssertFalse(first.busy)
+
+        hatch.rebuild()
+        XCTAssertTrue(hatch.health().busy, "asked for at once")
+        await fulfillment(of: [rebuilt], timeout: 5)
+        let second = hatch.health()
+        XCTAssertNotNil(second.changedAt)
+        // Times are whole seconds, so the core's own tests check a rebuild moves them on.
+        XCTAssertNotNil(second.scannedAt)
+        XCTAssertFalse(second.busy, "heard of only once its list is in use")
+        XCTAssertFalse(second.behind || second.stopped)
+        XCTAssertFalse(hatch.holds(folder: "/"), "made-up names have no folders on disk")
+    }
+
     func testAnAppRowOpensItsBundle() {
         let app = Row(name: "Visual Studio Code", folder: "/Applications", isFolder: false, isApp: true)
         XCTAssertEqual(app.path, "/Applications/Visual Studio Code.app")
