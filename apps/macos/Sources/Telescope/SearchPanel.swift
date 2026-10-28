@@ -33,6 +33,15 @@ final class Panel: NSPanel {
         search.previewing ? search.closePreview() : search.hide()
     }
 
+    /// ⌘W does what Esc does; with no close button, AppKit would only beep.
+    override func performClose(_ sender: Any?) {
+        cancelOperation(sender)
+    }
+
+    override func validateMenuItem(_ item: NSMenuItem) -> Bool {
+        item.action == #selector(performClose(_:)) || super.validateMenuItem(item)
+    }
+
     override func acceptsPreviewPanelControl(_ panel: QLPreviewPanel!) -> Bool {
         true
     }
@@ -98,8 +107,18 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
 
     private var hatch: Hatch?
     private let hasAccess: () -> Bool
+    /// Full Disk Access was off when last checked, so the list leaves the guarded folders out.
+    private(set) var lacksAccess = false
     private let stage: any Stage
     private(set) var notice: Notice?
+    private let finder: @Sendable () -> FinderFolder
+    /// The first time, asking waits for your answer to macOS's question, so it never holds a
+    /// thread Swift's tasks share, and presses meanwhile queue up behind it.
+    private let finderQueue = DispatchQueue(label: "io.github.jovanhartono.telescope.finder", qos: .userInitiated)
+    /// Counts presses of the Finder hotkey and shows, so only the answer to the newest press
+    /// opens the window, and only if it hasn't been opened since.
+    private var finderAsks = 0
+    private(set) var health: HealthWindow?
     private var indexingSince: TimeInterval = 0
     private(set) var indexed = false
     /// The first list was the one saved at the last launch.
@@ -130,10 +149,12 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
     /// what you open ranks higher, kept in that file. The apps in `apps` are found by name.
     init(
         root: String = NSHomeDirectory(), saved: String? = nil, opens: String? = nil, apps: [String] = [],
-        hasAccess: @escaping () -> Bool = { Hatch.hasFullDiskAccess() }, stage: any Stage = Screen()
+        hasAccess: @escaping () -> Bool = { Hatch.hasFullDiskAccess() }, stage: any Stage = Screen(),
+        finder: @escaping @Sendable () -> FinderFolder = FinderFolder.ask
     ) {
         self.hasAccess = hasAccess
         self.stage = stage
+        self.finder = finder
         appFolders = apps
         super.init()
         build()
@@ -144,9 +165,9 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
         if let count = ProcessInfo.processInfo.environment["TELESCOPE_STAND_IN"].flatMap(UInt64.init) {
             hatch = Hatch(standIn: count, onEvent: onEvent)
         } else {
-            let access = hasAccess()
-            post(access ? nil : .needsAccess)
-            hatch = Hatch(root: root, fullDisk: access, saved: saved, onEvent: onEvent)
+            lacksAccess = !hasAccess()
+            post(lacksAccess ? .needsAccess : nil)
+            hatch = Hatch(root: root, fullDisk: !lacksAccess, saved: saved, onEvent: onEvent)
         }
         if hatch == nil { problem = "Search couldn't start. Rebuild Telescope." }
         if let opens { hatch?.rankOpens(keptIn: opens) }
@@ -166,9 +187,15 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
         stage.putAway(panel)
     }
 
-    func show() {
+    /// `needsFinder` shows the Finder line, which only the Finder hotkey's window has.
+    func show(needsFinder: Bool = false) {
         let pressed = pressedAt()
+        finderAsks += 1
         recheckAccess()
+        if needsFinder != (notice == .needsFinder) {
+            post(needsFinder ? .needsFinder : lacksAccess ? .needsAccess : nil)
+            fit()
+        }
         // Read again on each show, about 0.3 ms off the main thread, so a new app is found.
         if !appFolders.isEmpty { hatch?.readApps(in: appFolders) }
         if stale { runAgain() }
@@ -207,7 +234,61 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
             // Shown again while fading out: keep it.
             guard let self, !shown else { return }
             stage.putAway(panel)
+            if notice == .needsFinder {
+                post(lacksAccess ? .needsAccess : nil)
+                fit()
+            }
         }
+    }
+
+    /// The Finder hotkey: the window opens searching inside the folder the front Finder window
+    /// shows, or as you left it when no Finder window shows a folder the list holds.
+    func toggleInFinderFolder() {
+        if shown { return hide() }
+        finderAsks += 1
+        let ask = finderAsks
+        let pressed = pressedAt()
+        let finder = finder
+        finderQueue.async { [weak self] in
+            let answer = finder()
+            Task { @MainActor in self?.heardFinder(answer, ask: ask, pressed: pressed) }
+        }
+    }
+
+    private func heardFinder(_ answer: FinderFolder, ask: Int, pressed: TimeInterval) {
+        guard ask == finderAsks, !shown else { return }
+        timing.notice("Finder's folder read \(ms(since: pressed), format: .fixed(precision: 2)) ms after the hotkey")
+        switch answer {
+        // Without Full Disk Access, Finder on Downloads would otherwise search an empty list.
+        case .folder(let path) where hatch?.holds(folder: path) == true:
+            scopes = [Row(folderAt: path)]
+            field.stringValue = ""
+            showScopes()
+            search()
+        case .folder, .none:
+            break
+        case .denied:
+            return show(needsFinder: true)
+        case .failed(let code):
+            failures.error("Finder didn't tell its folder: \(code)")
+        }
+        show()
+    }
+
+    /// ⌘,: the search window steps aside for the health view.
+    @objc func showHealth(_ sender: Any?) {
+        hide()
+        if health == nil {
+            health = HealthWindow(
+                read: { [weak self] in self?.hatch?.health() ?? Health(stopped: true) },
+                hasAccess: { [weak self] in
+                    guard let self else { return false }
+                    recheckAccess()
+                    return !lacksAccess
+                },
+                rebuild: { [weak self] in self?.hatch?.rebuild() }, stage: stage)
+        }
+        health?.show()
     }
 
     private func build() {
@@ -307,8 +388,9 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
     /// Checked on each show while access is missing, so the line goes once access is switched
     /// on in System Settings and Later is clicked, and the guarded folders come in.
     func recheckAccess() {
-        guard notice == .needsAccess, hasAccess() else { return }
-        post(nil)
+        guard lacksAccess, hasAccess() else { return }
+        lacksAccess = false
+        if notice == .needsAccess { post(nil) }
         hatch?.grantFullDisk()
         fit()
     }
@@ -331,8 +413,9 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
     }
 
     @objc private func openSettings(_ sender: Any?) {
+        guard let page = notice?.settings else { return }
         hide()
-        NSWorkspace.shared.open(Notice.settings)
+        stage.open(page)
     }
 
     /// A fifth of the way down the screen that has the mouse.
@@ -448,10 +531,12 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
             indexed = true
             hatch?.watch()
             search()
+            health?.refresh()
         case .rebuilt(let count, let took):
             timing.notice("rebuilt \(count) entries in \(took) ms after a change")
             hatch?.watch()
             if shown { runAgain() } else { stale = true }
+            health?.refresh()
         case .reranked:
             if shown { runAgain() } else { stale = true }
         case .ready(let ticket) where ticket == newest:

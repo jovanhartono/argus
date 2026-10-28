@@ -10,8 +10,15 @@ final class NoticeTests: XCTestCase {
 
     func testSettingsOpensOnFullDiskAccess() {
         XCTAssertEqual(
-            Notice.settings.absoluteString,
+            Notice.needsAccess.settings.absoluteString,
             "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles")
+    }
+
+    func testTheFinderLineOpensAutomation() {
+        XCTAssertEqual(
+            Notice.needsFinder.settings.absoluteString,
+            "x-apple.systempreferences:com.apple.preference.security?Privacy_Automation")
+        XCTAssertTrue(Notice.needsFinder.text.contains("control Finder"), Notice.needsFinder.text)
     }
 
     func testTheProbedListIsMacOSOwnInTheHomeFolder() {

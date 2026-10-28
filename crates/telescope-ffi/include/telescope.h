@@ -7,7 +7,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-static const uint32_t TL_ABI_VERSION = 10;
+static const uint32_t TL_ABI_VERSION = 11;
 
 static const uint32_t TL_OK = 0;
 static const uint32_t TL_GONE = 1;
@@ -79,6 +79,16 @@ typedef struct TlLines {
     void *owner;
 } TlLines;
 
+typedef struct TlHealth {
+    uint64_t entries;
+    uint64_t scanned_at;
+    uint64_t scan_ms;
+    uint64_t changed_at;
+    bool busy;
+    bool behind;
+    bool stopped;
+} TlHealth;
+
 uint32_t tl_abi_version(void);
 TlCore *tl_core_new(const uint8_t *root, size_t root_len, uint32_t full_disk, uint32_t everything, const TlSaved *saved, void *ctx, TlEventFn on_event);
 TlCore *tl_core_new_stand_in(uint64_t count, void *ctx, TlEventFn on_event);
@@ -90,6 +100,8 @@ uint32_t tl_index_everything(const TlCore *core, uint32_t on, uint64_t mark);
 uint32_t tl_volume_added(const TlCore *core, const uint8_t *path, size_t len, uint64_t mark);
 uint32_t tl_volume_removed(const TlCore *core, const uint8_t *path, size_t len, uint64_t mark);
 uint32_t tl_watched(const TlCore *core, TlRows *out, uint64_t *since);
+uint32_t tl_health(const TlCore *core, TlHealth *out);
+uint32_t tl_holds_folder(const TlCore *core, const uint8_t *path, size_t len);
 uint32_t tl_take(const TlCore *core, uint64_t ticket, TlRows *out);
 void tl_rows_free(TlRows rows);
 uint32_t tl_frecency_open(const TlCore *core, const uint8_t *file, size_t len);

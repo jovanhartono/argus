@@ -22,5 +22,7 @@
 	<true/>
 	<key>NSHighResolutionCapable</key>
 	<true/>
+	<key>NSAppleEventsUsageDescription</key>
+	<string>The Finder hotkey asks Finder which folder its front window shows, to search inside it.</string>
 </dict>
 </plist>
