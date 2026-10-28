@@ -123,7 +123,7 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
     private(set) var shown = false
     /// By kind of file, or by path for an app, which has its own.
     private var icons: [String: NSImage] = [:]
-    private var readingIcons: Set<String> = []
+    private(set) var readingIcons: Set<String> = []
     private let appFolders: [String]
 
     /// With `saved`, the list kept in that file at the last launch shows at once. With `opens`,
@@ -452,6 +452,8 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
             timing.notice("rebuilt \(count) entries in \(took) ms after a change")
             hatch?.watch()
             if shown { runAgain() } else { stale = true }
+        case .reranked:
+            if shown { runAgain() } else { stale = true }
         case .ready(let ticket) where ticket == newest:
             take(ticket)
         case .ready:
@@ -703,7 +705,7 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
     }
 
     func previewPanel(_ panel: QLPreviewPanel!, previewItemAt index: Int) -> QLPreviewItem! {
-        selected?.url as NSURL?
+        selected?.real as NSURL?
     }
 
     /// The arrows still pick the next result while the preview has the keys.
@@ -797,7 +799,10 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
     private func icon(for row: Row) -> NSImage {
         if row.isApp {
             let scale = panel.backingScaleFactor
-            let own = "\(row.path) \(scale)"
+            // An app updated with a new icon, or found while still being copied in, is drawn again.
+            var info = stat()
+            let changed = stat(row.path, &info) == 0 ? info.st_mtimespec.tv_sec : 0
+            let own = "\(row.path) \(scale) \(changed)"
             if let drawn = icons[own] { return drawn }
             readIcon(of: row.path, as: own, scale: scale)
             return kindIcon(".app", .applicationBundle)
@@ -824,8 +829,8 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
             let drawn = await appIcon(at: path, scale: scale)
             guard let self else { return }
             readingIcons.remove(key)
-            let image = drawn.map { NSImage(cgImage: $0, size: NSSize(width: 32, height: 32)) }
-                ?? kindIcon(".app", .applicationBundle)
+            guard let drawn else { return }
+            let image = NSImage(cgImage: drawn, size: NSSize(width: 32, height: 32))
             icons[key] = image
             table.enumerateAvailableRowViews { view, row in
                 guard rows.indices.contains(row), rows[row].path == path,
@@ -849,10 +854,7 @@ private func rowIcon(_ system: NSImage) -> NSImage {
 /// The app's icon at a row's size, as Finder shows it. /Applications/Safari.app is a link into
 /// the system's own volume, and read at the link Quick Look draws the link's icon instead.
 private nonisolated func appIcon(at path: String, scale: CGFloat) async -> CGImage? {
-    let real = URL(fileURLWithPath: path).resolvingSymlinksInPath()
-    nonisolated(unsafe) let request = QLThumbnailGenerator.Request(
-        fileAt: real, size: CGSize(width: 32, height: 32), scale: scale, representationTypes: .icon)
-    return try? await QLThumbnailGenerator.shared.generateBestRepresentation(for: request).cgImage
+    await quickLookPicture(of: URL(fileURLWithPath: path).resolvingSymlinksInPath(), side: 32, scale: scale, .icon)
 }
 
 /// When the key behind the current event went down, so timings include the wait to reach us.

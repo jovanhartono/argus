@@ -61,6 +61,9 @@ pub const TL_EVENT_REBUILT: u32 = 5;
 pub const TL_EVENT_LINES: u32 = 6;
 /// The saved list is in use, in place of a first scan; `value` is its entry count.
 pub const TL_EVENT_OPENED: u32 = 7;
+/// The same search may now answer in another order: an open was counted, or the apps read
+/// again differ. `value` is 0.
+pub const TL_EVENT_RERANKED: u32 = 8;
 
 const ROWS: usize = 50;
 /// Lines a text search shows, across all its folders.
@@ -1172,6 +1175,7 @@ fn serve(
             }
             Job::Opened => {
                 stale = true;
+                notify.send(TL_EVENT_RERANKED, 0);
                 continue;
             }
             // Read on each show, so the same apps found again cost no new boosts.
@@ -1180,6 +1184,7 @@ fn serve(
                 if fresh != apps {
                     apps = fresh;
                     stale = true;
+                    notify.send(TL_EVENT_RERANKED, 0);
                 }
                 continue;
             }
@@ -1482,10 +1487,10 @@ pub unsafe extern "C" fn tl_submit(
 /// Reads the apps in `folders`, and in the plain folders directly inside them, in the
 /// background before the next search, which then finds them by name beside the files, as rows
 /// with `is_app`. Replaces the apps read before, so calling this again picks up apps installed
-/// or deleted since. `folders` holds `len` bytes: paths in UTF-8, each ending in a NUL byte;
-/// none (`len` 0) leaves searches without apps. A folder that is missing, unreadable or not
-/// UTF-8 adds nothing. Returns 1 once queued, or 0 once the core has stopped. Safe to call from
-/// any thread.
+/// or deleted since; `TL_EVENT_RERANKED` follows when they differ. `folders` holds `len` bytes:
+/// full paths in UTF-8, each ending in a NUL byte; none (`len` 0) leaves searches without apps.
+/// A folder that is missing, unreadable, relative or not UTF-8 adds nothing. Returns 1 once
+/// queued, or 0 once the core has stopped. Safe to call from any thread.
 ///
 /// # Safety
 /// `core` came from `tl_core_new` or `tl_core_new_stand_in`, and `folders` points to `len` bytes
@@ -1501,8 +1506,8 @@ pub unsafe extern "C" fn tl_apps(core: *const TlCore, folders: *const u8, len: u
         let folders = bytes
             .split(|&byte| byte == 0)
             .filter_map(|folder| std::str::from_utf8(folder).ok())
-            .filter(|folder| !folder.is_empty())
             .map(PathBuf::from)
+            .filter(|folder| folder.is_absolute())
             .collect();
         let sent = core
             .jobs
@@ -1901,8 +1906,9 @@ pub unsafe extern "C" fn tl_frecency_open(core: *const TlCore, file: *const u8, 
     })
 }
 
-/// Counts one open of `path`, a real path in UTF-8 of a file or folder the window opened, so it
-/// ranks higher from the next search on. With a file from `tl_frecency_open`, the list is saved
+/// Counts one open of `path`, a real path in UTF-8 of a file or folder the window opened, or an
+/// app's bundle as its row names it, so it ranks higher from the next search on, which
+/// `TL_EVENT_RERANKED` tells of. With a file from `tl_frecency_open`, the list is saved
 /// there before this returns, so call it off the main thread; a save that fails is told as a
 /// `TL_EVENT_NOTE`, and the open still counts until the core is freed. Returns 1 once counted,
 /// or 0 for a path that is empty, isn't UTF-8 or is longer than 4096 bytes. Safe to call from
@@ -2723,6 +2729,99 @@ mod tests {
             thread::sleep(Duration::from_millis(10));
         }
         panic!("the core still takes apps");
+    }
+
+    /// A relative folder would be read from wherever the app was started, "/" for the window.
+    #[cfg(unix)]
+    #[test]
+    fn a_relative_folder_adds_no_apps_even_where_it_leads_to_some() {
+        let (_dir, root) = app_folder(&["Budget.app"]);
+        let here = std::env::current_dir().unwrap();
+        let up = "../".repeat(here.components().count() - 1);
+        let relative = PathBuf::from(up).join(root.strip_prefix("/").unwrap());
+        assert!(relative.join("Budget.app").is_dir());
+        let events = Events::default();
+        let core = start(2_000, &events);
+        assert_eq!(apps(&core, &[&relative]), 1);
+        let rows = shown(&core, &events, "budget");
+        assert!(rows.iter().all(|row| !row.is_app), "{rows:?}");
+    }
+
+    #[test]
+    fn reranked_is_told_when_the_apps_change_or_an_open_counts() {
+        let (_dir, root) = app_folder(&["Budget.app"]);
+        let events = Events::default();
+        let core = start(2_000, &events);
+        let reranked = || events.count(TL_EVENT_RERANKED, 0);
+        assert_eq!(apps(&core, &[&root]), 1);
+        events.wait_for_times(TL_EVENT_RERANKED, 0, 1);
+
+        // The same apps read again: nothing to tell, and the search after it says so.
+        assert_eq!(apps(&core, &[&root]), 1);
+        shown(&core, &events, "budget");
+        assert_eq!(reranked(), 1);
+
+        std::fs::create_dir(root.join("Budget Tracker.app")).unwrap();
+        assert_eq!(apps(&core, &[&root]), 1);
+        events.wait_for_times(TL_EVENT_RERANKED, 0, 2);
+
+        assert_eq!(opened(&core, &root.join("Budget.app")), 1);
+        events.wait_for_times(TL_EVENT_RERANKED, 0, 3);
+        shown(&core, &events, "budget");
+        assert_eq!(reranked(), 3);
+    }
+
+    /// Apps are numbered by their place in the list read, which an install or delete shifts.
+    #[test]
+    fn an_opened_app_keeps_its_place_when_the_apps_read_again_move_it() {
+        let (_dir, root) = app_folder(&["A Budget.app", "Budget.app", "Budget Planner.app"]);
+        let events = Events::default();
+        let core = start(2_000, &events);
+        assert_eq!(opened(&core, &root.join("Budget Planner.app")), 1);
+        let first_two = || -> Vec<String> {
+            assert_eq!(apps(&core, &[&root]), 1);
+            let rows = shown(&core, &events, "budget");
+            rows.into_iter()
+                .filter(|row| row.is_app)
+                .map(|row| row.name)
+                .take(2)
+                .collect()
+        };
+        assert_eq!(first_two(), ["Budget Planner", "Budget"]);
+        std::fs::remove_dir(root.join("A Budget.app")).unwrap();
+        assert_eq!(first_two(), ["Budget Planner", "Budget"], "after a delete");
+        std::fs::create_dir(root.join("Budget Aardvark.app")).unwrap();
+        assert_eq!(
+            first_two(),
+            ["Budget Planner", "Budget"],
+            "after an install"
+        );
+    }
+
+    /// /Applications/Safari.app is a link, and the window counts the open at the row's path.
+    #[cfg(unix)]
+    #[test]
+    fn an_app_reached_through_a_link_ranks_by_the_links_path() {
+        let (_dir, root) = app_folder(&["Budget.app", "Apps"]);
+        let (_far, elsewhere) = app_folder(&["Budget Planner.app"]);
+        let apps_dir = root.join("Apps");
+        std::os::unix::fs::symlink(root.join("Budget.app"), apps_dir.join("Budget.app")).unwrap();
+        std::os::unix::fs::symlink(
+            elsewhere.join("Budget Planner.app"),
+            apps_dir.join("Budget Planner.app"),
+        )
+        .unwrap();
+        let events = Events::default();
+        let core = start(2_000, &events);
+        assert_eq!(apps(&core, &[&apps_dir]), 1);
+        let first = |core: &Core| shown(core, &events, "budget")[0].name.clone();
+        assert_eq!(first(&core), "Budget");
+
+        // Its own bundle, which no row shows, ranks nothing.
+        assert_eq!(opened(&core, &elsewhere.join("Budget Planner.app")), 1);
+        assert_eq!(first(&core), "Budget");
+        assert_eq!(opened(&core, &apps_dir.join("Budget Planner.app")), 1);
+        assert_eq!(first(&core), "Budget Planner");
     }
 
     #[test]

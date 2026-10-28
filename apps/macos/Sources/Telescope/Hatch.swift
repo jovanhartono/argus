@@ -16,6 +16,10 @@ struct Row: Equatable {
     }
 
     var url: URL { URL(fileURLWithPath: path, isDirectory: isFolder || isApp) }
+
+    /// /Applications/Safari.app is a link into the system's own volume; read at the link, its
+    /// kind, size and picture are the link's.
+    var real: URL { isApp ? url.resolvingSymlinksInPath() : url }
 }
 
 /// The only file that touches Rust's pointers. Rows are copied into Swift strings and Rust's
@@ -31,6 +35,8 @@ final class Hatch {
         case failed(code: Int32)
         /// A list built again after a change is in use.
         case rebuilt(count: UInt64, ms: UInt64)
+        /// An open was counted or the apps changed, so the same search may answer in another order.
+        case reranked
     }
 
     /// One core per app, so the C callback can find its listener without a context pointer.
@@ -103,7 +109,8 @@ final class Hatch {
         .urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
         .appendingPathComponent("io.github.jovanhartono.telescope/opened").path
 
-    /// The folders apps are installed in, as Finder's Applications folder shows them together.
+    /// The folders apps are installed in, as Finder's Applications folder shows them together;
+    /// the same as telescope_core's `top_folders`, which `tl` searches.
     nonisolated static let appFolders = ["/Applications", "/System/Applications", NSHomeDirectory() + "/Applications"]
 
     /// macOS's name for the FSEvents log of the volume `path` is on, or nil when it keeps none.
@@ -251,6 +258,7 @@ final class Hatch {
         case TL_EVENT_READY: listener?(.ready(ticket: value))
         case TL_EVENT_FAILED: listener?(.failed(code: Int32(truncatingIfNeeded: value)))
         case TL_EVENT_REBUILT: listener?(.rebuilt(count: value & 0xFFFF_FFFF, ms: value >> 32))
+        case TL_EVENT_RERANKED: listener?(.reranked)
         default: break
         }
     }

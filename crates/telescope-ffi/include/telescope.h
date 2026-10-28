@@ -20,6 +20,7 @@ static const uint32_t TL_EVENT_NOTE = 4;
 static const uint32_t TL_EVENT_REBUILT = 5;
 static const uint32_t TL_EVENT_LINES = 6;
 static const uint32_t TL_EVENT_OPENED = 7;
+static const uint32_t TL_EVENT_RERANKED = 8;
 
 typedef struct TlCore TlCore;
 

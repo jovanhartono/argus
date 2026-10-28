@@ -428,6 +428,52 @@ final class SearchPanelTests: XCTestCase {
             drawn.append(try XCTUnwrap(pixels(of: icon, scale: 2, in: aqua)))
         }
         XCTAssertTrue(drawn[0] == drawn[1], "both are plain app folders, so both show the plain app icon")
+        for kind in [UTType.folder, .data] {
+            XCTAssertNotEqual(drawn[0], pixels(of: NSWorkspace.shared.icon(for: kind), scale: 2, in: aqua), "\(kind)")
+        }
+    }
+
+    /// Read at the link, the pane said "Alias – 54 bytes" for Safari.
+    func testThePaneDescribesAnAppReachedThroughALinkAsTheApp() async throws {
+        let apps = realRoot.appendingPathComponent("Applications")
+        let elsewhere = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: elsewhere) }
+        let real = elsewhere.appendingPathComponent("Budget Linked.app")
+        try FileManager.default.createDirectory(at: apps, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: real, withIntermediateDirectories: true)
+        try FileManager.default.createSymbolicLink(
+            at: apps.appendingPathComponent("Budget Linked.app"), withDestinationURL: real)
+        let window = try await opened(access: true, apps: [apps.path])
+        window.show()
+        defer { window.hide() }
+        try await type("budget", in: window)
+        try await until { window.rows.first?.isApp == true }
+        XCTAssertEqual(window.selected?.path, apps.appendingPathComponent("Budget Linked.app").path)
+        window.toggleDetails(nil)
+        XCTAssertEqual(window.pane.details?.type, .applicationBundle)
+        XCTAssertFalse(window.pane.summary.stringValue.contains("–"), window.pane.summary.stringValue)
+        let resolved = real.resolvingSymlinksInPath().path
+        XCTAssertEqual(window.pane.waiting?.path, resolved)
+        XCTAssertEqual(item(window)?.path, resolved)
+        XCTAssertEqual(window.pane.place.stringValue, apps.path, "found in the folder it is listed in")
+    }
+
+    func testAnAppIconArrivingAfterTheRowsChangedStaysOffThem() async throws {
+        try Data().write(to: root.appendingPathComponent("budget.pdf"))
+        let window = try await opened(access: true, apps: ["/System/Applications"])
+        window.show()
+        defer { window.hide() }
+        try await type("calculator", in: window)
+        try await until { window.rows.first?.name == "Calculator" }
+        window.panel.displayIfNeeded()
+        // Typed on before Quick Look is likely done.
+        try await type("budget", in: window)
+        try await until { window.rows.map(\.name) == ["budget.pdf"] }
+        try await until { window.readingIcons.isEmpty }
+        try await settled(window)
+        assertOnScreen(window)
+        let icon = try XCTUnwrap(cell(window, 0)?.icon.image)
+        XCTAssertNotEqual(icon.representations.first?.pixelsWide, 32 * Int(window.panel.backingScaleFactor))
     }
 
     /// Waits for an app row's own icon: one picture at the row's size, a few KB, never macOS's
@@ -462,15 +508,43 @@ final class SearchPanelTests: XCTestCase {
         XCTAssertTrue(try XCTUnwrap(stage.opened.first).hasDirectoryPath)
         XCTAssertFalse(window.shown)
 
+        // The hotkey brings the same search back, already in the new order.
+        try await until { window.stale }
         window.show()
         defer { window.hide() }
-        try await type("budge", in: window)
+        try await until { window.rows.map(\.name) == ["Budget Planner", "Budget"] }
+        XCTAssertEqual(window.selected?.name, "Budget Planner", "the app opened stays picked")
+    }
+
+    func testShowInFinderOnAnAppRevealsItsBundleAndCountsAsAnOpen() async throws {
+        let apps = realRoot.appendingPathComponent("Applications")
+        for name in ["Budget.app", "Budget Planner.app"] {
+            try FileManager.default.createDirectory(
+                at: apps.appendingPathComponent(name), withIntermediateDirectories: true)
+        }
+        let window = try await opened(access: true, apps: [apps.path])
+        window.show()
+        try await type("budget", in: window)
+        try await until { window.rows.map(\.name) == ["Budget", "Budget Planner"] }
+        down(window)
+        window.showInFinder(nil)
+        XCTAssertEqual(stage.shownInFinder.map(\.path), [apps.appendingPathComponent("Budget Planner.app").path])
+        XCTAssertTrue(try XCTUnwrap(stage.shownInFinder.first).hasDirectoryPath)
+        XCTAssertEqual(stage.opened, [])
+
+        try await until { window.stale }
+        window.show()
+        defer { window.hide() }
         try await until { window.rows.map(\.name) == ["Budget Planner", "Budget"] }
     }
 
-    func testAnAppInstalledWhileHiddenIsFoundOnTheNextShow() async throws {
-        let apps = realRoot.appendingPathComponent("Applications")
-        try FileManager.default.createDirectory(at: apps, withIntermediateDirectories: false)
+    func testAnAppInstalledOrDeletedWhileHiddenShowsOnTheNextShow() async throws {
+        // Outside your folders, as /Applications is, so no new list runs the search again.
+        let outside = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: outside, withIntermediateDirectories: false)
+        defer { try? FileManager.default.removeItem(at: outside) }
+        let apps = URL(fileURLWithPath: String(cString: realpath(outside.path, nil)), isDirectory: true)
+        let budget = apps.appendingPathComponent("Budget.app")
         let window = try await opened(access: true, apps: [apps.path])
         window.show()
         try await type("budget", in: window)
@@ -478,12 +552,46 @@ final class SearchPanelTests: XCTestCase {
         XCTAssertEqual(window.rows, [])
         window.hide()
 
-        try FileManager.default.createDirectory(
-            at: apps.appendingPathComponent("Budget.app"), withIntermediateDirectories: false)
+        try FileManager.default.createDirectory(at: budget, withIntermediateDirectories: false)
+        window.show()
+        try await until { window.rows.map(\.path) == [budget.path] }
+        window.hide()
+
+        try FileManager.default.removeItem(at: budget)
         window.show()
         defer { window.hide() }
+        try await until { window.rows.isEmpty }
+        XCTAssertTrue(window.control(NSTextField(), textView: NSTextView(), doCommandBy: #selector(NSResponder.insertNewline(_:))))
+        XCTAssertEqual(stage.opened, [])
+    }
+
+    /// Telescope runs for weeks, through app updates and apps found while still being copied in.
+    func testAnAppChangedSinceItsIconWasDrawnIsDrawnAgain() async throws {
+        let apps = realRoot.appendingPathComponent("Applications")
+        let bundle = apps.appendingPathComponent("Budget.app")
+        try FileManager.default.createDirectory(at: bundle, withIntermediateDirectories: true)
+        let window = try await opened(access: true, apps: [apps.path])
+        window.show()
+        defer { window.hide() }
+        try await type("budget", in: window)
+        try await until { window.rows.first?.isApp == true }
+        try await settled(window)
+        let first = try await ownIcon(window, row: 0)
+        var answered = window.answered
         try await type("budge", in: window)
-        try await until { window.rows.map(\.path) == [apps.appendingPathComponent("Budget.app").path] }
+        try await until { window.answered != answered }
+        try await settled(window)
+        XCTAssertTrue(window.readingIcons.isEmpty)
+        XCTAssertTrue(cell(window, 0)?.icon.image === first, "drawn once while the app stays as it is")
+
+        let updated = Date(timeIntervalSinceNow: -3600)
+        try FileManager.default.setAttributes([.modificationDate: updated], ofItemAtPath: bundle.path)
+        answered = window.answered
+        try await type("budget", in: window)
+        try await until { window.answered != answered }
+        try await settled(window)
+        let second = try await ownIcon(window, row: 0)
+        XCTAssertFalse(second === first, "drawn again for the app as it is now")
     }
 
     func testWithoutAppFoldersNoAppIsFound() async throws {
@@ -515,20 +623,21 @@ final class SearchPanelTests: XCTestCase {
         XCTAssertTrue(window.control(NSTextField(), textView: NSTextView(), doCommandBy: #selector(NSResponder.insertNewline(_:))))
         XCTAssertEqual(stage.opened.map(\.path), [picked])
 
+        try await until { window.stale }
         window.show()
-        try await type("budget", in: window)
-        try await until { window.rows.first?.name == first[2] }
-        down(window)
-        let revealed = window.rows[1].name
-        let shown = window.rows[1].path
+        try await until { window.rows.map(\.name) == [first[2], first[0], first[1]] }
+        // The last row, below a file never picked.
+        window.table.selectRowIndexes([2], byExtendingSelection: false)
+        let revealed = first[1]
         window.showInFinder(nil)
-        XCTAssertEqual(stage.shownInFinder.map(\.path), [shown])
+        XCTAssertEqual(stage.shownInFinder.map(\.lastPathComponent), [revealed])
         XCTAssertEqual(stage.opened.count, 1)
 
+        try await until { window.stale }
         window.show()
-        try await type("budge", in: window)
         // One opened, one shown in Finder: both rank above the file never picked.
         try await until { Set(window.rows.prefix(2).map(\.name)) == [first[2], revealed] }
+        XCTAssertEqual(window.rows.last?.name, first[0])
         window.hide()
 
         // Saved in the order picked, so the second one there means both are.

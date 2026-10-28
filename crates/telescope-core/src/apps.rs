@@ -312,6 +312,47 @@ mod tests {
         assert_eq!(found(&apps), BTreeSet::from([dir.path().join("Open.app")]));
     }
 
+    /// The window reads the apps on every show and ranks again only when they differ.
+    #[cfg(unix)]
+    #[test]
+    fn the_same_folders_read_twice_are_equal_until_an_app_comes_or_goes() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        make(
+            root,
+            &[
+                "Applications/Zed.app",
+                "Applications/Alpha.app",
+                "Applications/Utilities/Terminal.app",
+                "Applications/Adobe/Photoshop.app",
+                "Applications/Empty",
+                "Home/Mine.app",
+                "sealed/Safari.app",
+            ],
+            &["Applications/notes.txt"],
+        );
+        symlink(
+            root.join("sealed/Safari.app"),
+            root.join("Applications/Safari.app"),
+        )
+        .unwrap();
+        let top = || vec![root.join("Applications"), root.join("Home")];
+        let before = Apps::scan_folders(top());
+        assert_eq!(before.len(), 6);
+        assert_eq!(Apps::scan_folders(top()), before);
+
+        make(root, &["Applications/Utilities/Console.app"], &[]);
+        let installed = Apps::scan_folders(top());
+        assert_ne!(installed, before);
+        assert_eq!(Apps::scan_folders(top()), installed);
+        fs::remove_dir(root.join("Applications/Utilities/Console.app")).unwrap();
+        assert_eq!(Apps::scan_folders(top()), before);
+        // A plain file or an emptied folder changes nothing.
+        make(root, &["Applications/More"], &["Applications/Setup.dmg"]);
+        assert_eq!(Apps::scan_folders(top()), before);
+    }
+
     #[test]
     fn counts_its_memory() {
         let dir = tempfile::tempdir().unwrap();
