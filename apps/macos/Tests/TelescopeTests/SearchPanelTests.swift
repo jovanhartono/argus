@@ -9,9 +9,11 @@ final class SearchPanelTests: XCTestCase {
     private var root: URL!
     private var access = false
     private var checks = 0
+    private var stage: OffStage!
 
     override func setUp() async throws {
         _ = NSApplication.shared
+        stage = OffStage()
         root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
     }
@@ -722,25 +724,96 @@ final class SearchPanelTests: XCTestCase {
         XCTAssertNil(preview.delegate)
     }
 
+    func testShowingBringsTheWindowForwardWithTheKeysInTheBox() async throws {
+        let window = try await opened(access: true)
+        XCTAssertEqual(stage.forward, 0)
+        window.show()
+        defer { window.hide() }
+        XCTAssertEqual(stage.forward, 1)
+        XCTAssertFalse(window.panel.isVisible, "the test keeps it off the screen")
+        XCTAssertTrue(stage.isKey(window.panel))
+        XCTAssertTrue(window.panel.firstResponder === window.field.currentEditor())
+        XCTAssertFalse(stage.isActive, "the window takes the keys without making Telescope the active app")
+    }
+
     func testAPreviewClosedWhileTelescopeIsActiveHandsTheKeysBackToTheBox() async throws {
+        try Data().write(to: root.appendingPathComponent("budget.txt"))
         let window = try await opened(access: false)
         window.show()
         defer { window.hide() }
-        NSApp.activate(ignoringOtherApps: true)
-        let unlocked = await soon { NSApp.isActive && window.panel.isKeyWindow }
-        try XCTSkipUnless(unlocked, "needs an unlocked screen")
-        let preview = QLPreviewPanel.shared()!
-        window.panel.beginPreviewPanelControl(preview)
+        try await type("budget", in: window)
+        try await until { window.rows.count == 1 }
+        window.quickLook(nil)
+        try await until { window.previewing }
         window.panel.makeFirstResponder(window.settings)
-        preview.makeKeyAndOrderFront(nil)
+
+        // A click on the preview makes Telescope the active app and gives the preview the keys.
+        stage.isActive = true
+        stage.key = nil
+        stage.previewIsKey = true
+        window.windowDidResignKey(Notification(name: NSWindow.didResignKeyNotification, object: window.panel))
+        await nextTurn()
+        XCTAssertTrue(window.shown, "a click on the preview keeps the window")
+        XCTAssertNil(stage.key, "the preview keeps the keys")
+
+        // Esc on the preview: it lets go of the keys and nothing else picks them up.
+        window.closePreview()
+        stage.previewIsKey = false
+        window.windowDidResignKey(Notification(name: NSWindow.didResignKeyNotification, object: QLPreviewPanel.shared()))
+        await nextTurn()
+        XCTAssertTrue(window.shown)
+        XCTAssertTrue(stage.isKey(window.panel))
+        XCTAssertTrue(window.panel.firstResponder === window.field.currentEditor())
+    }
+
+    func testOnScreenAPreviewClosedWhileTelescopeIsActiveHandsTheKeysBackToTheBox() async throws {
+        try onScreenOnly()
+        try Data("budget\n".utf8).write(to: root.appendingPathComponent("budget.txt"))
+        let window = try await opened(access: false, on: Screen())
+        window.show()
+        defer { window.hide() }
+        try await type("budget", in: window)
+        try await until { window.rows.count == 1 }
+        window.quickLook(nil)
+        try await until { window.previewing }
+        let preview = QLPreviewPanel.shared()!
+        try await until { preview.currentController as AnyObject === window.panel }
+
+        // A click on the preview makes Telescope the active app and gives the preview the keys.
+        NSApp.activate(ignoringOtherApps: true)
+        let unlocked = await soon { NSApp.isActive }
+        try XCTSkipUnless(unlocked, "needs an unlocked screen")
+        window.panel.makeFirstResponder(window.settings)
+        preview.makeKey()
         try await until { preview.isKeyWindow }
         await nextTurn()
         XCTAssertTrue(window.shown, "a click on the preview keeps the window")
 
-        preview.orderOut(nil)
+        // Esc on the preview.
+        window.closePreview()
         try await until { window.panel.isKeyWindow }
         try await until { window.panel.firstResponder === window.field.currentEditor() }
         XCTAssertTrue(window.shown)
+    }
+
+    func testAPreviewClosedWithTheWindowAlreadyKeyLeavesTheFocusWhereItWas() async throws {
+        try Data().write(to: root.appendingPathComponent("budget.txt"))
+        let window = try await opened(access: false)
+        window.show()
+        defer { window.hide() }
+        try await type("budget", in: window)
+        try await until { window.rows.count == 1 }
+        window.quickLook(nil)
+        try await until { window.previewing }
+        window.panel.makeFirstResponder(window.settings)
+
+        // macOS handed the keys back to the window on its own.
+        stage.isActive = true
+        window.closePreview()
+        window.windowDidResignKey(Notification(name: NSWindow.didResignKeyNotification, object: QLPreviewPanel.shared()))
+        await nextTurn()
+        XCTAssertTrue(window.shown)
+        XCTAssertTrue(window.panel.firstResponder === window.settings)
     }
 
     func testFocusLeavingTelescopeWithAPreviewUpHidesBoth() async throws {
@@ -753,12 +826,13 @@ final class SearchPanelTests: XCTestCase {
         window.quickLook(nil)
         try await until { window.previewing }
 
+        // A click in another app: no window of Telescope's has the keys, and it isn't active.
+        stage.key = nil
         window.windowDidResignKey(Notification(name: NSWindow.didResignKeyNotification, object: QLPreviewPanel.shared()))
         XCTAssertTrue(window.shown, "decided once macOS has picked the next key window")
-        // Another test may have left Telescope active; on a locked screen it never is.
-        NSApp.deactivate()
         try await until { !window.shown }
         try await until { !window.previewing }
+        XCTAssertEqual(stage.closes, 1)
     }
 
     func testTheSearchWindowLosingTheKeysWithAPreviewUpWaitsToDecide() async throws {
@@ -789,13 +863,14 @@ final class SearchPanelTests: XCTestCase {
         let window = try await opened(access: true)
         window.show()
         window.hide()
+        stage.key = nil
+        stage.isActive = true
         window.panel.makeFirstResponder(window.settings)
         window.settleKeys()
         await nextTurn()
         XCTAssertFalse(window.shown)
         XCTAssertTrue(window.panel.firstResponder === window.settings, "the box isn't handed the keys")
-        try await until { !window.panel.isVisible }
-        XCTAssertFalse(window.panel.isKeyWindow)
+        XCTAssertNil(stage.key, "nor is the window")
     }
 
     func testEscOnOpenSettingsClosesThePreviewFirst() async throws {
@@ -845,7 +920,8 @@ final class SearchPanelTests: XCTestCase {
         window.hide()
         try await until { window.rows.count == 1 }
         await nextTurn()
-        XCTAssertFalse(QLPreviewPanel.shared().isVisible)
+        XCTAssertEqual(stage.opens, 0)
+        XCTAssertFalse(stage.previewShows)
     }
 
     func testCommandYClosesThePreviewEvenWhileResultsAreOnTheirWay() async throws {
@@ -911,6 +987,8 @@ final class SearchPanelTests: XCTestCase {
         down(window)
         XCTAssertEqual(window.inPreview, window.rows[2].url, "the last row stays picked")
         XCTAssertTrue(window.previewing)
+        XCTAssertEqual(stage.reloads, 1, "only a new file reloads the preview")
+        XCTAssertEqual(stage.opens, 1)
     }
 
     func testClearingTheBoxClosesThePreview() async throws {
@@ -926,7 +1004,8 @@ final class SearchPanelTests: XCTestCase {
         // Clearing asks to close from both the empty list and the cleared selection.
         try await type("", in: window)
         XCTAssertFalse(window.previewing)
-        try await until { !QLPreviewPanel.shared().isVisible }
+        try await until { !stage.previewShows }
+        XCTAssertEqual(stage.closes, 1, "a second close would keep it open")
         XCTAssertTrue(window.shown)
     }
 
@@ -943,12 +1022,13 @@ final class SearchPanelTests: XCTestCase {
         // The second Esc lands while the preview is still fading out.
         let esc = #selector(NSResponder.cancelOperation(_:))
         XCTAssertTrue(window.control(NSTextField(), textView: NSTextView(), doCommandBy: esc))
-        XCTAssertTrue(QLPreviewPanel.shared().isVisible)
+        XCTAssertTrue(stage.previewShows)
         XCTAssertTrue(window.control(NSTextField(), textView: NSTextView(), doCommandBy: esc))
         XCTAssertEqual(window.field.stringValue, "")
-        try await until { !QLPreviewPanel.shared().isVisible }
+        try await until { !stage.previewShows }
         await nextTurn()
-        XCTAssertFalse(QLPreviewPanel.shared().isVisible, "stays closed")
+        XCTAssertFalse(stage.previewShows, "stays closed")
+        XCTAssertEqual(stage.closes, 1)
         XCTAssertTrue(window.shown)
     }
 
@@ -975,6 +1055,7 @@ final class SearchPanelTests: XCTestCase {
         XCTAssertEqual(window.selected?.url, picked)
         XCTAssertEqual(window.inPreview, picked)
         XCTAssertTrue(window.previewing)
+        XCTAssertEqual(stage.reloads, 1, "the same file isn't loaded again")
     }
 
     func testReturnOnAFileGoneWhilePreviewingClosesThePreviewAndSaysSo() async throws {
@@ -1051,13 +1132,14 @@ final class SearchPanelTests: XCTestCase {
         XCTAssertTrue(window.shown, "⌘Y again closes only the preview")
     }
 
-    func testQuickLookFindsTheWindowAndShowsTheSelectedFile() async throws {
+    func testOnScreenQuickLookFindsTheWindowAndShowsTheSelectedFile() async throws {
+        try onScreenOnly()
         let notes = root.appendingPathComponent("notes")
         try FileManager.default.createDirectory(at: notes, withIntermediateDirectories: false)
         for name in ["budget a.txt", "budget b.txt"] {
             try Data("budget\n".utf8).write(to: notes.appendingPathComponent(name))
         }
-        let window = try await opened(access: true)
+        let window = try await opened(access: true, on: Screen())
         window.show()
         defer { window.hide() }
         let unlocked = await soon { window.panel.isKeyWindow }
@@ -1495,6 +1577,20 @@ final class SearchPanelTests: XCTestCase {
             characters: characters, charactersIgnoringModifiers: characters, isARepeat: false, keyCode: 0)!
     }
 
+    /// For the few tests that need the real screen: they bring windows forward and take the keys,
+    /// so they run only with TELESCOPE_FOCUS_TESTS=1.
+    private func onScreenOnly() throws {
+        try XCTSkipUnless(
+            ProcessInfo.processInfo.environment["TELESCOPE_FOCUS_TESTS"] == "1",
+            "takes the screen; run with TELESCOPE_FOCUS_TESTS=1")
+        // Started as main.swift starts the app; otherwise none of the runner's ordinary windows,
+        // such as the preview, can take the keys.
+        if NSApp.activationPolicy() != .accessory {
+            NSApp.setActivationPolicy(.accessory)
+            NSApp.finishLaunching()
+        }
+    }
+
     /// Whether `done` comes true within 1 s, for checks that skip rather than fail.
     private func soon(_ done: () -> Bool) async -> Bool {
         for _ in 0..<100 where !done() { try? await Task.sleep(for: .milliseconds(10)) }
@@ -1552,12 +1648,13 @@ final class SearchPanelTests: XCTestCase {
     }
 
     /// Waits for the scan, so its event can't reach the next test's core.
-    private func opened(access: Bool) async throws -> SearchPanel {
+    private func opened(access: Bool, on stage: (any Stage)? = nil) async throws -> SearchPanel {
         self.access = access
-        let window = SearchPanel(root: root.path) { [unowned self] in
+        let hasAccess = { [unowned self] in
             checks += 1
             return self.access
         }
+        let window = SearchPanel(root: root.path, hasAccess: hasAccess, stage: stage ?? self.stage)
         for _ in 0..<500 where !window.indexed { try await Task.sleep(for: .milliseconds(10)) }
         XCTAssertTrue(window.indexed)
         return window

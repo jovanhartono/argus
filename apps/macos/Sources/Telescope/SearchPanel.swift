@@ -97,6 +97,7 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
 
     private var hatch: Hatch?
     private let hasAccess: () -> Bool
+    private let stage: any Stage
     private(set) var notice: Notice?
     private var indexingSince: TimeInterval = 0
     private(set) var indexed = false
@@ -119,8 +120,12 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
     private(set) var shown = false
     private var icons: [String: NSImage] = [:]
 
-    init(root: String = NSHomeDirectory(), hasAccess: @escaping () -> Bool = { Hatch.hasFullDiskAccess() }) {
+    init(
+        root: String = NSHomeDirectory(), hasAccess: @escaping () -> Bool = { Hatch.hasFullDiskAccess() },
+        stage: any Stage = Screen()
+    ) {
         self.hasAccess = hasAccess
+        self.stage = stage
         super.init()
         build()
         let onEvent: (Hatch.Event) -> Void = { [weak self] event in self?.heard(event) }
@@ -160,8 +165,8 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
         shown = true
         place()
         panel.alphaValue = reduceMotion ? 1 : 0
-        panel.orderFrontRegardless()
-        panel.makeKey()
+        stage.bringForward(panel)
+        stage.makeKey(panel)
         // Your last search comes back selected, so typing replaces it.
         if let editor = field.currentEditor() {
             editor.selectAll(nil)
@@ -621,13 +626,10 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
         if previewing { return closePreview() }
         onceAnswered { [weak self] in
             guard let self, !composing, let row = selected, found(row) else { return }
-            // In front but not key, so typing and the arrows stay in the box. With no change of key
-            // window to notice, it is told to look for the window that feeds it.
-            let preview = QLPreviewPanel.shared()!
+            // In front but not key, so typing and the arrows stay in the box.
             inPreview = row.url
             closing = false
-            preview.updateController()
-            preview.orderFront(nil)
+            stage.openPreview()
         }
     }
 
@@ -643,7 +645,7 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
     }
 
     var previewing: Bool {
-        !closing && QLPreviewPanel.sharedPreviewPanelExists() && QLPreviewPanel.shared().isVisible
+        !closing && stage.previewShows
     }
 
     /// Quick Look takes about 0.2 s to close and stays visible meanwhile; a second close in
@@ -651,7 +653,7 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
     func closePreview() {
         guard previewing else { return }
         closing = true
-        QLPreviewPanel.shared().orderOut(nil)
+        stage.closePreview()
     }
 
     /// The preview moves with the selection, and closes once nothing is selected. It closes
@@ -663,16 +665,16 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
         }
         guard row.url != inPreview else { return }
         inPreview = row.url
-        QLPreviewPanel.shared().reloadData()
+        stage.reloadPreview()
     }
 
     /// A click on the preview gives it the keys and closing it hands them back to the box; only
     /// a click in another app hides the window.
     func settleKeys() {
         DispatchQueue.main.async { [weak self] in
-            guard let self, shown, !panel.isKeyWindow, !QLPreviewPanel.shared().isKeyWindow else { return }
-            guard NSApp.isActive else { return hide() }
-            panel.makeKey()
+            guard let self, shown, !stage.isKey(panel), !stage.previewIsKey else { return }
+            guard stage.isActive else { return hide() }
+            stage.makeKey(panel)
             if field.currentEditor() == nil { panel.makeFirstResponder(field) }
         }
     }

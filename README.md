@@ -24,6 +24,12 @@ rustup target add x86_64-apple-darwin        # once, before the first .dmg
 ./scripts/make-dmg.sh                        # builds build/Telescope.dmg for Apple and Intel chips
 ```
 
+`swift test` never brings a window forward or takes the keys, so you can keep working while it runs. Two tests need the real screen and are skipped unless asked for: they open the search window and Quick Look in front of your apps and make Telescope the active app for about two seconds. Run them with the screen unlocked and hands off the keyboard:
+
+```sh
+TELESCOPE_FOCUS_TESTS=1 swift test --package-path apps/macos --filter testOnScreen
+```
+
 ## Install from the .dmg
 
 Telescope isn't notarized by Apple, so macOS asks you once before it opens:
