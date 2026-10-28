@@ -49,6 +49,9 @@ final class HealthFormatTests: XCTestCase {
         XCTAssertEqual(english.scan(opened, now: now), "Not since launch; the saved list opened instead")
         // Still the saved list while its rebuild runs.
         XCTAssertEqual(english.scan(Health(entries: 48_127, busy: true), now: now), english.scan(opened, now: now))
+        XCTAssertEqual(english.scan(Health(stopped: true), now: now), "Didn’t finish", "the first scan failed")
+        XCTAssertEqual(english.scan(Health(entries: 48_127, stopped: true), now: now), english.scan(opened, now: now))
+        XCTAssertEqual(english.scan(Health(scannedAt: now, scanMs: 5, stopped: true), now: now), "Just now, took 5 ms")
     }
 
     func testTheLastChangeTheStateAndAccess() {
@@ -56,6 +59,10 @@ final class HealthFormatTests: XCTestCase {
         XCTAssertEqual(english.change(Health(changedAt: now.addingTimeInterval(-120)), now: now), "2 minutes ago")
         XCTAssertEqual(english.state(Health()), "Up to date")
         XCTAssertEqual(english.state(Health(busy: true)), "Updating…")
+        XCTAssertEqual(english.state(Health(behind: true)), "Missing a change: rebuild the index")
+        XCTAssertEqual(english.state(Health(busy: true, behind: true)), "Updating…", "the rebuild reads it")
+        XCTAssertEqual(english.state(Health(stopped: true)), "Stopped: quit and reopen Telescope")
+        XCTAssertEqual(english.state(Health(busy: true, behind: true, stopped: true)), english.state(Health(stopped: true)))
         XCTAssertEqual(english.access(true), "On")
         XCTAssertEqual(english.access(false), "Off: Desktop, Documents, Downloads and cloud drives are left out")
     }
@@ -78,7 +85,12 @@ final class HealthWindowTests: XCTestCase {
         XCTAssertEqual(NSApp.windows.filter(\.isVisible), [], "a test put a window on the screen")
     }
 
-    private func window() -> HealthWindow {
+    private func until(_ done: () -> Bool, file: StaticString = #filePath, line: UInt = #line) async throws {
+        for _ in 0..<500 where !done() { try await Task.sleep(for: .milliseconds(10)) }
+        XCTAssertTrue(done(), file: file, line: line)
+    }
+
+    private func window(tick: TimeInterval = 1) -> HealthWindow {
         HealthWindow(
             read: { [unowned self] in
                 reads += 1
@@ -89,7 +101,7 @@ final class HealthWindowTests: XCTestCase {
                 rebuilds += 1
                 health.busy = true
             },
-            stage: stage, format: HealthFormat(locale: Locale(identifier: "en_US")))
+            stage: stage, format: HealthFormat(locale: Locale(identifier: "en_US")), tick: tick)
     }
 
     func testShowingReadsTheCoreAndTakesTheKeysOffStage() {
@@ -165,15 +177,61 @@ final class HealthWindowTests: XCTestCase {
     }
 
     func testItReadsOnlyWhileShownAndTicksOnTheirAges() async throws {
-        let window = window()
+        let window = window(tick: 0.05)
         window.refresh()
         XCTAssertEqual(reads, 0)
         window.show()
-        try await Task.sleep(for: .milliseconds(2_300))
-        XCTAssertGreaterThanOrEqual(reads, 2, "ticks about once a second")
+        try await until { self.reads >= 3 }
         window.hide()
         let hidden = reads
-        try await Task.sleep(for: .milliseconds(1_700))
+        try await Task.sleep(for: .milliseconds(200))
         XCTAssertEqual(reads, hidden, "hidden, it reads nothing")
+    }
+
+    func testTheAgesMoveOnWithTheClock() {
+        let at = Date(timeIntervalSince1970: 1_800_000_000)
+        health = Health(entries: 3, scannedAt: at, scanMs: 90, changedAt: at)
+        let window = window()
+        window.show()
+        defer { window.hide() }
+        window.refresh(now: at.addingTimeInterval(30))
+        XCTAssertEqual(window.scanned.stringValue, "Just now, took 90 ms")
+        XCTAssertEqual(window.changed.stringValue, "Just now")
+        window.refresh(now: at.addingTimeInterval(3 * 60))
+        XCTAssertEqual(window.scanned.stringValue, "3 minutes ago, took 90 ms")
+        XCTAssertEqual(window.changed.stringValue, "3 minutes ago")
+    }
+
+    /// The first scan failed, the engine stopped, or it never started: no Rebuild to press.
+    func testAStoppedCoreSaysSoAndOffersNoRebuild() {
+        health = Health(stopped: true)
+        let window = window()
+        window.show()
+        defer { window.hide() }
+        XCTAssertEqual(window.entries.stringValue, "0")
+        XCTAssertEqual(window.scanned.stringValue, "Didn’t finish")
+        XCTAssertEqual(window.state.stringValue, "Stopped: quit and reopen Telescope")
+        XCTAssertFalse(window.rebuild.isEnabled)
+    }
+
+    func testAFailedRebuildSaysTheListIsBehindAndRebuildStaysOffered() {
+        health.behind = true
+        let window = window()
+        window.show()
+        defer { window.hide() }
+        XCTAssertEqual(window.state.stringValue, "Missing a change: rebuild the index")
+        XCTAssertTrue(window.rebuild.isEnabled)
+    }
+
+    /// Each tick sets the same words again; only Open Settings coming or going resizes.
+    func testATickWithNothingNewKeepsTheWindowsFrame() {
+        let window = window()
+        window.show()
+        defer { window.hide() }
+        let frame = window.panel.frame
+        window.panel.setFrameOrigin(NSPoint(x: frame.minX + 40, y: frame.minY))
+        window.refresh()
+        XCTAssertEqual(window.panel.frame.minX, frame.minX + 40, "a window moved by hand stays")
+        XCTAssertEqual(window.panel.frame.size, frame.size)
     }
 }

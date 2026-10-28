@@ -61,7 +61,11 @@ final class HatchTests: XCTestCase {
         await fulfillment(of: [rebuilt], timeout: 5)
         let second = hatch.health()
         XCTAssertNotNil(second.changedAt)
-        XCTAssertGreaterThanOrEqual(try XCTUnwrap(second.scannedAt), scanned)
+        // Times are whole seconds, so the core's own tests check a rebuild moves them on.
+        XCTAssertNotNil(second.scannedAt)
+        XCTAssertFalse(second.busy, "heard of only once its list is in use")
+        XCTAssertFalse(second.behind || second.stopped)
+        XCTAssertFalse(hatch.holds(folder: "/"), "made-up names have no folders on disk")
     }
 
     func testAnAppRowOpensItsBundle() {

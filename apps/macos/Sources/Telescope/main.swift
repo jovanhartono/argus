@@ -19,6 +19,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         KeyboardShortcuts.onKeyDown(for: .searchFinderFolder) { window.toggleInFinderFolder() }
         self.window = window
     }
+
+    /// ⌘, while the health view itself is key, which the search window's chain doesn't reach.
+    @objc func showHealth(_ sender: Any?) {
+        window?.showHealth(sender)
+    }
 }
 
 /// Never shown, but AppKit finds ⌘Q, ⌘V, ⌘A, ⌘Z and the search window's own keys through it.

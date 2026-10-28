@@ -1024,16 +1024,92 @@ final class SearchPanelTests: XCTestCase {
         XCTAssertEqual(window.scopes.map(\.path), [second], "the late answer is dropped")
     }
 
+    /// macOS's question can keep Finder's answer waiting while you search the usual way.
     func testAFinderAnswerAfterTheWindowOpenedAnotherWayIsDropped() async throws {
+        try FileManager.default.createDirectory(
+            at: root.appendingPathComponent("notes"), withIntermediateDirectories: false)
+        let notes = realRoot.appendingPathComponent("notes").path
+        let gate = Gate()
         let window = try await opened(access: true) {
-            Thread.sleep(forTimeInterval: 0.2)
-            return .folder("/")
+            gate.wait()
+            return .folder(notes)
         }
-        window.toggleInFinderFolder()
+        for hidden in [false, true] {
+            window.toggleInFinderFolder()
+            window.show()
+            try await type("budget", in: window)
+            if hidden { window.hide() }
+            gate.open()
+            try await until { gate.answered }
+            // The answer reaches the window on its next turn.
+            try await Task.sleep(for: .milliseconds(100))
+            XCTAssertEqual(window.shown, !hidden, "\(hidden)")
+            XCTAssertTrue(window.scopes.isEmpty, "\(hidden)")
+            XCTAssertEqual(window.field.stringValue, "budget", "what you typed stays")
+            window.hide()
+            gate.reset()
+        }
+    }
+
+    func testAFolderTheListLeavesOutOpensTheWindowAsYouLeftIt() async throws {
+        for path in ["Downloads/budget.txt", "notes/budget.txt"] {
+            let file = root.appendingPathComponent(path)
+            try FileManager.default.createDirectory(
+                at: file.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try Data().write(to: file)
+        }
+        let downloads = realRoot.appendingPathComponent("Downloads").path
+        for (access, folder) in [(false, downloads), (true, "/"), (true, NSTemporaryDirectory())] {
+            let window = try await opened(access: access, finder: { .folder(folder) })
+            window.toggleInFinderFolder()
+            try await until { window.shown }
+            defer { window.hide() }
+            XCTAssertTrue(window.scopes.isEmpty, folder)
+            XCTAssertTrue(window.chip.isHidden)
+            XCTAssertEqual(window.notice, access ? nil : .needsAccess, "the line says why Downloads is left out")
+            try await type("budget", in: window)
+            try await until { !window.rows.isEmpty }
+            XCTAssertTrue(window.rows.contains { $0.path.hasSuffix("notes/budget.txt") }, folder)
+        }
+    }
+
+    /// Hidden and shown again within the fade, by the usual hotkey.
+    func testTheFinderLineGoesWithTheFinderWindowEvenMidFade() async throws {
+        for access in [true, false] {
+            let window = try await opened(access: access, finder: { .denied })
+            window.toggleInFinderFolder()
+            try await until { window.shown }
+            XCTAssertEqual(window.notice, .needsFinder)
+            window.hide()
+            window.toggle()
+            defer { window.hide() }
+            XCTAssertTrue(window.shown)
+            XCTAssertEqual(window.notice, access ? nil : .needsAccess)
+            XCTAssertEqual(window.settings.isHidden, access)
+            assertFits(window)
+            try await Task.sleep(for: .milliseconds(Int(Metric.fade * 1_000) + 100))
+            XCTAssertEqual(window.notice, access ? nil : .needsAccess, "the fade's end changes nothing")
+        }
+    }
+
+    func testCommandWHidesTheWindowAsEscDoes() async throws {
+        let window = try await opened(access: true)
         window.show()
-        defer { window.hide() }
-        try await Task.sleep(for: .milliseconds(400))
-        XCTAssertTrue(window.scopes.isEmpty)
+        let close = NSMenuItem(title: "Close", action: #selector(NSWindow.performClose(_:)), keyEquivalent: "w")
+        XCTAssertTrue(window.panel.validateMenuItem(close), "not greyed out, so ⌘W doesn't beep")
+        window.panel.performClose(nil)
+        XCTAssertFalse(window.shown)
+    }
+
+    /// The health view's own chain ends at the app's delegate, which shows the view again.
+    func testCommandCommaIsHeardWhileTheHealthViewIsKey() async throws {
+        let window = try await opened(access: true)
+        window.showHealth(nil)
+        let health = try XCTUnwrap(window.health)
+        defer { health.hide() }
+        let action = #selector(SearchPanel.showHealth(_:))
+        XCTAssertFalse(health.responds(to: action))
+        XCTAssertTrue(AppDelegate().responds(to: action))
     }
 
     func testCommandCommaSwapsTheSearchWindowForTheHealthView() async throws {
@@ -2235,6 +2311,33 @@ final class SearchPanelTests: XCTestCase {
 }
 
 /// Counts calls to a stand-in Finder, which come from background threads.
+/// Holds a stand-in Finder until the test lets it answer.
+private final class Gate: @unchecked Sendable {
+    private let lock = NSCondition()
+    private var opened = false
+    private var done = false
+
+    var answered: Bool { lock.withLock { done } }
+
+    func wait() {
+        lock.withLock {
+            while !opened { lock.wait() }
+            done = true
+        }
+    }
+
+    func open() {
+        lock.withLock {
+            opened = true
+            lock.broadcast()
+        }
+    }
+
+    func reset() {
+        lock.withLock { (opened, done) = (false, false) }
+    }
+}
+
 private final class Asked: @unchecked Sendable {
     private let lock = NSLock()
     private var count = 0

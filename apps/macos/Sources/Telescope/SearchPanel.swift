@@ -33,6 +33,15 @@ final class Panel: NSPanel {
         search.previewing ? search.closePreview() : search.hide()
     }
 
+    /// ⌘W does what Esc does; with no close button, AppKit would only beep.
+    override func performClose(_ sender: Any?) {
+        cancelOperation(sender)
+    }
+
+    override func validateMenuItem(_ item: NSMenuItem) -> Bool {
+        item.action == #selector(performClose(_:)) || super.validateMenuItem(item)
+    }
+
     override func acceptsPreviewPanelControl(_ panel: QLPreviewPanel!) -> Bool {
         true
     }
@@ -103,7 +112,11 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
     private let stage: any Stage
     private(set) var notice: Notice?
     private let finder: @Sendable () -> FinderFolder
-    /// Counts presses of the Finder hotkey, so only the newest answer opens the window.
+    /// The first time, asking waits for your answer to macOS's question, so it never holds a
+    /// thread Swift's tasks share, and presses meanwhile queue up behind it.
+    private let finderQueue = DispatchQueue(label: "io.github.jovanhartono.telescope.finder", qos: .userInitiated)
+    /// Counts presses of the Finder hotkey and shows, so only the answer to the newest press
+    /// opens the window, and only if it hasn't been opened since.
     private var finderAsks = 0
     private(set) var health: HealthWindow?
     private var indexingSince: TimeInterval = 0
@@ -174,9 +187,15 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
         stage.putAway(panel)
     }
 
-    func show() {
+    /// `needsFinder` shows the Finder line, which only the Finder hotkey's window has.
+    func show(needsFinder: Bool = false) {
         let pressed = pressedAt()
+        finderAsks += 1
         recheckAccess()
+        if needsFinder != (notice == .needsFinder) {
+            post(needsFinder ? .needsFinder : lacksAccess ? .needsAccess : nil)
+            fit()
+        }
         // Read again on each show, about 0.3 ms off the main thread, so a new app is found.
         if !appFolders.isEmpty { hatch?.readApps(in: appFolders) }
         if stale { runAgain() }
@@ -223,16 +242,16 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
     }
 
     /// The Finder hotkey: the window opens searching inside the folder the front Finder window
-    /// shows, or as you left it when no Finder window shows a folder.
+    /// shows, or as you left it when no Finder window shows a folder the list holds.
     func toggleInFinderFolder() {
         if shown { return hide() }
         finderAsks += 1
         let ask = finderAsks
         let pressed = pressedAt()
         let finder = finder
-        Task.detached(priority: .userInitiated) { [weak self] in
+        finderQueue.async { [weak self] in
             let answer = finder()
-            await self?.heardFinder(answer, ask: ask, pressed: pressed)
+            Task { @MainActor in self?.heardFinder(answer, ask: ask, pressed: pressed) }
         }
     }
 
@@ -240,18 +259,18 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
         guard ask == finderAsks, !shown else { return }
         timing.notice("Finder's folder read \(ms(since: pressed), format: .fixed(precision: 2)) ms after the hotkey")
         switch answer {
-        case .folder(let path):
+        // Without Full Disk Access, Finder on Downloads would otherwise search an empty list.
+        case .folder(let path) where hatch?.holds(folder: path) == true:
             scopes = [Row(folderAt: path)]
             field.stringValue = ""
             showScopes()
             search()
+        case .folder, .none:
+            break
         case .denied:
-            post(.needsFinder)
-            fit()
+            return show(needsFinder: true)
         case .failed(let code):
             failures.error("Finder didn't tell its folder: \(code)")
-        case .none:
-            break
         }
         show()
     }
@@ -261,7 +280,7 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
         hide()
         if health == nil {
             health = HealthWindow(
-                read: { [weak self] in self?.hatch?.health() ?? Health() },
+                read: { [weak self] in self?.hatch?.health() ?? Health(stopped: true) },
                 hasAccess: { [weak self] in
                     guard let self else { return false }
                     recheckAccess()

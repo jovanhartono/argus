@@ -9,6 +9,10 @@ struct Health: Equatable {
     /// Nil until a list after the first comes into use.
     var changedAt: Date?
     var busy = false
+    /// A rebuild failed, so the list misses a change until a whole new one reads it.
+    var behind = false
+    /// Search stopped working, or never started, and no list will come.
+    var stopped = false
 }
 
 /// The health view's words, in your language where macOS has them.
@@ -22,6 +26,7 @@ struct HealthFormat {
     /// "5 minutes ago, took 0.9 s".
     func scan(_ health: Health, now: Date) -> String {
         guard let at = health.scannedAt else {
+            if health.entries == 0 && health.stopped { return "Didn’t finish" }
             return health.busy && health.entries == 0 ? "Under way" : "Not since launch; the saved list opened instead"
         }
         return "\(ago(at, now: now)), took \(duration(ms: health.scanMs))"
@@ -32,7 +37,9 @@ struct HealthFormat {
     }
 
     func state(_ health: Health) -> String {
-        health.busy ? "Updating…" : "Up to date"
+        if health.stopped { return "Stopped: quit and reopen Telescope" }
+        if health.busy { return "Updating…" }
+        return health.behind ? "Missing a change: rebuild the index" : "Up to date"
     }
 
     func access(_ fullDisk: Bool) -> String {
@@ -91,6 +98,7 @@ final class HealthWindow: NSObject, NSWindowDelegate {
     private let onRebuild: () -> Void
     private let stage: any Stage
     private let format: HealthFormat
+    private let tick: TimeInterval
     private let dates = DetailsFormat()
     private var ticking: Timer?
     private(set) var shown = false
@@ -98,13 +106,14 @@ final class HealthWindow: NSObject, NSWindowDelegate {
 
     init(
         read: @escaping () -> Health, hasAccess: @escaping () -> Bool, rebuild: @escaping () -> Void,
-        stage: any Stage, format: HealthFormat = HealthFormat()
+        stage: any Stage, format: HealthFormat = HealthFormat(), tick: TimeInterval = 1
     ) {
         self.read = read
         self.hasAccess = hasAccess
         onRebuild = rebuild
         self.stage = stage
         self.format = format
+        self.tick = tick
         super.init()
         build()
     }
@@ -165,10 +174,10 @@ final class HealthWindow: NSObject, NSWindowDelegate {
         panel.makeFirstResponder(rebuild)
         // The ages tick on while it shows, and a rebuild with no new list still ends.
         ticking?.invalidate()
-        ticking = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
+        ticking = Timer.scheduledTimer(withTimeInterval: tick, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated { self?.refresh() }
         }
-        ticking?.tolerance = 0.5
+        ticking?.tolerance = tick / 2
     }
 
     func hide() {
@@ -191,8 +200,9 @@ final class HealthWindow: NSObject, NSWindowDelegate {
         changed.toolTip = health.changedAt.map(dates.date)
         state.stringValue = format.state(health)
         access.stringValue = format.access(fullDisk)
+        rebuild.isEnabled = !health.busy && !health.stopped
+        guard grid.row(at: 5).isHidden != fullDisk else { return }
         grid.row(at: 5).isHidden = fullDisk
-        rebuild.isEnabled = !health.busy
         fitKeepingTop()
     }
 
