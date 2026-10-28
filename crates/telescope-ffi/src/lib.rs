@@ -267,15 +267,26 @@ type Newest = Option<(Arc<Scope>, Arc<Index>)>;
 /// rebuild was asked for, or 0 for the first list.
 type Watched = (Vec<(String, Watch)>, u64);
 
-#[derive(Default)]
 struct Live {
-    /// How far apart rebuilds start while files keep changing: `GAP`, outside tests.
+    /// How far apart rebuilds start while files keep changing.
     gap: Duration,
     plan: Mutex<Plan>,
     wake: Condvar,
     /// None for made-up names, or before the first list.
     newest: Mutex<Newest>,
     watched: Mutex<Watched>,
+}
+
+impl Default for Live {
+    fn default() -> Self {
+        Self {
+            gap: GAP,
+            plan: Mutex::default(),
+            wake: Condvar::new(),
+            newest: Mutex::default(),
+            watched: Mutex::default(),
+        }
+    }
 }
 
 impl Live {
@@ -1752,6 +1763,16 @@ mod tests {
     }
 
     #[test]
+    fn both_kinds_of_core_space_rebuilds_by_the_gap() {
+        let (_dir, home) = home_with(&[]);
+        let (names, folder) = (Events::default(), Events::default());
+        let cores = [start(100, &names), scan(home.to_str().unwrap(), 1, &folder)];
+        for core in &cores {
+            assert_eq!(unsafe { &(*core.0).live }.gap, GAP);
+        }
+    }
+
+    #[test]
     fn freeing_the_core_silences_it() {
         let events = Events::default();
         let core = start(2_000, &events);
@@ -1797,8 +1818,18 @@ mod tests {
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].0, "budget.txt");
 
-        // Nothing more changed, so nothing more is built.
-        std::thread::sleep(GAP + Duration::from_millis(200));
+        // Nothing more changed, so once the rebuild ends none more is asked for.
+        let live = unsafe { &(*core.0).live };
+        let asked = Instant::now();
+        while live.plan.lock().unwrap().running {
+            assert!(
+                asked.elapsed() < Duration::from_secs(60),
+                "the rebuild never ended"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let plan = live.plan.lock().unwrap();
+        assert!(!plan.wanted && plan.recheck.is_none());
         assert_eq!(events.rebuilt().len(), 1);
     }
 
@@ -2104,7 +2135,6 @@ mod tests {
         });
         let freed = freed.recv_timeout(Duration::from_secs(60));
         assert!(freed.is_ok(), "freeing waited out the gap");
-        assert!(events.rebuilt().is_empty());
     }
 
     fn index_of(files: &[&str]) -> (tempfile::TempDir, Arc<Index>) {
@@ -2906,7 +2936,10 @@ mod tests {
         fn stop(self, live: &Live) {
             live.plan(|plan| plan.stopped = true);
             self.go.send(()).unwrap();
-            self.thread.join().unwrap();
+            // A thread that missed the stop now fails at its next step instead of hanging.
+            drop(self.go);
+            let stopped = self.thread.join();
+            assert!(stopped.is_ok(), "the rebuild thread went on after the stop");
         }
     }
 
@@ -2933,43 +2966,57 @@ mod tests {
         rebuilds.stop(&live);
     }
 
-    /// Plays changes at the given milliseconds against a rebuild thread, one millisecond at a
-    /// time, each rebuild taking `takes` ms, and returns when each rebuild started and its mark.
-    /// The change at `changes[i]` has mark `i + 1`.
-    fn burst(changes: &[u64], gap: u64, takes: u64, until: u64) -> Vec<(u64, u64)> {
+    /// Plays changes at the given milliseconds against a rebuild thread whose first list
+    /// started `ago` ms before 0, each rebuild taking `takes` ms, and returns when each rebuild
+    /// started and its mark. The change at `changes[i]` has mark `i + 1`. As with a real wait,
+    /// the thread looks again only when a change comes, its rebuild ends, or its wait is up.
+    fn burst(changes: &[u64], gap: u64, takes: u64, ago: u64, until: u64) -> Vec<(u64, u64)> {
         let live = live(Duration::from_millis(gap));
-        let rebuilds = rebuilds(&live, LONG_AGO);
-        let mut started = Vec::new();
-        let mut running_until = None;
+        let rebuilds = rebuilds(&live, Duration::from_millis(ago));
+        // `last` counts from the first list's start, like `expected`.
+        let (mut started, mut last, mut wakes) = (Vec::new(), 0, None);
+        let mut step = Step::Waits(None);
         for ms in 0..=until {
             rebuilds.set_ms(ms);
+            let mut came = false;
             for (mark, _) in (1..).zip(changes).filter(|&(_, &at)| at == ms) {
                 live.plan(|plan| plan.want(mark));
+                came = true;
             }
-            // A rebuild under way looks at nothing until it ends.
-            if running_until.is_some_and(|end| ms < end) {
+            let running = matches!(step, Step::Starts { .. });
+            if wakes != Some(ms) && (!came || running) {
                 continue;
             }
-            running_until = None;
-            if let Step::Starts { at, mark, .. } = rebuilds.step() {
-                started.push((u64::try_from(at.as_millis()).unwrap(), mark));
-                running_until = Some(ms + takes);
-            }
+            step = rebuilds.step();
+            wakes = match step {
+                Step::Starts { mark, .. } => {
+                    started.push((ms, mark));
+                    last = ms + ago;
+                    Some(ms + takes)
+                }
+                Step::Waits(Some(left)) => {
+                    let gap_left = last + gap - (ms + ago);
+                    assert_eq!(left, Duration::from_millis(gap_left), "at {ms} ms");
+                    Some(ms + gap_left)
+                }
+                Step::Waits(None) => None,
+            };
         }
+        assert_eq!(step, Step::Waits(None), "still busy at {until} ms");
         rebuilds.stop(&live);
         started
     }
 
     /// The rule written out plainly: a rebuild starts at the first millisecond with a change
     /// waiting, none running, and a gap since the last one began.
-    fn expected(changes: &[u64], gap: u64, takes: u64, until: u64) -> Vec<(u64, u64)> {
-        let (mut started, mut last, mut free_at, mut next) = (Vec::new(), None, 0, 0);
+    fn expected(changes: &[u64], gap: u64, takes: u64, ago: u64, until: u64) -> Vec<(u64, u64)> {
+        // `last` counts from the first list's start.
+        let (mut started, mut last, mut free_at, mut next) = (Vec::new(), 0, 0, 0);
         for ms in 0..=until {
             let waiting = changes.get(next).is_some_and(|&at| at <= ms);
-            let rested = last.is_none_or(|last| ms >= last + gap);
-            if waiting && ms >= free_at && rested {
+            if waiting && ms >= free_at && ms + ago >= last + gap {
                 started.push((ms, next as u64 + 1));
-                (last, free_at) = (Some(ms), ms + takes);
+                (last, free_at) = (ms + ago, ms + takes);
                 next = changes.partition_point(|&at| at <= ms);
             }
         }
@@ -2978,13 +3025,14 @@ mod tests {
 
     #[test]
     fn a_burst_of_changes_rebuilds_a_gap_apart_and_ends_with_the_last_change() {
-        // A save every 7 ms for a third of a second, a 100 ms gap, rebuilds of 30 ms.
+        // A save every 7 ms for a third of a second, a 100 ms gap, rebuilds of 30 ms, and the
+        // first list a minute back.
         let changes: Vec<u64> = (0..50).map(|i| 7 * i + 1).collect();
-        let started = burst(&changes, 100, 30, 600);
+        let started = burst(&changes, 100, 30, 60_000, 600);
         // One at once, then one per gap, each reading every change since the one before; the
         // last, at 401 ms, reads the last change, made at 344 ms.
         assert_eq!(started, [(1, 1), (101, 2), (201, 16), (301, 30), (401, 44)]);
-        assert_eq!(started, expected(&changes, 100, 30, 600));
+        assert_eq!(started, expected(&changes, 100, 30, 60_000, 600));
     }
 
     #[test]
@@ -2998,19 +3046,28 @@ mod tests {
             seed % below
         };
         for _ in 0..64 {
-            let (gap, takes) = (random(120), 1 + random(60));
+            // The first list sometimes still inside its gap at 0.
+            let (gap, takes, ago) = (random(120), 1 + random(60), random(240));
             let mut at = 0;
             let changes: Vec<u64> = (0..=random(40))
                 .map(|_| {
-                    // Two changes in the same millisecond, now and then.
-                    at += random(16);
+                    // Two changes in the same millisecond now and then, and now and then a
+                    // pause longer than any gap.
+                    at += match random(8) {
+                        0 => 200 + random(400),
+                        _ => random(16),
+                    };
                     at
                 })
                 .collect();
             let until = at + 2 * (gap + takes) + 1;
-            let case = format!("gap {gap}, takes {takes}, changes {changes:?}");
-            let started = burst(&changes, gap, takes, until);
-            assert_eq!(started, expected(&changes, gap, takes, until), "{case}");
+            let case = format!("gap {gap}, takes {takes}, ago {ago}, changes {changes:?}");
+            let started = burst(&changes, gap, takes, ago, until);
+            assert_eq!(
+                started,
+                expected(&changes, gap, takes, ago, until),
+                "{case}"
+            );
             let last = started.last().unwrap();
             assert!(last.0 >= *changes.last().unwrap(), "{case}");
         }
@@ -3034,20 +3091,20 @@ mod tests {
     fn a_change_during_a_rebuild_is_judged_by_the_list_it_brings() {
         let (_dir, home) = home_with(&["notes/budget.txt"]);
         let notes = home.join("notes");
-        let settings = Settings::new(&home, &home, Clutter::Skip, Ignore::default(), Access::Full);
-        let live = Arc::new(Live::default());
-        let index = settings.scan().unwrap().index;
-        let scope = Some(settings.scope());
-        live.publish(Built { index, scope }, 0);
-        let core = Core(Box::into_raw(Box::new(TlCore {
-            searcher: Arc::default(),
-            jobs: None,
-            done: Arc::default(),
-            live: Arc::clone(&live),
-            worker: None,
-            text: None,
-        })));
-        // Each rebuild leaves the list as it was.
+        let live = live(Duration::ZERO);
+        // What a rebuild reading the folder now would hand on.
+        let list = || {
+            let settings =
+                Settings::new(&home, &home, Clutter::Skip, Ignore::default(), Access::Full);
+            let index = settings.scan().unwrap().index;
+            Built {
+                index,
+                scope: Some(settings.scope()),
+            }
+        };
+        live.publish(list(), 0);
+        let core = idle_core(&live);
+        // Unless the test hands one on, each rebuild leaves the list as it was.
         let rebuilds = rebuilds(&live, LONG_AGO);
 
         live.plan(|plan| plan.want(1));
@@ -3057,37 +3114,53 @@ mod tests {
         assert!(!live.plan.lock().unwrap().wanted);
         assert_eq!(rebuilds.step(), Step::Waits(None));
 
+        // The list it brings has the new file, though the one before didn't.
         live.plan(|plan| plan.want(3));
         assert_eq!(rebuilds.step(), starts(0, 3));
         std::fs::write(notes.join("plan.md"), "").unwrap();
-        assert_eq!(changed_at(&core, &[&notes, &notes], 0, 5), 1);
         assert_eq!(changed_at(&core, &[&notes], 0, 4), 1);
+        live.publish(list(), 3);
+        assert_eq!(rebuilds.step(), Step::Waits(None));
+
+        live.plan(|plan| plan.want(5));
+        assert_eq!(rebuilds.step(), starts(0, 5));
+        std::fs::write(notes.join("todo.md"), "").unwrap();
+        assert_eq!(changed_at(&core, &[&notes, &notes], 0, 7), 1);
+        assert_eq!(changed_at(&core, &[&notes], 0, 6), 1);
         assert_eq!(
             live.plan.lock().unwrap().recheck,
-            Some((vec![notes.clone()], 4))
+            Some((vec![notes.clone()], 6))
         );
-        assert_eq!(rebuilds.step(), starts(0, 4));
+        assert_eq!(rebuilds.step(), starts(0, 6));
         rebuilds.stop(&live);
     }
 
     #[test]
     fn full_disk_access_reaches_one_rebuild() {
         let live = live(Duration::ZERO);
+        let core = idle_core(&live);
         let rebuilds = rebuilds(&live, LONG_AGO);
+        let told = |mark| Step::Starts {
+            at: Duration::ZERO,
+            full_disk: true,
+            mark,
+            clutter: Clutter::Skip,
+        };
         live.plan(|plan| {
             plan.full_disk = true;
             plan.wanted = true;
         });
-        let told = Step::Starts {
-            at: Duration::ZERO,
-            full_disk: true,
-            mark: 0,
-            clutter: Clutter::Skip,
-        };
-        assert_eq!(rebuilds.step(), told);
+        assert_eq!(rebuilds.step(), told(0));
         assert_eq!(rebuilds.step(), Step::Waits(None));
         live.plan(|plan| plan.wanted = true);
         assert_eq!(rebuilds.step(), starts(0, 0));
+
+        // Granted while that one runs, so it reaches the one after.
+        unsafe { tl_grant_full_disk(core.0, 5) };
+        assert_eq!(rebuilds.step(), told(5));
+        assert_eq!(rebuilds.step(), Step::Waits(None));
+        live.plan(|plan| plan.want(6));
+        assert_eq!(rebuilds.step(), starts(0, 6));
         rebuilds.stop(&live);
     }
 
@@ -3152,30 +3225,54 @@ mod tests {
     }
 
     #[test]
+    fn a_change_and_a_switch_both_waiting_start_one_rebuild_from_the_first() {
+        let live = live(Duration::ZERO);
+        let core = idle_core(&live);
+        let rebuilds = rebuilds(&live, LONG_AGO);
+        assert_eq!(switch(&core, 1, 3), 1);
+        live.plan(|plan| plan.want(5));
+        assert_eq!(rebuilds.step(), keeps_everything(3));
+        assert_eq!(rebuilds.step(), Step::Waits(None));
+
+        // Switched off and back before it starts, so only the change counts.
+        assert_eq!(switch(&core, 0, 6), 1);
+        live.plan(|plan| plan.want(8));
+        assert_eq!(switch(&core, 1, 9), 0);
+        assert_eq!(rebuilds.step(), keeps_everything(8));
+        assert_eq!(rebuilds.step(), Step::Waits(None));
+        rebuilds.stop(&live);
+    }
+
+    #[test]
     fn a_change_while_a_rebuild_keeping_everything_runs_waits_for_its_list() {
         let (_dir, home) = home_with(&["notes/a.txt", "Library/Caches/com.example/cache.db"]);
         let caches = home.join("Library/Caches/com.example");
-        let settings = Settings::new(&home, &home, Clutter::Skip, Ignore::default(), Access::Full);
-        let live = Arc::new(Live::default());
-        let index = settings.scan().unwrap().index;
-        live.publish(
+        let list = |clutter| {
+            let settings = Settings::new(&home, &home, clutter, Ignore::default(), Access::Full);
+            let index = settings.scan().unwrap().index;
             Built {
                 index,
                 scope: Some(settings.scope()),
-            },
-            0,
-        );
+            }
+        };
+        let live = live(Duration::ZERO);
+        live.publish(list(Clutter::Skip), 0);
         let core = idle_core(&live);
         assert_eq!(changed(&core, &[&caches], 0), 0);
         let rebuilds = rebuilds(&live, LONG_AGO);
         assert_eq!(switch(&core, 1, 3), 1);
         assert_eq!(rebuilds.step(), keeps_everything(3));
+        // The rebuild read the caches just before the new file came.
+        let read = list(Clutter::Keep);
         std::fs::write(caches.join("new.db"), "").unwrap();
         assert_eq!(changed_at(&core, &[&caches], 0, 4), 1);
         assert_eq!(
             live.plan.lock().unwrap().recheck,
             Some((vec![caches.clone()], 4))
         );
+        live.publish(read, 3);
+        assert_eq!(rebuilds.step(), keeps_everything(4));
+        assert_eq!(rebuilds.step(), Step::Waits(None));
         rebuilds.stop(&live);
     }
 
@@ -3220,6 +3317,37 @@ mod tests {
         live.plan(|plan| plan.stopped = true);
         let woke = stopped.recv_timeout(Duration::from_secs(60));
         assert!(woke.is_ok(), "stopping didn't cut the hour short");
+    }
+
+    /// The hand-moved clock steps the thread whether or not anything woke it, so this one runs
+    /// on the wall clock.
+    #[test]
+    fn each_way_of_asking_wakes_a_sleeping_rebuild_thread() {
+        let live = live(Duration::ZERO);
+        let core = idle_core(&live);
+        let (tell, waits) = mpsc::channel();
+        let (began, starts) = mpsc::channel();
+        {
+            let live = Arc::clone(&live);
+            thread::spawn(move || {
+                rebuild_loop(&live, &Told(tell), Instant::now(), |disk, clutter, mark| {
+                    let _ = began.send((disk, clutter, mark));
+                });
+            });
+        }
+        let minute = Duration::from_secs(60);
+        // Told while it still holds the plan, so each ask comes once it is asleep.
+        let asleep = || assert_eq!(waits.recv_timeout(minute), Ok(None));
+        let next_start = || starts.recv_timeout(minute);
+        asleep();
+        assert_eq!(changed_at(&core, &[], 1, 1), 1);
+        assert_eq!(next_start(), Ok((false, Clutter::Skip, 1)));
+        asleep();
+        unsafe { tl_grant_full_disk(core.0, 2) };
+        assert_eq!(next_start(), Ok((true, Clutter::Skip, 2)));
+        asleep();
+        assert_eq!(switch(&core, 1, 3), 1);
+        assert_eq!(next_start(), Ok((false, Clutter::Keep, 3)));
     }
 
     #[test]
