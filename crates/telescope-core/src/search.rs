@@ -15,6 +15,7 @@ const MAX_WORDS: usize = 8;
 /// Ranking weights, in frizbee's units, where a matched letter is worth 12.
 const WHOLE_WORD_BONUS: u16 = 24;
 const DEPTH_PENALTY: u32 = 2;
+const FOLDER_WORD_PENALTY: u32 = 4;
 const RARER_BY: usize = 4;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -268,12 +269,15 @@ fn run(
     let wide = limit + app_hits.iter().filter(inside).count();
     // A word found in a folder above counts as a clean match of that word, so "synergy readme"
     // ranks synergy-core/README.md above a long name that scatters the letters of both words.
+    // The same letters inside the name count a little more, so for "shop workspace"
+    // Shop.xcworkspace beats shop-web/.idea/workspace.xml.
     let match_score = u32::from(Config::default().scoring.match_score);
     let mut folder_bonus = [0u32; 1 << MAX_WORDS];
     for (mask, bonus) in folder_bonus.iter_mut().enumerate() {
         for (w, word) in words.iter().enumerate() {
             if mask >> w & 1 == 1 {
-                *bonus += match_score * word.needle.chars().count() as u32;
+                *bonus += (match_score * word.needle.chars().count() as u32)
+                    .saturating_sub(FOLDER_WORD_PENALTY);
             }
         }
     }
@@ -1363,6 +1367,23 @@ mod tests {
         assert_eq!(
             first(&index, "synergy readme"),
             "/home/synergy-core/README.md"
+        );
+    }
+
+    #[test]
+    fn a_name_holding_every_word_beats_one_that_needs_a_folder_above() {
+        let mut builder = IndexBuilder::new();
+        let root = builder.push("/home", NO_PARENT, true);
+        let web = builder.push("shop-web", root, true);
+        let idea = builder.push(".idea", web, true);
+        builder.push("workspace.xml", idea, false);
+        let app = builder.push("shop-app", root, true);
+        let ios = builder.push("ios", app, true);
+        builder.push("Shop.xcworkspace", ios, false);
+        let index = builder.finish();
+        assert_eq!(
+            first(&index, "shop workspace"),
+            "/home/shop-app/ios/Shop.xcworkspace"
         );
     }
 
