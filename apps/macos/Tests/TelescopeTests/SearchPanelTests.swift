@@ -881,6 +881,287 @@ final class SearchPanelTests: XCTestCase {
         XCTAssertFalse(window.previewing)
     }
 
+    func testCommandIOpensThePaneBesideThePickedFileAndClosesIt() async throws {
+        try Data("twelve bytes".utf8).write(to: root.appendingPathComponent("budget.txt"))
+        let window = try await opened(access: true)
+        window.show()
+        defer { window.hide() }
+        try await type("budget", in: window)
+        try await until { window.rows.count == 1 }
+        try await settled(window)
+        XCTAssertEqual(window.panel.frame.width, Metric.width)
+        let left = window.panel.frame.minX
+        let top = window.panel.frame.maxY
+
+        window.toggleDetails(nil)
+        XCTAssertTrue(window.detailing)
+        XCTAssertFalse(window.pane.isHidden)
+        try await until { window.panel.frame.width == Metric.width + 1 + Metric.pane }
+        try await until { window.panel.frame.height == Metric.field + 1 + Metric.details }
+        XCTAssertEqual(window.panel.frame.minX, left, "grows to the right")
+        XCTAssertEqual(window.panel.frame.maxY, top, "the box stays put")
+        XCTAssertEqual(window.pane.frame.maxX, window.panel.contentView!.bounds.width)
+        XCTAssertEqual(window.pane.name.stringValue, "budget.txt")
+        let values = try window.rows[0].url.resourceValues(forKeys: [
+            .localizedTypeDescriptionKey, .creationDateKey, .contentModificationDateKey,
+        ])
+        let format = DetailsFormat()
+        XCTAssertEqual(window.pane.summary.stringValue, "\(values.localizedTypeDescription!) – 12 bytes")
+        XCTAssertEqual(window.pane.place.stringValue, window.rows[0].folder)
+        XCTAssertEqual(window.pane.modified.stringValue, format.date(values.contentModificationDate))
+        XCTAssertEqual(window.pane.created.stringValue, format.date(values.creationDate))
+
+        window.toggleDetails(nil)
+        XCTAssertFalse(window.detailing)
+        XCTAssertTrue(window.pane.isHidden)
+        try await until { window.panel.frame.width == Metric.width }
+        try await settled(window)
+        XCTAssertEqual(window.panel.frame.minX, left)
+        XCTAssertNil(window.pane.waiting, "an unfinished thumbnail is given up")
+    }
+
+    func testThePaneFollowsTheArrowsAndAClick() async throws {
+        let notes = root.appendingPathComponent("notes")
+        try FileManager.default.createDirectory(at: notes, withIntermediateDirectories: false)
+        for name in ["budget a.txt", "budget b.txt", "budget c.txt"] {
+            try Data(name.utf8).write(to: notes.appendingPathComponent(name))
+        }
+        let window = try await opened(access: true)
+        window.show()
+        defer { window.hide() }
+        try await type("budget", in: window)
+        try await until { window.rows.count == 3 }
+        window.toggleDetails(nil)
+        XCTAssertEqual(window.pane.row, window.rows[0])
+        down(window)
+        XCTAssertEqual(window.pane.row, window.rows[1])
+        XCTAssertEqual(window.pane.name.stringValue, window.rows[1].name)
+        window.table.selectRowIndexes([2], byExtendingSelection: false)
+        XCTAssertEqual(window.pane.row, window.rows[2])
+        XCTAssertEqual(window.pane.waiting, window.rows[2].url, "only the picked file's thumbnail is drawn")
+    }
+
+    func testAThumbnailReplacesTheIconAndAnOlderOneNeverLands() async throws {
+        let notes = root.appendingPathComponent("notes")
+        try FileManager.default.createDirectory(at: notes, withIntermediateDirectories: false)
+        for name in ["budget a.txt", "budget b.txt"] {
+            try Data("budget\nnumbers\n".utf8).write(to: notes.appendingPathComponent(name))
+        }
+        let window = try await opened(access: true)
+        window.show()
+        defer { window.hide() }
+        try await type("budget", in: window)
+        try await until { window.rows.count == 2 }
+        window.toggleDetails(nil)
+        XCTAssertEqual(window.pane.waiting, window.rows[0].url)
+        let icon = window.pane.picture.image
+        XCTAssertNotNil(icon, "the icon shows at once")
+        down(window)
+        XCTAssertNil(window.pane.thumbnailed)
+        XCTAssertEqual(window.pane.waiting, window.rows[1].url)
+
+        try await until { window.pane.thumbnailed != nil }
+        XCTAssertEqual(window.pane.thumbnailed, window.rows[1].url)
+        XCTAssertNil(window.pane.waiting)
+        XCTAssertFalse(window.pane.picture.image === icon)
+        try await Task.sleep(for: .milliseconds(300))
+        XCTAssertEqual(window.pane.thumbnailed, window.rows[1].url, "the first file's thumbnail never lands")
+    }
+
+    func testThePaneStepsAsideWhileNothingIsPicked() async throws {
+        try Data().write(to: root.appendingPathComponent("budget.txt"))
+        let window = try await opened(access: true)
+        window.show()
+        defer { window.hide() }
+        window.toggleDetails(nil)
+        XCTAssertFalse(window.detailing, "an empty box has nothing to show")
+        XCTAssertEqual(window.panel.frame.width, Metric.width)
+
+        try await type("budget", in: window)
+        try await until { window.detailing }
+        try await until { window.panel.frame.width == Metric.width + 1 + Metric.pane }
+
+        try await type("zzzz", in: window)
+        try await until { window.rows.isEmpty }
+        XCTAssertFalse(window.detailing, "No Results")
+        XCTAssertTrue(window.pane.isHidden)
+        try await until { window.panel.frame.width == Metric.width }
+        XCTAssertEqual(window.panel.frame.height, Metric.field + 1 + Metric.message)
+
+        try await type("budget", in: window)
+        try await until { window.detailing }
+        XCTAssertTrue(window.detailsOn, "the switch stays on")
+        try await until { window.panel.frame.width == Metric.width + 1 + Metric.pane }
+    }
+
+    func testThePaneStaysOnAcrossHidesAndShowsWhatChangedMeanwhile() async throws {
+        let url = root.appendingPathComponent("budget.txt")
+        try Data("abc".utf8).write(to: url)
+        let window = try await opened(access: true)
+        window.show()
+        try await type("budget", in: window)
+        try await until { window.rows.count == 1 }
+        window.toggleDetails(nil)
+        XCTAssertTrue(window.pane.summary.stringValue.hasSuffix("3 bytes"), window.pane.summary.stringValue)
+        window.hide()
+
+        try Data("abcdef".utf8).write(to: url)
+        window.show()
+        defer { window.hide() }
+        XCTAssertTrue(window.detailing)
+        XCTAssertEqual(window.panel.frame.width, Metric.width + 1 + Metric.pane, "opens at its full width")
+        XCTAssertTrue(window.pane.summary.stringValue.hasSuffix("6 bytes"), window.pane.summary.stringValue)
+    }
+
+    func testAMadeUpNameShowsItCantBeFoundWithoutAThumbnail() async throws {
+        setenv("TELESCOPE_STAND_IN", "1000", 1)
+        defer { unsetenv("TELESCOPE_STAND_IN") }
+        let window = try await opened(access: true)
+        window.show()
+        defer { window.hide() }
+        try await type("budget", in: window)
+        try await until { !window.rows.isEmpty }
+        window.toggleDetails(nil)
+        XCTAssertTrue(window.detailing)
+        XCTAssertTrue(window.pane.summary.stringValue.hasSuffix("can’t be found"), window.pane.summary.stringValue)
+        XCTAssertEqual(window.pane.created.stringValue, "—")
+        XCTAssertNil(window.pane.waiting)
+        XCTAssertNotNil(window.pane.picture.image)
+    }
+
+    func testWithThePaneClosedTheArrowsReadNothing() async throws {
+        let notes = root.appendingPathComponent("notes")
+        try FileManager.default.createDirectory(at: notes, withIntermediateDirectories: false)
+        for name in ["budget a.txt", "budget b.txt"] {
+            try Data().write(to: notes.appendingPathComponent(name))
+        }
+        let window = try await opened(access: true)
+        window.show()
+        defer { window.hide() }
+        try await type("budget", in: window)
+        try await until { window.rows.count == 2 }
+        down(window)
+        XCTAssertNil(window.pane.row)
+        XCTAssertNil(window.pane.waiting)
+    }
+
+    /// The top row stays row 0, so the table says nothing; the pane must still follow the file.
+    func testANewListWithAnotherTopFileShowsThatFile() async throws {
+        try Data("abc".utf8).write(to: root.appendingPathComponent("budget.txt"))
+        try Data("abcdef".utf8).write(to: root.appendingPathComponent("budget plan.md"))
+        let window = try await opened(access: true)
+        window.show()
+        defer { window.hide() }
+        try await type("budget", in: window)
+        try await until { window.rows.count == 2 }
+        window.toggleDetails(nil)
+        XCTAssertEqual(window.pane.row, window.rows[0])
+
+        try await type("budget p", in: window)
+        try await until { window.rows.map(\.name) == ["budget plan.md"] }
+        XCTAssertEqual(window.table.selectedRow, 0)
+        XCTAssertEqual(window.pane.row, window.rows[0])
+        XCTAssertEqual(window.pane.name.stringValue, "budget plan.md")
+        XCTAssertTrue(window.pane.summary.stringValue.hasSuffix("6 bytes"), window.pane.summary.stringValue)
+        XCTAssertEqual(window.pane.waiting, window.rows[0].url)
+    }
+
+    func testAFileSavedWhileThePaneShowsGetsItsNewSize() async throws {
+        let url = root.appendingPathComponent("budget.txt")
+        try Data("abc".utf8).write(to: url)
+        let window = try await opened(access: true)
+        window.show()
+        defer { window.hide() }
+        try await type("budget", in: window)
+        try await until { window.rows.count == 1 }
+        window.toggleDetails(nil)
+        let picked = window.rows[0].url
+        try await until { window.pane.thumbnailed == picked }
+
+        // The new file ranks below, so the saved one keeps row 0 in the new list.
+        try Data("abcdef".utf8).write(to: url)
+        try Data().write(to: root.appendingPathComponent("budget 2.txt"))
+        try await until { window.rows.count == 2 }
+        XCTAssertEqual(window.selected?.url, picked)
+        XCTAssertEqual(window.table.selectedRow, 0)
+        XCTAssertTrue(window.pane.summary.stringValue.hasSuffix("6 bytes"), window.pane.summary.stringValue)
+        XCTAssertEqual(window.pane.waiting, picked, "a new thumbnail for the new contents")
+    }
+
+    func testAClickBelowTheRowsKeepsThePick() async throws {
+        try Data().write(to: root.appendingPathComponent("budget.txt"))
+        let window = try await opened(access: true)
+        window.show()
+        defer { window.hide() }
+        try await type("budget", in: window)
+        try await until { window.rows.count == 1 }
+        window.toggleDetails(nil)
+        let kept = window.tableView(window.table, selectionIndexesForProposedSelection: [])
+        XCTAssertEqual(kept, [0])
+        XCTAssertEqual(window.tableView(window.table, selectionIndexesForProposedSelection: [0]), [0])
+    }
+
+    func testThePaneMovesTheWindowOffTheRightEdgeAndClosingMovesItBack() async throws {
+        try Data().write(to: root.appendingPathComponent("budget.txt"))
+        let window = try await opened(access: true)
+        window.show()
+        defer { window.hide() }
+        try await type("budget", in: window)
+        try await until { window.rows.count == 1 }
+        try await settled(window)
+        let visible = try XCTUnwrap(window.panel.screen?.visibleFrame)
+        // Dragged close to the right edge.
+        let left = visible.maxX - Metric.width - 10
+        window.panel.setFrameOrigin(NSPoint(x: left, y: window.panel.frame.minY))
+        let top = window.panel.frame.maxY
+
+        window.toggleDetails(nil)
+        try await until { window.panel.frame.width == Metric.width + 1 + Metric.pane }
+        try await settled(window)
+        XCTAssertEqual(window.panel.frame.maxX, visible.maxX, accuracy: 0.5, "stays on the screen")
+        XCTAssertEqual(window.panel.frame.maxY, top)
+
+        window.toggleDetails(nil)
+        try await until { window.panel.frame.width == Metric.width }
+        try await settled(window)
+        XCTAssertEqual(window.panel.frame.minX, left, accuracy: 0.5, "the box goes back where it was")
+    }
+
+    func testAListTallerThanThePaneSetsTheHeight() async throws {
+        let notes = root.appendingPathComponent("notes")
+        try FileManager.default.createDirectory(at: notes, withIntermediateDirectories: false)
+        for index in 1...7 {
+            try Data().write(to: notes.appendingPathComponent("budget \(index).txt"))
+        }
+        let window = try await opened(access: true)
+        window.show()
+        defer { window.hide() }
+        try await type("budget", in: window)
+        try await until { window.rows.count == 7 }
+        window.toggleDetails(nil)
+        let list = 7 * Metric.row + 2 * Metric.inset
+        XCTAssertGreaterThan(list, Metric.details)
+        try await until { window.panel.frame.height == Metric.field + 1 + list }
+        XCTAssertEqual(window.pane.frame.height, list)
+    }
+
+    func testWithoutAccessTheButtonStaysAtTheRightEndBesideThePane() async throws {
+        try Data().write(to: root.appendingPathComponent("budget.txt"))
+        let window = try await opened(access: false)
+        window.show()
+        defer { window.hide() }
+        try await type("budget", in: window)
+        try await until { window.rows.count == 1 }
+        let gap = Metric.width - window.settings.frame.maxX
+        window.toggleDetails(nil)
+        try await until { window.panel.frame.width == Metric.width + 1 + Metric.pane }
+        try await settled(window)
+        let bar = try XCTUnwrap(window.settings.superview)
+        XCTAssertEqual(bar.bounds.width, window.panel.frame.width)
+        XCTAssertEqual(bar.bounds.width - window.settings.frame.maxX, gap)
+        assertFits(window)
+    }
+
     /// Waits out the 0.15 s resize: rows below the window's edge get no view until it grows.
     private func settled(_ window: SearchPanel, file: StaticString = #filePath, line: UInt = #line) async throws {
         let scroll = try XCTUnwrap(window.table.enclosingScrollView, file: file, line: line)
