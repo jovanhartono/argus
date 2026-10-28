@@ -89,6 +89,29 @@ final class SearchPanelTests: XCTestCase {
         XCTAssertEqual(checks, before, "with access there is nothing more to check")
     }
 
+    func testTheListSavedAtTheLastLaunchAnswersAtOnce() async throws {
+        try Data().write(to: root.appendingPathComponent("budget.pdf"))
+        let support = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: support) }
+        let file = support.appendingPathComponent("index").path
+        do {
+            let first = try await opened(access: true, saved: file)
+            // Saved 2 s after the first list.
+            for _ in 0..<1000 where !FileManager.default.fileExists(atPath: file) {
+                try await Task.sleep(for: .milliseconds(10))
+            }
+            XCTAssertTrue(FileManager.default.fileExists(atPath: file))
+            XCTAssertFalse(first.reopened)
+        }
+        // Gone before `support` is, so no save is under way as the folder goes.
+        do {
+            let window = try await opened(access: true, saved: file)
+            XCTAssertTrue(window.reopened)
+            try await type("budget", in: window)
+            try await until { window.rows.map(\.name) == ["budget.pdf"] }
+        }
+    }
+
     func testANewListKeepsTheSelectedFileSelected() async throws {
         let notes = root.appendingPathComponent("notes")
         try FileManager.default.createDirectory(at: notes, withIntermediateDirectories: false)
@@ -1752,13 +1775,13 @@ final class SearchPanelTests: XCTestCase {
     }
 
     /// Waits for the scan, so its event can't reach the next test's core.
-    private func opened(access: Bool, on stage: (any Stage)? = nil) async throws -> SearchPanel {
+    private func opened(access: Bool, on stage: (any Stage)? = nil, saved: String? = nil) async throws -> SearchPanel {
         self.access = access
         let hasAccess = { [unowned self] in
             checks += 1
             return self.access
         }
-        let window = SearchPanel(root: root.path, hasAccess: hasAccess, stage: stage ?? self.stage)
+        let window = SearchPanel(root: root.path, saved: saved, hasAccess: hasAccess, stage: stage ?? self.stage)
         for _ in 0..<500 where !window.indexed { try await Task.sleep(for: .milliseconds(10)) }
         XCTAssertTrue(window.indexed)
         return window

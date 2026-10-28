@@ -101,6 +101,8 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
     private(set) var notice: Notice?
     private var indexingSince: TimeInterval = 0
     private(set) var indexed = false
+    /// The first list was the one saved at the last launch.
+    private(set) var reopened = false
     private var problem: String?
     /// The file you picked was moved or deleted after the list was built.
     private(set) var missing: String?
@@ -120,9 +122,10 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
     private(set) var shown = false
     private var icons: [String: NSImage] = [:]
 
+    /// With `saved`, the list kept in that file at the last launch shows at once.
     init(
-        root: String = NSHomeDirectory(), hasAccess: @escaping () -> Bool = { Hatch.hasFullDiskAccess() },
-        stage: any Stage = Screen()
+        root: String = NSHomeDirectory(), saved: String? = nil,
+        hasAccess: @escaping () -> Bool = { Hatch.hasFullDiskAccess() }, stage: any Stage = Screen()
     ) {
         self.hasAccess = hasAccess
         self.stage = stage
@@ -137,7 +140,7 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
         } else {
             let access = hasAccess()
             post(access ? nil : .needsAccess)
-            hatch = Hatch(root: root, fullDisk: access, onEvent: onEvent)
+            hatch = Hatch(root: root, fullDisk: access, saved: saved, onEvent: onEvent)
         }
         if hatch == nil { problem = "Search couldn't start. Rebuild Telescope." }
         fit()
@@ -425,8 +428,14 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
 
     private func heard(_ event: Hatch.Event) {
         switch event {
-        case .indexed(let count):
-            timing.notice("indexed \(count) entries in \(ms(since: self.indexingSince), format: .fixed(precision: 0)) ms")
+        case .indexed(let count), .opened(let count):
+            let took = ms(since: indexingSince)
+            if case .opened = event {
+                reopened = true
+                timing.notice("opened \(count) saved entries in \(took, format: .fixed(precision: 0)) ms")
+            } else {
+                timing.notice("indexed \(count) entries in \(took, format: .fixed(precision: 0)) ms")
+            }
             indexed = true
             hatch?.watch()
             search()

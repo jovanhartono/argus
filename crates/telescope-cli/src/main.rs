@@ -296,7 +296,9 @@ fn load(folder: &Path, options: &Options) -> Option<Index> {
         }
         Some(file) => {
             let started = Instant::now();
-            match telescope_core::save_index(file, &scan, &settings, opened_at.unwrap_or(0)) {
+            let event_id = opened_at.unwrap_or(0);
+            let unreadable = scan.unreadable_folders;
+            match telescope_core::save_index(file, index, unreadable, &settings, event_id) {
                 Ok(()) => {
                     let size = std::fs::metadata(file).map_or(0, |file| file.len());
                     println!("saved {:.1} MB in {:.1} ms", mb(size), ms(started));
