@@ -138,7 +138,8 @@ fn boost(score: f64) -> u32 {
         .round() as u32
 }
 
-/// One spelling per path, so "/a/b/" and "/a//b" count as opens of "/a/b".
+/// One spelling per path, so "/a/b/" and "/a//b" count as opens of "/a/b". On Windows this
+/// also turns "/" into "\".
 fn tidy(path: &Path) -> PathBuf {
     path.components().collect()
 }
@@ -317,7 +318,7 @@ impl Frecency {
         // Keyed by the bundle's path, so an app opened from its row or from its bundle in
         // ~/Applications shares one boost, and keeps it when the app row hides the bundle's.
         for app in 0..apps.len() as AppId {
-            let path = apps.path(app);
+            let path = tidy(&apps.path(app));
             if let Some(&at) = path.to_str().and_then(|path| self.at.get(path)) {
                 let boost = boost(score(at, now));
                 if boost > 0 {
@@ -534,7 +535,7 @@ mod tests {
             let a: Vec<u64> = (0..=next(8)).map(|_| NOW - next(90 * DAY)).collect();
             let b: Vec<u64> = (0..=next(8)).map(|_| NOW - next(90 * DAY)).collect();
             let list = opened(&[("/a", &a), ("/b", &b)]);
-            let higher = list.at["/a"] > list.at["/b"];
+            let higher = list.at[&*key("/a")] > list.at[&*key("/b")];
             for later in [0, DAY, 45 * DAY, 400 * DAY] {
                 let now = NOW + later;
                 let (a, b) = (Path::new("/a"), Path::new("/b"));
@@ -619,8 +620,8 @@ mod tests {
             }
             list.record(Path::new("/home/new"), NOW);
             assert_eq!(list.len(), MOST_FILES);
-            assert!(!list.at.contains_key("/home/1023"));
-            assert!(list.at.contains_key("/home/new"));
+            assert!(!list.at.contains_key(&*key("/home/1023")));
+            assert!(list.at.contains_key(&*key("/home/new")));
         }
     }
 
@@ -630,7 +631,7 @@ mod tests {
         let mut list = opened(&[("/home/ahead.md", &[NOW + 3650 * DAY])]);
         assert_eq!(list.score(ahead, NOW), 1.0);
         list.record(Path::new("/home/today.md"), NOW);
-        assert_eq!(list.at["/home/ahead.md"], NOW as f64);
+        assert_eq!(list.at[&*key("/home/ahead.md")], NOW as f64);
         list.record(Path::new("/home/today.md"), NOW);
         assert!(list.score(ahead, NOW) < list.score(Path::new("/home/today.md"), NOW));
 
@@ -688,7 +689,7 @@ mod tests {
             assert!(list.record(Path::new(&path), now));
             let now = now as f64;
             assert!(list.len() <= MOST_FILES);
-            assert!(list.at.contains_key(path.as_str()));
+            assert!(list.at.contains_key(&*key(&path)));
             for &at in list.at.values() {
                 assert!(at.is_finite() && at >= now - FORGET_AFTER, "{at} {now}");
                 assert!(at <= now + MOST_AHEAD + CLOCK_SLACK, "{at} {now}");
@@ -774,9 +775,9 @@ mod tests {
         assert_eq!(bytes[12..16], crc32fast::hash(&zeroed).to_le_bytes());
         assert_eq!(bytes[16..20], [2, 0, 0, 0]);
         assert_eq!(bytes[20..28], 1.0_f64.to_le_bytes());
-        assert_eq!(bytes[28..32], [2, 0, b'/', b'a']);
+        assert_eq!(bytes[28..32], [&[2, 0], key("/a").as_bytes()].concat());
         assert_eq!(bytes[32..40], 2.0_f64.to_le_bytes());
-        assert_eq!(bytes[40..], [2, 0, b'/', b'b']);
+        assert_eq!(bytes[40..], [&[2, 0], key("/b").as_bytes()].concat());
     }
 
     #[test]
@@ -935,6 +936,11 @@ mod tests {
         builder.push("README.md", src, false);
         builder.push("README.md", root, false);
         builder.finish()
+    }
+
+    /// The path as the list keeps it, with "\" for "/" on Windows.
+    fn key(path: &str) -> String {
+        tidy(Path::new(path)).to_str().unwrap().to_owned()
     }
 
     fn boosts_of(list: &Frecency, index: &Index, now: u64) -> Boosts {
