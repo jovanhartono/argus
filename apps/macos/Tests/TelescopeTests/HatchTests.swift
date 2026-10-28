@@ -17,7 +17,7 @@ final class HatchTests: XCTestCase {
                     answered = ticket
                     ready.fulfill()
                 case .failed: XCTFail("the core stopped")
-                case .rebuilt, .opened: XCTFail("nothing changed or saved")
+                case .rebuilt, .opened, .reranked: XCTFail("nothing changed, saved or opened")
                 }
             })
         await fulfillment(of: [indexed], timeout: 5)
@@ -32,6 +32,25 @@ final class HatchTests: XCTestCase {
         XCTAssertNil(hatch.take(ticket), "rows are handed over once")
     }
 
+    func testAnAppRowOpensItsBundle() {
+        let app = Row(name: "Visual Studio Code", folder: "/Applications", isFolder: false, isApp: true)
+        XCTAssertEqual(app.path, "/Applications/Visual Studio Code.app")
+        XCTAssertTrue(app.url.hasDirectoryPath)
+        XCTAssertEqual(app.url.path, app.path)
+        let file = Row(name: "Visual Studio Code", folder: "/Applications", isFolder: false)
+        XCTAssertEqual(file.path, "/Applications/Visual Studio Code")
+        XCTAssertFalse(file.url.hasDirectoryPath)
+        XCTAssertEqual(file.real, file.url)
+    }
+
+    /// The one link every Mac has: Safari lives on the system's own volume.
+    func testAnAppRowReachedThroughALinkReadsTheAppItself() throws {
+        let safari = Row(name: "Safari", folder: "/Applications", isFolder: false, isApp: true)
+        let link = try FileManager.default.destinationOfSymbolicLink(atPath: safari.path)
+        XCTAssertNotEqual(safari.real.path, safari.path, link)
+        XCTAssertEqual(try safari.real.resourceValues(forKeys: [.contentTypeKey]).contentType, .applicationBundle)
+    }
+
     func testASearchInsideAFolderFindsOnlyWhatIsInIt() async throws {
         let indexed = expectation(description: "indexed")
         var ready: [UInt64: XCTestExpectation] = [:]
@@ -41,7 +60,7 @@ final class HatchTests: XCTestCase {
                 case .indexed: indexed.fulfill()
                 case .ready(let ticket): ready[ticket]?.fulfill()
                 case .failed: XCTFail("the core stopped")
-                case .rebuilt, .opened: XCTFail("nothing changed or saved")
+                case .rebuilt, .opened, .reranked: XCTFail("nothing changed, saved or opened")
                 }
             })
         await fulfillment(of: [indexed], timeout: 5)
@@ -86,6 +105,7 @@ final class HatchTests: XCTestCase {
                 case .failed: XCTFail("the scan failed")
                 case .rebuilt: break
                 case .opened: XCTFail("nothing was saved")
+                case .reranked: XCTFail("nothing was opened")
                 }
             })
         await fulfillment(of: [indexed], timeout: 5)
@@ -152,6 +172,7 @@ final class HatchTests: XCTestCase {
                 case .ready: break
                 case .failed: XCTFail("the scan failed")
                 case .opened: XCTFail("nothing was saved")
+                case .reranked: XCTFail("nothing was opened")
                 }
             })
         // The scan may or may not have read them yet; either way the list ends up with them.
@@ -336,6 +357,7 @@ final class HatchTests: XCTestCase {
                 case .rebuilt(let count, _): counts.add(count)
                 case .ready: break
                 case .failed: XCTFail("the scan failed")
+                case .reranked: XCTFail("nothing was opened")
                 }
             })
         await fulfillment(of: [first], timeout: 5)

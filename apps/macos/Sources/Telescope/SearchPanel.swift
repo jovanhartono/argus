@@ -1,5 +1,6 @@
 import AppKit
 import OSLog
+import QuickLookThumbnailing
 import QuickLookUI
 import UniformTypeIdentifiers
 
@@ -114,21 +115,26 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
     /// A search run again on a new list, which keeps the selected file when it answers.
     private var rerun: UInt64 = 0
     /// The ticket the rows on screen answer; 0 before any answer, so an empty list isn't "No Results".
-    private var answered: UInt64 = 0
+    private(set) var answered: UInt64 = 0
     private var pending: (() -> Void)?
     /// The file the open preview shows, so a new list with the same file picked doesn't reload it.
     private(set) var inPreview: URL?
     private var closing = false
     private(set) var shown = false
+    /// By kind of file, or by path for an app, which has its own.
     private var icons: [String: NSImage] = [:]
+    private(set) var readingIcons: Set<String> = []
+    private let appFolders: [String]
 
-    /// With `saved`, the list kept in that file at the last launch shows at once.
+    /// With `saved`, the list kept in that file at the last launch shows at once. With `opens`,
+    /// what you open ranks higher, kept in that file. The apps in `apps` are found by name.
     init(
-        root: String = NSHomeDirectory(), saved: String? = nil,
+        root: String = NSHomeDirectory(), saved: String? = nil, opens: String? = nil, apps: [String] = [],
         hasAccess: @escaping () -> Bool = { Hatch.hasFullDiskAccess() }, stage: any Stage = Screen()
     ) {
         self.hasAccess = hasAccess
         self.stage = stage
+        appFolders = apps
         super.init()
         build()
         let onEvent: (Hatch.Event) -> Void = { [weak self] event in self?.heard(event) }
@@ -143,6 +149,7 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
             hatch = Hatch(root: root, fullDisk: access, saved: saved, onEvent: onEvent)
         }
         if hatch == nil { problem = "Search couldn't start. Rebuild Telescope." }
+        if let opens { hatch?.rankOpens(keptIn: opens) }
         fit()
     }
 
@@ -162,6 +169,8 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
     func show() {
         let pressed = pressedAt()
         recheckAccess()
+        // Read again on each show, about 0.3 ms off the main thread, so a new app is found.
+        if !appFolders.isEmpty { hatch?.readApps(in: appFolders) }
         if stale { runAgain() }
         // A file saved while the window was hidden shows its new size and date.
         showDetails()
@@ -443,6 +452,8 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
             timing.notice("rebuilt \(count) entries in \(took) ms after a change")
             hatch?.watch()
             if shown { runAgain() } else { stale = true }
+        case .reranked:
+            if shown { runAgain() } else { stale = true }
         case .ready(let ticket) where ticket == newest:
             take(ticket)
         case .ready:
@@ -610,12 +621,12 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
     private func open(revealing reveal: Bool) {
         guard !composing, let row = selected, found(row) else { return }
         hide()
-        let url = row.url
         if reveal {
-            NSWorkspace.shared.activateFileViewerSelecting([url])
+            stage.showInFinder(row.url)
         } else {
-            NSWorkspace.shared.open(url)
+            stage.open(row.url)
         }
+        hatch?.opened(row.path)
     }
 
     @objc func showInFinder(_ sender: Any?) {
@@ -694,7 +705,7 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
     }
 
     func previewPanel(_ panel: QLPreviewPanel!, previewItemAt index: Int) -> QLPreviewItem! {
-        selected?.url as NSURL?
+        selected?.real as NSURL?
     }
 
     /// The arrows still pick the next result while the preview has the keys.
@@ -786,19 +797,64 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
     }
 
     private func icon(for row: Row) -> NSImage {
-        let key = row.isFolder ? "/" : (row.name as NSString).pathExtension.lowercased()
-        if let cached = icons[key] { return cached }
-        let type = row.isFolder ? UTType.folder : (UTType(filenameExtension: key) ?? .data)
-        let system = NSWorkspace.shared.icon(for: type)
-        // Handed the icon itself, a row's image view asks macOS for a stand-in picture each
-        // time, most of the time spent filling the rows. Drawn from a copy, it doesn't.
-        let image = NSImage(size: NSSize(width: 32, height: 32), flipped: false) { @Sendable rect in
-            system.draw(in: rect)
-            return true
+        if row.isApp {
+            let scale = panel.backingScaleFactor
+            // An app updated with a new icon, or found while still being copied in, is drawn again.
+            var info = stat()
+            let changed = stat(row.path, &info) == 0 ? info.st_mtimespec.tv_sec : 0
+            let own = "\(row.path) \(scale) \(changed)"
+            if let drawn = icons[own] { return drawn }
+            readIcon(of: row.path, as: own, scale: scale)
+            return kindIcon(".app", .applicationBundle)
         }
+        if row.isFolder { return kindIcon("/", .folder) }
+        let ext = (row.name as NSString).pathExtension.lowercased()
+        return kindIcon(ext, UTType(filenameExtension: ext) ?? .data)
+    }
+
+    /// ".app" and "/" are never a file's extension.
+    private func kindIcon(_ key: String, _ type: @autoclosure () -> UTType) -> NSImage {
+        if let cached = icons[key] { return cached }
+        let image = rowIcon(NSWorkspace.shared.icon(for: type()))
         icons[key] = image
         return image
     }
+
+    /// Drawn here, an app's icon took up to 140 ms the first time and macOS kept about 11 MB in
+    /// Telescope for 98 apps. Quick Look draws it in its own process at the row's size; until
+    /// then, or if it can't, the row shows the icon every app shares.
+    private func readIcon(of path: String, as key: String, scale: CGFloat) {
+        guard readingIcons.insert(key).inserted else { return }
+        Task { [weak self] in
+            let drawn = await appIcon(at: path, scale: scale)
+            guard let self else { return }
+            readingIcons.remove(key)
+            guard let drawn else { return }
+            let image = NSImage(cgImage: drawn, size: NSSize(width: 32, height: 32))
+            icons[key] = image
+            table.enumerateAvailableRowViews { view, row in
+                guard rows.indices.contains(row), rows[row].path == path,
+                    let cell = view.view(atColumn: 0) as? ResultCell
+                else { return }
+                cell.show(rows[row], icon: image)
+            }
+        }
+    }
+}
+
+/// Handed the icon itself, a row's image view asks macOS for a stand-in picture each time, most
+/// of the time spent filling the rows. Drawn from a copy, it doesn't.
+private func rowIcon(_ system: NSImage) -> NSImage {
+    NSImage(size: NSSize(width: 32, height: 32), flipped: false) { @Sendable rect in
+        system.draw(in: rect)
+        return true
+    }
+}
+
+/// The app's icon at a row's size, as Finder shows it. /Applications/Safari.app is a link into
+/// the system's own volume, and read at the link Quick Look draws the link's icon instead.
+private nonisolated func appIcon(at path: String, scale: CGFloat) async -> CGImage? {
+    await quickLookPicture(of: URL(fileURLWithPath: path).resolvingSymlinksInPath(), side: 32, scale: scale, .icon)
 }
 
 /// When the key behind the current event went down, so timings include the wait to reach us.
