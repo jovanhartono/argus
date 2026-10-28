@@ -2171,6 +2171,7 @@ final class SearchPanelTests: XCTestCase {
     }
 
     func testEachKeystrokeStopsTheTextSearchAndItsLinesNeverLand() async throws {
+        try writeMany()
         for at in 0..<200 {
             try write("budget line \(at)\nreview line \(at)\n", at: "notes/plan \(at).txt")
         }
@@ -2178,7 +2179,7 @@ final class SearchPanelTests: XCTestCase {
         window.show()
         defer { window.hide() }
         try await type("budget", in: window)
-        try await until { window.textTicket != 0 || !window.hits.isEmpty }
+        try await untilClose { window.textTicket != 0 }
         try await type("review", in: window)
         XCTAssertEqual(window.textTicket, 0, "stopped at the keystroke")
         let matches = { Set(window.hits.map { ($0.text as NSString).substring(with: $0.match) }) }
@@ -2195,7 +2196,7 @@ final class SearchPanelTests: XCTestCase {
         defer { window.hide() }
         try await type("zebra", in: window)
         try await until { window.answered != 0 }
-        XCTAssertTrue(["Searching inside files…", nil].contains(window.status))
+        XCTAssertEqual(window.status, window.hits.isEmpty ? "Searching inside files…" : nil)
         try await until { window.hits.count == 1 }
         XCTAssertEqual(window.rows, [])
         XCTAssertEqual(window.table.selectedRow, 1)
@@ -2242,27 +2243,114 @@ final class SearchPanelTests: XCTestCase {
         XCTAssertEqual(window.hits, [])
         window.show()
         defer { window.hide() }
-        try await until { window.hits.count == 1 }
-
-        // Hiding stops a search under way; shown again, the lines are never listed twice.
-        window.hide()
-        XCTAssertEqual(window.textTicket, 0)
-        window.show()
         try await until { window.hits.count == 1 && window.textTicket == 0 }
+
+        // Shown again, the files are read again, the old line staying up until the new one comes.
+        window.hide()
+        window.show()
+        XCTAssertNotEqual(window.textTicket, 0)
+        XCTAssertEqual(window.hits.count, 1)
+        try await until { window.textTicket == 0 }
+        XCTAssertEqual(window.hits.count, 1, "never listed twice")
     }
 
-    func testClearingTheBoxDropsTheLines() async throws {
+    func testHidingMidSearchKeepsTheLinesAndTheHeightAndShowingReadsAgain() async throws {
+        try writeMany()
+        // Fewer lines than the 100 a search stops at, so it reads every file.
+        for at in 0..<30 { try write("x\nthe budget \(at)\n", at: "filler/\(at)/plan.txt") }
+        let window = try await opened(access: true, textFolders: [root.path])
+        window.show()
+        defer { window.hide() }
+        try await type("budget", in: window)
+        try await untilClose { window.textTicket != 0 && !window.hits.isEmpty }
+        window.hide()
+        XCTAssertEqual(window.textTicket, 0, "hiding stops it")
+        let partial = window.hits.count
+        try await Task.sleep(for: .milliseconds(200))
+        XCTAssertEqual(window.hits.count, partial, "nothing lands while hidden")
+        try await settled(window)
+        let height = window.panel.frame.height
+
+        window.show()
+        XCTAssertNotEqual(window.textTicket, 0, "the stopped search starts again")
+        XCTAssertEqual(window.hits.count, partial, "the lines stay until the new ones come")
+        XCTAssertEqual(window.panel.frame.height, height)
+        try await until { window.textTicket == 0 && window.hits.count == 30 }
+        XCTAssertEqual(Set(window.hits.map(\.path)).count, 30, "no line listed twice")
+    }
+
+    func testClearingTheBoxDropsTheLinesAndTypingAgainFindsThem() async throws {
         try write("the budget", at: "notes/plan.txt")
         let window = try await opened(access: true, textFolders: [root.path])
         window.show()
         defer { window.hide() }
         try await type("budget", in: window)
-        try await until { window.hits.count == 1 }
+        try await until { window.hits.count == 1 && window.textTicket == 0 }
         try await type("", in: window)
         XCTAssertEqual(window.hits, [])
         XCTAssertEqual(window.table.numberOfRows, 0)
         XCTAssertEqual(window.textTicket, 0)
         try await until { window.panel.frame.height == Metric.field }
+
+        try await type("budget", in: window)
+        try await until { window.hits.count == 1 && window.textTicket == 0 }
+        XCTAssertNil(window.status)
+    }
+
+    func testLinesFollowAFileEditedWhileHidden() async throws {
+        try write("the budget", at: "notes/plan.txt")
+        let window = try await opened(access: true, textFolders: [root.path])
+        window.show()
+        defer { window.hide() }
+        try await type("budget", in: window)
+        try await until { window.hits.map(\.line) == [1] && window.textTicket == 0 }
+        window.hide()
+        try write("intro\nthe budget", at: "notes/plan.txt")
+        window.show()
+        try await until { window.hits.map(\.line) == [2] && window.textTicket == 0 }
+        XCTAssertEqual(window.table.selectedRow, 1)
+    }
+
+    func testAWordNoNameHasSaysSearchingFromTheFirstFrame() async throws {
+        try writeMany()
+        let window = try await opened(access: true, textFolders: [root.path])
+        window.show()
+        defer { window.hide() }
+        try await type("zzqx", in: window)
+        try await untilClose { window.answered != 0 }
+        try XCTSkipIf(window.textTicket == 0, "the files were read before the names were seen")
+        XCTAssertEqual(window.status, "Searching inside files…")
+        try await until { window.textTicket == 0 }
+        XCTAssertEqual(window.status, "No Results")
+    }
+
+    func testWithoutATextEngineNamesStillShowAndNoLineIsAwaited() async throws {
+        setenv("TELESCOPE_STAND_IN", "1000", 1)
+        defer { unsetenv("TELESCOPE_STAND_IN") }
+        let window = try await opened(access: true, textFolders: [root.path])
+        window.show()
+        defer { window.hide() }
+        try await type("zzqx", in: window)
+        try await until { window.answered != 0 }
+        XCTAssertEqual(window.textTicket, 0)
+        XCTAssertEqual(window.status, "No Results", "never stuck on Searching inside files…")
+        try await type("zzq", in: window)
+        try await until { window.answered != 0 }
+        XCTAssertEqual(window.textTicket, 0)
+    }
+
+    func testFoldersAddedInTheHealthViewAreSearchedFromTheWindow() async throws {
+        try write("the budget", at: "notes/plan.txt")
+        let window = try await opened(access: true)
+        window.showHealth(nil)
+        let health = try XCTUnwrap(window.health)
+        stage.chosen = [root]
+        health.addFolders()
+        health.hide()
+        window.show()
+        defer { window.hide() }
+        try await type("budget", in: window)
+        try await until { window.hits.count == 1 }
     }
 
     func testNothingFoundAnywhereSaysNoResultsOnceTheFilesAreRead() async throws {
@@ -2279,7 +2367,9 @@ final class SearchPanelTests: XCTestCase {
         try write("the budget", at: "notes/plan.txt")
         try write("the budget", at: "other/plan.txt")
         let notes = realRoot.appendingPathComponent("notes").path
-        let window = try await opened(access: true, textFolders: [realRoot.path], finder: { .folder(notes) })
+        // Chosen through /var, while Finder and the list name /private/var.
+        XCTAssertNotEqual(root.path, realRoot.path)
+        let window = try await opened(access: true, textFolders: [root.path], finder: { .folder(notes) })
         window.toggleInFinderFolder()
         try await until { window.shown }
         defer { window.hide() }
@@ -2299,11 +2389,11 @@ final class SearchPanelTests: XCTestCase {
         down(window)
         XCTAssertEqual(window.table.selectedRow, 2)
 
-        try write("x", at: "notes/budget b.txt")
+        try write("budget again", at: "notes/budget b.txt")
         try await until { window.rows.count == 2 }
-        XCTAssertEqual(window.hits.count, 1, "the same search keeps its lines")
-        XCTAssertEqual(window.textTicket, 0, "and reads no file again")
-        XCTAssertEqual(window.table.selectedRow, 3)
+        XCTAssertFalse(window.hits.isEmpty, "the same search keeps its lines while it reads them again")
+        try await until { window.hits.count == 2 && window.textTicket == 0 }
+        XCTAssertEqual(window.table.selectedRow, 3 + window.hits.firstIndex { $0.path.hasSuffix("/plan.txt") }!)
         XCTAssertEqual(window.selected?.name, "plan.txt")
         XCTAssertEqual(window.header, 2)
         try await settled(window)
@@ -2338,6 +2428,47 @@ final class SearchPanelTests: XCTestCase {
         cell.show(Row(name: "q3 budget", folder: "/notes", isFolder: false), icon: icon)
         let plain = cell.name.attributedStringValue.attribute(.font, at: 4, effectiveRange: nil) as? NSFont
         XCTAssertFalse(plain?.fontDescriptor.symbolicTraits.contains(.bold) ?? true, "no bold left from the line")
+    }
+
+    func testAMatchPastTheRowsEndIsBroughtIntoView() {
+        let cell = ResultCell()
+        let text = String(repeating: "lorem ipsum ", count: 12) + "naïve budget" + String(repeating: " dolor", count: 6)
+        XCTAssertLessThan(text.utf8.count, 200, "the core sends a line this short whole")
+        let at = (text as NSString).range(of: "budget")
+        cell.show(TextHit(path: "/notes/plan.txt", text: text, match: at, line: 1), icon: NSImage())
+        let shown = cell.name.attributedStringValue
+        XCTAssertTrue(shown.string.hasPrefix("…"))
+        XCTAssertTrue(shown.string.hasSuffix(" dolor"), "the end is kept; the label cuts it if it must")
+        var bold = NSRange()
+        let font = shown.attribute(.font, at: (shown.string as NSString).range(of: "budget").location, effectiveRange: &bold)
+        XCTAssertEqual((shown.string as NSString).substring(with: bold), "budget")
+        XCTAssertTrue((font as? NSFont)?.fontDescriptor.symbolicTraits.contains(.bold) ?? false)
+        let upToMatch = shown.attributedSubstring(from: NSRange(location: 0, length: NSMaxRange(bold)))
+        XCTAssertLessThan(upToMatch.size().width, cell.name.frame.width, "the match shows")
+        XCTAssertTrue(shown.string.dropFirst().hasPrefix("ipsum ") || shown.string.dropFirst().hasPrefix("lorem "), "cut between words")
+
+        let short = TextHit(path: "/notes/plan.txt", text: "q3 budget", match: NSRange(location: 3, length: 6), line: 2)
+        cell.show(short, icon: NSImage())
+        XCTAssertEqual(cell.name.stringValue, "q3 budget", "a line that fits is shown whole")
+
+        let wrong = TextHit(path: "/notes/plan.txt", text: "q3", match: NSRange(location: 3, length: 6), line: 3)
+        cell.show(wrong, icon: NSImage())
+        XCTAssertEqual(cell.name.stringValue, "q3", "a match past the line's end is ignored")
+        let font2 = cell.name.attributedStringValue.attribute(.font, at: 0, effectiveRange: nil) as? NSFont
+        XCTAssertFalse(font2?.fontDescriptor.symbolicTraits.contains(.bold) ?? true)
+    }
+
+    /// Enough files without the words the tests look for that reading them takes a while.
+    private func writeMany() throws {
+        let filler = String(repeating: "nothing to see in this line\n", count: 400)
+        for at in 0..<1500 { try write(filler, at: "filler/\(at % 30)/f\(at).txt") }
+    }
+
+    /// Polls every millisecond for a moment that may pass between two 10 ms polls; skips the test
+    /// when the moment passed unseen.
+    private func untilClose(_ done: () -> Bool) async throws {
+        for _ in 0..<5000 where !done() { try await Task.sleep(for: .milliseconds(1)) }
+        try XCTSkipUnless(done(), "the moment passed before it was seen")
     }
 
     private func write(_ text: String, at path: String) throws {

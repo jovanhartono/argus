@@ -75,10 +75,22 @@ final class HatchTextTests: XCTestCase {
     func testACancelledSearchHandsNothingOverAndTheNextOneRuns() async throws {
         let cancelled = hatch.searchText("budget", in: [root.path])
         hatch.cancelText()
-        try await Task.sleep(for: .milliseconds(200))
         XCTAssertNil(hatch.takeText(cancelled))
-        let (hits, _) = try await found("rocket", in: [root.path])
-        XCTAssertEqual(hits.count, 1)
+        let (hits, end) = try await found("rocket", in: [root.path])
+        XCTAssertEqual(hits.map(\.text), ["🚀 Budget rocket"], "no line of the stopped search comes with it")
+        XCTAssertEqual(end.filesSearched, 1)
+    }
+
+    func testALongLineIsCutAroundTheMatchWithItsPlaceCountedAsAppKitCounts() async throws {
+        let before = String(repeating: "é ", count: 150)
+        let line = before + "budget" + String(repeating: " ✓", count: 40)
+        try line.write(to: notes.appendingPathComponent("long.txt"), atomically: true, encoding: .utf8)
+        let (hits, _) = try await found("budget", in: [notes.path])
+        let hit = try XCTUnwrap(hits.first { $0.path.hasSuffix("/long.txt") })
+        XCTAssertLessThanOrEqual(hit.text.utf8.count, 200)
+        XCTAssertLessThan(hit.text.utf16.count, line.utf16.count, "cut")
+        XCTAssertEqual((hit.text as NSString).substring(with: hit.match), "budget")
+        XCTAssertGreaterThan(hit.match.location, 0, "a little of what comes before stays")
     }
 
     private func found(_ query: String, in folders: [String]) async throws -> ([TextHit], TextBatch) {

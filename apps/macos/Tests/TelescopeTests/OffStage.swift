@@ -72,9 +72,16 @@ final class OffStage: Stage {
     /// What the open panel answers; the test sets it before the click.
     var chosen: [URL] = []
     private(set) var choosing = 0
+    private(set) weak var sheetOn: NSWindow?
+    private(set) var handedBack = 0
 
-    func chooseFolders(_ done: @escaping @MainActor ([URL]) -> Void) {
+    func chooseFolders(on window: NSWindow, _ done: @escaping @MainActor ([URL]) -> Void) {
         choosing += 1
+        sheetOn = window
         done(chosen)
+    }
+
+    func handBack() {
+        handedBack += 1
     }
 }

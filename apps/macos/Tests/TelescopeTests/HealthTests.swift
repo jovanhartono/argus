@@ -252,8 +252,10 @@ final class HealthWindowTests: XCTestCase {
         window.show()
         defer { window.hide() }
         stage.chosen = [URL(fileURLWithPath: home + "/notes"), URL(fileURLWithPath: "/Volumes/Work")]
+        stage.key = nil
         window.addFolders()
         XCTAssertEqual(stage.choosing, 1)
+        XCTAssertTrue(stage.sheetOn === window.panel, "the open panel hangs from this window, never behind it")
         XCTAssertEqual(folders.paths, [home + "/notes", "/Volumes/Work"])
         XCTAssertEqual(window.folderList.numberOfRows, 2)
         let first = window.folderList.view(atColumn: 0, row: 0, makeIfNecessary: true) as? NSTextField
@@ -283,6 +285,18 @@ final class HealthWindowTests: XCTestCase {
         held.answer([URL(fileURLWithPath: "/tmp/notes")])
         XCTAssertFalse(holding.choosing)
         XCTAssertEqual(folders.paths, ["/tmp/notes"])
+        holding.windowDidResignKey(Notification(name: NSWindow.didResignKeyNotification))
+        XCTAssertFalse(holding.shown, "with the open panel gone, a click in another app hides it again")
+    }
+
+    func testHidingHandsTheKeysBack() {
+        let window = window()
+        window.show()
+        XCTAssertEqual(stage.handedBack, 0)
+        window.hide()
+        XCTAssertEqual(stage.handedBack, 1)
+        window.hide()
+        XCTAssertEqual(stage.handedBack, 1, "only when it was showing")
     }
 
     func testRemoveTakesTheSelectedFolders() {
@@ -316,7 +330,8 @@ private final class HeldStage: Stage {
     func reloadPreview() {}
     func open(_ url: URL) {}
     func showInFinder(_ url: URL) {}
-    func chooseFolders(_ done: @escaping @MainActor ([URL]) -> Void) { self.done = done }
+    func chooseFolders(on window: NSWindow, _ done: @escaping @MainActor ([URL]) -> Void) { self.done = done }
+    func handBack() {}
     func answer(_ urls: [URL]) { done?(urls) }
 }
 
@@ -350,5 +365,20 @@ final class TextFoldersTests: XCTestCase {
         XCTAssertEqual(folders.reached(within: "/Users/me/downloads"), [])
         XCTAssertEqual(folders.reached(within: "/Volumes/Work/plans"), ["/Volumes/Work/plans"])
         XCTAssertEqual(folders.reached(within: "/"), folders.paths)
+    }
+
+    func testAFolderChosenThroughALinkIsKeptAtItsRealPlace() throws {
+        let home = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let notes = home.appendingPathComponent("notes")
+        try FileManager.default.createDirectory(at: notes, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: home) }
+        let link = home.appendingPathComponent("link")
+        try FileManager.default.createSymbolicLink(at: link, withDestinationURL: notes)
+        let real = String(cString: realpath(notes.path, nil))
+        XCTAssertTrue(notes.path.hasPrefix("/var/"), "the temporary folder is reached through /var")
+        let folders = TextFolders()
+        folders.add([notes.path, link.path])
+        XCTAssertEqual(folders.paths, [real], "both name the same folder")
+        XCTAssertEqual(folders.reached(within: real + "/2026"), [real + "/2026"])
     }
 }

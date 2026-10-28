@@ -14,9 +14,10 @@ final class TextFolders {
         paths = defaults?.stringArray(forKey: Self.key) ?? []
     }
 
-    /// Each folder once, in the order added.
+    /// Each folder once, in the order added. Kept as the list spells it, links followed, so a
+    /// folder Finder shows as /private/var/… is found inside one chosen as /var/….
     func add(_ folders: [String]) {
-        for folder in folders where !paths.contains(folder) { paths.append(folder) }
+        for folder in folders.map(Self.real) where !paths.contains(folder) { paths.append(folder) }
         defaults?.set(paths, forKey: Self.key)
     }
 
@@ -34,9 +35,15 @@ final class TextFolders {
             return folder.isInside(scope) ? folder : nil
         }
     }
+
+    /// Foundation's own resolving turns /private/var back into /var, so it is asked of macOS.
+    private static func real(_ path: String) -> String {
+        guard let resolved = realpath(path, nil) else { return path }
+        defer { free(resolved) }
+        return String(cString: resolved)
+    }
 }
 
-/// A text search: what was typed, and the folders it reads.
 struct TextAsk: Equatable {
     let query: String
     let folders: [String]

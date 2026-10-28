@@ -8,8 +8,8 @@ final class ResultCell: NSTableCellView {
     let icon = NSImageView(frame: NSRect(x: 6, y: 8, width: 32, height: 32))
     let name = NSTextField(labelWithString: "")
     let folder = NSTextField(labelWithString: "")
-    /// The line shown, so its colours follow the selection.
     private(set) var hit: TextHit?
+    private var shown = ("", NSRange())
     private(set) var isHeader = false
 
     init() {
@@ -44,13 +44,13 @@ final class ResultCell: NSTableCellView {
         guard found != hit else { return }
         hit = found
         name.lineBreakMode = .byTruncatingTail
+        shown = Self.excerpt(found.text, match: found.match, width: name.frame.width, font: Self.bold)
         paint()
         let file = found.file
         folder.stringValue = "\(file.name), line \(found.line) · \((file.folder as NSString).abbreviatingWithTildeInPath)"
         if icon.image !== image { icon.image = image }
     }
 
-    /// The title above the lines found inside files, in a shorter row.
     func showHeader(_ title: String) {
         guard !isHeader else { return }
         hit = nil
@@ -78,14 +78,33 @@ final class ResultCell: NSTableCellView {
 
     /// An attributed line keeps the colour it was made with, so it is made again on selection.
     private func paint() {
-        guard let hit else { return }
+        guard hit != nil else { return }
+        let (text, match) = shown
         let color = name.textColor ?? .labelColor
         let line = NSMutableAttributedString(
-            string: hit.text, attributes: [.font: NSFont.systemFont(ofSize: NSFont.systemFontSize), .foregroundColor: color])
-        if NSMaxRange(hit.match) <= line.length {
-            line.addAttribute(.font, value: NSFont.boldSystemFont(ofSize: NSFont.systemFontSize), range: hit.match)
+            string: text, attributes: [.font: NSFont.systemFont(ofSize: NSFont.systemFontSize), .foregroundColor: color])
+        if match.length > 0, NSMaxRange(match) <= line.length {
+            line.addAttribute(.font, value: Self.bold, range: match)
         }
         name.attributedStringValue = line
+    }
+
+    private static let bold = NSFont.boldSystemFont(ofSize: NSFont.systemFontSize)
+
+    /// A line up to 200 bytes comes whole, wider than the row; its end is cut off, so a match
+    /// near the end would be too. Then the line starts a few words before the match instead.
+    static func excerpt(_ text: String, match: NSRange, width: CGFloat, font: NSFont) -> (String, NSRange) {
+        let line = text as NSString
+        let lead = 24
+        // Measuring takes about 50 µs a line; this few letters fit in any row.
+        guard NSMaxRange(match) <= line.length, NSMaxRange(match) > lead + 16,
+            line.substring(to: NSMaxRange(match)).size(withAttributes: [.font: font]).width > width
+        else { return (text, match) }
+        var start = line.rangeOfComposedCharacterSequence(at: max(0, match.location - lead)).location
+        let space = line.range(of: " ", range: NSRange(location: start, length: match.location - start))
+        if space.location != NSNotFound { start = NSMaxRange(space) }
+        guard start > 0 else { return (text, match) }
+        return ("…" + line.substring(from: start), NSRange(location: match.location - start + 1, length: match.length))
     }
 
     override var backgroundStyle: NSView.BackgroundStyle {

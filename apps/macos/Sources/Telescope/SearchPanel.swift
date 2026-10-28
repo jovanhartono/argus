@@ -8,7 +8,6 @@ enum Metric {
     static let width: CGFloat = 680
     static let field: CGFloat = 56
     static let row: CGFloat = 48
-    /// The title above the lines found inside files.
     static let header: CGFloat = 28
     static let visibleRows = 8
     static let inset: CGFloat = 8
@@ -132,16 +131,20 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
     private var sentAt: [UInt64: TimeInterval] = [:]
     private(set) var rows: [Row] = []
     let textFolders: TextFolders
-    /// Lines found inside files, listed under the files found by name.
     private(set) var hits: [TextHit] = []
-    /// The text search under way, or 0.
     private(set) var textTicket: UInt64 = 0
-    /// What the lines on screen answer, while that search runs or once it ran to the end.
     private var textAsked: TextAsk?
+    /// The search for those lines ran to the end while the window showed, and no file changed
+    /// since it started. Editing a file's text brings no new list, so each show reads again.
+    private var textWhole = false
+    /// A search run again for the same words leaves the old lines up until its own come, so the
+    /// window doesn't shrink and grow back.
+    private var replacing = false
+    private var filesChangedAt: TimeInterval = 0
     /// When the key behind the text search under way went down; nil for a search run again.
     private var textTypedAt: TimeInterval?
     private var textStartedAt: TimeInterval = 0
-    /// The title's row as the table last heard it, which has its own height.
+    private var textDue = false
     private var shownHeader: Int?
     /// The list changed while the window was hidden, so the results on screen may be old.
     private(set) var stale = false
@@ -219,8 +222,8 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
         // A file saved while the window was hidden shows its new size and date.
         showDetails()
         shown = true
-        if answered == newest { startText(textAsk(), typedAt: nil) }
         place()
+        if answered == newest { startText(textAsk(), typedAt: nil) }
         panel.alphaValue = reduceMotion ? 1 : 0
         stage.bringForward(panel)
         stage.makeKey(panel)
@@ -241,6 +244,7 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
         shown = false
         pending = nil
         stopText()
+        textWhole = false
         closePreview()
         // A word left half-typed when you click away is kept as typed, so searching isn't
         // blocked once you're back.
@@ -471,7 +475,7 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
         if !indexed { return "Getting ready…" }
         if let missing { return missing }
         if answered != 0 && rows.isEmpty && hits.isEmpty {
-            return textTicket == 0 ? "No Results" : "Searching inside files…"
+            return textTicket == 0 && !textDue ? "No Results" : "Searching inside files…"
         }
         return nil
     }
@@ -485,12 +489,10 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
         return detailing ? max(list, Metric.details) : list
     }
 
-    /// The table's rows: the files found by name, then a title and the lines found inside files.
     var listed: Int {
         rows.count + (hits.isEmpty ? 0 : 1 + hits.count)
     }
 
-    /// The title's row, while there are lines to show.
     var header: Int? {
         hits.isEmpty ? nil : rows.count
     }
@@ -500,7 +502,6 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
         return hits.indices.contains(at) ? hits[at] : nil
     }
 
-    /// The top file found by name, or else the first line found inside a file.
     private var top: Int? {
         rows.isEmpty ? (hits.isEmpty ? nil : rows.count + 1) : 0
     }
@@ -577,6 +578,8 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
         case .rebuilt(let count, let took):
             timing.notice("rebuilt \(count) entries in \(took) ms after a change")
             hatch?.watch()
+            filesChangedAt = ProcessInfo.processInfo.systemUptime
+            textWhole = false
             if shown { runAgain() } else { stale = true }
             health?.refresh()
         case .reranked:
@@ -611,7 +614,7 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
             newest = 0
             sentAt = [:]
             rows = []
-            hits = []
+            dropLines()
             answered = 0
             refill()
             follow()
@@ -694,7 +697,7 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
         rerun = 0
         let ask = textAsk()
         // Lines found for what was typed before go with its names.
-        if ask == nil || ask != textAsked { hits = [] }
+        if ask != textAsked { dropLines() }
         rows = fresh
         answered = ticket
         refill()
@@ -706,9 +709,12 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
         // Picking the same row again tells the table nothing, yet it may hold another file now.
         showDetails()
         follow()
-        fit()
         let typed = sentAt.removeValue(forKey: ticket)
         sentAt = sentAt.filter { $0.key > ticket }
+        // Started after the names' first frame, which it would slow by 0.3-0.5 ms; that frame
+        // already says "Searching inside files…", not "No Results".
+        textDue = shown && needsText(ask)
+        fit()
         if let action = pending {
             pending = nil
             action()
@@ -720,6 +726,10 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
         startText(ask, typedAt: typed)
     }
 
+    private func needsText(_ ask: TextAsk?) -> Bool {
+        ask != nil && (ask != textAsked || !textWhole && textTicket == 0)
+    }
+
     /// What a text search for the box would look for, or nil when no chosen folder is reached.
     private func textAsk() -> TextAsk? {
         guard !field.stringValue.isEmpty, !composing else { return nil }
@@ -727,39 +737,68 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
         return folders.isEmpty ? nil : TextAsk(query: field.stringValue, folders: folders)
     }
 
-    /// Starts once the names are drawn, so reading files never holds them up, and only while the
-    /// window shows. Lines already found for the same search stay.
+    /// Only while the window shows. The same words are read again once the last search for them
+    /// was stopped by hiding, failed, or saw a file change; never while one runs, so files that
+    /// keep changing can't keep restarting it.
     private func startText(_ ask: TextAsk?, typedAt typed: TimeInterval?) {
-        guard shown, let ask, ask != textAsked, let hatch else { return }
-        if !hits.isEmpty {
-            hits = []
-            refill()
+        textDue = false
+        guard shown, let hatch else { return }
+        if ask != textAsked {
+            let had = !hits.isEmpty
+            dropLines()
+            if had { refill() }
         }
+        guard let ask, needsText(ask) else { return fit() }
+        replacing = !hits.isEmpty
         textAsked = ask
         textTypedAt = typed
         textStartedAt = ProcessInfo.processInfo.systemUptime
         textTicket = hatch.searchText(ask.query, in: ask.folders)
-        if textTicket == 0 { textAsked = nil }
+        if textTicket == 0 {
+            textAsked = nil
+            replacing = false
+        }
         fit()
+    }
+
+    private func dropLines() {
+        hits = []
+        textAsked = nil
+        textWhole = false
+        replacing = false
     }
 
     private func stopText() {
         guard textTicket != 0 else { return }
         hatch?.cancelText()
         textTicket = 0
-        textAsked = nil
     }
 
     private func takeText(_ ticket: UInt64) {
         guard let batch = hatch?.takeText(ticket) else { return }
+        let replaced = replacing && (!batch.hits.isEmpty || batch.done)
+        let picked = replaced ? hit(at: table.selectedRow) : nil
+        if replaced {
+            replacing = false
+            hits = []
+        }
         let first = hits.isEmpty && !batch.hits.isEmpty
-        if !batch.hits.isEmpty {
+        if replaced || !batch.hits.isEmpty {
             hits += batch.hits
             refill()
-            if table.selectedRow < 0, let top { select(top) }
+            if let picked, let at = hits.firstIndex(where: { $0.path == picked.path && $0.line == picked.line }) {
+                select(rows.count + 1 + at)
+            } else if table.selectedRow < 0, let top {
+                select(top)
+            }
+            if replaced {
+                showDetails()
+                follow()
+            }
         }
         if batch.done {
             textTicket = 0
+            textWhole = !batch.failed && filesChangedAt < textStartedAt
             if batch.failed { failures.error("a text search stopped early") }
             let took = ms(since: textStartedAt)
             timing.notice(
@@ -794,7 +833,6 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
         let pressed = pressedAt()
         let before = table.selectedRow
         var next = min(max(before + step, 0), listed - 1)
-        // The title above the lines is stepped over.
         if next == header { next = (0..<listed).contains(next + step) ? next + step : before }
         guard next >= 0 else { return }
         select(next)
@@ -1007,6 +1045,8 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
     /// reloadData throws every row away and builds it again, most of the wait after a keystroke.
     private func refill() {
         table.noteNumberOfRowsChanged()
+        // The table keeps the old heights through noteNumberOfRowsChanged, so the title's old
+        // row would stay short.
         if shownHeader != header {
             let moved = IndexSet([shownHeader, header].compactMap { $0 }.filter { $0 < listed })
             shownHeader = header

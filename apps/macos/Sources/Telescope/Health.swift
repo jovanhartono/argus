@@ -95,7 +95,6 @@ final class HealthWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, NST
     let rebuild = KeyButton(title: "Rebuild Index", target: nil, action: nil)
     let grid = NSGridView()
     let folderList = NSTableView()
-    /// Add and remove, under the list, as in System Settings' own lists.
     let folderButtons = NSSegmentedControl(
         images: [NSImage(named: NSImage.addTemplateName)!, NSImage(named: NSImage.removeTemplateName)!],
         trackingMode: .momentary, target: nil, action: nil)
@@ -181,7 +180,6 @@ final class HealthWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, NST
         panel.center()
     }
 
-    /// The list, its add and remove buttons, and a line on what it is for.
     private func folderBox() -> NSView {
         let column = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("folder"))
         column.resizingMask = .autoresizingMask
@@ -226,7 +224,7 @@ final class HealthWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, NST
 
     func addFolders() {
         choosing = true
-        stage.chooseFolders { [weak self] urls in
+        stage.chooseFolders(on: panel) { [weak self] urls in
             guard let self else { return }
             choosing = false
             folders.add(urls.map(\.path))
@@ -277,6 +275,7 @@ final class HealthWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, NST
         ticking?.invalidate()
         ticking = nil
         stage.putAway(panel)
+        stage.handBack()
     }
 
     /// Reads the core again; does nothing while hidden, so a hidden window costs nothing.

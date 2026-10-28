@@ -192,11 +192,7 @@ final class Hatch {
     /// name never waits for it. Every older text search stops. Returns 0 when it can't start.
     func searchText(_ query: String, in folders: [String]) -> UInt64 {
         var query = query
-        var bytes: [UInt8] = []
-        for folder in folders {
-            bytes += folder.utf8
-            bytes.append(0)
-        }
+        let bytes = Hatch.nulJoined(folders)
         return query.withUTF8 { tl_grep_submit(core, bytes, bytes.count, $0.baseAddress, $0.count) }
     }
 
@@ -225,19 +221,23 @@ final class Hatch {
         return TextBatch(hits: hits, done: out.done, failed: out.failed, filesSearched: out.report.files_searched)
     }
 
-    /// Stops the text search under way; no more lines come for it.
     func cancelText() {
         tl_grep_cancel(core)
     }
 
     /// Reads the apps in `folders` before the next search, so one installed since shows too.
     func readApps(in folders: [String]) {
+        let bytes = Hatch.nulJoined(folders)
+        _ = tl_apps(core, bytes, bytes.count)
+    }
+
+    private static func nulJoined(_ folders: [String]) -> [UInt8] {
         var bytes: [UInt8] = []
         for folder in folders {
             bytes += folder.utf8
             bytes.append(0)
         }
-        _ = tl_apps(core, bytes, bytes.count)
+        return bytes
     }
 
     /// Ranks what you opened often and lately higher, by the opens kept in `file`.
