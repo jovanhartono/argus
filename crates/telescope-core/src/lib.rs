@@ -11,6 +11,7 @@ mod stand_in;
 mod store;
 mod update;
 mod walk;
+mod within;
 
 pub use apps::{AppId, Apps};
 pub use frecency::{Boosts, Frecency, FrecencyError, unix_now};
@@ -23,6 +24,7 @@ pub use stand_in::stand_in;
 pub use store::{OpenError, Opened, Saved, Settings, open_index, open_or_scan, save_index};
 pub use update::Update;
 pub use walk::{Access, Clutter, Scan, home, scan, scan_until};
+pub use within::Within;
 
 #[cfg(test)]
 #[global_allocator]

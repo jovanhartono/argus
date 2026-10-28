@@ -7,7 +7,7 @@ use std::sync::OnceLock;
 use std::time::Instant;
 use telescope_core::{
     Access, Apps, Boosts, Clutter, Frecency, Hit, Ignore, Index, Item, Opened, Searcher, Settings,
-    unix_now,
+    Within, unix_now,
 };
 use telescope_grep::Grep;
 
@@ -32,6 +32,7 @@ as FSEvents reports them, and --save <file> to save the index afterwards
 add --frecency <file> to search, bench and golden to rank files opened often and lately higher,
 by the opens tl open-record kept in it, a list apart from the Mac app's, which writes over its
 own from memory
+add --in <folder> to search and bench to search only inside that folder of the index
 put -- before text that starts with --, like: tl grep ~ -- --all
 
 your own ignore list, ~/.config/telescope/ignore, takes one folder per line
@@ -53,6 +54,7 @@ struct Options {
     changes: Option<PathBuf>,
     save: Option<PathBuf>,
     frecency: Option<PathBuf>,
+    within: Option<PathBuf>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -137,6 +139,7 @@ fn parse(mut args: Vec<OsString>) -> Option<(Command, Options)> {
     let changes = take(&mut args, "--changes")?;
     let save = take(&mut args, "--save")?;
     let frecency = take(&mut args, "--frecency")?;
+    let within = take(&mut args, "--in")?;
     args.extend(after_dashes);
     let command = match args.as_slice() {
         [flag] if flag == "--version" => Command::Version,
@@ -170,6 +173,10 @@ fn parse(mut args: Vec<OsString>) -> Option<(Command, Options)> {
         },
         _ => return None,
     };
+    // `tl grep ~ todo --in ~/work` would quietly grep all of ~.
+    if within.is_some() && !matches!(command, Command::Search(_) | Command::Bench { .. }) {
+        return None;
+    }
     Some((
         command,
         Options {
@@ -178,6 +185,7 @@ fn parse(mut args: Vec<OsString>) -> Option<(Command, Options)> {
             changes,
             save,
             frecency,
+            within,
         },
     ))
 }
@@ -370,19 +378,40 @@ fn rank(index: &Index, apps: &Apps, hits: &[Hit], expected: &Path) -> Option<usi
     })
 }
 
+/// The folder `--in` names, worked out once; `Some(None)` searches the whole index.
+fn within(index: &Index, options: &Options) -> Option<Option<Within>> {
+    let Some(folder) = &options.within else {
+        return Some(None);
+    };
+    let started = Instant::now();
+    // The index holds real paths, as the scan resolved them.
+    let real = std::fs::canonicalize(folder).unwrap_or_else(|_| folder.clone());
+    let Some(within) = Within::folder(index, &real) else {
+        eprintln!("tl: {} is not a folder in the index", folder.display());
+        return None;
+    };
+    println!("inside {}, found in {:.2} ms", real.display(), ms(started));
+    Some(Some(within))
+}
+
 fn search(folder: &Path, options: &Options) -> ExitCode {
     let Some(index) = load(folder, options) else {
         return ExitCode::FAILURE;
     };
     let apps = apps();
     let boosts = boosts(&index, &apps, options);
+    let Some(within) = within(&index, options) else {
+        return ExitCode::FAILURE;
+    };
+    let within = within.as_ref();
     let searcher = Searcher::default();
     eprintln!("type a search and press Enter; Ctrl-D quits");
     for line in std::io::stdin().lock().lines() {
         let Ok(query) = line else { break };
         let started = Instant::now();
+        let ticket = searcher.ticket();
         let hits = searcher
-            .search_with(&index, &apps, &query, searcher.ticket(), 10, &boosts)
+            .search_with(&index, &apps, within, &query, ticket, 10, &boosts)
             .unwrap_or_default();
         println!("{query:?} in {:.1} ms", ms(started));
         for hit in hits {
@@ -506,13 +535,18 @@ fn bench(folder: &Path, options: &Options, query_file: &Path, threads: Option<us
     };
     let apps = apps();
     let boosts = boosts(&index, &apps, options);
+    let Some(within) = within(&index, options) else {
+        return ExitCode::FAILURE;
+    };
+    let within = within.as_ref();
     let searcher = threads.map_or_else(Searcher::default, Searcher::with_threads);
 
     let mut times: Vec<(f64, &str)> = Vec::new();
     for query in &queries {
         for typed in keystrokes(query) {
             let started = Instant::now();
-            searcher.search_with(&index, &apps, typed, searcher.ticket(), 50, &boosts);
+            let ticket = searcher.ticket();
+            searcher.search_with(&index, &apps, within, typed, ticket, 50, &boosts);
             times.push((ms(started), typed));
         }
     }
@@ -548,7 +582,8 @@ fn bench(folder: &Path, options: &Options, query_file: &Path, threads: Option<us
                     let ticket = searcher.ticket();
                     let (searcher, index, apps, boosts) = (&searcher, &index, &apps, &boosts);
                     scope.spawn(move || {
-                        let hits = searcher.search_with(index, apps, query, ticket, 50, boosts);
+                        let hits =
+                            searcher.search_with(index, apps, within, query, ticket, 50, boosts);
                         hits.is_some()
                     })
                 })
@@ -600,8 +635,9 @@ fn golden(folder: &Path, options: &Options, case_file: &Path) -> ExitCode {
 
     let mut in_top_3 = 0;
     for (query, expected) in &cases {
+        let ticket = searcher.ticket();
         let hits = searcher
-            .search_with(&index, &apps, query, searcher.ticket(), 100, &boosts)
+            .search_with(&index, &apps, None, query, ticket, 100, &boosts)
             .unwrap_or_default();
         let rank = rank(&index, &apps, &hits, expected);
         let place = match rank {
@@ -986,6 +1022,7 @@ mod tests {
                 changes: None,
                 save: None,
                 frecency: None,
+                within: None,
             }
         );
         let line = "grep ~ todo --save b.idx --changes c.txt --frecency f";
@@ -998,8 +1035,24 @@ mod tests {
                 changes: Some("c.txt".into()),
                 save: Some("b.idx".into()),
                 frecency: Some("f".into()),
+                within: None,
             }
         );
+        let (found, options) = parse(args("bench ~ --in ~/work q.txt")).unwrap();
+        assert!(matches!(found, Command::Bench { .. }));
+        assert_eq!(options.within, Some("~/work".into()));
+        assert!(parse(args("search ~ --in")).is_none());
+        assert!(parse(args("search ~ --in a --in b")).is_none());
+        for line in [
+            "grep ~ todo --in a",
+            "golden ~ g.tsv --in a",
+            "index ~ --in a",
+            "grep-bench ~ q --in a",
+        ] {
+            assert!(parse(args(line)).is_none(), "{line}");
+        }
+        let (found, _) = parse(args("grep ~ -- --in")).unwrap();
+        assert!(matches!(found, Command::Grep { .. }));
         let (_, options) = parse(args("index ~ --load a.idx --save a.idx")).unwrap();
         assert_eq!(options.load, Some("a.idx".into()));
         assert_eq!(options.save, Some("a.idx".into()));
@@ -1104,6 +1157,7 @@ mod tests {
             changes: changes.map(PathBuf::from),
             save: save.map(PathBuf::from),
             frecency: None,
+            within: None,
         };
         let same = options(Some("i"), None, Some("i"));
         assert!(unchanged_since_opened(&same, true));
