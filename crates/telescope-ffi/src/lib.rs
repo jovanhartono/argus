@@ -21,7 +21,7 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 use telescope_core::{
-    Access, Clutter, Hit, Ignore, Index, Pages, Scope, Searcher, Settings, Ticket, Watch,
+    Access, Apps, Clutter, Hit, Ignore, Index, Pages, Scope, Searcher, Settings, Ticket, Watch,
 };
 use telescope_grep::{Found, Grep, Report};
 
@@ -565,6 +565,8 @@ fn serve(
     done: &Done,
     notify: &Notify,
 ) {
+    // The window has no app rows yet.
+    let apps = Apps::default();
     while let Ok(job) = inbox.recv() {
         let (ticket, query) = match job {
             // Searches sent before this one ran on the old list; the old list is freed here.
@@ -579,7 +581,7 @@ fn serve(
             Job::Search { ticket, query } => (ticket, query),
         };
         // A search replaced by a newer keystroke gives up and is never shown.
-        let Some(hits) = searcher.search(&index, &query, ticket, ROWS) else {
+        let Some(hits) = searcher.search(&index, &apps, &query, ticket, ROWS) else {
             continue;
         };
         // A key pressed just as the search finished: skip rows the window would refuse.
@@ -672,11 +674,14 @@ fn pack(index: &Index, hits: &[Hit]) -> Packed {
         rows: Vec::with_capacity(hits.len()),
         text: String::new(),
     };
-    for hit in hits {
-        let path = index.path(hit.entry);
+    // An app hit would take a row's place yet show nothing; `serve` passes no apps until
+    // TlRow can show one.
+    debug_assert!(hits.iter().all(|hit| hit.entry().is_some()), "{hits:?}");
+    for entry in hits.iter().filter_map(Hit::entry) {
+        let path = index.path(entry);
         let folder = path.parent().unwrap_or(&path).to_string_lossy();
         let name_start = packed.text.len() as u32;
-        packed.text.push_str(index.name(hit.entry));
+        packed.text.push_str(index.name(entry));
         let folder_start = packed.text.len() as u32;
         packed.text.push_str(&folder);
         packed.rows.push(TlRow {
@@ -684,7 +689,7 @@ fn pack(index: &Index, hits: &[Hit]) -> Packed {
             name_len: folder_start - name_start,
             folder_start,
             folder_len: folder.len() as u32,
-            is_folder: index.is_dir(hit.entry),
+            is_folder: index.is_dir(entry),
         });
     }
     packed
@@ -1480,22 +1485,34 @@ mod tests {
         let index = telescope_core::stand_in(2_000);
         let searcher = Searcher::with_threads(1);
         let expected: Vec<_> = searcher
-            .search(&index, "budget", searcher.ticket(), ROWS)
+            .search(&index, &Apps::default(), "budget", searcher.ticket(), ROWS)
             .unwrap()
             .iter()
             .map(|hit| {
-                let path = index.path(hit.entry);
+                let entry = hit.entry().unwrap();
+                let path = index.path(entry);
                 let folder = path.parent().unwrap().to_string_lossy().into_owned();
-                (
-                    index.name(hit.entry).to_owned(),
-                    folder,
-                    index.is_dir(hit.entry),
-                )
+                (index.name(entry).to_owned(), folder, index.is_dir(entry))
             })
             .collect();
         assert_eq!(expected.len(), ROWS);
         assert_eq!(take(&core, ticket), Some(expected));
         assert_eq!(take(&core, ticket), None);
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "App")]
+    fn app_hits_are_refused_until_a_row_can_show_one() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("Budget.app")).unwrap();
+        let apps = Apps::scan_folders(vec![dir.path().to_path_buf()]);
+        let index = telescope_core::stand_in(2_000);
+        let searcher = Searcher::with_threads(1);
+        let hits = searcher
+            .search(&index, &apps, "budget", searcher.ticket(), ROWS)
+            .unwrap();
+        pack(&index, &hits);
     }
 
     #[test]
