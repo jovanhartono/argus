@@ -85,10 +85,14 @@ final class Hatch {
         tl_core_free(core)
     }
 
-    /// Returns the search's ticket at once, or 0 when the core has stopped.
-    func submit(_ query: String) -> UInt64 {
+    /// Returns the search's ticket at once, or 0 when the core has stopped. With `folder`, a full
+    /// path, only what is inside it is found.
+    func submit(_ query: String, in folder: String? = nil) -> UInt64 {
         var query = query
-        return query.withUTF8 { tl_submit(core, $0.baseAddress, $0.count) }
+        var folder = folder ?? ""
+        return query.withUTF8 { text in
+            folder.withUTF8 { tl_submit(core, text.baseAddress, text.count, $0.baseAddress, $0.count) }
+        }
     }
 
     /// The rows for `ticket`, or nil once a newer search exists or they were already taken.

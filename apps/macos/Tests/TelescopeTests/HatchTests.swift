@@ -32,6 +32,39 @@ final class HatchTests: XCTestCase {
         XCTAssertNil(hatch.take(ticket), "rows are handed over once")
     }
 
+    func testASearchInsideAFolderFindsOnlyWhatIsInIt() async throws {
+        let indexed = expectation(description: "indexed")
+        var ready: [UInt64: XCTestExpectation] = [:]
+        let hatch = try XCTUnwrap(
+            Hatch(standIn: 10_000) { event in
+                switch event {
+                case .indexed: indexed.fulfill()
+                case .ready(let ticket): ready[ticket]?.fulfill()
+                case .failed: XCTFail("the core stopped")
+                case .rebuilt: XCTFail("nothing changed")
+                }
+            })
+        await fulfillment(of: [indexed], timeout: 5)
+        func rows(_ query: String, in folder: String?) async throws -> [Row] {
+            let answered = expectation(description: query)
+            let ticket = hatch.submit(query, in: folder)
+            ready[ticket] = answered
+            await fulfillment(of: [answered], timeout: 5)
+            return try XCTUnwrap(hatch.take(ticket))
+        }
+
+        let folders = try await rows("budget", in: nil).filter(\.isFolder)
+        let folder = try XCTUnwrap(folders.first).path
+        let inside = try await rows("re", in: folder)
+        XCTAssertFalse(inside.isEmpty)
+        XCTAssertTrue(inside.allSatisfy { $0.folder == folder || $0.folder.hasPrefix(folder + "/") }, folder)
+        XCTAssertFalse(inside.contains { $0.path == folder }, "the folder itself isn't inside it")
+        let nowhere = try await rows("re", in: "/stand-in/nowhere")
+        XCTAssertEqual(nowhere, [])
+        let unicode = try await rows("re", in: "/stand-in/会議-報告")
+        XCTAssertEqual(unicode, [])
+    }
+
     func testAScannedFolderComesBackAsRows() async throws {
         let files = FileManager.default
         let root = files.temporaryDirectory.appendingPathComponent(UUID().uuidString)
