@@ -2,7 +2,7 @@
 
 A fast, light file and app launcher for macOS and Windows, written in Rust. "Telescope" is a codename.
 
-Status: milestone M2, the daily driver, in progress. It moves the Mac app from made-up names to real files that stay up to date as they change. Its steps are in [docs/m2-daily-driver.html](docs/m2-daily-driver.html). The plan is in [docs/research.html](docs/research.html), and the finished M1 window is in [docs/m1-window.html](docs/m1-window.html).
+Status: milestone M2, the daily driver, in progress. It moves the Mac app from made-up names to real files that stay up to date as they change. Its steps are in [docs/m2-daily-driver.html](docs/m2-daily-driver.html). Most of M3, beats Spotlight, and all of M4, text search, were built early while M2's release and 7-day run are pending: [docs/m3-beats-spotlight.html](docs/m3-beats-spotlight.html) and [docs/m4-text-search.html](docs/m4-text-search.html). The plan is in [docs/research.html](docs/research.html), and the finished M1 window is in [docs/m1-window.html](docs/m1-window.html).
 
 ## Build
 
