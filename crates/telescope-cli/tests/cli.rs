@@ -391,6 +391,109 @@ fn open_record_counts_a_link_itself_and_resolves_its_folder() {
     assert!(first(&out), "{out}");
 }
 
+#[test]
+fn a_volume_joins_the_index_and_survives_saving() {
+    let dir = folder();
+    let drive = tempfile::tempdir().unwrap();
+    fs::create_dir(drive.path().join("photos")).unwrap();
+    fs::write(drive.path().join("photos/beach.jpg"), "").unwrap();
+    let (files, saved) = (path(dir.path(), "files"), path(dir.path(), "files.idx"));
+    let volume = drive.path().to_str().unwrap();
+    let output = tl(&[
+        "index", &files, "--all", "--volume", volume, "--save", &saved,
+    ]);
+    let out = stdout(&output);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(out.contains(": 3 entries, +"), "{out}");
+    // The folder and a.txt, then the drive, photos and the beach.
+    assert!(out.contains("5 entries (3 folders)"), "{out}");
+    // Opened again, its paths are whole, built up from the drive's own entry.
+    let output = tl_with_input(&["search", &files, "--all", "--load", &saved], "beach\n");
+    let out = stdout(&output);
+    assert!(out.contains("5 entries (3 folders)"), "{out}");
+    let beach = fs::canonicalize(drive.path())
+        .unwrap()
+        .join("photos/beach.jpg");
+    assert!(out.contains(&format!("  {}\n", beach.display())), "{out}");
+
+    // Opened with the drive already in it, as when trying more changes on a saved index.
+    let output = tl(&[
+        "index", &files, "--all", "--load", &saved, "--volume", volume,
+    ]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(stdout(&output).contains("already in the index"));
+    assert!(stdout(&output).contains("5 entries (3 folders)"));
+
+    let output = tl(&["index", &files, "--all", "--volume", &files]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        stderr(&output).contains("cannot add") && stderr(&output).contains("exists"),
+        "{}",
+        stderr(&output)
+    );
+}
+
+#[test]
+fn changes_on_a_volume_are_read_again_and_not_skipped() {
+    let dir = folder();
+    let drive = tempfile::tempdir().unwrap();
+    let real = fs::canonicalize(drive.path()).unwrap();
+    fs::create_dir(real.join("photos")).unwrap();
+    let changes = path(dir.path(), "changes.txt");
+    fs::write(&changes, format!("{}\n", real.join("photos").display())).unwrap();
+    let output = tl(&[
+        "index",
+        &path(dir.path(), "files"),
+        "--all",
+        "--volume",
+        real.to_str().unwrap(),
+        "--changes",
+        &changes,
+    ]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    let out = stdout(&output);
+    assert!(out.contains("read 1 changed folders again"), "{out}");
+    assert!(!stderr(&output).contains("skipped"), "{}", stderr(&output));
+}
+
+#[cfg(unix)]
+#[test]
+fn folders_on_a_volume_not_fully_read_are_counted() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = folder();
+    let drive = tempfile::tempdir().unwrap();
+    let locked = drive.path().join("locked");
+    fs::create_dir(&locked).unwrap();
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+    let files = path(dir.path(), "files");
+    let output = tl(&[
+        "index",
+        &files,
+        "--all",
+        "--volume",
+        drive.path().to_str().unwrap(),
+    ]);
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(stdout(&output).contains("folders not fully read: 1"));
+}
+
+fn tl_with_input(args: &[&str], input: &str) -> Output {
+    use std::io::Write;
+    use std::process::Stdio;
+    let mut child = Command::new(env!("CARGO_BIN_EXE_tl"))
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    stdin.write_all(input.as_bytes()).unwrap();
+    drop(stdin);
+    child.wait_with_output().unwrap()
+}
+
 /// Rust ignores SIGPIPE, so without restoring it every print to a closed pipe panics.
 #[cfg(unix)]
 #[test]

@@ -6,6 +6,8 @@
 //! that ticket's rows are ready; the window then copies them out with `tl_take`.
 //! When files change, `tl_changed` asks a second thread to build the list again; the new list
 //! reaches the worker through the same queue as the searches, so each search sees one whole list.
+//! `tl_volume_added` and `tl_volume_removed` go through that thread too, adding a drive to a
+//! copy of the newest list or taking one out, without reading the home folder again.
 //! A text search, inside files, runs the same way on a worker of its own, started with the
 //! first one, so a name search never waits behind it: `tl_grep_submit`, then `tl_grep_take`
 //! for each batch of lines found.
@@ -15,14 +17,14 @@ use std::ffi::{CString, c_void};
 use std::io;
 use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 use telescope_core::{
-    Access, Apps, Boosts, Clutter, Frecency, Hit, Ignore, Index, Pages, Scope, Searcher, Settings,
-    Ticket, Watch, Within, unix_now,
+    Access, Apps, Boosts, Clutter, Frecency, Hit, Ignore, Index, Pages, Refusal, Scope, Searcher,
+    Settings, Ticket, Watch, Within, unix_now,
 };
 use telescope_grep::{Found, Grep, Report};
 
@@ -30,7 +32,7 @@ use telescope_grep::{Found, Grep, Report};
 static PAGES: Pages = Pages;
 
 /// Raise this with any change below, so a window built against an older header refuses to start.
-pub const TL_ABI_VERSION: u32 = 7;
+pub const TL_ABI_VERSION: u32 = 8;
 
 pub const TL_OK: u32 = 0;
 /// No rows for that ticket: not ready yet, already taken, or a newer search replaced them.
@@ -164,6 +166,8 @@ pub struct TlCore {
     worker: Option<JoinHandle<()>>,
     /// None only for a core a test built without threads.
     text: Option<Text>,
+    /// Which volumes join the list, by their real paths; none for made-up names.
+    judge: Option<Judge>,
 }
 
 /// The files opened from the window, for ranking, and the file they are kept in, if any.
@@ -180,6 +184,8 @@ impl TlCore {
         }
     }
 }
+
+type Judge = fn(&Path) -> Result<PathBuf, Refusal>;
 
 /// What text search needs. Its threads start with the first search, so a window that never
 /// searches inside files never pays for them.
@@ -256,13 +262,27 @@ struct Plan {
     everything_listed: bool,
     /// The mark of the switch that `everything` waits on, if any.
     switched: Option<u64>,
+    /// The volumes the window said were mounted, by their real paths. Each list reads them
+    /// once Full Disk Access is on.
+    volumes: Vec<PathBuf>,
+    /// Full Disk Access is on, so lists read `volumes`. Kept here rather than read beside
+    /// the plan, so a volume added just as access is granted is never left out.
+    granted: bool,
+    /// `volumes` changed, or folders on them did, since the newest list, or the one being
+    /// built, was started.
+    volumes_changed: bool,
+    /// Folders on the newest list's volumes that changed, read again in place of a new list.
+    volume_changes: Vec<PathBuf>,
+    /// The window's mark on the first volume change still waiting.
+    mounted: Option<u64>,
 }
 
 impl Plan {
-    fn new(everything: bool) -> Self {
+    fn new(everything: bool, granted: bool) -> Self {
         Self {
             everything,
             everything_listed: everything,
+            granted,
             ..Self::default()
         }
     }
@@ -281,6 +301,86 @@ impl Plan {
         } else {
             Clutter::Skip
         }
+    }
+
+    /// The volumes for the list about to be built, and the folders on them to read again,
+    /// which brings any volume change waiting.
+    fn volumes(&mut self) -> (Vec<PathBuf>, Vec<PathBuf>) {
+        self.volumes_changed = false;
+        let volumes = if self.granted {
+            self.volumes.clone()
+        } else {
+            Vec::new()
+        };
+        (volumes, std::mem::take(&mut self.volume_changes))
+    }
+
+    fn change_volumes(&mut self, mark: u64) {
+        self.volumes_changed = true;
+        self.mounted = Some(self.mounted.map_or(mark, |mounted| mounted.min(mark)));
+    }
+
+    /// Folders on the newest list's volumes to read again, unless a new list will anyway.
+    fn reread(&mut self, paths: Vec<PathBuf>, mark: u64) {
+        if self.wanted {
+            self.want(mark);
+            return;
+        }
+        for path in paths {
+            if !self.volume_changes.contains(&path) {
+                self.volume_changes.push(path);
+            }
+        }
+        self.change_volumes(mark);
+    }
+
+    /// Forgets a volume that could not be read, so the window may add it again. Returns
+    /// whether it was still wanted.
+    fn forget(&mut self, volume: &Path) -> bool {
+        let at = self.volumes.iter().position(|held| held == volume);
+        at.map(|at| self.volumes.remove(at)).is_some()
+    }
+}
+
+/// What one turn of the rebuild thread builds.
+struct Pass {
+    /// Full Disk Access came on since the last turn.
+    full_disk: bool,
+    /// Whether the new list keeps clutter, or `None` when only volumes changed, which
+    /// leaves the newest list's root as it is.
+    clutter: Option<Clutter>,
+    /// The mark of the first change the pass reads.
+    mark: u64,
+    volumes: Vec<PathBuf>,
+    /// Folders on the newest list's volumes to read again; a whole new list reads them all.
+    changes: Vec<PathBuf>,
+}
+
+/// What the newest list misses of the folders that changed.
+#[derive(Debug, PartialEq)]
+enum Missed {
+    Nothing,
+    /// Only folders on its volumes, read again in place.
+    OnVolumes(Vec<PathBuf>),
+    /// Enough to build it again.
+    More,
+}
+
+fn missed<P: AsRef<Path>>(scope: &Scope, index: &Index, paths: &[P]) -> Missed {
+    let mut on_volumes = Vec::new();
+    for path in paths.iter().map(AsRef::as_ref) {
+        if scope.holds(path, index) {
+            continue;
+        }
+        if !index.volumes().any(|volume| path.starts_with(volume)) {
+            return Missed::More;
+        }
+        on_volumes.push(path.to_path_buf());
+    }
+    if on_volumes.is_empty() {
+        Missed::Nothing
+    } else {
+        Missed::OnVolumes(on_volumes)
     }
 }
 
@@ -303,6 +403,8 @@ struct Live {
     /// Taken around each read or save of the opens' file, so it never goes back to an older
     /// list, while searches never wait for the disk.
     saves: Mutex<()>,
+    /// Counts volumes taken out, so a scan of one stops at once and never holds up its eject.
+    ejected: AtomicU64,
 }
 
 impl Default for Live {
@@ -315,6 +417,7 @@ impl Default for Live {
             watched: Mutex::default(),
             opens: Mutex::default(),
             saves: Mutex::default(),
+            ejected: AtomicU64::default(),
         }
     }
 }
@@ -344,9 +447,38 @@ impl Live {
         index
     }
 
-    fn misses_a_change_in(&self, paths: &[PathBuf]) -> bool {
+    fn misses(&self, paths: &[PathBuf]) -> Missed {
         let newest = self.newest.lock().unwrap().clone();
-        newest.is_some_and(|(scope, index)| paths.iter().any(|path| !scope.holds(path, &index)))
+        newest.map_or(Missed::Nothing, |(scope, index)| {
+            missed(&scope, &index, paths)
+        })
+    }
+
+    /// Adds each of `volumes` to `index`. One taken out meanwhile stops its scan and is left
+    /// out; one that cannot be read is forgotten, so the window may add it again, and told
+    /// as a note. Returns whether any joined.
+    fn add_volumes(
+        &self,
+        settings: &Settings,
+        index: &mut Index,
+        volumes: &[PathBuf],
+        notify: &Notify,
+    ) -> bool {
+        let ejected = self.ejected.load(Ordering::Relaxed);
+        let stop = || self.ejected.load(Ordering::Relaxed) != ejected;
+        let mut joined = false;
+        for volume in volumes {
+            match settings.add_volume_until(index, volume, &stop) {
+                Ok(_) => joined = true,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(error) => {
+                    if self.plan.lock().unwrap().forget(volume) {
+                        notify.note(&format!("{} could not be read: {error}", volume.display()));
+                    }
+                }
+            }
+        }
+        joined
     }
 }
 
@@ -358,6 +490,8 @@ enum Source {
         access: Access,
         /// Problems with the ignore list already told, so a rebuild doesn't repeat them.
         told: Vec<String>,
+        /// What the newest list was built with, so a volume joins it by the same rules.
+        settings: Option<Box<Settings>>,
     },
 }
 
@@ -367,13 +501,25 @@ struct Built {
 }
 
 impl Source {
-    fn build(&mut self, clutter: Clutter, notify: &Notify) -> io::Result<Built> {
-        let (root, access, told) = match self {
+    /// Scans the root, then adds each of `volumes`, as `Live::add_volumes` does.
+    fn build(
+        &mut self,
+        clutter: Clutter,
+        volumes: &[PathBuf],
+        live: &Live,
+        notify: &Notify,
+    ) -> io::Result<Built> {
+        let (root, access, told, last) = match self {
             Self::StandIn(count) => {
                 let index = telescope_core::stand_in(*count);
                 return Ok(Built { index, scope: None });
             }
-            Self::Home { root, access, told } => (root, *access, told),
+            Self::Home {
+                root,
+                access,
+                told,
+                settings,
+            } => (root, *access, told, settings),
         };
         // The folder being scanned, not $HOME, which a launch from a terminal may change.
         let home = std::fs::canonicalize(root)?;
@@ -393,10 +539,58 @@ impl Source {
             }
         };
         let settings = Settings::new(&home, &home, clutter, ignore, access);
-        let index = settings.scan()?.index;
-        Ok(Built {
+        let mut index = settings.scan()?.index;
+        live.add_volumes(&settings, &mut index, volumes, notify);
+        let scope = Some(settings.scope(&index));
+        *last = Some(Box::new(settings));
+        Ok(Built { index, scope })
+    }
+
+    /// The newest list with the volumes added or taken out to match `volumes` and the
+    /// folders in `changes` read again, its root left as it is, or `None` when that changes
+    /// nothing. The newest list stays in use meanwhile, so this works on a copy: the memory
+    /// a rebuild takes, without reading the home folder.
+    fn graft(
+        &self,
+        volumes: &[PathBuf],
+        changes: &[PathBuf],
+        live: &Live,
+        notify: &Notify,
+    ) -> Option<Built> {
+        let Self::Home {
+            settings: Some(settings),
+            ..
+        } = self
+        else {
+            return None;
+        };
+        let newest = live.newest.lock().unwrap().clone()?.1;
+        let gone: Vec<PathBuf> = newest
+            .volumes()
+            .filter(|&held| !volumes.iter().any(|volume| volume == held))
+            .map(Path::to_path_buf)
+            .collect();
+        let new: Vec<PathBuf> = volumes
+            .iter()
+            .filter(|volume| !newest.volumes().any(|held| held == volume.as_path()))
+            .cloned()
+            .collect();
+        if gone.is_empty() && new.is_empty() && changes.is_empty() {
+            return None;
+        }
+        let mut index = Index::clone(&newest);
+        drop(newest);
+        for volume in &gone {
+            settings.remove_volume(&mut index, volume);
+        }
+        // Before the new volumes join, which are read whole.
+        settings.update(&mut index, changes);
+        let joined = live.add_volumes(settings, &mut index, &new, notify);
+        // A change read again is promised a new list, even one that lists the same.
+        let changed = joined || !gone.is_empty() || !changes.is_empty();
+        changed.then(|| Built {
+            scope: Some(settings.scope(&index)),
             index,
-            scope: Some(settings.scope()),
         })
     }
 }
@@ -467,8 +661,12 @@ pub unsafe extern "C" fn tl_core_new(
             0 => Access::Limited,
             _ => Access::Full,
         };
-        let told = Vec::new();
-        let source = Source::Home { root, access, told };
+        let source = Source::Home {
+            root,
+            access,
+            told: Vec::new(),
+            settings: None,
+        };
         start(ctx, on_event, source, everything != 0, GAP)
     })
 }
@@ -506,18 +704,21 @@ fn start(
     };
     let searcher = Arc::new(Searcher::default());
     let done = Arc::default();
-    let live = Arc::new(Live {
-        gap,
-        plan: Mutex::new(Plan::new(everything)),
-        ..Live::default()
-    });
     let (jobs, inbox) = mpsc::channel();
     let notify = Notify { ctx, on_event };
-    let (home, full_disk) = match &source {
+    let (home, full_disk, judge) = match &source {
         // Real folders all the same, so no pop-ups before `tl_grant_full_disk`.
-        Source::StandIn(_) => (telescope_core::home(), false),
-        Source::Home { root, access, .. } => (root.clone(), *access == Access::Full),
+        Source::StandIn(_) => (telescope_core::home(), false, None),
+        Source::Home { root, access, .. } => {
+            let judge: Judge = telescope_core::check_volume;
+            (root.clone(), *access == Access::Full, Some(judge))
+        }
     };
+    let live = Arc::new(Live {
+        gap,
+        plan: Mutex::new(Plan::new(everything, full_disk)),
+        ..Live::default()
+    });
     let text = Text {
         home,
         full_disk: AtomicBool::new(full_disk),
@@ -539,6 +740,7 @@ fn start(
         live,
         worker: Some(worker),
         text: Some(text),
+        judge,
     }))
 }
 
@@ -555,9 +757,13 @@ fn work(
 ) {
     let started = Instant::now();
     let first = panic::catch_unwind(AssertUnwindSafe(|| {
-        let clutter = live.plan.lock().unwrap().list();
+        let (clutter, (volumes, _)) = {
+            let mut plan = live.plan.lock().unwrap();
+            plan.mounted = None;
+            (plan.list(), plan.volumes())
+        };
         source
-            .build(clutter, &notify)
+            .build(clutter, &volumes, live, &notify)
             .map(|built| live.publish(built, 0))
     }));
     let index = match first {
@@ -578,16 +784,8 @@ fn work(
         thread::Builder::new()
             .name("rebuild".into())
             .spawn(move || {
-                rebuild_loop(&live, &Wall, started, |full_disk, clutter, mark| {
-                    rebuild(
-                        &mut source,
-                        full_disk,
-                        clutter,
-                        mark,
-                        &live,
-                        &swaps,
-                        &notify,
-                    );
+                rebuild_loop(&live, &Wall, started, |pass| {
+                    rebuild(&mut source, pass, &live, &swaps, &notify);
                 });
             })
             .expect("start the rebuild thread")
@@ -737,20 +935,16 @@ impl Clock for Wall {
 
 /// Calls `rebuild` for each rebuild wanted until the core stops: one at a time, with changes
 /// made meanwhile waiting as one more, each starting at least `live.gap` after the one before.
-/// `last` is when the first list was started. `rebuild` is told when Full Disk Access came on,
-/// whether to keep clutter, and the mark of the first change it reads.
-fn rebuild_loop(
-    live: &Live,
-    clock: &impl Clock,
-    mut last: Instant,
-    mut rebuild: impl FnMut(bool, Clutter, u64),
-) {
+/// `last` is when the first list was started. A turn with only volumes to add or take out,
+/// or folders on them to read again, leaves the root as the newest list has it.
+fn rebuild_loop(live: &Live, clock: &impl Clock, mut last: Instant, mut rebuild: impl FnMut(Pass)) {
     let mut plan = live.plan.lock().unwrap();
     loop {
         if plan.stopped {
             return;
         }
-        if !plan.wanted && plan.everything == plan.everything_listed {
+        let whole = plan.wanted || plan.everything != plan.everything_listed;
+        if !whole && !plan.volumes_changed {
             plan = clock.sleep(live, plan, None);
             continue;
         }
@@ -762,51 +956,55 @@ fn rebuild_loop(
         plan.wanted = false;
         plan.running = true;
         let full_disk = std::mem::take(&mut plan.full_disk);
-        let mark = [plan.asked.take(), plan.switched];
+        let mark = [plan.asked.take(), plan.switched, plan.mounted.take()];
         let mark = mark.into_iter().flatten().min().unwrap_or_default();
-        let clutter = plan.list();
+        let clutter = whole.then(|| plan.list());
+        let (volumes, changes) = plan.volumes();
         drop(plan);
         last = now;
-        rebuild(full_disk, clutter, mark);
+        rebuild(Pass {
+            full_disk,
+            clutter,
+            mark,
+            volumes,
+            changes: if whole { Vec::new() } else { changes },
+        });
         plan = live.plan.lock().unwrap();
         plan.running = false;
         if let Some((paths, mark)) = plan.recheck.take() {
             drop(plan);
-            let missed = live.misses_a_change_in(&paths);
+            let missed = live.misses(&paths);
             plan = live.plan.lock().unwrap();
-            if missed {
-                plan.want(mark);
+            match missed {
+                Missed::Nothing => {}
+                Missed::OnVolumes(paths) => plan.reread(paths, mark),
+                Missed::More => plan.want(mark),
             }
         }
     }
 }
 
 /// A failed rebuild keeps the list in use and is told as a note.
-fn rebuild(
-    source: &mut Source,
-    full_disk: bool,
-    clutter: Clutter,
-    mark: u64,
-    live: &Live,
-    swaps: &Sender<Job>,
-    notify: &Notify,
-) {
-    if let (true, Source::Home { access, .. }) = (full_disk, &mut *source) {
+fn rebuild(source: &mut Source, pass: Pass, live: &Live, swaps: &Sender<Job>, notify: &Notify) {
+    if let (true, Source::Home { access, .. }) = (pass.full_disk, &mut *source) {
         *access = Access::Full;
     }
     let started = Instant::now();
     let built = panic::catch_unwind(AssertUnwindSafe(|| {
-        source
-            .build(clutter, notify)
-            .map(|built| live.publish(built, mark))
+        let built = match pass.clutter {
+            Some(clutter) => source.build(clutter, &pass.volumes, live, notify).map(Some),
+            None => Ok(source.graft(&pass.volumes, &pass.changes, live, notify)),
+        };
+        built.map(|built| built.map(|built| live.publish(built, pass.mark)))
     }))
     .unwrap_or_else(|_| Err(io::Error::other("a bug in the engine")));
     match built {
-        Ok(index) => {
+        Ok(Some(index)) => {
             let took = started.elapsed().as_millis().min(u32::MAX.into()) as u32;
             // Fails only once the worker has stopped.
             let _ = swaps.send(Job::Swap { index, took });
         }
+        Ok(None) => {}
         Err(error) => notify.note(&format!("the list could not be built again: {error}")),
     }
 }
@@ -957,9 +1155,15 @@ pub unsafe extern "C" fn tl_changed(
                 }
                 return 1;
             }
-            (Some(paths), Some((scope, index))) => {
-                paths.iter().any(|path| !scope.holds(path, &index))
-            }
+            (Some(paths), Some((scope, index))) => match missed(&scope, &index, &paths) {
+                Missed::Nothing => false,
+                Missed::More => true,
+                // Read again in place, without the home folder.
+                Missed::OnVolumes(paths) => {
+                    live.plan(|plan| plan.reread(paths, mark));
+                    return 1;
+                }
+            },
         };
         if wanted {
             live.plan(|plan| plan.want(mark));
@@ -983,6 +1187,7 @@ pub unsafe extern "C" fn tl_grant_full_disk(core: *const TlCore, mark: u64) {
         }
         core.live.plan(|plan| {
             plan.full_disk = true;
+            plan.granted = true;
             plan.want(mark);
         });
     })
@@ -1017,6 +1222,98 @@ pub unsafe extern "C" fn tl_index_everything(core: *const TlCore, on: u32, mark:
         core.live.wake.notify_all();
         1
     })
+}
+
+/// Tells the core a volume was mounted at `path`, `len` bytes of UTF-8 such as
+/// "/Volumes/Photos", so the list reads it too: a drive plugged in, not a file server, a Time
+/// Machine backup, an opened disk image or the startup disk under another name. It joins the
+/// newest list without the home folder being read again, and `TL_EVENT_REBUILT` follows,
+/// unless it is ejected first. One that cannot be read is told as a `TL_EVENT_NOTE` and
+/// forgotten, so calling this again tries once more. Without Full Disk Access it is
+/// remembered and read once `tl_grant_full_disk` is called, as macOS asks before an app reads
+/// an external drive. Returns 1 when that work was queued, else 0, as for a volume already
+/// added. `mark` is as for `tl_changed`. Safe to call from any thread, and given the path
+/// macOS mounted the volume at, it reads only the system's list of mounts, never the volume.
+///
+/// # Safety
+/// `core` came from `tl_core_new` or `tl_core_new_stand_in`, and `path` points to `len` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tl_volume_added(
+    core: *const TlCore,
+    path: *const u8,
+    len: usize,
+    mark: u64,
+) -> u32 {
+    guard(0, || {
+        let core = unsafe { &*core };
+        let Some(path) = (unsafe { path_from(path, len) }) else {
+            return 0;
+        };
+        let Some(Ok(volume)) = core.judge.map(|judge| judge(path)) else {
+            return 0;
+        };
+        let mut plan = core.live.plan.lock().unwrap();
+        if plan.stopped || plan.volumes.contains(&volume) {
+            return 0;
+        }
+        plan.volumes.push(volume);
+        if !plan.granted {
+            return 0;
+        }
+        plan.change_volumes(mark);
+        drop(plan);
+        core.live.wake.notify_all();
+        1
+    })
+}
+
+/// Tells the core the volume at `path`, by its real path, is going away, so the
+/// newest list drops it and everything on it without the home folder being read again;
+/// `TL_EVENT_REBUILT` follows. Call it once macOS says the volume will unmount: a new list
+/// stops naming it in `tl_watched`, and a scan of it under way stops at once, so it never
+/// keeps the volume busy. Returns 1 when that work was queued, else 0, as for a volume the
+/// core was never told of. `mark` is as for `tl_changed`. Safe to call from any thread, and
+/// never touches the volume.
+///
+/// # Safety
+/// `core` came from `tl_core_new` or `tl_core_new_stand_in`, and `path` points to `len` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tl_volume_removed(
+    core: *const TlCore,
+    path: *const u8,
+    len: usize,
+    mark: u64,
+) -> u32 {
+    guard(0, || {
+        let core = unsafe { &*core };
+        let Some(path) = (unsafe { path_from(path, len) }) else {
+            return 0;
+        };
+        let mut plan = core.live.plan.lock().unwrap();
+        if !plan.forget(path) {
+            return 0;
+        }
+        core.live.ejected.fetch_add(1, Ordering::Relaxed);
+        if plan.stopped || !plan.granted {
+            return 0;
+        }
+        plan.change_volumes(mark);
+        drop(plan);
+        core.live.wake.notify_all();
+        1
+    })
+}
+
+/// `len` bytes of UTF-8 at `path` as a path, or `None` for a null pointer or other bytes.
+///
+/// # Safety
+/// `path` points to `len` bytes, or is null.
+unsafe fn path_from<'a>(path: *const u8, len: usize) -> Option<&'a Path> {
+    if path.is_null() {
+        return None;
+    }
+    let bytes = unsafe { std::slice::from_raw_parts(path, len) };
+    std::str::from_utf8(bytes).ok().map(Path::new)
 }
 
 /// The folders to watch for changes to the newest list, sorted, as rows whose names are full
@@ -2218,6 +2515,7 @@ mod tests {
             live: Arc::default(),
             worker: None,
             text: None,
+            judge: None,
         })));
         let live = unsafe { &(*core.0).live };
         live.plan(|plan| plan.want(5));
@@ -2390,6 +2688,270 @@ mod tests {
         assert_eq!(switch(&core, 1, 1), 0);
         drop(core);
         assert_eq!(events.seen.lock().unwrap().len(), 1);
+    }
+
+    /// Takes any folder as a volume, as temporary folders are never one.
+    fn any_folder(path: &Path) -> Result<PathBuf, Refusal> {
+        std::fs::canonicalize(path).map_err(|_| Refusal::NotAVolume)
+    }
+
+    /// A home folder with notes, a volume with a photo, and a core scanning the home folder.
+    fn home_and_volume(
+        full_disk: u32,
+        events: &Events,
+    ) -> (Core, [tempfile::TempDir; 2], [PathBuf; 2]) {
+        let (home_dir, home) = home_with(&["notes/a.txt"]);
+        let (volume_dir, volume) = home_with(&["photos/beach.jpg"]);
+        let core = scan(home.to_str().unwrap(), full_disk, events);
+        events.wait_for_event(TL_EVENT_INDEXED);
+        unsafe { (*core.0).judge = Some(any_folder) };
+        (core, [home_dir, volume_dir], [home, volume])
+    }
+
+    fn mounted(core: &Core, volume: &Path, mark: u64) -> u32 {
+        let path = volume.to_str().unwrap();
+        unsafe { tl_volume_added(core.0, path.as_ptr(), path.len(), mark) }
+    }
+
+    fn unmounted(core: &Core, volume: &Path, mark: u64) -> u32 {
+        let path = volume.to_str().unwrap();
+        unsafe { tl_volume_removed(core.0, path.as_ptr(), path.len(), mark) }
+    }
+
+    #[test]
+    fn a_volume_joins_and_leaves_without_the_home_folder_read_again() {
+        let events = Events::default();
+        let (core, _dirs, [home, volume]) = home_and_volume(1, &events);
+        // Never told, so only a full read of the home folder would find it.
+        std::fs::write(home.join("notes/unseen.txt"), "").unwrap();
+
+        assert_eq!(mounted(&core, &volume, 5), 1);
+        assert_eq!(mounted(&core, &volume, 6), 0, "already added");
+        // The home folder, notes and a.txt, then the volume, photos and the beach.
+        assert_eq!(events.wait_for_rebuilt(1), 6);
+        assert_eq!(found(&core, &events, "beach"), ["beach.jpg"]);
+        assert!(found(&core, &events, "unseen").is_empty());
+        assert_eq!(watched(&core).1, 5);
+        let volume_text = volume.to_string_lossy().into_owned();
+        assert!(watched_inside(&core).contains(&volume_text));
+
+        // A change on the volume reads only the folder it is in.
+        std::fs::write(volume.join("photos/dunes.jpg"), "").unwrap();
+        assert_eq!(changed_at(&core, &[&volume.join("photos")], 0, 6), 1);
+        assert_eq!(events.wait_for_rebuilt(2), 7);
+        assert_eq!(found(&core, &events, "dunes"), ["dunes.jpg"]);
+        assert!(found(&core, &events, "unseen").is_empty());
+        assert_eq!(watched(&core).1, 6);
+
+        assert_eq!(unmounted(&core, &volume, 7), 1);
+        assert_eq!(unmounted(&core, &volume, 8), 0, "already gone");
+        assert_eq!(events.wait_for_rebuilt(3), 3);
+        assert!(found(&core, &events, "beach").is_empty());
+        assert!(!watched_inside(&core).contains(&volume_text));
+        assert_eq!(watched(&core).1, 7);
+
+        assert_eq!(mounted(&core, &volume, 9), 1);
+        assert_eq!(events.wait_for_rebuilt(4), 7);
+        // A change in the home folder still brings a whole new list, the volume read again.
+        assert_eq!(changed_at(&core, &[&home.join("notes")], 0, 10), 1);
+        assert_eq!(events.wait_for_rebuilt(5), 8);
+        assert_eq!(found(&core, &events, "unseen"), ["unseen.txt"]);
+        assert_eq!(found(&core, &events, "dunes"), ["dunes.jpg"]);
+    }
+
+    #[test]
+    fn a_volume_waits_for_full_disk_access() {
+        let events = Events::default();
+        let (core, _dirs, [_, volume]) = home_and_volume(0, &events);
+        assert_eq!(mounted(&core, &volume, 2), 0);
+        unsafe { tl_grant_full_disk(core.0, 3) };
+        assert_eq!(events.wait_for_rebuilt(1), 6);
+        assert_eq!(found(&core, &events, "beach"), ["beach.jpg"]);
+    }
+
+    #[test]
+    fn a_volume_taken_out_before_access_never_joins() {
+        let events = Events::default();
+        let (core, _dirs, [_, volume]) = home_and_volume(0, &events);
+        assert_eq!(mounted(&core, &volume, 2), 0);
+        assert_eq!(unmounted(&core, &volume, 3), 0);
+        unsafe { tl_grant_full_disk(core.0, 4) };
+        assert_eq!(events.wait_for_rebuilt(1), 3);
+    }
+
+    #[test]
+    fn a_core_refuses_volumes_it_cannot_take() {
+        let events = Events::default();
+        let (core, [_home, volume_dir], [_, volume]) = home_and_volume(1, &events);
+        let refuse = |path: *const u8, len| unsafe { tl_volume_added(core.0, path, len, 1) };
+        assert_eq!(refuse(std::ptr::null(), 0), 0);
+        assert_eq!(refuse([0xff].as_ptr(), 1), 0);
+        let gone = volume_dir.path().join("gone");
+        assert_eq!(mounted(&core, &gone, 1), 0, "refused by the judge");
+        assert_eq!(unmounted(&core, &volume, 1), 0, "never added");
+        let removed = unsafe { tl_volume_removed(core.0, std::ptr::null(), 0, 1) };
+        assert_eq!(removed, 0);
+
+        // Made-up names have no volumes.
+        let stand_in_events = Events::default();
+        let stand_in = start(100, &stand_in_events);
+        assert_eq!(mounted(&stand_in, &volume, 1), 0);
+
+        // Nor does a core that failed.
+        let failed_events = Events::default();
+        let failed = scan(
+            volume_dir.path().join("gone").to_str().unwrap(),
+            1,
+            &failed_events,
+        );
+        failed_events.wait_for_event(TL_EVENT_FAILED);
+        unsafe { (*failed.0).judge = Some(any_folder) };
+        assert_eq!(mounted(&failed, &volume, 1), 0);
+        // Nothing waits, so no new list is coming.
+        for core in [&core, &failed] {
+            let live = unsafe { &(*core.0).live };
+            let plan = live.plan.lock().unwrap();
+            assert!(plan.volumes.is_empty() && !plan.volumes_changed && plan.mounted.is_none());
+        }
+    }
+
+    /// A home folder's list published as the newest, and the source that built it, so a
+    /// test drives `graft` itself.
+    fn home_source(home: &Path, live: &Live, notify: &Notify) -> Source {
+        let mut source = Source::Home {
+            root: home.to_path_buf(),
+            access: Access::Full,
+            told: Vec::new(),
+            settings: None,
+        };
+        let built = source.build(Clutter::Skip, &[], live, notify).unwrap();
+        live.publish(built, 0);
+        live.plan(|plan| plan.granted = true);
+        source
+    }
+
+    fn notify_to(events: &Events) -> Notify {
+        let ctx = events as *const Events as *mut c_void;
+        Notify {
+            ctx,
+            on_event: record,
+        }
+    }
+
+    /// Grafts what the plan holds onto the newest list, which then becomes the newest.
+    fn graft(source: &Source, live: &Live, notify: &Notify) -> Option<u64> {
+        let (volumes, changes) = live.plan.lock().unwrap().volumes();
+        let built = source.graft(&volumes, &changes, live, notify)?;
+        Some(live.publish(built, 0).entry_count() as u64)
+    }
+
+    #[test]
+    fn a_volume_plugged_in_and_out_within_one_gap_brings_no_list() {
+        let (_h, home) = home_with(&["notes/a.txt"]);
+        let (_v, volume) = home_with(&["photos/beach.jpg"]);
+        let (live, events) = (Live::default(), Events::default());
+        let notify = notify_to(&events);
+        let source = home_source(&home, &live, &notify);
+        live.plan(|plan| {
+            plan.volumes.push(volume.clone());
+            plan.forget(&volume);
+        });
+        assert_eq!(graft(&source, &live, &notify), None);
+    }
+
+    #[test]
+    fn two_volumes_plugged_in_within_one_gap_bring_one_list() {
+        let (_h, home) = home_with(&["notes/a.txt"]);
+        let (_a, photos) = home_with(&["beach.jpg"]);
+        let (_b, music) = home_with(&["song.mp3"]);
+        let (live, events) = (Live::default(), Events::default());
+        let notify = notify_to(&events);
+        let source = home_source(&home, &live, &notify);
+        live.plan(|plan| plan.volumes = vec![photos.clone(), music.clone()]);
+        assert_eq!(graft(&source, &live, &notify), Some(7));
+        let newest = live.newest.lock().unwrap().clone().unwrap().1;
+        let held: Vec<&Path> = newest.volumes().collect();
+        assert_eq!(held, [photos.as_path(), music.as_path()]);
+        assert_eq!(graft(&source, &live, &notify), None, "already held");
+    }
+
+    #[test]
+    fn a_volume_that_cannot_be_read_is_forgotten_and_told() {
+        let (_h, home) = home_with(&["notes/a.txt"]);
+        let (_v, volume) = home_with(&["photos/beach.jpg"]);
+        let (live, events) = (Live::default(), Events::default());
+        let notify = notify_to(&events);
+        let source = home_source(&home, &live, &notify);
+        let unplugged = volume.with_extension("unplugged");
+        std::fs::rename(&volume, &unplugged).unwrap();
+        live.plan(|plan| plan.volumes.push(volume.clone()));
+        assert_eq!(graft(&source, &live, &notify), None);
+        assert!(live.plan.lock().unwrap().volumes.is_empty());
+        let notes = events.notes.lock().unwrap().clone();
+        assert_eq!(notes.len(), 1);
+        assert!(notes[0].starts_with(&format!("{} could not be read", volume.display())));
+
+        // Told again once it is back, it joins.
+        std::fs::rename(&unplugged, &volume).unwrap();
+        live.plan(|plan| plan.volumes.push(volume.clone()));
+        assert_eq!(graft(&source, &live, &notify), Some(6));
+    }
+
+    #[test]
+    fn a_change_on_a_volume_reads_that_folder_alone() {
+        let (_h, home) = home_with(&["notes/a.txt"]);
+        let (_v, volume) = home_with(&["photos/beach.jpg"]);
+        let (live, events) = (Live::default(), Events::default());
+        let notify = notify_to(&events);
+        let source = home_source(&home, &live, &notify);
+        live.plan(|plan| plan.volumes.push(volume.clone()));
+        assert_eq!(graft(&source, &live, &notify), Some(6));
+
+        std::fs::write(home.join("notes/unseen.txt"), "").unwrap();
+        std::fs::write(volume.join("photos/dunes.jpg"), "").unwrap();
+        let (photos, notes) = (volume.join("photos"), home.join("notes"));
+        let on_volume = Missed::OnVolumes(vec![photos.clone()]);
+        assert_eq!(live.misses(&[volume.clone(), photos.clone()]), on_volume);
+        assert_eq!(live.misses(&[photos.clone(), notes.clone()]), Missed::More);
+        live.plan(|plan| plan.reread(vec![photos.clone()], 3));
+        assert_eq!(graft(&source, &live, &notify), Some(7));
+        assert_eq!(
+            live.misses(&[volume.clone(), photos.clone()]),
+            Missed::Nothing
+        );
+        assert_eq!(live.misses(std::slice::from_ref(&notes)), Missed::More);
+
+        // Asked for a whole new list already, which reads them anyway.
+        live.plan(|plan| {
+            plan.want(4);
+            plan.reread(vec![photos.clone()], 5);
+            assert!(plan.volume_changes.is_empty());
+            assert_eq!(plan.asked, Some(4));
+        });
+    }
+
+    #[test]
+    fn a_volume_added_just_as_access_is_granted_is_never_left_out() {
+        let (_a, photos) = home_with(&["beach.jpg"]);
+        let (_b, music) = home_with(&["song.mp3"]);
+        let live = Arc::new(Live::default());
+        let core = idle_core(&live);
+        unsafe { (*core.0).judge = Some(any_folder) };
+        // Told first: remembered, and the list access brings reads it.
+        assert_eq!(mounted(&core, &photos, 1), 0);
+        live.plan(|plan| assert_eq!(plan.volumes(), (Vec::new(), Vec::new())));
+        unsafe { tl_grant_full_disk(core.0, 2) };
+        live.plan(|plan| {
+            assert!(plan.wanted && plan.granted);
+            assert_eq!(plan.volumes().0, std::slice::from_ref(&photos));
+        });
+        // Granted first: read at once.
+        assert_eq!(mounted(&core, &music, 3), 1);
+        live.plan(|plan| {
+            assert!(plan.volumes_changed);
+            assert_eq!(plan.mounted, Some(3));
+            assert_eq!(plan.volumes().0, [photos.clone(), music.clone()]);
+        });
     }
 
     #[test]
@@ -3419,12 +3981,13 @@ mod tests {
     enum Step {
         /// Waiting for a change, or for this much more time to pass.
         Waits(Option<Duration>),
-        /// A rebuild began this far into the test, and holds until the next step.
+        /// A rebuild began this far into the test, and holds until the next step. `clutter`
+        /// is `None` for one that only changed volumes.
         Starts {
             at: Duration,
             full_disk: bool,
             mark: u64,
-            clutter: Clutter,
+            clutter: Option<Clutter>,
         },
     }
 
@@ -3433,7 +3996,7 @@ mod tests {
             at: Duration::from_millis(ms),
             full_disk: false,
             mark,
-            clutter: Clutter::Skip,
+            clutter: Some(Clutter::Skip),
         }
     }
 
@@ -3499,13 +4062,13 @@ mod tests {
             let (live, clock) = (Arc::clone(live), Arc::clone(&clock));
             let last = clock.zero - ago;
             thread::spawn(move || {
-                rebuild_loop(&live, &*clock, last, |full_disk, clutter, mark| {
+                rebuild_loop(&live, &*clock, last, |pass| {
                     let at = clock.now() - clock.zero;
                     clock.tell(Step::Starts {
                         at,
-                        full_disk,
-                        mark,
-                        clutter,
+                        full_disk: pass.full_disk,
+                        mark: pass.mark,
+                        clutter: pass.clutter,
                     });
                 });
             })
@@ -3701,10 +4264,8 @@ mod tests {
             let settings =
                 Settings::new(&home, &home, Clutter::Skip, Ignore::default(), Access::Full);
             let index = settings.scan().unwrap().index;
-            Built {
-                index,
-                scope: Some(settings.scope()),
-            }
+            let scope = Some(settings.scope(&index));
+            Built { index, scope }
         };
         live.publish(list(), 0);
         let core = idle_core(&live);
@@ -3748,7 +4309,7 @@ mod tests {
             at: Duration::ZERO,
             full_disk: true,
             mark,
-            clutter: Clutter::Skip,
+            clutter: Some(Clutter::Skip),
         };
         live.plan(|plan| {
             plan.full_disk = true;
@@ -3777,6 +4338,7 @@ mod tests {
             live: Arc::clone(live),
             worker: None,
             text: None,
+            judge: None,
         })))
     }
 
@@ -3789,8 +4351,49 @@ mod tests {
             at: Duration::ZERO,
             full_disk: false,
             mark,
-            clutter: Clutter::Keep,
+            clutter: Some(Clutter::Keep),
         }
+    }
+
+    #[test]
+    fn a_volume_change_alone_keeps_the_root_and_waits_out_the_gap() {
+        let gap = Duration::from_millis(200);
+        let live = live(gap);
+        let rebuilds = rebuilds(&live, Duration::ZERO);
+        live.plan(|plan| plan.change_volumes(5));
+        live.plan(|plan| plan.change_volumes(4));
+        assert_eq!(rebuilds.step(), Step::Waits(Some(gap)));
+        rebuilds.set_ms(200);
+        let volumes_only = Step::Starts {
+            at: gap,
+            full_disk: false,
+            mark: 4,
+            clutter: None,
+        };
+        assert_eq!(rebuilds.step(), volumes_only);
+        assert_eq!(rebuilds.step(), Step::Waits(None));
+        rebuilds.stop(&live);
+    }
+
+    #[test]
+    fn a_volume_change_beside_a_whole_rebuild_rides_along() {
+        let live = live(Duration::from_millis(200));
+        let rebuilds = rebuilds(&live, LONG_AGO);
+        live.plan(|plan| {
+            plan.want(8);
+            plan.granted = true;
+            plan.volumes.push("/Volumes/Photos".into());
+            plan.volume_changes.push("/Volumes/Photos/2026".into());
+            plan.change_volumes(6);
+        });
+        assert_eq!(rebuilds.step(), starts(0, 6));
+        assert_eq!(rebuilds.step(), Step::Waits(None));
+        {
+            let plan = live.plan.lock().unwrap();
+            assert!(plan.volume_changes.is_empty() && !plan.volumes_changed);
+            assert_eq!(plan.mounted, None);
+        }
+        rebuilds.stop(&live);
     }
 
     #[test]
@@ -3854,10 +4457,8 @@ mod tests {
         let list = |clutter| {
             let settings = Settings::new(&home, &home, clutter, Ignore::default(), Access::Full);
             let index = settings.scan().unwrap().index;
-            Built {
-                index,
-                scope: Some(settings.scope()),
-            }
+            let scope = Some(settings.scope(&index));
+            Built { index, scope }
         };
         let live = live(Duration::ZERO);
         live.publish(list(Clutter::Skip), 0);
@@ -3909,7 +4510,7 @@ mod tests {
         {
             let live = Arc::clone(&live);
             thread::spawn(move || {
-                rebuild_loop(&live, &Told(tell), Instant::now(), |_, _, _| {
+                rebuild_loop(&live, &Told(tell), Instant::now(), |_| {
                     panic!("no rebuild within the hour");
                 });
                 let _ = done.send(());
@@ -3934,8 +4535,8 @@ mod tests {
         {
             let live = Arc::clone(&live);
             thread::spawn(move || {
-                rebuild_loop(&live, &Told(tell), Instant::now(), |disk, clutter, mark| {
-                    let _ = began.send((disk, clutter, mark));
+                rebuild_loop(&live, &Told(tell), Instant::now(), |pass| {
+                    let _ = began.send((pass.full_disk, pass.clutter, pass.mark));
                 });
             });
         }
@@ -3945,13 +4546,16 @@ mod tests {
         let next_start = || starts.recv_timeout(minute);
         asleep();
         assert_eq!(changed_at(&core, &[], 1, 1), 1);
-        assert_eq!(next_start(), Ok((false, Clutter::Skip, 1)));
+        assert_eq!(next_start(), Ok((false, Some(Clutter::Skip), 1)));
         asleep();
         unsafe { tl_grant_full_disk(core.0, 2) };
-        assert_eq!(next_start(), Ok((true, Clutter::Skip, 2)));
+        assert_eq!(next_start(), Ok((true, Some(Clutter::Skip), 2)));
         asleep();
         assert_eq!(switch(&core, 1, 3), 1);
-        assert_eq!(next_start(), Ok((false, Clutter::Keep, 3)));
+        assert_eq!(next_start(), Ok((false, Some(Clutter::Keep), 3)));
+        asleep();
+        live.plan(|plan| plan.change_volumes(4));
+        assert_eq!(next_start(), Ok((false, None, 4)));
     }
 
     #[test]

@@ -7,6 +7,7 @@ use rayon::prelude::*;
 use std::cmp::Ordering;
 use std::ffi::OsStr;
 use std::fs;
+use std::io;
 use std::path::{Component, Path, PathBuf};
 
 /// Every search reads the removed entries and the names added entries store again, so the
@@ -32,7 +33,7 @@ pub struct Update {
 /// has one run of them, plus one more for each update that added to it. A run may also hold
 /// removed entries, so each child found is checked against its parent.
 #[cfg_attr(test, derive(Debug, PartialEq))]
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(crate) struct Runs {
     /// Each folder's first run, by the folder's place in `folders`.
     first: Vec<(EntryId, EntryId)>,
@@ -66,23 +67,21 @@ impl Index {
     /// children leave with everything inside them, new ones are added with everything the
     /// rules keep inside them, and a move is a removal plus an addition. A path that is not
     /// an indexed folder updates the deepest indexed folder on its way, so a file's own path,
-    /// a new folder's or a deleted one's all work.
-    pub(crate) fn update<P: AsRef<Path>>(
-        &mut self,
-        root: &Path,
-        rules: &Rules,
-        changed: &[P],
-    ) -> Update {
+    /// a new folder's or a deleted one's all work. A path under no root changes nothing.
+    pub(crate) fn update<P: AsRef<Path>>(&mut self, rules: &Rules, changed: &[P]) -> Update {
         let mut update = Update::default();
-        if self.folders.first() != Some(&0) {
+        if self.roots.is_empty() {
             return update;
         }
-        if self.runs.is_none() {
-            self.runs = Some(Runs::default());
-            self.add_runs(0);
-        }
+        self.find_runs();
+        // Copied, as the lists change below while these paths are still read.
+        let roots: Vec<(EntryId, PathBuf)> = self
+            .roots
+            .iter()
+            .map(|&root| (root, PathBuf::from(self.name(root))))
+            .collect();
         let changed: Vec<&Path> = changed.iter().map(AsRef::as_ref).collect();
-        let mut targets = self.changed_folders(root, &changed);
+        let mut targets = self.changed_folders(&roots, &changed);
         // Parents first, so a folder its parent replaced is not read into the old one.
         targets.sort_unstable_by_key(|&(folder, ..)| folder);
         targets.dedup_by_key(|&mut (folder, ..)| folder);
@@ -94,10 +93,10 @@ impl Index {
         for chunk in targets.chunks(READ_CHUNK) {
             let listings: Vec<(Listing, bool)> = chunk
                 .par_iter()
-                .map_init(PathBuf::new, |at, &(folder, depth, below)| {
-                    folder_path(at, root, below, depth);
+                .map_init(PathBuf::new, |at, &(folder, depth, top, below)| {
+                    folder_path(at, &roots[top].1, below, depth);
                     let passage = self.passages.binary_search(&folder).is_ok();
-                    let listing = rules.list(at, folder == 0, passage);
+                    let listing = rules.list(at, self.is_root(folder), passage);
                     // A folder deleted since it was found lost everything in it.
                     let partial = listing.unreadable
                         && fs::symlink_metadata(&at).is_ok_and(|meta| meta.is_dir());
@@ -105,7 +104,7 @@ impl Index {
                 })
                 .collect();
             for (&(folder, ..), (listing, partial)) in chunk.iter().zip(listings) {
-                if folder != 0 && self.entry_parent[folder as usize] == NO_PARENT {
+                if self.is_removed(folder) {
                     continue;
                 }
                 update.folders_read += 1;
@@ -118,58 +117,195 @@ impl Index {
             update.unreadable_folders += walked.unreadable_folders;
             update.added = self.splice(&walked.builder.lists(), &added.anchors);
         }
-
-        if (self.removed + self.added) * COMPACT_SHARE > self.len() {
-            self.compact();
-            update.compacted = true;
-        }
+        update.compacted = self.compact_if_due();
         update
     }
 
+    /// Rebuilds the lists once the entries removed, and the names added entries store again,
+    /// pass their share. Returns whether it did.
+    fn compact_if_due(&mut self) -> bool {
+        let due = (self.removed + self.added) * COMPACT_SHARE > self.len();
+        if due {
+            self.compact();
+        }
+        due
+    }
+
+    /// Scans `volume`, a real path, as one more root, keeping what `rules` keep inside it,
+    /// without reading any other root again. Fails with the system's own error when the
+    /// volume cannot be opened, with `AlreadyExists` when it is, holds or sits inside a root
+    /// already indexed, and with `InvalidInput` for an index with no root to add it beside.
+    /// A volume gone by the end of the scan, as one unplugged midway, fails with `NotFound`,
+    /// and one `stop` asked to leave fails with `Interrupted`; neither leaves anything behind.
+    pub(crate) fn add_volume(
+        &mut self,
+        volume: &Path,
+        rules: &Rules,
+        stop: &(dyn Fn() -> bool + Sync),
+    ) -> io::Result<Update> {
+        if self.roots.is_empty() {
+            return Err(io::ErrorKind::InvalidInput.into());
+        }
+        let overlaps = self.roots.iter().any(|&root| {
+            let root = Path::new(self.name(root));
+            volume.starts_with(root) || root.starts_with(volume)
+        });
+        if overlaps {
+            return Err(io::ErrorKind::AlreadyExists.into());
+        }
+        fs::read_dir(volume)?;
+        let mut builder = IndexBuilder::new();
+        let anchor = builder.push("", NO_PARENT, true);
+        let folders = vec![(volume.to_path_buf(), anchor, false)];
+        let walked = walk(builder, rules, anchor, folders, stop);
+        if stop() {
+            return Err(io::ErrorKind::Interrupted.into());
+        }
+        if !fs::symlink_metadata(volume).is_ok_and(|meta| meta.is_dir()) {
+            return Err(io::ErrorKind::NotFound.into());
+        }
+        let new = walked.builder.lists();
+        let name = volume.to_string_lossy();
+        self.reserve_exact(name.len(), &new);
+        // Appended whole, each folder's children side by side as a scan leaves them, so
+        // nothing needs compacting and searches stay as fast as on a fresh scan.
+        let (added, apart) = (self.added, self.children_apart);
+        let root = self.push_root(&name);
+        let entries = self.splice(&new, &[root]);
+        (self.added, self.children_apart) = (added, apart);
+        Ok(Update {
+            folders_read: 1,
+            added: 1 + entries,
+            unreadable_folders: walked.unreadable_folders,
+            ..Update::default()
+        })
+    }
+
+    /// Room for a root named with `name_bytes` and what `new` holds below it, and no more:
+    /// the lists usually grow by a sixteenth, which a whole volume needs not.
+    fn reserve_exact(&mut self, name_bytes: usize, new: &Index) {
+        let names = new.distinct_names();
+        let (entries, folders) = (new.len(), new.folders.len());
+        self.names.reserve_exact(name_bytes + new.names.len());
+        self.name_starts.reserve_exact(names);
+        self.name_letters.reserve_exact(names);
+        self.name_word_starts.reserve_exact(names);
+        self.entry_name.reserve_exact(entries);
+        self.entry_parent.reserve_exact(entries);
+        self.entry_depth.reserve_exact(entries);
+        self.folders.reserve_exact(folders);
+        self.folder_inodes.reserve_exact(folders);
+        self.passages.reserve_exact(new.passages.len());
+        self.roots.reserve_exact(1);
+    }
+
+    /// Takes a volume and everything inside it out of search. `None` when `volume` is not a
+    /// volume this index holds.
+    pub(crate) fn remove_volume(&mut self, volume: &Path) -> Option<Update> {
+        let root = self.root_at(volume).filter(|&root| root != 0)?;
+        self.find_runs();
+        let removed = self.remove_root(root);
+        Some(Update {
+            removed,
+            compacted: self.compact_if_due(),
+            ..Update::default()
+        })
+    }
+
+    fn remove_root(&mut self, root: EntryId) -> usize {
+        self.roots.retain(|&kept| kept != root);
+        self.remove(root)
+    }
+
+    /// Appends a root, its name stored like any name an update adds.
+    fn push_root(&mut self, name: &str) -> EntryId {
+        let root = self.len() as EntryId;
+        let name_id = self.distinct_names() as NameId;
+        if self.names.capacity() - self.names.len() < name.len() {
+            self.names
+                .reserve_exact(name.len().max(self.names.len() / GROW_BY));
+        }
+        self.names.push_str(name);
+        grow(&mut self.name_starts, 1);
+        self.name_starts.push(self.names.len() as u32);
+        let (letters, starts) = name_fingerprints(name);
+        grow(&mut self.name_letters, 1);
+        grow(&mut self.name_word_starts, 1);
+        self.name_letters.push(letters);
+        self.name_word_starts.push(starts);
+        for list in [&mut self.entry_name, &mut self.entry_parent] {
+            grow(list, 1);
+        }
+        self.entry_name.push(name_id);
+        self.entry_parent.push(NO_PARENT);
+        grow(&mut self.entry_depth, 1);
+        self.entry_depth.push(0);
+        grow(&mut self.folders, 1);
+        grow(&mut self.folder_inodes, 1);
+        self.folders.push(root);
+        self.folder_inodes.push(0);
+        self.roots.push(root);
+        self.added += 1;
+        root
+    }
+
+    fn find_runs(&mut self) {
+        if self.runs.is_none() {
+            self.runs = Some(Runs::default());
+            self.add_runs(0);
+        }
+    }
+
     /// For each changed folder, the deepest indexed folder on its path that is still a folder
-    /// on disk, how many names below `root` lead to it, and one such path. A path outside the
-    /// root has none. Nothing is copied per path, as a catch-up after a restart may bring many
-    /// thousands.
+    /// on disk, how many names below its root lead to it, that root's place in `roots`, and
+    /// one such path. A path under no root has none. Nothing is copied per path, as a
+    /// catch-up after a restart may bring many thousands.
     fn changed_folders<'p>(
         &self,
-        root: &Path,
+        roots: &[(EntryId, PathBuf)],
         changed: &[&'p Path],
-    ) -> Vec<(EntryId, usize, &'p Path)> {
-        // Each path below the root, beside what is left of it below the folder reached so far.
-        let mut paths: Vec<(&Path, &Path)> = changed
-            .iter()
-            .filter_map(|path| path.strip_prefix(root).ok())
-            .map(|below| (below, below))
-            .collect();
-        // `Path` sorts name by name, so paths into one folder sit together and its children are
-        // looked up once for them all.
-        paths.sort_unstable_by_key(|&(below, _)| below);
+    ) -> Vec<(EntryId, usize, usize, &'p Path)> {
         let mut found = Vec::new();
-        self.descend(0, 0, &mut paths, &mut found);
-        drop(paths);
+        // Roots never sit inside one another, so each path is below one root at most.
+        for (top, (root, root_path)) in roots.iter().enumerate() {
+            // Each path below the root, beside what is left of it below the folder reached so far.
+            let mut paths: Vec<(&Path, &Path)> = changed
+                .iter()
+                .filter_map(|path| path.strip_prefix(root_path).ok())
+                .map(|below| (below, below))
+                .collect();
+            // `Path` sorts name by name, so paths into one folder sit together and its children
+            // are looked up once for them all.
+            paths.sort_unstable_by_key(|&(below, _)| below);
+            self.descend(*root, 0, top, &mut paths, &mut found);
+        }
         found
             .into_par_iter()
-            .map_init(PathBuf::new, |at, (mut folder, mut depth, below)| {
-                folder_path(at, root, below, depth);
+            .map_init(PathBuf::new, |at, (mut folder, mut depth, top, below)| {
+                folder_path(at, &roots[top].1, below, depth);
                 // A folder deleted or turned into a file is read from its parent, which lost it.
-                while folder != 0 && !fs::symlink_metadata(&at).is_ok_and(|meta| meta.is_dir()) {
+                while !self.is_root(folder)
+                    && !fs::symlink_metadata(&at).is_ok_and(|meta| meta.is_dir())
+                {
                     folder = self.entry_parent[folder as usize];
                     at.pop();
                     depth -= 1;
                 }
-                (folder, depth, below)
+                (folder, depth, top, below)
             })
             .collect()
     }
 
     /// Finds the folder for each of `paths`, which are sorted and all lead through `folder`,
-    /// `depth` names below the root. Each folder is found once, however many paths lead to it.
+    /// `depth` names below root number `top`. Each folder is found once, however many paths
+    /// lead to it.
     fn descend<'p>(
         &self,
         folder: EntryId,
         depth: usize,
+        top: usize,
         paths: &mut [(&'p Path, &'p Path)],
-        found: &mut Vec<(EntryId, usize, &'p Path)>,
+        found: &mut Vec<(EntryId, usize, usize, &'p Path)>,
     ) {
         let ends = paths.partition_point(|&(_, rest)| first_name(rest).is_none());
         let mut here = paths[..ends].first().map(|&(below, _)| below);
@@ -190,14 +326,14 @@ impl Index {
                             parts.next();
                             *rest = parts.as_path();
                         }
-                        self.descend(children[at].1, depth + 1, group, found);
+                        self.descend(children[at].1, depth + 1, top, group, found);
                     }
                     Err(_) => here = here.or(Some(group[0].0)),
                 }
             }
         }
         if let Some(below) = here {
-            found.push((folder, depth, below));
+            found.push((folder, depth, top, below));
         }
     }
 
@@ -376,7 +512,10 @@ impl Index {
                 self.passages.push(id);
             }
         }
-        self.add_runs(first_new);
+        // Without runs yet, the first update finds them all, these included.
+        if self.runs.is_some() {
+            self.add_runs(first_new);
+        }
         self.added += entries;
         self.children_apart |= entries > 0;
         entries
@@ -435,6 +574,7 @@ impl Index {
         let mut folders = Vec::with_capacity(self.folder_count());
         let mut folder_inodes = Vec::with_capacity(self.folder_count());
         let mut passages = Vec::new();
+        let mut roots = Vec::with_capacity(self.roots.len());
         let mut passage = self.passages.iter().peekable();
         let (mut slot, mut kept) = (0, 0);
         for entry in 0..self.len() {
@@ -442,7 +582,10 @@ impl Index {
             slot += usize::from(is_folder);
             let is_passage = passage.next_if_eq(&&(entry as EntryId)).is_some();
             let parent = match self.entry_parent[entry] {
-                NO_PARENT if entry == 0 => NO_PARENT,
+                NO_PARENT if self.is_root(entry as EntryId) => {
+                    roots.push(kept as EntryId);
+                    NO_PARENT
+                }
                 NO_PARENT => continue,
                 parent => match self.folders.binary_search(&parent) {
                     Ok(at) if placed[at] != NO_PARENT => placed[at],
@@ -480,6 +623,7 @@ impl Index {
         self.folder_inodes = folder_inodes;
         passages.shrink_to_fit();
         self.passages = passages;
+        self.roots = roots;
         (self.removed, self.removed_folders, self.added) = (0, 0, 0);
         self.add_depths_and_letters();
     }
@@ -530,19 +674,28 @@ mod tests {
     use crate::{Access, Clutter, Ignore, Scan, Searcher, Settings};
     use std::collections::BTreeSet;
 
-    /// What search can find: every entry still in the index, by its path below the root.
+    /// The root `path` is under, and its entry.
+    fn top_of<'i>(index: &'i Index, path: &Path) -> (&'i Path, EntryId) {
+        let mut tops = index.roots.iter().map(|&r| (Path::new(index.name(r)), r));
+        tops.find(|(top, _)| path.starts_with(top))
+            .expect("a path up to a root")
+    }
+
+    /// What search can find: every entry still in the index, by its path below `root`, or
+    /// its whole path on a volume.
     fn findable(index: &Index, root: &Path) -> BTreeSet<(PathBuf, (Kind, u32))> {
-        (1..index.len() as EntryId)
+        (0..index.len() as EntryId)
             .filter(|&entry| index.entry_parent[entry as usize] != NO_PARENT)
             .map(|entry| {
                 let path = index.path(entry);
-                let below = path.strip_prefix(root).expect("a path up to the root");
+                let below = path.strip_prefix(top_of(index, &path).0).unwrap();
                 assert_eq!(
                     usize::from(index.entry_depth[entry as usize]),
                     below.components().count().min(255),
                     "{below:?}"
                 );
-                (below.to_path_buf(), index.kind(entry))
+                let shown = path.strip_prefix(root).unwrap_or(&path);
+                (shown.to_path_buf(), index.kind(entry))
             })
             .collect()
     }
@@ -555,7 +708,8 @@ mod tests {
             &index.entry_name,
             &index.entry_parent,
             &index.folders,
-            &index.passages
+            &index.passages,
+            &index.roots
         ));
         assert_eq!(index.folder_inodes.len(), index.folders.len());
         assert_eq!(index.entry_depth.len(), index.len());
@@ -567,16 +721,16 @@ mod tests {
     }
 
     /// What deciding whether a change needs a new list reads: each folder's children, and
-    /// each folder found by its names from the root.
-    fn assert_children_found(index: &Index, root: &Path, context: &str) {
+    /// each folder found by its names from its root.
+    fn assert_children_found(index: &Index, context: &str) {
         let mut every = vec![Vec::new(); index.len()];
-        for (entry, &parent) in index.entry_parent.iter().enumerate().skip(1) {
+        for (entry, &parent) in index.entry_parent.iter().enumerate() {
             if parent != NO_PARENT {
                 every[parent as usize].push(entry as EntryId);
             }
         }
         for &folder in &index.folders {
-            if folder != 0 && index.entry_parent[folder as usize] == NO_PARENT {
+            if index.is_removed(folder) {
                 continue;
             }
             let expected = &every[folder as usize];
@@ -590,20 +744,31 @@ mod tests {
                 .collect();
             assert_eq!(folders, expected, "{context}");
             let path = index.path(folder);
-            let names = path.strip_prefix(root).unwrap().iter();
-            let found = index.find_folder(names.map(|name| name.to_str().unwrap()));
+            let (top, top_entry) = top_of(index, &path);
+            let names = path.strip_prefix(top).unwrap().iter();
+            let found = index.find_folder(top_entry, names.map(|name| name.to_str().unwrap()));
             assert_eq!(found, Some(folder), "{context}: {path:?}");
         }
     }
 
+    /// What a fresh scan finds, with the same volumes added.
+    fn fresh(settings: &Settings, volumes: &[PathBuf]) -> Index {
+        let mut fresh = settings.scan().unwrap().index;
+        for volume in volumes {
+            settings.add_volume(&mut fresh, volume).unwrap();
+        }
+        fresh
+    }
+
     fn assert_current(settings: &Settings, index: &Index, root: &Path, context: &str) {
         assert_sound(index);
-        assert_children_found(index, root, context);
-        let fresh = settings.scan().unwrap().index;
+        assert_children_found(index, context);
+        let volumes: Vec<PathBuf> = index.volumes().map(Path::to_path_buf).collect();
+        let fresh = fresh(settings, &volumes);
         assert_eq!(findable(index, root), findable(&fresh, root), "{context}");
         assert_eq!(
             (index.entry_count(), index.folder_count()),
-            (fresh.len(), fresh.folders.len()),
+            (fresh.entry_count(), fresh.folder_count()),
             "{context}"
         );
     }
@@ -779,7 +944,8 @@ mod tests {
 
     /// Batches of random changes, each applied in two updates, must leave the index finding
     /// what a fresh scan finds. With `swaps` off no batch puts a folder where another one
-    /// was, the one change only an inode tells apart.
+    /// was, the one change only an inode tells apart. Every third tree has two volumes beside
+    /// it, changed too, and now and then ejected and plugged in again.
     fn random_changes(swaps: bool, seeds: u64) {
         let rules = "Old\n!~/.hidden/keep\n!~/node_modules/keep\n!~/vendor/keep\n\
                      !~/Notes.app/keep\n!~/Library/keep\n";
@@ -801,23 +967,63 @@ mod tests {
                 for _ in 0..60 {
                     change(rng, &root, &BTreeSet::new());
                 }
+                // Volumes are read only with Full Disk Access.
+                let (_volume_dirs, volumes): (Vec<_>, Vec<_>) = (0..2).map(|_| temp_root()).unzip();
+                let with_volumes = seed % 3 == 1 && access == Access::Full;
+                for volume in &volumes {
+                    for _ in 0..30 {
+                        change(rng, volume, &BTreeSet::new());
+                    }
+                }
                 let (ignore, problems) = Ignore::parse(rules, &root, access);
                 assert!(problems.is_empty());
                 let settings = Settings::new(&root, &root, clutter, ignore, access);
                 let mut index = settings.scan().unwrap().index;
+                if with_volumes {
+                    for volume in &volumes {
+                        settings.add_volume(&mut index, volume).unwrap();
+                    }
+                }
                 for round in 0..30 {
                     let context = format!("variant {variant}, seed {seed}, round {round}");
-                    let taken: BTreeSet<PathBuf> = if swaps {
-                        BTreeSet::new()
-                    } else {
-                        on_disk(&root)
+                    let taken = |top: &Path| -> BTreeSet<PathBuf> {
+                        if swaps {
+                            return BTreeSet::new();
+                        }
+                        on_disk(top)
                             .into_iter()
                             .filter_map(|(path, is_dir)| is_dir.then_some(path))
                             .collect()
                     };
+                    let tops = [&root, &volumes[0], &volumes[1]];
+                    let taken = tops.map(|top| taken(top));
                     let mut changed = Vec::new();
                     for _ in 0..=rng.below(6) {
-                        changed.extend(change(rng, &root, &taken));
+                        let top = if with_volumes { rng.below(3) } else { 0 };
+                        changed.extend(change(rng, tops[top], &taken[top]));
+                    }
+                    // Ejected or plugged in again, with changes on it still to come.
+                    for volume in volumes.iter().filter(|_| with_volumes && rng.below(8) == 0) {
+                        let (live, held) = (index.entry_count(), index.volumes().count());
+                        match settings.remove_volume(&mut index, volume) {
+                            Some(ejected) => {
+                                assert_eq!(index.entry_count(), live - ejected.removed);
+                                assert_eq!(index.volumes().count(), held - 1, "{context}");
+                            }
+                            None => {
+                                let plugged = settings.add_volume(&mut index, volume).unwrap();
+                                assert_eq!(index.entry_count(), live + plugged.added);
+                                assert_eq!(index.volumes().count(), held + 1, "{context}");
+                            }
+                        }
+                    }
+                    let roots: Vec<&Path> = std::iter::once(root.as_path())
+                        .chain(index.volumes())
+                        .collect();
+                    for (at, a) in roots.iter().enumerate() {
+                        for b in &roots[at + 1..] {
+                            assert!(!a.starts_with(b) && !b.starts_with(a), "{context}");
+                        }
                     }
                     if rng.below(5) == 0 {
                         changed.push(root.parent().unwrap().join("elsewhere"));
@@ -849,8 +1055,13 @@ mod tests {
                             unreadable_folders: 0,
                         };
                         save_index(&file, &scan, &settings, 0).unwrap();
-                        index = open_index(&file, &settings).unwrap().scan.index;
+                        let opened = open_index(&file, &settings).unwrap().scan.index;
                         fs::remove_file(file).unwrap();
+                        // Counted again from the lists, as an update counted them on the way.
+                        let counts =
+                            |i: &Index| (i.removed, i.removed_folders, i.added, i.roots.clone());
+                        assert_eq!(counts(&opened), counts(&scan.index), "{context}");
+                        index = opened;
                     }
                 }
             }
@@ -1018,9 +1229,9 @@ mod tests {
         changed.push(PathBuf::from(dotted));
         let changed: Vec<&Path> = changed.iter().map(PathBuf::as_path).collect();
         let mut found: Vec<(&str, usize)> = index
-            .changed_folders(&root, &changed)
+            .changed_folders(&[(0, root.clone())], &changed)
             .into_iter()
-            .map(|(folder, depth, _)| (index.name(folder), depth))
+            .map(|(folder, depth, ..)| (index.name(folder), depth))
             .collect();
         found.sort_unstable();
         assert_eq!(found, [("a", 1), ("a-b", 1), ("b", 2), ("e", 1)]);
@@ -1318,6 +1529,339 @@ mod tests {
         assert_eq!(settings.update(&mut index, &[root.join("d1")]).added, 1);
         let capacities = |lists: [(usize, usize); 9]| lists.map(|(_, capacity)| capacity);
         assert_eq!(capacities(lists(&index)), capacities(grown));
+    }
+
+    /// A home folder and a volume beside it, each with a plan.
+    fn home_and_volume() -> (tempfile::TempDir, PathBuf, tempfile::TempDir, PathBuf) {
+        let (home_dir, home) = temp_root();
+        pad(&home);
+        write(&home, &["docs/plan.md", "docs/notes.txt"]);
+        let (volume_dir, volume) = temp_root();
+        write(
+            &volume,
+            &[
+                "Photos/2026/trip/plan.md",
+                "Photos/2026/trip/IMG_0001.JPG",
+                ".Spotlight-V100/store.db",
+                "Projects/site/node_modules/react/index.js",
+                "top.txt",
+            ],
+        );
+        (home_dir, home, volume_dir, volume)
+    }
+
+    fn skip_clutter(home: &Path) -> Settings {
+        Settings::new(home, home, Clutter::Skip, Ignore::default(), Access::Full)
+    }
+
+    #[test]
+    fn a_volume_is_added_ejected_and_added_again_without_reading_home() {
+        let (_h, home, _v, volume) = home_and_volume();
+        let settings = skip_clutter(&home);
+        let mut index = settings.scan().unwrap().index;
+        let home_only = findable(&index, &home);
+        // Never told, so only reading home again would find it.
+        write(&home, &["docs/unseen.txt"]);
+
+        let added = settings.add_volume(&mut index, &volume).unwrap();
+        assert!(search(&index, "unseen").is_empty());
+        fs::remove_file(home.join("docs/unseen.txt")).unwrap();
+        // The volume, Photos, 2026, trip, its two files, Projects, site and top.txt; hidden
+        // folders and node_modules are clutter there too.
+        assert_eq!((added.added, added.removed), (9, 0));
+        assert_eq!(index.volumes().collect::<Vec<_>>(), [volume.as_path()]);
+        assert_current(&settings, &index, &home, "with the volume");
+        let mut plans = [
+            home.join("docs/plan.md"),
+            volume.join("Photos/2026/trip/plan.md"),
+        ];
+        plans.sort();
+        assert_eq!(search(&index, "plan"), plans);
+        let on_volume = findable(&index, &home).len() - home_only.len();
+        assert_eq!(on_volume, 8);
+        // Depth counts from the volume, as from home.
+        let trip = search(&index, "IMG_0001");
+        assert_eq!(trip, [volume.join("Photos/2026/trip/IMG_0001.JPG")]);
+
+        let ejected = settings.remove_volume(&mut index, &volume).unwrap();
+        assert_eq!(ejected.removed, 9);
+        assert_eq!(index.volumes().count(), 0);
+        assert_eq!(findable(&index, &home), home_only);
+        assert_eq!(search(&index, "plan"), [home.join("docs/plan.md")]);
+        assert_current(&settings, &index, &home, "after ejecting it");
+        assert!(settings.remove_volume(&mut index, &volume).is_none());
+
+        settings.add_volume(&mut index, &volume).unwrap();
+        assert_eq!(findable(&index, &home).len() - home_only.len(), on_volume);
+        assert_current(&settings, &index, &home, "plugged in again");
+    }
+
+    #[test]
+    fn changes_on_a_volume_update_it_in_place() {
+        let (_h, home, _v, volume) = home_and_volume();
+        let settings = skip_clutter(&home);
+        let mut index = settings.scan().unwrap().index;
+        settings.add_volume(&mut index, &volume).unwrap();
+        write(
+            &volume,
+            &["Photos/2026/trip/IMG_0002.JPG", "new/plan v2.md"],
+        );
+        fs::remove_file(volume.join("top.txt")).unwrap();
+        write(&home, &["docs/budget.xlsx"]);
+
+        let changed = [
+            volume.join("Photos/2026/trip"),
+            volume.clone(),
+            home.join("docs"),
+        ];
+        let update = settings.update(&mut index, &changed);
+        assert_eq!(update.folders_read, 3);
+        assert_eq!((update.added, update.removed), (4, 1));
+        assert_current(&settings, &index, &home, "after changes on both");
+        assert_eq!(search(&index, "plan v2"), [volume.join("new/plan v2.md")]);
+    }
+
+    #[test]
+    fn a_volume_survives_saving_compacting_and_opening() {
+        let (_h, home, _v, volume) = home_and_volume();
+        let (_w, other) = temp_root();
+        write(&other, &["a.txt"]);
+        let settings = skip_clutter(&home);
+        let mut index = settings.scan().unwrap().index;
+        settings.add_volume(&mut index, &other).unwrap();
+        settings.add_volume(&mut index, &volume).unwrap();
+        // Ejecting the first volume leaves the second one's root numbered higher than
+        // anything a compaction keeps before it.
+        settings.remove_volume(&mut index, &other).unwrap();
+        fs::remove_dir_all(home.join(PADDING)).unwrap();
+        assert!(settings.update(&mut index, &[&home]).compacted);
+        assert_eq!(index.volumes().collect::<Vec<_>>(), [volume.as_path()]);
+        assert_current(&settings, &index, &home, "after compacting");
+
+        let file = index_file(&home);
+        let scan = Scan {
+            index,
+            unreadable_folders: 0,
+        };
+        save_index(&file, &scan, &settings, 0).unwrap();
+        let opened = open_index(&file, &settings).unwrap().scan.index;
+        fs::remove_file(file).unwrap();
+        assert!(opened == scan.index);
+        assert_current(&settings, &opened, &home, "after opening");
+    }
+
+    #[test]
+    fn refuses_a_volume_it_cannot_or_need_not_add() {
+        let (_h, home, _v, volume) = home_and_volume();
+        let settings = skip_clutter(&home);
+        let mut index = settings.scan().unwrap().index;
+        settings.add_volume(&mut index, &volume).unwrap();
+        let before = findable(&index, &home);
+        let (_f, loose) = temp_root();
+        write(&loose, &["f.txt"]);
+        let file = loose.join("f.txt");
+        let (_b, backup) = temp_root();
+        write(&backup, &["Backups.backupdb/Mac/2026-10-28-101500/a.txt"]);
+        let kind = |path: &Path, index: &mut Index| {
+            settings
+                .add_volume(index, path)
+                .map(|_| ())
+                .unwrap_err()
+                .kind()
+        };
+        for (path, expected) in [
+            (volume.clone(), io::ErrorKind::AlreadyExists),
+            (volume.join("Photos"), io::ErrorKind::AlreadyExists),
+            (home.clone(), io::ErrorKind::AlreadyExists),
+            (home.join("docs"), io::ErrorKind::AlreadyExists),
+            (
+                home.parent().unwrap().to_path_buf(),
+                io::ErrorKind::AlreadyExists,
+            ),
+            (volume.join("gone"), io::ErrorKind::NotFound),
+            (file.clone(), io::ErrorKind::NotADirectory),
+            (backup, io::ErrorKind::Unsupported),
+        ] {
+            assert_eq!(kind(&path, &mut index), expected, "{path:?}");
+        }
+        assert_eq!(findable(&index, &home), before);
+        assert_eq!(index.volumes().count(), 1);
+        assert!(settings.remove_volume(&mut index, &home).is_none());
+        assert!(settings.remove_volume(&mut index, &file).is_none());
+
+        let limited = Settings::new(
+            &home,
+            &home,
+            Clutter::Skip,
+            Ignore::default(),
+            Access::Limited,
+        );
+        let mut index = limited.scan().unwrap().index;
+        let (_o, other) = temp_root();
+        let refused = limited.add_volume(&mut index, &other).unwrap_err();
+        assert_eq!(refused.kind(), io::ErrorKind::PermissionDenied);
+        let mut empty = IndexBuilder::new().finish();
+        assert_eq!(kind(&other, &mut empty), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn a_volume_unplugged_midway_leaves_nothing_behind() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let (_h, home, _v, volume) = home_and_volume();
+        let settings = skip_clutter(&home);
+        let mut index = settings.scan().unwrap().index;
+        // Once updated, so the runs are found too.
+        settings.update(&mut index, &[home.join("docs")]);
+        let before = index.clone();
+        // Gone once its top folder is read.
+        let asked = AtomicUsize::new(0);
+        let unplug = || {
+            if asked.fetch_add(1, Ordering::Relaxed) == 1 {
+                fs::remove_dir_all(&volume).unwrap();
+            }
+            false
+        };
+        let failed = settings.add_volume_until(&mut index, &volume, &unplug);
+        assert_eq!(failed.unwrap_err().kind(), io::ErrorKind::NotFound);
+        assert!(asked.load(Ordering::Relaxed) > 1);
+        assert!(index == before);
+
+        // Plugged in again, it comes back whole.
+        write(&volume, &["Photos/again.jpg"]);
+        settings.add_volume(&mut index, &volume).unwrap();
+        assert_current(&settings, &index, &home, "plugged in again");
+    }
+
+    #[test]
+    fn a_volume_ejected_midway_leaves_nothing_behind() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let (_h, home, _v, volume) = home_and_volume();
+        let settings = skip_clutter(&home);
+        let mut index = settings.scan().unwrap().index;
+        let before = index.clone();
+        // Ejected once its top folder is read, so the folders inside are never opened.
+        let asked = AtomicUsize::new(0);
+        let eject = || asked.fetch_add(1, Ordering::Relaxed) >= 1;
+        let stopped = settings.add_volume_until(&mut index, &volume, &eject);
+        assert_eq!(stopped.unwrap_err().kind(), io::ErrorKind::Interrupted);
+        assert!(index == before);
+        // The top folder, one ask for each of Photos and Projects, then one at the end.
+        assert_eq!(asked.load(Ordering::Relaxed), 4);
+    }
+
+    #[test]
+    fn a_volume_costs_what_scanning_it_alone_costs() {
+        let (_h, home, _v, volume) = home_and_volume();
+        let settings = skip_clutter(&home);
+        let mut index = settings.scan().unwrap().index;
+        let home_bytes = index.heap_bytes();
+        let alone = skip_clutter(&volume).scan().unwrap().index;
+        let added = settings.add_volume(&mut index, &volume).unwrap();
+        assert!(!added.compacted);
+        // No room kept for updates, no runs, and nothing counted toward a compaction.
+        assert!(index.heap_bytes() <= home_bytes + alone.heap_bytes());
+        assert!(index.runs.is_none());
+        assert_eq!((index.added, index.removed), (0, 0));
+        assert!(!index.children_apart);
+        assert_current(&settings, &index, &home, "with the volume");
+
+        // A whole volume larger than home is still no reason to compact.
+        let (_b, big) = temp_root();
+        pad(&big);
+        let added = settings.add_volume(&mut index, &big).unwrap();
+        assert!(!added.compacted);
+        assert_current(&settings, &index, &home, "with a big volume");
+    }
+
+    #[test]
+    fn a_volume_beside_a_folder_its_name_starts_with() {
+        let (_dir, top) = temp_root();
+        let (home, homework) = (top.join("home"), top.join("homework"));
+        write(&home, &["notes.txt"]);
+        write(&homework, &["essay.txt"]);
+        let settings = skip_clutter(&home);
+        let mut index = settings.scan().unwrap().index;
+        settings.add_volume(&mut index, &homework).unwrap();
+        assert_eq!(search(&index, "essay"), [homework.join("essay.txt")]);
+        let scope = settings.scope(&index);
+        write(&homework, &["draft.txt"]);
+        assert!(!scope.holds(&homework, &index));
+        assert!(scope.holds(&home, &index));
+        settings.update(&mut index, &[&homework]);
+        assert_current(&settings, &index, &home, "after a change on it");
+        assert!(
+            settings
+                .remove_volume(&mut index, &top.join("home"))
+                .is_none()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_volume_reached_through_a_link_is_held_by_its_real_path() {
+        let (_h, home, _v, volume) = home_and_volume();
+        let (_l, links) = temp_root();
+        let link = links.join("Photos drive");
+        std::os::unix::fs::symlink(&volume, &link).unwrap();
+        let settings = skip_clutter(&home);
+        let mut index = settings.scan().unwrap().index;
+        settings.add_volume(&mut index, &link).unwrap();
+        assert_eq!(index.volumes().collect::<Vec<_>>(), [volume.as_path()]);
+        assert!(settings.remove_volume(&mut index, &link).is_none());
+        assert!(settings.remove_volume(&mut index, &volume).is_some());
+    }
+
+    #[test]
+    fn changes_on_two_volumes_at_once() {
+        let (_h, home, _v, volume) = home_and_volume();
+        let (_o, other) = temp_root();
+        write(&other, &["Music/song.mp3"]);
+        let settings = skip_clutter(&home);
+        let mut index = settings.scan().unwrap().index;
+        settings.add_volume(&mut index, &volume).unwrap();
+        settings.add_volume(&mut index, &other).unwrap();
+        write(&volume, &["Photos/2026/trip/IMG_0002.JPG"]);
+        fs::remove_dir_all(other.join("Music")).unwrap();
+        write(&other, &["Films/clip.mov"]);
+
+        let changed = [volume.join("Photos/2026/trip"), other.join("Music"), other];
+        let update = settings.update(&mut index, &changed);
+        assert_eq!((update.added, update.removed), (3, 2));
+        assert_current(&settings, &index, &home, "after changes on both volumes");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_volume_read_in_part_still_joins() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_h, home, _v, volume) = home_and_volume();
+        let locked = volume.join("Projects");
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+        let settings = skip_clutter(&home);
+        let mut index = settings.scan().unwrap().index;
+        let added = settings.add_volume(&mut index, &volume);
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+        let added = added.unwrap();
+        assert_eq!(added.unreadable_folders, 1);
+        assert_eq!(search(&index, "Projects"), [locked]);
+    }
+
+    #[test]
+    fn a_volume_ejected_without_notice_empties_on_the_next_change() {
+        let (_h, home, _v, volume) = home_and_volume();
+        let settings = skip_clutter(&home);
+        let mut index = settings.scan().unwrap().index;
+        settings.add_volume(&mut index, &volume).unwrap();
+        fs::remove_dir_all(&volume).unwrap();
+
+        let update = settings.update(&mut index, &[volume.join("Photos")]);
+        assert_eq!((update.removed, update.unreadable_folders), (8, 0));
+        assert_eq!(index.volumes().collect::<Vec<_>>(), [volume.as_path()]);
+        assert_eq!(search(&index, "plan"), [home.join("docs/plan.md")]);
+        // Only the volume's own entry was left.
+        let ejected = settings.remove_volume(&mut index, &volume).unwrap();
+        assert_eq!(ejected.removed, 1);
+        assert_current(&settings, &index, &home, "after removing it");
     }
 
     #[test]

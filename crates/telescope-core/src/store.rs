@@ -1,6 +1,6 @@
 //! The saved index: one file that opens in milliseconds, so a restart needs no rescan.
 //!
-//! Version 2, every number little-endian:
+//! Version 3, every number little-endian:
 //!
 //! | bytes | what                                                       |
 //! |-------|------------------------------------------------------------|
@@ -12,13 +12,14 @@
 //! | 28    | entries added since the lists were last built, low 31 bits |
 //! |       | of a u32; the top bit is set once an update added any      |
 //! | 32    | sizes, u32 each: settings bytes, name bytes, distinct      |
-//! |       | names, entries, folders, passages                          |
-//! | 56    | settings, names, name starts, entry names, entry parents,  |
-//! |       | folders, folder inodes, passages; the last six as u32      |
-//! |       | lists, folder inodes as long as folders                    |
+//! |       | names, entries, folders, passages, roots                   |
+//! | 60    | settings, names, name starts, entry names, entry parents,  |
+//! |       | folders, folder inodes, passages, roots; the last seven as |
+//! |       | u32 lists, folder inodes as long as folders                |
 //!
-//! An entry an update removed keeps its place with `NO_PARENT` as its parent. Version 1 had
-//! no removed or added entries, folder inodes or passages.
+//! An entry an update removed keeps its place with `NO_PARENT` as its parent, as a root does.
+//! Version 1 had no removed or added entries, folder inodes or passages; version 2 had one
+//! root, entry 0, and no volumes.
 
 use crate::Ignore;
 use crate::index::{EntryId, Index, NO_PARENT, NameId};
@@ -33,8 +34,8 @@ use std::io::{self, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 const MAGIC: [u8; 8] = *b"TL-INDEX";
-const VERSION: u32 = 2;
-const HEADER: usize = 56;
+const VERSION: u32 = 3;
+const HEADER: usize = 60;
 const CRC: std::ops::Range<usize> = 12..16;
 const SIZES: usize = 32;
 /// The added count's bits at byte 28; the top bit says an update added children apart.
@@ -107,14 +108,56 @@ impl Settings {
 
     /// Brings an index built with these settings up to date with the folders that changed,
     /// as FSEvents reports them: real paths, each a folder whose children changed. A path
-    /// outside `root()` is ignored.
+    /// outside `root()` and every volume is ignored.
     pub fn update<P: AsRef<Path>>(&self, index: &mut Index, changed: &[P]) -> Update {
-        index.update(&self.root, &self.rules, changed)
+        index.update(&self.rules, changed)
     }
 
-    pub fn scope(&self) -> Scope {
+    /// Adds a mounted volume to an index built with these settings, scanned by the same
+    /// rules, without reading the root or other volumes again. `volume` may be any path to
+    /// it; `check_volume` tells which volumes to add. Fails as `scan` does for a volume
+    /// that cannot be opened; with `PermissionDenied` without Full Disk Access, as macOS asks
+    /// before an app reads an external drive; with `AlreadyExists` for a folder the index
+    /// already reads, or one holding it; with `Unsupported` for an older Time Machine disk;
+    /// and with `NotFound` for a volume gone before the scan ended, which leaves nothing
+    /// behind.
+    pub fn add_volume(&self, index: &mut Index, volume: &Path) -> io::Result<Update> {
+        self.add_volume_until(index, volume, &|| false)
+    }
+
+    /// As `add_volume`, but once `stop` says so the scan ends and fails with `Interrupted`,
+    /// leaving nothing behind, so an eject never waits for it.
+    pub fn add_volume_until(
+        &self,
+        index: &mut Index,
+        volume: &Path,
+        stop: &(dyn Fn() -> bool + Sync),
+    ) -> io::Result<Update> {
+        if self.rules.access() == Access::Limited {
+            return Err(io::ErrorKind::PermissionDenied.into());
+        }
+        let volume = fs::canonicalize(volume)?;
+        if crate::volume::holds_backups(&volume) {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "a Time Machine backup",
+            ));
+        }
+        index.add_volume(&volume, &self.rules, stop)
+    }
+
+    /// Takes a volume and everything on it out of the index, as when it is ejected; `volume`
+    /// is its real path, as `Index::volumes` lists it. `None` when the index holds no such
+    /// volume.
+    pub fn remove_volume(&self, index: &mut Index, volume: &Path) -> Option<Update> {
+        index.remove_volume(volume)
+    }
+
+    /// The folders `index`, built with these settings, holds: the root and its volumes.
+    pub fn scope(&self, index: &Index) -> Scope {
         Scope::new(
             self.root.clone(),
+            index.volumes().map(Path::to_path_buf).collect(),
             self.rules.clone(),
             self.rules.ignore_folder(),
         )
@@ -223,6 +266,7 @@ fn write(
         index.len(),
         index.folders.len(),
         index.passages.len(),
+        index.roots.len(),
     ];
     let mut head = [0; HEADER];
     head[..8].copy_from_slice(&MAGIC);
@@ -255,6 +299,7 @@ fn write(
         &index.folders,
         &index.folder_inodes,
         &index.passages,
+        &index.roots,
     ] {
         for chunk in list.chunks(CHUNK / 4) {
             buffer.clear();
@@ -297,9 +342,11 @@ fn read(mut file: impl Read, length: u64, settings: &Settings) -> Result<Saved, 
         entries,
         folders,
         passages,
-    ] = [0, 4, 8, 12, 16, 20].map(|at| u64::from(number(SIZES + at)));
+        roots,
+    ] = [0, 4, 8, 12, 16, 20, 24].map(|at| u64::from(number(SIZES + at)));
     // Checked before anything is allocated, so a damaged size never asks for gigabytes.
-    let body = settings_len + names_len + 4 * (distinct + 1 + 2 * entries + 2 * folders + passages);
+    let lists = distinct + 1 + 2 * entries + 2 * folders + passages + roots;
+    let body = settings_len + names_len + 4 * lists;
     if length != HEADER as u64 + body {
         return Err(OpenError::WrongLength);
     }
@@ -322,6 +369,7 @@ fn read(mut file: impl Read, length: u64, settings: &Settings) -> Result<Saved, 
     let folders = reader.numbers(folder_count)?;
     let folder_inodes = reader.numbers(folder_count)?;
     let passages = reader.numbers(passages)?;
+    let roots = reader.numbers(roots)?;
     if reader.crc.finalize() != saved_crc {
         return Err(OpenError::Damaged);
     }
@@ -333,6 +381,7 @@ fn read(mut file: impl Read, length: u64, settings: &Settings) -> Result<Saved, 
         &entry_parent,
         &folders,
         &passages,
+        &roots,
     );
     if !sound {
         return Err(OpenError::Damaged);
@@ -345,6 +394,7 @@ fn read(mut file: impl Read, length: u64, settings: &Settings) -> Result<Saved, 
         folders,
         folder_inodes,
         passages,
+        roots,
     );
     index.added = added;
     index.children_apart = children_apart;
@@ -394,6 +444,7 @@ pub(crate) fn is_sound(
     entry_parent: &[EntryId],
     folders: &[EntryId],
     passages: &[EntryId],
+    roots: &[EntryId],
 ) -> bool {
     let distinct = name_starts.len() - 1;
     let ascending = |list: &[EntryId]| list.windows(2).all(|pair| pair[0] < pair[1]);
@@ -404,7 +455,6 @@ pub(crate) fn is_sound(
             .iter()
             .all(|&start| names.is_char_boundary(start as usize))
         && entry_name.iter().all(|&name| (name as usize) < distinct)
-        && entry_parent.first().is_none_or(|&root| root == NO_PARENT)
         && ascending(folders)
         && folders
             .last()
@@ -413,12 +463,22 @@ pub(crate) fn is_sound(
         && passages
             .iter()
             .all(|passage| folders.binary_search(passage).is_ok())
-        && parents_are_folders_in_the_index(entry_parent, folders)
+        && (roots.first() == Some(&0) || (entry_parent.is_empty() && roots.is_empty()))
+        && ascending(roots)
+        && roots.iter().all(|&root| {
+            entry_parent.get(root as usize) == Some(&NO_PARENT)
+                && folders.binary_search(&root).is_ok()
+        })
+        && parents_are_folders_in_the_index(entry_parent, folders, roots)
 }
 
 /// Each entry's parent is an earlier folder that an update has not removed, so every path
-/// walks up to the root and removing a folder reaches everything inside it.
-fn parents_are_folders_in_the_index(entry_parent: &[EntryId], folders: &[EntryId]) -> bool {
+/// walks up to a root and removing a folder reaches everything inside it.
+fn parents_are_folders_in_the_index(
+    entry_parent: &[EntryId],
+    folders: &[EntryId],
+    roots: &[EntryId],
+) -> bool {
     let mut is_folder = vec![0_u64; entry_parent.len().div_ceil(64)];
     for &folder in folders {
         is_folder[folder as usize / 64] |= 1 << (folder % 64);
@@ -432,7 +492,7 @@ fn parents_are_folders_in_the_index(entry_parent: &[EntryId], folders: &[EntryId
             parent == NO_PARENT
                 || (at < entry
                     && is_folder[at / 64] >> (at % 64) & 1 == 1
-                    && (at == 0 || entry_parent[at] != NO_PARENT))
+                    && (entry_parent[at] != NO_PARENT || roots.binary_search(&parent).is_ok()))
         })
 }
 
@@ -513,6 +573,11 @@ mod tests {
             entry_name: name.to_vec(),
             entry_parent: parent.to_vec(),
             entry_depth: Vec::new(),
+            roots: if parent.is_empty() {
+                Vec::new()
+            } else {
+                vec![0]
+            },
             folders: folders.to_vec(),
             folder_inodes: vec![0; folders.len()],
             passages: Vec::new(),
@@ -560,6 +625,11 @@ mod tests {
             let mut folders = vec![builder.push("/", NO_PARENT, true)];
             for _ in 0..next(300) {
                 let name: String = (0..next(6)).map(|_| letters[next(letters.len())]).collect();
+                // Now and then a volume, a root of its own.
+                if next(40) == 0 {
+                    folders.push(builder.push(&format!("/Volumes/{name}"), NO_PARENT, true));
+                    continue;
+                }
                 let parent = folders[next(folders.len())];
                 let kind = [Kind::File, Kind::File, Kind::Folder, Kind::Passage][next(4)];
                 let is_dir = kind != Kind::File;
@@ -569,17 +639,20 @@ mod tests {
                 }
             }
             let mut built = builder.finish();
-            // Entries an update removed, each with everything inside it.
+            // Entries an update removed, each with everything inside it, and volumes ejected.
             for _ in 0..next(20) {
                 let entry = 1 + next(built.len());
                 if entry < built.len() {
                     built.entry_parent[entry] = NO_PARENT;
                 }
             }
+            if built.roots.len() > 1 && next(2) == 0 {
+                built.roots.remove(1 + next(built.roots.len() - 1));
+            }
             for entry in 1..built.len() {
                 let parent = built.entry_parent[entry];
                 if parent != NO_PARENT
-                    && parent != 0
+                    && !built.roots.contains(&parent)
                     && built.entry_parent[parent as usize] == NO_PARENT
                 {
                     built.entry_parent[entry] = NO_PARENT;
@@ -593,6 +666,7 @@ mod tests {
                 built.folders,
                 built.folder_inodes,
                 built.passages,
+                built.roots,
             );
             index.added = next(1000);
             let scan = Scan {
@@ -654,25 +728,26 @@ mod tests {
         let bytes = encode(&scan, &settings, 0x0102_0304_0506_0708);
 
         assert_eq!(bytes[..8], *b"TL-INDEX");
-        assert_eq!(bytes[8..12], [2, 0, 0, 0]);
+        assert_eq!(bytes[8..12], [3, 0, 0, 0]);
         let mut zeroed = bytes.clone();
         zeroed[12..16].fill(0);
         assert_eq!(bytes[12..16], crc32fast::hash(&zeroed).to_le_bytes());
         assert_eq!(bytes[16..24], [8, 7, 6, 5, 4, 3, 2, 1]);
         assert_eq!(bytes[24..28], [0x0D, 0x0C, 0x0B, 0x0A]);
         assert_eq!(bytes[28..32], [0x11, 0x10, 0x0F, 0x8E]);
-        let sizes = [settings.key.len() as u32, 3, 2, 2, 2, 1];
+        let sizes = [settings.key.len() as u32, 3, 2, 2, 2, 1, 1];
         let expected: Vec<u8> = sizes.iter().flat_map(|size| size.to_le_bytes()).collect();
-        assert_eq!(bytes[32..56], expected);
-        assert_eq!(bytes[56..56 + settings.key.len()], settings.key);
-        let lists = &bytes[56 + settings.key.len()..];
+        assert_eq!(bytes[32..60], expected);
+        assert_eq!(bytes[60..60 + settings.key.len()], settings.key);
+        let lists = &bytes[60 + settings.key.len()..];
         assert_eq!(lists[..3], *b"/ab");
         assert_eq!(lists[3..15], [0, 0, 0, 0, 1, 0, 0, 0, 3, 0, 0, 0]);
         assert_eq!(lists[15..23], [0, 0, 0, 0, 1, 0, 0, 0]);
         assert_eq!(lists[23..31], [0xFF, 0xFF, 0xFF, 0xFF, 0, 0, 0, 0]);
         assert_eq!(lists[31..39], [0, 0, 0, 0, 1, 0, 0, 0]);
         assert_eq!(lists[39..47], [4, 3, 2, 1, 5, 0, 0, 0]);
-        assert_eq!(lists[47..], [1, 0, 0, 0]);
+        assert_eq!(lists[47..51], [1, 0, 0, 0]);
+        assert_eq!(lists[51..], [0, 0, 0, 0]);
     }
 
     #[test]
@@ -738,7 +813,14 @@ mod tests {
     #[test]
     fn refuses_other_versions_and_other_files() {
         let (dir, settings, bytes) = saved_tree();
-        for version in [0, 1, 3, u32::MAX, u32::from_be_bytes(VERSION.to_le_bytes())] {
+        for version in [
+            0,
+            1,
+            2,
+            4,
+            u32::MAX,
+            u32::from_be_bytes(VERSION.to_le_bytes()),
+        ] {
             let mut old = bytes.clone();
             old[8..12].copy_from_slice(&version.to_le_bytes());
             let opened = decode(&old, &settings);
@@ -855,11 +937,45 @@ mod tests {
             index.passages = passages.to_vec();
             index
         };
+        // The root, a volume and a file on it.
+        let with_roots = |parents: &[u32], folders: &[u32], roots: &[u32]| {
+            let mut index = raw("/abc", &[0, 1, 2, 4], &[0, 1, 2], parents, folders);
+            index.roots = roots.to_vec();
+            index
+        };
+        let volume = [NO_PARENT, NO_PARENT, 1];
         let sound = [
             raw("/aé", &[0, 1, 4], &[0, 1], &[NO_PARENT, 0], &[0]),
             // Removed by an update.
             raw("/aé", &[0, 1, 4], &[0, 1], &[NO_PARENT, NO_PARENT], &[0]),
             with_passages(&[1]),
+            with_roots(&volume, &[0, 1], &[0, 1]),
+            // An ejected volume, everything on it removed.
+            with_roots(&[NO_PARENT; 3], &[0, 1], &[0]),
+            // Two roots of one name, which no update makes: odd, yet nothing points outside
+            // a list, and a path finds the first.
+            {
+                let mut twins = with_roots(&volume, &[0, 1], &[0, 1]);
+                twins.entry_name[1] = twins.entry_name[0];
+                assert_eq!(twins.root_at(Path::new(twins.name(1))), Some(0));
+                twins
+            },
+        ];
+        let unsound_roots = [
+            with_roots(&volume, &[0, 1], &[1]),
+            with_roots(&volume, &[0, 1], &[]),
+            with_roots(&volume, &[0, 1], &[0, 1, 1]),
+            with_roots(&volume, &[0, 1], &[0, 3]),
+            with_roots(&volume, &[0, 1], &[0, NO_PARENT]),
+            with_roots(&volume, &[0], &[0, 1]),
+            with_roots(&[NO_PARENT, 0, 1], &[0, 1], &[0, 1]),
+            // A file left on an ejected volume.
+            with_roots(&volume, &[0, 1], &[0]),
+            {
+                let mut empty = raw("", &[0], &[], &[], &[]);
+                empty.roots = vec![0];
+                empty
+            },
         ];
         let unsound = [
             raw("/aé", &[0, 1, 3], &[0, 1], &[NO_PARENT, 0], &[0]),
@@ -888,7 +1004,7 @@ mod tests {
         for index in sound {
             assert!(decode(&encode(&whole(index), &settings, 0), &settings).is_ok());
         }
-        for (i, index) in unsound.into_iter().enumerate() {
+        for (i, index) in unsound.into_iter().chain(unsound_roots).enumerate() {
             let opened = decode(&encode(&whole(index), &settings, 0), &settings);
             assert!(matches!(opened, Err(OpenError::Damaged)), "case {i}");
         }
