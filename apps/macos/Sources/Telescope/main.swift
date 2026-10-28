@@ -26,6 +26,7 @@ private func keyMenu() -> NSMenu {
     file.addItem(withTitle: "Copy Path", action: #selector(SearchPanel.copyPath(_:)), keyEquivalent: "c")
         .keyEquivalentModifierMask = [.command, .option]
     file.addItem(withTitle: "Quick Look", action: #selector(SearchPanel.quickLook(_:)), keyEquivalent: "y")
+    file.addItem(withTitle: "Details", action: #selector(SearchPanel.toggleDetails(_:)), keyEquivalent: "i")
     let edit = NSMenu(title: "Edit")
     edit.addItem(withTitle: "Undo", action: Selector(("undo:")), keyEquivalent: "z")
     edit.addItem(withTitle: "Redo", action: Selector(("redo:")), keyEquivalent: "Z")
