@@ -1,7 +1,7 @@
 import Foundation
 
 /// The health view's "Index everything" switch: off at first, as the whole home folder,
-/// Library and clutter included, is about 2.4 million entries instead of 48,000.
+/// Library and clutter included, is about 2.5 million entries instead of 48,000.
 @MainActor
 final class IndexEverything {
     private let defaults: UserDefaults?

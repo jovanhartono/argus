@@ -9,6 +9,8 @@ struct Health: Equatable {
     /// Nil until a list after the first comes into use.
     var changedAt: Date?
     var busy = false
+    /// Busy reading the whole folder, not just the folders that changed.
+    var building = false
     /// A rebuild failed, so the list misses a change until a whole new one reads it.
     var behind = false
     /// Search stopped working, or never started, and no list will come.
@@ -46,8 +48,10 @@ struct HealthFormat {
         fullDisk ? "On" : "Off: Desktop, Documents, Downloads and cloud drives are left out"
     }
 
+    /// A whole home folder held 2,478,045 entries on the Mac this was measured on.
     func everything(_ fullDisk: Bool) -> String {
-        let what = "Includes Library and clutter, about 2.4M items."
+        let count = 2_500_000.formatted(.number.notation(.compactName).locale(locale))
+        let what = "Includes Library and clutter, about \(count) items."
         return fullDisk ? what : what + " Needs Full Disk Access."
     }
 
@@ -99,7 +103,7 @@ final class HealthWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, NST
     let settings = KeyButton(title: "Open Settings", target: nil, action: nil)
     let rebuild = KeyButton(title: "Rebuild Index", target: nil, action: nil)
     let everything = NSButton(checkboxWithTitle: "Index everything", target: nil, action: nil)
-    /// Spins while a new list is built, as after flipping the switch, which takes 10 to 20 s.
+    /// Spins while a whole new list is built, as after flipping the switch: 10 to 20 s.
     let progress = NSProgressIndicator()
     let everythingHint = NSTextField(wrappingLabelWithString: "")
     let grid = NSGridView()
@@ -113,6 +117,7 @@ final class HealthWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, NST
     private let read: () -> Health
     private let hasAccess: () -> Bool
     private let onRebuild: () -> Void
+    private let isEverything: () -> Bool
     private let onEverything: (Bool) -> Void
     private let stage: any Stage
     private let format: HealthFormat
@@ -124,7 +129,7 @@ final class HealthWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, NST
 
     init(
         read: @escaping () -> Health, hasAccess: @escaping () -> Bool, rebuild: @escaping () -> Void,
-        stage: any Stage, folders: TextFolders = TextFolders(), everything: Bool = false,
+        stage: any Stage, folders: TextFolders = TextFolders(), everything: @escaping () -> Bool = { false },
         indexEverything: @escaping (Bool) -> Void = { _ in }, format: HealthFormat = HealthFormat(),
         tick: TimeInterval = 1
     ) {
@@ -132,8 +137,8 @@ final class HealthWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, NST
         self.read = read
         self.hasAccess = hasAccess
         onRebuild = rebuild
+        isEverything = everything
         onEverything = indexEverything
-        self.everything.state = everything ? .on : .off
         self.stage = stage
         self.format = format
         self.tick = tick
@@ -202,6 +207,7 @@ final class HealthWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, NST
         progress.style = .spinning
         progress.controlSize = .small
         progress.isHidden = true
+        progress.setAccessibilityLabel("Building the index")
         everythingHint.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
         everythingHint.textColor = .secondaryLabelColor
         everythingHint.preferredMaxLayoutWidth = 260
@@ -329,13 +335,20 @@ final class HealthWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, NST
         changed.toolTip = health.changedAt.map(dates.date)
         state.stringValue = format.state(health)
         access.stringValue = format.access(fullDisk)
-        rebuild.isEnabled = !health.busy && !health.stopped
-        everything.isEnabled = fullDisk && !health.stopped
+        let building = health.building && !health.stopped
+        rebuild.isEnabled = !building && !health.stopped
+        let on = isEverything()
+        everything.state = on ? .on : .off
+        // Without access it can still be turned off, just not on.
+        everything.isEnabled = (fullDisk || on) && !health.stopped
         everythingHint.stringValue = format.everything(fullDisk)
-        let building = health.busy && !health.stopped
         if building == progress.isHidden {
             progress.isHidden = !building
             building ? progress.startAnimation(nil) : progress.stopAnimation(nil)
+            let words = building ? "Building the index" : "Index built"
+            NSAccessibility.post(
+                element: progress, notification: .announcementRequested,
+                userInfo: [.announcement: words, .priority: NSAccessibilityPriorityLevel.high.rawValue])
         }
         guard grid.row(at: 5).isHidden != fullDisk else { return }
         grid.row(at: 5).isHidden = fullDisk

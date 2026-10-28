@@ -1150,6 +1150,19 @@ final class SearchPanelTests: XCTestCase {
         XCTAssertTrue(window.health === health, "one view, shown again")
     }
 
+    func testTheCachedHealthViewShowsTheSwitchAsItIsNow() async throws {
+        let everything = IndexEverything()
+        let window = try await opened(access: true, everything: everything)
+        window.showHealth(nil)
+        let health = try XCTUnwrap(window.health)
+        health.hide()
+        everything.isOn = true
+        window.showHealth(nil)
+        defer { health.hide() }
+        XCTAssertTrue(window.health === health)
+        XCTAssertEqual(health.everything.state, .on)
+    }
+
     func testTheHealthViewsSwitchListsCachesLiveAndIsKept() async throws {
         let caches = root.appendingPathComponent("Library/Caches")
         try FileManager.default.createDirectory(at: caches, withIntermediateDirectories: true)
@@ -1200,11 +1213,29 @@ final class SearchPanelTests: XCTestCase {
         let health = try XCTUnwrap(window.health)
         defer { health.hide() }
         XCTAssertEqual(health.entries.stringValue, "2", "the folder and Library, without the caches")
-        XCTAssertFalse(health.everything.isEnabled)
+        XCTAssertTrue(health.everythingHint.stringValue.hasSuffix("Needs Full Disk Access."))
 
         access = true
         try await until { health.health.entries == 4 && !health.health.busy }
         XCTAssertTrue(health.everything.isEnabled)
+    }
+
+    func testASwitchTurnedOffWithoutAccessStaysOffWhenAccessComes() async throws {
+        let caches = root.appendingPathComponent("Library/Caches")
+        try FileManager.default.createDirectory(at: caches, withIntermediateDirectories: true)
+        try Data().write(to: caches.appendingPathComponent("cached.db"))
+        let everything = IndexEverything()
+        everything.isOn = true
+        let window = try await opened(access: false, everything: everything)
+        window.showHealth(nil)
+        let health = try XCTUnwrap(window.health)
+        defer { health.hide() }
+        health.everything.performClick(nil)
+        XCTAssertFalse(everything.isOn)
+
+        access = true
+        try await until { health.health.changedAt != nil && !health.health.busy }
+        XCTAssertEqual(health.health.entries, 2, "the list access brought skips the caches")
     }
 
     func testARowsURLIsItsPathAndKnowsAFolder() {

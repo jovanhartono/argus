@@ -405,6 +405,61 @@ final class HatchTests: XCTestCase {
         try await counts.reach(4, within: 10)
     }
 
+    func testSwitchingBackBeforeTheRebuildStartsBuildsNothing() async throws {
+        let (root, _) = try folderWithNotes()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let (hatch, counts) = try await watching(root)
+        // Within the core's half-second gap after the first list.
+        XCTAssertTrue(hatch.indexEverything(true))
+        XCTAssertFalse(hatch.indexEverything(false), "the list in use already skips clutter")
+        XCTAssertFalse(hatch.health().building)
+        try await Task.sleep(for: .seconds(1))
+        XCTAssertEqual(counts.heard, 0)
+    }
+
+    /// The switch was kept on from a launch before access was granted.
+    func testAccessGrantedWithTheSwitchOnBuildsOneList() async throws {
+        let (root, _) = try folderWithNotes()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let caches = root.appendingPathComponent("Library/Caches")
+        try FileManager.default.createDirectory(at: caches, withIntermediateDirectories: true)
+        try Data().write(to: caches.appendingPathComponent("found.txt"))
+        let (hatch, counts) = try await watching(root, fullDisk: false)
+        hatch.grantFullDisk(everything: true)
+        // The folder, notes, a.txt, Library, Caches and found.txt.
+        try await counts.reach(6, within: 10)
+        try await Task.sleep(for: .seconds(1))
+        XCTAssertEqual(counts.heard, 1, "no second list")
+        XCTAssertFalse(hatch.indexEverything(true), "already on")
+    }
+
+    /// The switch flipped and the app quit before the new list was saved: the saved list,
+    /// built the other way, must not open.
+    func testAListSavedWithTheSwitchTheOtherWayIsScannedAgain() async throws {
+        for everything in [true, false] {
+            let (root, _) = try folderWithNotes()
+            defer { try? FileManager.default.removeItem(at: root) }
+            let caches = root.appendingPathComponent("Library/Caches")
+            try FileManager.default.createDirectory(at: caches, withIntermediateDirectories: true)
+            try Data().write(to: caches.appendingPathComponent("found.txt"))
+            let support = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            defer { try? FileManager.default.removeItem(at: support) }
+            let file = support.appendingPathComponent("index").path
+            do {
+                let (first, _) = try await watching(root, everything: !everything, saved: file)
+                let deadline = ProcessInfo.processInfo.systemUptime + 10
+                while !FileManager.default.fileExists(atPath: file) {
+                    guard ProcessInfo.processInfo.systemUptime < deadline else { return XCTFail("never saved") }
+                    try await Task.sleep(for: .milliseconds(50))
+                }
+                _ = first
+            }
+            let (hatch, _) = try await watching(root, everything: everything, saved: file, opened: false)
+            let found = try await names(hatch, "found")
+            XCTAssertEqual(found, everything ? ["found.txt"] : [], "\(everything)")
+        }
+    }
+
     /// The names a search for `query` finds, once its answer comes.
     private func names(_ hatch: Hatch, _ query: String) async throws -> [String] {
         let ticket = hatch.submit(query)
@@ -427,12 +482,12 @@ final class HatchTests: XCTestCase {
     /// A core over `root`, keeping its list in `saved` when given, watched once its first list
     /// is in, scanned or `opened` from the file.
     private func watching(
-        _ root: URL, everything: Bool = false, saved: String? = nil, opened: Bool = false
+        _ root: URL, fullDisk: Bool = true, everything: Bool = false, saved: String? = nil, opened: Bool = false
     ) async throws -> (Hatch, Counts) {
         let counts = Counts()
         let first = expectation(description: opened ? "opened" : "indexed")
         let hatch = try XCTUnwrap(
-            Hatch(root: root.path, fullDisk: true, everything: everything, saved: saved) { event in
+            Hatch(root: root.path, fullDisk: fullDisk, everything: everything, saved: saved) { event in
                 switch event {
                 case .indexed:
                     XCTAssertFalse(opened, "scanned in place of the saved list")

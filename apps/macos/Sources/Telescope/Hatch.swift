@@ -259,9 +259,10 @@ final class Hatch {
         changes.async { _ = tl_opened(core, path, path.count) }
     }
 
-    /// Builds the list again with the folders macOS guards, now that it lets Telescope in.
-    func grantFullDisk() {
-        tl_grant_full_disk(core, FSEventsGetCurrentEventId())
+    /// Builds the list again with the folders macOS guards, now that it lets Telescope in, and
+    /// with `everything`, clutter too in that same list.
+    func grantFullDisk(everything: Bool = false) {
+        tl_grant_full_disk(core, everything ? 1 : 0, FSEventsGetCurrentEventId())
     }
 
     /// Lists clutter and the ignore list's folders from the next list on, or leaves them out
@@ -278,7 +279,7 @@ final class Hatch {
         let date = { (seconds: UInt64) in seconds == 0 ? nil : Date(timeIntervalSince1970: TimeInterval(seconds)) }
         return Health(
             entries: out.entries, scannedAt: date(out.scanned_at), scanMs: out.scan_ms, changedAt: date(out.changed_at),
-            busy: out.busy, behind: out.behind, stopped: out.stopped)
+            busy: out.busy, building: out.building, behind: out.behind, stopped: out.stopped)
     }
 
     /// Whether a search inside the folder at `path` can find anything. Never waits for a scan

@@ -65,9 +65,11 @@ final class HealthFormatTests: XCTestCase {
         XCTAssertEqual(english.state(Health(busy: true, behind: true, stopped: true)), english.state(Health(stopped: true)))
         XCTAssertEqual(english.access(true), "On")
         XCTAssertEqual(english.access(false), "Off: Desktop, Documents, Downloads and cloud drives are left out")
-        XCTAssertEqual(english.everything(true), "Includes Library and clutter, about 2.4M items.")
+        XCTAssertEqual(english.everything(true), "Includes Library and clutter, about 2.5M items.")
         XCTAssertEqual(
-            english.everything(false), "Includes Library and clutter, about 2.4M items. Needs Full Disk Access.")
+            english.everything(false), "Includes Library and clutter, about 2.5M items. Needs Full Disk Access.")
+        let german = HealthFormat(locale: Locale(identifier: "de_DE"))
+        XCTAssertTrue(german.everything(true).contains("about 2,5"), german.everything(true))
     }
 }
 
@@ -80,6 +82,7 @@ final class HealthWindowTests: XCTestCase {
     private var health = Health(entries: 48_127, scannedAt: Date(), scanMs: 90)
     private var folders: TextFolders!
     private var switched: [Bool] = []
+    private var everything = false
 
     override func setUp() async throws {
         _ = NSApplication.shared
@@ -96,8 +99,10 @@ final class HealthWindowTests: XCTestCase {
         XCTAssertTrue(done(), file: file, line: line)
     }
 
-    private func window(tick: TimeInterval = 1, everything: Bool = false) -> HealthWindow {
-        HealthWindow(
+    /// The switch as the core takes it: switched back before the new list started, none is built.
+    private func window(tick: TimeInterval = 1) -> HealthWindow {
+        let listed = everything
+        return HealthWindow(
             read: { [unowned self] in
                 reads += 1
                 return health
@@ -105,60 +110,97 @@ final class HealthWindowTests: XCTestCase {
             hasAccess: { [unowned self] in fullDisk },
             rebuild: { [unowned self] in
                 rebuilds += 1
-                health.busy = true
+                (health.busy, health.building) = (true, true)
             },
-            stage: stage, folders: folders, everything: everything,
-            indexEverything: { [unowned self] in
-                switched.append($0)
-                health.busy = true
+            stage: stage, folders: folders, everything: { [unowned self] in everything },
+            indexEverything: { [unowned self] on in
+                switched.append(on)
+                everything = on
+                guard fullDisk else { return }
+                (health.busy, health.building) = (on != listed, on != listed)
             },
             format: HealthFormat(locale: Locale(identifier: "en_US")), tick: tick)
     }
 
-    func testIndexEverythingStartsAsSavedAndSpinsWhileTheNewListIsBuilt() {
+    func testIndexEverythingSpinsWhileTheNewListIsBuiltAndStopsWhenSwitchedBackInTime() {
         let window = window()
         window.show()
         defer { window.hide() }
         XCTAssertEqual(window.everything.state, .off)
         XCTAssertTrue(window.everything.isEnabled)
         XCTAssertTrue(window.progress.isHidden, "nothing is being built")
+        XCTAssertEqual(window.progress.accessibilityLabel(), "Building the index")
 
         window.everything.performClick(nil)
         XCTAssertEqual(switched, [true])
         XCTAssertFalse(window.progress.isHidden)
         XCTAssertEqual(window.state.stringValue, "Updating…")
         XCTAssertFalse(window.rebuild.isEnabled)
-        XCTAssertTrue(window.everything.isEnabled, "it can be switched back before the list is in")
+        XCTAssertTrue(window.everything.isEnabled, "it can be switched back")
 
         window.everything.performClick(nil)
         XCTAssertEqual(switched, [true, false])
-        health.busy = false
-        window.refresh()
-        XCTAssertTrue(window.progress.isHidden)
+        XCTAssertTrue(window.progress.isHidden, "nothing to build once switched back before it started")
         XCTAssertEqual(window.state.stringValue, "Up to date")
+        XCTAssertTrue(window.rebuild.isEnabled)
+    }
 
-        let on = self.window(everything: true)
-        XCTAssertEqual(on.everything.state, .on)
+    func testTheSwitchShowsTheSettingAsItIsNow() {
+        everything = true
+        let window = window()
+        window.show()
+        XCTAssertEqual(window.everything.state, .on)
+        window.hide()
+        everything = false
+        window.show()
+        defer { window.hide() }
+        XCTAssertEqual(window.everything.state, .off, "set elsewhere while hidden")
+    }
+
+    /// With everything listed, ~/Library changes every few seconds and each change is a patch.
+    func testAPatchNeitherSpinsNorTakesRebuildAway() {
+        health.busy = true
+        let window = window()
+        window.show()
+        defer { window.hide() }
+        XCTAssertTrue(window.progress.isHidden)
+        XCTAssertTrue(window.rebuild.isEnabled)
+        XCTAssertEqual(window.state.stringValue, "Updating…")
     }
 
     /// Reading all of ~/Library without access stops on a macOS pop-up for each media library.
     func testWithoutAccessTheSwitchWaitsAndSaysWhy() {
         fullDisk = false
-        let window = window(everything: true)
+        let window = window()
         window.show()
         defer { window.hide() }
-        XCTAssertFalse(window.everything.isEnabled)
-        XCTAssertEqual(window.everything.state, .on, "kept as saved, for when access comes")
+        XCTAssertFalse(window.everything.isEnabled, "can't be turned on yet")
         XCTAssertTrue(window.everythingHint.stringValue.hasSuffix("Needs Full Disk Access."))
 
         fullDisk = true
         window.refresh()
         XCTAssertTrue(window.everything.isEnabled)
-        XCTAssertEqual(window.everythingHint.stringValue, "Includes Library and clutter, about 2.4M items.")
+        XCTAssertEqual(window.everythingHint.stringValue, "Includes Library and clutter, about 2.5M items.")
+    }
+
+    /// Kept on from before access was taken away, or from another Mac.
+    func testWithoutAccessASwitchLeftOnCanStillBeTurnedOff() {
+        fullDisk = false
+        everything = true
+        let window = window()
+        window.show()
+        defer { window.hide() }
+        XCTAssertEqual(window.everything.state, .on)
+        XCTAssertTrue(window.everything.isEnabled)
+        window.everything.performClick(nil)
+        XCTAssertEqual(switched, [false])
+        XCTAssertEqual(window.everything.state, .off)
+        XCTAssertFalse(window.everything.isEnabled, "and not on again until access comes")
+        XCTAssertTrue(window.progress.isHidden)
     }
 
     func testAStoppedCoreTakesNoSwitchAndShowsNoSpinner() {
-        health = Health(busy: true, stopped: true)
+        health = Health(busy: true, building: true, stopped: true)
         let window = window()
         window.show()
         defer { window.hide() }
@@ -201,7 +243,7 @@ final class HealthWindowTests: XCTestCase {
         XCTAssertEqual(window.state.stringValue, "Updating…")
         XCTAssertFalse(window.rebuild.isEnabled, "one rebuild at a time")
 
-        health.busy = false
+        (health.busy, health.building) = (false, false)
         health.changedAt = Date()
         window.refresh()
         XCTAssertTrue(window.rebuild.isEnabled)

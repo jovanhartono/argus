@@ -316,7 +316,7 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
                     return !lacksAccess
                 },
                 rebuild: { [weak self] in self?.hatch?.rebuild() }, stage: stage, folders: textFolders,
-                everything: everything.isOn,
+                everything: { [weak self] in self?.everything.isOn ?? false },
                 indexEverything: { [weak self] on in
                     guard let self else { return }
                     everything.isOn = on
@@ -426,8 +426,7 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
         guard lacksAccess, hasAccess() else { return }
         lacksAccess = false
         if notice == .needsAccess { post(nil) }
-        hatch?.grantFullDisk()
-        if everything.isOn { hatch?.indexEverything(true) }
+        hatch?.grantFullDisk(everything: everything.isOn)
         fit()
     }
 
