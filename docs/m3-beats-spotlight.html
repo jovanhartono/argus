@@ -1,0 +1,277 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Telescope Beats Spotlight</title>
+<style>
+:root {
+  --bg: #f5f5f7; --surface: #ffffff; --ink: #1d1d1f; --muted: #6e6e73; --line: #d2d2d7;
+  --accent: #0066cc; --accent-soft: #e8f0fb; --good: #1d7a4b; --good-soft: #e3f4ea;
+  --warn: #8f5400; --warn-soft: #fbefd9;
+  --font: -apple-system, BlinkMacSystemFont, system-ui, "Segoe UI", sans-serif;
+  --font-mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  color-scheme: light;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #000000; --surface: #1c1c1e; --ink: #f5f5f7; --muted: #98989d; --line: #38383a;
+    --accent: #2997ff; --accent-soft: #10243d; --good: #5ccb91; --good-soft: #12301f;
+    --warn: #f0b35a; --warn-soft: #33260e;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #000000; --surface: #1c1c1e; --ink: #f5f5f7; --muted: #98989d; --line: #38383a;
+  --accent: #2997ff; --accent-soft: #10243d; --good: #5ccb91; --good-soft: #12301f;
+  --warn: #f0b35a; --warn-soft: #33260e;
+  color-scheme: dark;
+}
+*, *::before, *::after { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--ink); font-family: var(--font); font-size: 17px; line-height: 1.55; -webkit-font-smoothing: antialiased; }
+.wrap { max-width: 980px; margin: 0 auto; padding: 56px max(16px, env(safe-area-inset-right, 0px)) 80px max(16px, env(safe-area-inset-left, 0px)); overflow-x: clip; }
+a { color: var(--accent); text-decoration: none; }
+a:hover { text-decoration: underline; }
+a:focus-visible, .term:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 2px; }
+h1, h2 { font-weight: 700; letter-spacing: -0.02em; text-wrap: balance; }
+h1 { font-size: clamp(2.2rem, 6vw, 3.4rem); line-height: 1.05; margin: 6px 0 12px; }
+h2 { font-size: clamp(1.5rem, 3.2vw, 2rem); line-height: 1.15; margin: 0 0 10px; }
+p { margin: 0 0 12px; }
+.prose { max-width: 66ch; }
+.lede { font-size: 1.2rem; color: var(--muted); max-width: 60ch; }
+.eyebrow { font-size: 0.8rem; font-weight: 600; color: var(--muted); }
+header { display: grid; gap: 4px; padding-bottom: 32px; }
+.chips { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
+.chip { font-size: 0.78rem; font-weight: 500; padding: 3px 11px; border-radius: 999px; white-space: nowrap; background: var(--surface); color: var(--muted); border: 0.5px solid var(--line); }
+.chip.keep { background: var(--good-soft); color: var(--good); border-color: transparent; }
+.chip.open { background: var(--warn-soft); color: var(--warn); border-color: transparent; }
+nav.toc { display: flex; flex-wrap: wrap; gap: 6px 20px; font-size: 0.92rem; padding-top: 16px; }
+section { border-top: 0.5px solid var(--line); padding-block: 48px 12px; display: grid; gap: 18px; }
+section > * { min-width: 0; }
+ul, ol { margin: 0; padding-left: 1.25rem; }
+li { margin-bottom: 6px; }
+li:last-child { margin-bottom: 0; }
+.table-wrap { overflow-x: auto; border-radius: 12px; background: var(--surface); }
+table { border-collapse: collapse; width: 100%; font-size: 0.9rem; line-height: 1.5; }
+.table-wrap table { min-width: 640px; }
+th, td { text-align: left; vertical-align: top; padding: 11px 16px; border-bottom: 0.5px solid var(--line); }
+tr:last-child td { border-bottom: 0; }
+th { font-size: 0.78rem; color: var(--muted); font-weight: 600; white-space: nowrap; }
+td.name { font-weight: 600; white-space: nowrap; }
+td.n { white-space: nowrap; font-variant-numeric: tabular-nums; }
+td .sub { display: block; color: var(--muted); font-size: 0.82rem; }
+.mono { font-family: var(--font-mono); font-size: 0.82rem; }
+kbd { font-family: var(--font); font-size: 0.8rem; padding: 1px 7px; border-radius: 5px; background: var(--surface); border: 0.5px solid var(--line); box-shadow: 0 1px 0 var(--line); white-space: nowrap; }
+figure { margin: 0; display: grid; gap: 12px; }
+figcaption { font-size: 0.88rem; color: var(--muted); max-width: 66ch; }
+footer { border-top: 0.5px solid var(--line); margin-top: 36px; padding-top: 20px; font-size: 0.85rem; color: var(--muted); }
+
+.fig-wrap { overflow-x: auto; background: var(--surface); border-radius: 12px; padding: 16px 12px; }
+.fig-wrap svg { display: block; width: 100%; height: auto; min-width: 640px; }
+.s-small { fill: var(--muted); font-family: var(--font); font-size: 12px; }
+.s-title { fill: var(--ink); font-family: var(--font); font-size: 13px; font-weight: 600; }
+.s-box { fill: var(--bg); stroke: var(--line); stroke-width: 1; }
+.s-box-hi { fill: var(--accent-soft); stroke: var(--accent); stroke-width: 1; }
+.s-arrow { stroke: var(--muted); stroke-width: 1.4; fill: none; }
+.s-head { fill: var(--muted); }
+
+.term { border-bottom: 1.5px dotted var(--accent); cursor: help; position: relative; }
+.term:focus { outline: none; }
+.term::after {
+  content: attr(data-tip); position: absolute; bottom: calc(100% + 8px); left: 50%; transform: translateX(-50%);
+  width: max-content; max-width: min(260px, 80vw); background: var(--ink); color: var(--bg);
+  font-size: 0.8rem; line-height: 1.45; font-weight: 400; padding: 0.45rem 0.65rem; border-radius: 8px;
+  opacity: 0; visibility: hidden; transition: opacity 0.15s; pointer-events: none; z-index: 10;
+}
+.term:hover::after, .term:focus::after { opacity: 1; visibility: visible; }
+@media (prefers-reduced-motion: reduce) { .term::after { transition: none; } }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <span class="eyebrow">Milestone M3 · steps and plan · updated 28 Oct 2026</span>
+  <h1>Telescope beats Spotlight</h1>
+  <p class="lede">The steps of milestone M3. Telescope learns what you open, finds your apps, opens instantly from the list it saved last time, lets you step into a folder, and tells you how its list is doing.</p>
+  <div class="chips">
+    <span class="chip keep">15 pull requests merged</span>
+    <span class="chip keep">20 of 20 golden searches in the top 3</span>
+    <span class="chip open">Restart, home-folder memory, index everything and drives to go</span>
+    <span class="chip">Built early, while M2's week runs</span>
+    <span class="chip">Swift + Rust</span>
+  </div>
+  <nav class="toc" aria-label="Sections">
+    <a href="#steps">Steps</a>
+    <a href="#launch">Opening instantly</a>
+    <a href="#rank">How a result earns its place</a>
+    <a href="#targets">M3 targets</a>
+    <a href="#decide">Decisions</a>
+    <a href="#left">What remains</a>
+    <a href="#next">Next steps</a>
+  </nav>
+</header>
+
+<main>
+<section id="steps">
+  <h2>Steps</h2>
+  <p class="prose">M3 was built early, overnight on 27-28 Oct 2026, while M2 waits on its release and its 7-day run. Most steps came in two halves: the Rust <span class="term" tabindex="0" data-tip="The part of Telescope that holds the list of files and does the searching. Written in Rust, shared by the Mac and Windows apps.">core</span> first, tested from the command line, then the Swift window. Each step landed as its own pull request. The window steps also have a longer row, with every number, on the <a href="m2-daily-driver.html#steps">M2 page</a>.</p>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Part</th><th>Step</th><th>What you get</th><th>Status</th></tr></thead>
+      <tbody>
+        <tr><td class="n">Core</td><td class="name">Saved list</td><td>The list can be written to a file and opened again instead of reading every folder. The whole home folder, 2.4 million entries in a 52 MB file, opens in about 20 ms against 10.8 s to scan. A damaged, foreign or out-of-date file is refused with a reason and Telescope scans instead</td><td class="n"><span class="chip keep">Done</span> <a href="https://github.com/jovanhartono/telescope/pull/28">#28</a></td></tr>
+        <tr><td class="n">Core</td><td class="name">Changed folders in place</td><td>A changed folder is read again and patched into the list instead of the whole list being rebuilt. 10,000 changes on a 395,000-entry tree take 0.55-0.75 s, and the result equals a fresh scan exactly</td><td class="n"><span class="chip keep">Done</span> <a href="https://github.com/jovanhartono/telescope/pull/36">#36</a></td></tr>
+        <tr><td class="n">Core</td><td class="name">The whole home folder</td><td>Indexing a whole home folder, 2.5 million entries when this was measured, peaks at about 87 MB instead of 125 MB. macOS kept large freed blocks of memory and counted them against Telescope; a small <span class="term" tabindex="0" data-tip="The part of a program that hands out memory and takes it back. Rust lets you swap in your own.">allocator</span> now gives those blocks straight back</td><td class="n"><span class="chip keep">Done</span> <a href="https://github.com/jovanhartono/telescope/pull/40">#40</a></td></tr>
+        <tr><td class="n">Core</td><td class="name">Short searches</td><td>One- to three-letter searches skip names that could never reach the visible list, with no result changed. On 4 slow cores, 95% of searches went from 38.7-48.2 ms to 32.7-38.0 ms on the whole home folder</td><td class="n"><span class="chip keep">Done</span> <a href="https://github.com/jovanhartono/telescope/pull/43">#43</a></td></tr>
+        <tr><td class="n">Window</td><td class="name">Details pane</td><td><kbd>⌘</kbd> <kbd>I</kbd> opens a pane beside the results with a picture of the selected file, its kind, size, folder and dates. Size and dates are read only for that one file, in 0.07-0.1 ms</td><td class="n"><span class="chip keep">Done</span> <a href="https://github.com/jovanhartono/telescope/pull/44">#44</a></td></tr>
+        <tr><td class="n">Core</td><td class="name">Apps by name</td><td>Searching finds apps in /Applications, /System/Applications and ~/Applications: 98 apps read in under 0.5 ms, 3.2 KB. An app ranks above a file whose name matches equally well</td><td class="n"><span class="chip keep">Done</span> <a href="https://github.com/jovanhartono/telescope/pull/45">#45</a></td></tr>
+        <tr><td class="n">Core</td><td class="name">Name before folder</td><td>A word found only in a folder above now earns 4 points less than the same word in the file's own name. The golden set went from 19 of 20 to 20 of 20 on the whole home folder, every one at rank 1</td><td class="n"><span class="chip keep">Done</span> <a href="https://github.com/jovanhartono/telescope/pull/46">#46</a></td></tr>
+        <tr><td class="n">Core</td><td class="name">What you open often</td><td>The core keeps up to 1,024 opened paths, each with a score that halves every 30 days, and lifts a match by up to four letters' worth. With 1,024 opened files a search costs under 1% more</td><td class="n"><span class="chip keep">Done</span> <a href="https://github.com/jovanhartono/telescope/pull/48">#48</a></td></tr>
+        <tr><td class="n">Test</td><td class="name">Steady rebuild tests</td><td>The tests of when a rebuild starts used a real clock and could fail on a busy Mac. They now move a pretend clock by hand: 100 of 100 runs pass under load, and 10 of them run in 0.09 s instead of 2.69 s</td><td class="n"><span class="chip keep">Done</span> <a href="https://github.com/jovanhartono/telescope/pull/49">#49</a></td></tr>
+        <tr><td class="n">Window</td><td class="name">Tab into a folder</td><td>With a folder picked, <kbd>Tab</kbd> searches only inside it, and a small label in the box shows where you are; <kbd>⌫</kbd> in an empty box steps back out. Results rank exactly as in a search of everything with the rest left out</td><td class="n"><span class="chip keep">Done</span> <a href="https://github.com/jovanhartono/telescope/pull/50">#50</a></td></tr>
+        <tr><td class="n">Core</td><td class="name">External drives</td><td>The core can add a mounted drive beside the home folder and drop it on eject, without reading home again: a 100,000-entry drive in about 61 ms. Disk images, Time Machine and network drives are left out. The window doesn't hear about drives yet</td><td class="n"><span class="chip keep">Done</span> <a href="https://github.com/jovanhartono/telescope/pull/52">#52</a></td></tr>
+        <tr><td class="n">Core</td><td class="name">Whole home under 60 MB</td><td>A smaller way to store the list: 72.7 MB down to 57.8 MB for the whole home folder, and about 58-59 MB at rest after opening the saved list. Searches are no slower</td><td class="n"><span class="chip keep">Done</span> <a href="https://github.com/jovanhartono/telescope/pull/54">#54</a></td></tr>
+        <tr><td class="n">Window</td><td class="name">Open the saved list at launch</td><td>The app searches last time's list at once, then asks macOS what changed while it was closed. Ready 188 ms typical after launch instead of 429 ms, measured in turns; a change is findable after 0.13 s instead of 0.24 s</td><td class="n"><span class="chip keep">Done</span> <a href="https://github.com/jovanhartono/telescope/pull/56">#56</a></td></tr>
+        <tr><td class="n">Window</td><td class="name">Apps and what you open, in the window</td><td>Apps show beside files with their own icons, and <kbd>Return</kbd> starts one. Every file or app you open ranks higher from the next keystroke and after a relaunch</td><td class="n"><span class="chip keep">Done</span> <a href="https://github.com/jovanhartono/telescope/pull/58">#58</a></td></tr>
+        <tr><td class="n">Window</td><td class="name">Index health and the Finder hotkey</td><td><kbd>⌘</kbd> <kbd>,</kbd> shows how many entries the list holds, when it was last read and whether it is up to date, with a Rebuild Index button. <kbd>⌘</kbd> <kbd>⇧</kbd> <kbd>⌥</kbd> <kbd>Space</kbd> opens the search already inside the folder the front Finder window shows</td><td class="n"><span class="chip keep">Done</span> <a href="https://github.com/jovanhartono/telescope/pull/59">#59</a></td></tr>
+        <tr><td class="n">Docs</td><td class="name">M3 and M4 pages</td><td>This page and the text-search page, with every number taken from the merged pull requests</td><td class="n"><span class="chip keep">Done</span> <a href="https://github.com/jovanhartono/telescope/pull/61">#61</a></td></tr>
+        <tr><td class="n">Window</td><td class="name">Index everything switch</td><td>A switch in the app to list the whole home folder, about 2.4 million entries instead of 48,000. The core is ready; the switch waits until memory stays under target after searches and during updates</td><td class="n"><span class="chip open">To do</span> <a href="https://github.com/jovanhartono/telescope/issues/21">#21</a></td></tr>
+        <tr><td class="n">Window</td><td class="name">External drives in the window</td><td>The app tells the core when a drive is plugged in or ejected</td><td class="n"><span class="chip open">To do</span> <a href="https://github.com/jovanhartono/telescope/issues/22">#22</a></td></tr>
+        <tr><td class="n">Core</td><td class="name">Patch without a second copy</td><td>Updates patch a copy of the list while searches use the old one, so with index everything on an update briefly holds two: about 140 MB</td><td class="n"><span class="chip open">To do</span> <a href="https://github.com/jovanhartono/telescope/issues/42">#42</a></td></tr>
+        <tr><td class="n">Test</td><td class="name">Damaged saved lists with drives</td><td>Random damaged saved lists that hold drives and removed entries, each refused or opened safely</td><td class="n"><span class="chip open">To do</span> <a href="https://github.com/jovanhartono/telescope/issues/55">#55</a></td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<section id="launch">
+  <h2>How Telescope opens instantly</h2>
+  <p class="prose">Without a saved list, every launch reads every folder again before the first search can run: about 0.1-0.5 s for the default folders and 10 s for a whole home folder. On a Mac that restarts each morning, that is a pause you feel every day.</p>
+  <p class="prose">Think of a shop that keeps last night's price list instead of counting every shelf each morning. Next to the list it keeps a bookmark in the delivery log. In the morning it opens with the old list at once, then reads the log from the bookmark on and fixes only the shelves that changed overnight.</p>
+  <ul class="prose">
+    <li><strong>The price list.</strong> A background thread writes the list to <span class="mono">~/Library/Application Support/io.github.jovanhartono.telescope/index</span> 2 s after it changes, into a new file that then replaces the old one in one step, so a crash mid-write never leaves half a list. 986 KB for 48,127 entries.</li>
+    <li><strong>The bookmark.</strong> macOS's change log for folders, <span class="term" tabindex="0" data-tip="macOS's built-in change log for folders. Apps subscribe to it instead of re-reading the disk over and over.">FSEvents</span>, numbers every change. Telescope saves the number of the last change its list includes, and the log's own name. If the log was wiped since, after a disk repair say, the name differs and Telescope scans instead.</li>
+    <li><strong>The morning.</strong> At launch the saved list answers searches at once. macOS replays the changes made while Telescope was closed, and each changed folder is read again and patched in: about 1 ms per change.</li>
+  </ul>
+  <figure>
+    <div class="fig-wrap">
+      <svg viewBox="0 0 900 220" role="img" aria-label="Launch: open the saved list in 37 to 132 milliseconds and search at once; meanwhile macOS replays changes since the bookmark, and each changed folder is patched in about 1 millisecond">
+        <defs><marker id="h" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="s-head" d="M0,0 L10,5 L0,10 z"/></marker></defs>
+        <rect class="s-box" x="20" y="40" width="170" height="56" rx="9"/>
+        <text class="s-title" x="34" y="63">Telescope starts</text>
+        <text class="s-small" x="34" y="81">macOS: 90-350 ms</text>
+        <rect class="s-box-hi" x="250" y="40" width="200" height="56" rx="9"/>
+        <text class="s-title" x="264" y="63">Open the saved list</text>
+        <text class="s-small" x="264" y="81">37-132 ms in the app</text>
+        <rect class="s-box" x="510" y="40" width="170" height="56" rx="9"/>
+        <text class="s-title" x="524" y="63">Search is ready</text>
+        <text class="s-small" x="524" y="81">188 ms typical</text>
+        <rect class="s-box" x="250" y="140" width="200" height="56" rx="9"/>
+        <text class="s-title" x="264" y="163">Replay from the bookmark</text>
+        <text class="s-small" x="264" y="181">only what changed while closed</text>
+        <rect class="s-box" x="510" y="140" width="200" height="56" rx="9"/>
+        <text class="s-title" x="524" y="163">Patch each changed folder</text>
+        <text class="s-small" x="524" y="181">about 1 ms each</text>
+        <line class="s-arrow" x1="190" y1="68" x2="248" y2="68" marker-end="url(#h)"/>
+        <line class="s-arrow" x1="450" y1="68" x2="508" y2="68" marker-end="url(#h)"/>
+        <path class="s-arrow" d="M350 96 L350 138" marker-end="url(#h)"/>
+        <line class="s-arrow" x1="450" y1="168" x2="508" y2="168" marker-end="url(#h)"/>
+        <path class="s-arrow" d="M710 168 L780 168 L780 96 L682 76" marker-end="url(#h)"/>
+        <text class="s-small" x="772" y="130" text-anchor="end">new list swapped in</text>
+      </svg>
+    </div>
+    <figcaption>Ready 131-370 ms after launch over 9 relaunches, 188 ms typical, on a busy Mac (28 Oct, load average 13-18). Before, the app scanned first: 429 ms typical and 770 ms for 95%. Most of what is left is macOS starting the app itself.</figcaption>
+  </figure>
+</section>
+
+<section id="rank">
+  <h2>How a result earns its place</h2>
+  <p class="prose">A launcher you trust puts the file you meant first. Spotlight often doesn't: it ranks by its own guesses and knows nothing of what you opened this morning. M3's ranking adds up a few plain points, like a judge's score card.</p>
+  <ul class="prose">
+    <li><strong>How well the name matches.</strong> Letters in order score; letters at the start of a word score more. This is M0's scoring, unchanged.</li>
+    <li><strong>How deep the file sits.</strong> Each folder down costs a little, so ~/report.pdf beats a report.pdf buried in a backup.</li>
+    <li><strong>Name before folder.</strong> When you type two words and one is only in a folder's name above, that word earns 4 points less than if it were in the file's own name. 4 is worth two folder levels.</li>
+    <li><strong>Apps.</strong> An app pays no depth cost, so it wins a tie with a file of the same name, but a weaker app match never beats a better file match.</li>
+    <li><strong>What you open.</strong> Each open adds to a path's <span class="term" tabindex="0" data-tip="A score that grows each time you open something and fades as the days pass, so what you use often and lately comes first.">frecency</span> score, which halves every 30 days. The boost is at most four letters' worth, so it lifts a good match over an equal one but can't drag a poor match to the top.</li>
+  </ul>
+  <p class="prose">The <span class="term" tabindex="0" data-tip="Your list of 20 real searches, each with the file you expect on top. Rerun after every ranking change.">golden set</span> checks it: 20 of 20 searches put the expected file in the top 3, on the default folders and on the whole home folder, every one at rank 1. The list itself stays on your Mac.</p>
+</section>
+
+<section id="targets">
+  <h2>What M3 must prove</h2>
+  <p class="prose">The milestone's own check is the golden set. The others come from the research plan's <a href="research.html#targets">final targets</a> and the features M3 promises.</p>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Check</th><th>Target</th><th>Measured on your Mac</th></tr></thead>
+      <tbody>
+        <tr><td class="name">Golden set</td><td class="n">18 of 20 in the top 3</td><td><span class="chip keep">Pass</span> 20 of 20 on the default folders (48,025 entries) and on the whole home folder (2,464,567 entries), every one at rank 1; the whole home folder was 19 of 20 before the name-before-folder step. 25 other two-word searches kept the same top 3 (<a href="https://github.com/jovanhartono/telescope/pull/46">#46</a>). Still 20 of 20 with 1,024 random opened files (<a href="https://github.com/jovanhartono/telescope/pull/48">#48</a>) and with a 100,000-entry drive added (<a href="https://github.com/jovanhartono/telescope/pull/52">#52</a>)</td></tr>
+        <tr><td class="name">Restart</td><td class="n">under 300 ms</td><td><span class="chip open">Partial</span> From launch to search ready: 188 ms typical, 131-370 ms over 9 relaunches (28 Oct, load average 13-18); 95% at 446 ms in an earlier round of 10 (load average 11-15). Inside the app, opening the saved list takes 37-132 ms, the Rust part 1-2.5 ms; macOS starting the app takes 90-350 ms on this busy Mac. A first search answers 1.8 ms after start instead of 66 ms (<a href="https://github.com/jovanhartono/telescope/pull/56">#56</a>). Owed: a run on a quiet Mac</td></tr>
+        <tr><td class="name">The seven features</td><td>Frecency, Tab into a folder, apps, saved list, index health, Finder hotkey, <kbd>⌘</kbd> <kbd>I</kbd> details</td><td><span class="chip keep">Pass</span> All seven are in the window (<a href="https://github.com/jovanhartono/telescope/pull/44">#44</a>, <a href="https://github.com/jovanhartono/telescope/pull/50">#50</a>, <a href="https://github.com/jovanhartono/telescope/pull/56">#56</a>, <a href="https://github.com/jovanhartono/telescope/pull/58">#58</a>, <a href="https://github.com/jovanhartono/telescope/pull/59">#59</a>). Still to check by hand: each in light and dark, and the first macOS question about controlling Finder</td></tr>
+        <tr><td class="name">Keystroke to results</td><td class="n">under 30 ms, 95% of the time</td><td><span class="chip keep">Pass</span> in the window's own code, whole home folder, 10 searches typed at 8 letters a second: 7.5-8.0 ms for 95% on file names and 7.3-9.4 ms on app names (28 Oct, load average 3-4.5, <a href="https://github.com/jovanhartono/telescope/pull/58">#58</a>). Real typing over the 7-day run is M2's check</td></tr>
+        <tr><td class="name">Short searches on slow cores</td><td class="n">under 50 ms on a low-end PC, 95% of the time<span class="sub">4 slow cores stand in for it, whole home folder</span></td><td><span class="chip keep">Pass</span> 32.7-38.0 ms against 38.7-48.2 ms before; one- to three-letter searches about twice as fast, 14.2 ms typical against 23.3 ms (28 Oct, load average 4-8, <a href="https://github.com/jovanhartono/telescope/pull/43">#43</a>). Never measured on an idle Mac</td></tr>
+        <tr><td class="name">Whole home folder at rest</td><td class="n">under 60 MB</td><td><span class="chip open">Partial</span> 58-59 MB after opening the saved list, the normal launch; the list itself 57.8 MB, down from 72.7 MB. 63 MB after searches and 68-73 MB right after a fresh scan (<a href="https://github.com/jovanhartono/telescope/pull/54">#54</a>). The default folders: 4.3-4.5 MB</td></tr>
+        <tr><td class="name">Whole home folder at peak</td><td class="n">under 150 MB</td><td><span class="chip keep">Pass</span> Scan 77.4 MB, opening the saved list 62.8 MB (<a href="https://github.com/jovanhartono/telescope/pull/54">#54</a>); catching up on 94,000 changed folders 102.5 MB (<a href="https://github.com/jovanhartono/telescope/pull/40">#40</a>); one change in the app 139-141.5 MB, close to the line because the update patches a copy (<a href="https://github.com/jovanhartono/telescope/issues/42">#42</a>)</td></tr>
+        <tr><td class="name">The app, idle</td><td class="n">under 60 MB, 0% CPU</td><td><span class="chip keep">Pass</span> 15 MB hidden, 0.00 s of CPU in 30 s, opened normally with every M3 window step in (28 Oct, <a href="https://github.com/jovanhartono/telescope/pull/58">#58</a>, <a href="https://github.com/jovanhartono/telescope/pull/59">#59</a>)</td></tr>
+        <tr><td class="name">App size</td><td class="n">under 6 MB for both chips</td><td><span class="chip keep">Pass</span> 2.5 MB for this Mac's chip with every M3 step in (<a href="https://github.com/jovanhartono/telescope/pull/59">#59</a>), 2.8 MB with M4's text search too (28 Oct, built for this page); 2.1 MB at the end of M2</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<section id="decide">
+  <h2>Decisions</h2>
+  <p class="prose">Taken on 27-28 Oct 2026 while the steps were built, each measured where a number could settle it. Every one is open to change.</p>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>#</th><th>Question</th><th>Decided</th><th>Not chosen</th></tr></thead>
+      <tbody>
+        <tr><td class="n">1</td><td>How the saved list is read</td><td>Read the whole file into memory in one go, checked end to end with a <span class="term" tabindex="0" data-tip="A short fingerprint of a file. Change one byte and the fingerprint changes, so damage is caught.">checksum</span> (about 2.6 ms of the 20 ms)</td><td>Mapping the file straight into memory: every search touches all of it anyway, updates need lists they can edit, and it needs unsafe code</td></tr>
+        <tr><td class="n">2</td><td>How the file is saved safely</td><td>Write a new file, then rename it over the old one in one step</td><td>Two copies saved in turn: twice the disk space for the same safety</td></tr>
+        <tr><td class="n">3</td><td>How a change reaches the list</td><td>Read the changed folder again and patch a copy of the list, while searches keep using the old one</td><td>Rebuilding everything, as in M2: 95 ms per change instead of 1 ms, and 12 s for a whole home folder instead of 45 ms</td></tr>
+        <tr><td class="n">4</td><td>Where external drives sit in the list</td><td>Each drive is a top of its own, beside the home folder</td><td>Hanging home and every drive under one made-up top folder: every file in home would sit one level deeper and rank differently</td></tr>
+        <tr><td class="n">5</td><td>Where apps live</td><td>A separate small list of apps, read when the window opens (0.3 ms), matched beside the files on every keystroke</td><td>Adding the app folders to the file list: the list, its updates and the saved file all assume one top folder. Watching the app folders for changes: idle cost for a rare event</td></tr>
+        <tr><td class="n">6</td><td>How apps rank</td><td>No depth cost, so an app wins a tie but never beats a better file match</td><td>A fixed bonus for apps: a weak app match would push out the file you meant</td></tr>
+        <tr><td class="n">7</td><td>App names</td><td>The bundle's name, without “.app”</td><td>The display name inside each app: 20 times slower to read and a new library, for 3 apps of 98 whose names differ</td></tr>
+        <tr><td class="n">8</td><td>App icons</td><td>Drawn by <span class="term" tabindex="0" data-tip="The macOS preview service. It draws pictures of files in its own process, off Telescope's memory.">Quick Look</span> in the background, the shared app icon until then</td><td>Asking macOS for each icon on the main thread: up to 140 ms the first time and about 11 MB kept for 98 apps</td></tr>
+        <tr><td class="n">9</td><td>How much a word in a folder counts</td><td>4 points less than the same word in the name; tests allow only 3 to 6</td><td>A tie-break on how many words the name holds; counting a folder word only when exact; a bigger penalty such as 24, which buries files whose folder is the point</td></tr>
+        <tr><td class="n">10</td><td>Opened apps</td><td>Counted by the app's own path, so the app row and its copy in ~/Applications share one boost</td><td>No boost for apps: an app opened from its file row would lose its boost once app rows show</td></tr>
+        <tr><td class="n">11</td><td>Apps inside a folder you tabbed into</td><td>Left out: apps live in /Applications, not your folders</td><td>Keeping apps whose bundle sits inside the folder</td></tr>
+        <tr><td class="n">12</td><td>Details pane reads</td><td>Size and dates on the main thread, only for the selected file (under 1 ms)</td><td>A background read: one frame later, with a flash of empty labels</td></tr>
+        <tr><td class="n">13</td><td>When Finder is asked for its folder</td><td>Only when the Finder hotkey is pressed</td><td>At launch: macOS would ask about controlling Finder before you ever used the hotkey</td></tr>
+        <tr><td class="n">14</td><td>Memory for the whole home folder</td><td>Telescope's own allocator for large blocks, and siblings stored as runs instead of a parent per entry</td><td>mimalloc (a C dependency with caches of its own); asking macOS to hand memory back, which freed nothing on macOS 26</td></tr>
+        <tr><td class="n">15</td><td>Fast short searches</td><td>Shortcuts that skip names that can't reach the visible list, checked against the full search on random trees</td><td>A <span class="term" tabindex="0" data-tip="An extra table listing every three-letter piece of every name. Fast lookups, lots of memory.">trigram index</span>: too much memory</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<section id="left">
+  <h2>What remains</h2>
+  <ul class="prose">
+    <li><strong>The index everything switch</strong> (<a href="https://github.com/jovanhartono/telescope/issues/21">#21</a>): the core can list the whole home folder, but memory sits at 63 MB after searches and an update peaks at about 140 MB while it patches a copy (<a href="https://github.com/jovanhartono/telescope/issues/42">#42</a>). The switch shows once both are under target.</li>
+    <li><strong>External drives in the window</strong> (<a href="https://github.com/jovanhartono/telescope/issues/22">#22</a>): the app has to tell the core when a drive is plugged in or ejected. A writable disk image you made yourself is still listed, and Time Machine on APFS may be missed.</li>
+    <li><strong>Damaged saved lists with drives</strong> (<a href="https://github.com/jovanhartono/telescope/issues/55">#55</a>): random damage tests that cover drives and removed entries.</li>
+    <li><strong>Restart under 300 ms on a quiet Mac</strong>: every launch timing so far ran at load average 11-18.</li>
+    <li><strong>Hand checks with the screen unlocked</strong>: the details pane, the folder label, app rows and the health window in light and dark; VoiceOver reading “Search in notes”; <kbd>Return</kbd> on an app; the first macOS question about controlling Finder.</li>
+  </ul>
+</section>
+
+<section id="next">
+  <h2>Next steps</h2>
+  <ol class="prose">
+    <li>Finish M2 first: the v0.2.0 release (<a href="https://github.com/jovanhartono/telescope/issues/24">#24</a>), the update test (<a href="https://github.com/jovanhartono/telescope/issues/13">#13</a>) and the 7-day run (<a href="https://github.com/jovanhartono/telescope/issues/25">#25</a>). The M3 work rides along in daily use.</li>
+    <li>The hand checks above, once, with the screen unlocked.</li>
+    <li>Patch the list without a second copy (<a href="https://github.com/jovanhartono/telescope/issues/42">#42</a>), then the index everything switch (<a href="https://github.com/jovanhartono/telescope/issues/21">#21</a>).</li>
+    <li>External drives in the window (<a href="https://github.com/jovanhartono/telescope/issues/22">#22</a>) and the damage tests (<a href="https://github.com/jovanhartono/telescope/issues/55">#55</a>). M3 closes when every check in <a href="#targets">What M3 must prove</a> passes.</li>
+  </ol>
+</section>
+</main>
+
+<footer>
+  Steps built on 27-28 Oct 2026. Final targets and the full plan: <a href="research.html">research.html</a>. The milestone before: <a href="m2-daily-driver.html">m2-daily-driver.html</a>. The text search built alongside: <a href="m4-text-search.html">m4-text-search.html</a>.
+</footer>
+
+</div>
+</body>
+</html>
