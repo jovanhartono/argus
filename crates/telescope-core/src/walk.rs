@@ -114,6 +114,10 @@ impl Rules {
         }
     }
 
+    pub(crate) fn access(&self) -> Access {
+        self.access
+    }
+
     /// The folder that holds your ignore list, when the list counts.
     pub(crate) fn ignore_folder(&self) -> Option<PathBuf> {
         (self.clutter == Clutter::Skip).then(|| Ignore::folder(&self.home, self.access))

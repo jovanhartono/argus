@@ -1,11 +1,11 @@
-//! The file-name index: every file and folder under one root, kept as flat lists.
+//! The file-name index: every file and folder under its roots, kept as flat lists.
 
 use crate::update::Runs;
 use crate::walk::Kind;
 use hashbrown::{DefaultHashBuilder, HashTable};
 use rayon::prelude::*;
 use std::hash::BuildHasher;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 pub type EntryId = u32;
 
@@ -19,6 +19,7 @@ pub(crate) const NO_PARENT: EntryId = EntryId::MAX;
 /// side by side, as the scan adds them all at once, until an update adds or removes some.
 /// Plain number lists keep memory low and can later be saved to disk as they are.
 #[cfg_attr(test, derive(Debug, PartialEq))]
+#[derive(Clone)]
 pub struct Index {
     /// Every distinct name once, back to back.
     pub(crate) names: String,
@@ -27,10 +28,13 @@ pub struct Index {
     pub(crate) name_letters: Vec<u64>,
     pub(crate) name_word_starts: Vec<u64>,
     pub(crate) entry_name: Vec<NameId>,
-    /// `NO_PARENT` for the root, and for an entry an update removed, which search skips.
+    /// `NO_PARENT` for a root, and for an entry an update removed, which search skips.
     pub(crate) entry_parent: Vec<EntryId>,
-    /// Folders between the entry and the root: 1 for the root's own children.
+    /// Folders between the entry and its root: 1 for a root's own children.
     pub(crate) entry_depth: Vec<u8>,
+    /// The folders scanned whole, smallest first, each named by its full path: entry 0, the
+    /// folder the scan started from, then each volume added since.
+    pub(crate) roots: Vec<EntryId>,
     /// Every folder's entry number, smallest first. Most entries are files, so this is
     /// smaller than a yes/no per entry.
     pub(crate) folders: Vec<EntryId>,
@@ -80,7 +84,20 @@ impl Index {
 
     /// Left in place by an update that found it gone; search skips it.
     pub fn is_removed(&self, entry: EntryId) -> bool {
-        entry != 0 && self.entry_parent[entry as usize] == NO_PARENT
+        self.entry_parent[entry as usize] == NO_PARENT && !self.is_root(entry)
+    }
+
+    /// A handful at most, so a look along the list beats a binary search.
+    pub(crate) fn is_root(&self, entry: EntryId) -> bool {
+        self.roots.contains(&entry)
+    }
+
+    /// The volumes added to the index, by their real paths, in the order they were added.
+    pub fn volumes(&self) -> impl Iterator<Item = &Path> {
+        self.roots
+            .iter()
+            .skip(1)
+            .map(|&root| Path::new(self.name(root)))
     }
 
     pub fn is_dir(&self, entry: EntryId) -> bool {
@@ -114,12 +131,19 @@ impl Index {
             .filter(move |&entry| self.entry_parent[entry as usize] == folder)
     }
 
-    /// The folder reached from the root through `names`, one folder at a time.
+    /// The root whose real path is `path`.
+    pub(crate) fn root_at(&self, path: &Path) -> Option<EntryId> {
+        let named = |&&root: &&EntryId| Path::new(self.name(root)) == path;
+        self.roots.iter().find(named).copied()
+    }
+
+    /// The folder reached from `root` through `names`, one folder at a time.
     pub(crate) fn find_folder<'a>(
         &self,
+        root: EntryId,
         names: impl IntoIterator<Item = &'a str>,
     ) -> Option<EntryId> {
-        let mut folder = 0;
+        let mut folder = root;
         for name in names {
             folder = self
                 .child_folders(folder)
@@ -147,6 +171,7 @@ impl Index {
             + self.folders.capacity() * size_of::<EntryId>()
             + self.folder_inodes.capacity() * size_of::<u32>()
             + self.passages.capacity() * size_of::<EntryId>()
+            + self.roots.capacity() * size_of::<EntryId>()
             + self.runs.as_ref().map_or(0, Runs::heap_bytes)
     }
 
@@ -277,6 +302,7 @@ impl IndexBuilder {
                 entry_name: Vec::new(),
                 entry_parent: Vec::new(),
                 entry_depth: Vec::new(),
+                roots: Vec::new(),
                 folders: Vec::new(),
                 folder_inodes: Vec::new(),
                 passages: Vec::new(),
@@ -363,6 +389,9 @@ impl IndexBuilder {
         index.folders.shrink_to_fit();
         index.folder_inodes.shrink_to_fit();
         index.passages.shrink_to_fit();
+        index.roots = (0..index.len() as EntryId)
+            .filter(|&entry| index.entry_parent[entry as usize] == NO_PARENT)
+            .collect();
         index.add_depths_and_letters();
         index
     }
@@ -370,6 +399,10 @@ impl IndexBuilder {
 
 impl Index {
     /// The lists a saved index keeps; depths and fingerprints are worked out again.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one per list a saved index keeps"
+    )]
     pub(crate) fn from_lists(
         names: String,
         name_starts: Vec<u32>,
@@ -378,6 +411,7 @@ impl Index {
         folders: Vec<EntryId>,
         folder_inodes: Vec<u32>,
         passages: Vec<EntryId>,
+        roots: Vec<EntryId>,
     ) -> Self {
         let mut index = Self {
             names,
@@ -387,6 +421,7 @@ impl Index {
             entry_name,
             entry_parent,
             entry_depth: Vec::new(),
+            roots,
             folders,
             folder_inodes,
             passages,
@@ -396,17 +431,19 @@ impl Index {
             added: 0,
             children_apart: false,
         };
+        // Every root is a folder without a parent, as a sound saved index holds.
         index.removed = index
             .entry_parent
             .iter()
-            .skip(1)
             .filter(|&&parent| parent == NO_PARENT)
-            .count();
+            .count()
+            - index.roots.len();
         index.removed_folders = index
             .folders
             .iter()
-            .filter(|&&folder| folder != 0 && index.entry_parent[folder as usize] == NO_PARENT)
-            .count();
+            .filter(|&&folder| index.entry_parent[folder as usize] == NO_PARENT)
+            .count()
+            - index.roots.len();
         index.add_depths_and_letters();
         index
     }
@@ -490,7 +527,7 @@ mod tests {
                 .iter()
                 .map(|name| name.to_str().unwrap())
                 .collect();
-            assert_eq!(index.find_folder(names), Some(folder), "{path:?}");
+            assert_eq!(index.find_folder(0, names), Some(folder), "{path:?}");
 
             let every =
                 (0..index.len() as EntryId).filter(|&e| index.entry_parent[e as usize] == folder);
@@ -512,8 +549,8 @@ mod tests {
                 .collect();
             assert_eq!(index.child_folders(folder).collect::<Vec<_>>(), folders);
         }
-        assert_eq!(index.find_folder(["a0", "nowhere"]), None);
-        assert_eq!(index.find_folder(["a0", "b0.txt"]), None);
+        assert_eq!(index.find_folder(0, ["a0", "nowhere"]), None);
+        assert_eq!(index.find_folder(0, ["a0", "b0.txt"]), None);
     }
 
     #[test]
