@@ -131,14 +131,14 @@ final class DetailsPane: NSView {
 
     override var isFlipped: Bool { true }
 
-    /// Reads the file again each time, so a new list after a save shows the new size and date;
-    /// the thumbnail is asked for again only when the file or its date changed.
+    /// Reads the file again each time, so a new list after a save shows the new size and date,
+    /// and "Today" turns into "Yesterday" overnight; the thumbnail is asked for again only when
+    /// the file or its date changed.
     func show(_ row: Row?, scale: CGFloat) {
         guard let row else { return stopThumbnail() }
         let details = Details.read(row)
-        guard row != self.row || details != self.details else { return }
         let other = row != self.row
-        let changed = other || details.modified != self.details?.modified
+        let changed = other || details.modified != self.details?.modified || details.found != self.details?.found
         self.row = row
         self.details = details
         set(name, row.name)
@@ -146,16 +146,24 @@ final class DetailsPane: NSView {
         set(place, format.folder((row.path as NSString).deletingLastPathComponent))
         set(created, format.date(details.created))
         set(modified, format.date(details.modified))
-        if other {
+        guard changed else { return }
+        if other || !details.found {
             picture.image = NSWorkspace.shared.icon(for: details.type)
             thumbnailed = nil
         }
-        guard changed else { return }
-        stopThumbnail()
+        cancelThumbnail()
         if details.found { thumbnail(of: row.url, scale: scale) }
     }
 
+    /// Given up before it landed, the thumbnail is asked for again when the same file shows next.
     func stopThumbnail() {
+        guard waiting != nil else { return }
+        cancelThumbnail()
+        row = nil
+        details = nil
+    }
+
+    private func cancelThumbnail() {
         thumbnailing?.cancel()
         thumbnailing = nil
         waiting = nil

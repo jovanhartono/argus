@@ -62,6 +62,7 @@ final class DetailsTests: XCTestCase {
         XCTAssertTrue(us.date(yesterday).hasPrefix("Yesterday at "), us.date(yesterday))
         let lastWeek = now.addingTimeInterval(-7 * 86_400)
         XCTAssertFalse(us.date(lastWeek).hasPrefix("Yesterday"), us.date(lastWeek))
+        XCTAssertFalse(us.date(lastWeek).hasPrefix("Today"), us.date(lastWeek))
     }
 
     func testOlderDatesSpellTheDayAndTime() {
@@ -139,32 +140,117 @@ final class DetailsTests: XCTestCase {
     @MainActor
     func testThePaneSaysWhereTheIndexedFolderItselfLives() {
         let pane = DetailsPane(format: us)
+        defer { pane.stopThumbnail() }
         pane.show(Row(name: root.path, folder: "", isFolder: true), scale: 2)
         XCTAssertEqual(pane.name.stringValue, root.path)
         XCTAssertEqual(pane.place.stringValue, root.deletingLastPathComponent().path)
         XCTAssertEqual(pane.summary.stringValue, "Folder")
-        pane.stopThumbnail()
     }
 
     @MainActor
-    func testThePaneReadsTheFileAgainButKeepsItsThumbnailWhenNothingChanged() throws {
+    func testThePaneReadsTheFileAgainButKeepsItsThumbnailWhenNothingChanged() async throws {
         let url = root.appendingPathComponent("notes.txt")
         try Data("abc".utf8).write(to: url)
         let row = Row(name: "notes.txt", folder: root.path, isFolder: false)
         let pane = DetailsPane(format: us)
+        defer { pane.stopThumbnail() }
         pane.show(row, scale: 2)
         XCTAssertEqual(pane.waiting, url)
-        pane.stopThumbnail()
+        try await until { pane.thumbnailed == url }
+        let thumbnail = pane.picture.image
         pane.show(row, scale: 2)
         XCTAssertNil(pane.waiting, "the same file unchanged asks for no new thumbnail")
+        XCTAssertTrue(pane.picture.image === thumbnail)
 
         try Data("abcdef".utf8).write(to: url)
         try FileManager.default.setAttributes([.modificationDate: Date(timeIntervalSinceNow: 60)], ofItemAtPath: url.path)
         pane.show(row, scale: 2)
         XCTAssertEqual(pane.summary.stringValue, "Plain Text Document – 6 bytes")
         XCTAssertEqual(pane.waiting, url, "a changed file gets a new thumbnail")
+        XCTAssertTrue(pane.picture.image === thumbnail, "the old one stays until the new one lands")
         pane.show(nil, scale: 2)
         XCTAssertNil(pane.waiting, "nothing picked gives up the thumbnail")
+    }
+
+    @MainActor
+    func testAThumbnailGivenUpIsAskedForAgainForTheSameFile() throws {
+        let url = root.appendingPathComponent("notes.txt")
+        try Data("abc".utf8).write(to: url)
+        let row = Row(name: "notes.txt", folder: root.path, isFolder: false)
+        let pane = DetailsPane(format: us)
+        defer { pane.stopThumbnail() }
+        pane.show(row, scale: 2)
+        pane.stopThumbnail()
+        XCTAssertNil(pane.waiting)
+        pane.show(row, scale: 2)
+        XCTAssertEqual(pane.waiting, url, "⌘I off and on again")
+        pane.show(nil, scale: 2)
+        pane.show(row, scale: 2)
+        XCTAssertEqual(pane.waiting, url, "No Results, then the same top file again")
+    }
+
+    @MainActor
+    func testAFileDeletedLosesItsThumbnail() async throws {
+        let url = root.appendingPathComponent("notes.txt")
+        try Data("abc".utf8).write(to: url)
+        let row = Row(name: "notes.txt", folder: root.path, isFolder: false)
+        let pane = DetailsPane(format: us)
+        defer { pane.stopThumbnail() }
+        pane.show(row, scale: 2)
+        try await until { pane.thumbnailed == url }
+        let thumbnail = pane.picture.image
+
+        try FileManager.default.removeItem(at: url)
+        pane.show(row, scale: 2)
+        XCTAssertTrue(pane.summary.stringValue.hasSuffix(" – can’t be found"), pane.summary.stringValue)
+        XCTAssertNil(pane.thumbnailed)
+        XCTAssertNil(pane.waiting)
+        XCTAssertFalse(pane.picture.image === thumbnail, "back to the icon")
+
+        try Data("abc".utf8).write(to: url)
+        pane.show(row, scale: 2)
+        XCTAssertEqual(pane.waiting, url, "put back, it gets its thumbnail again")
+    }
+
+    /// Shown again the next morning, "Today" has to become "Yesterday" though the file is unchanged.
+    @MainActor
+    func testThePaneWritesItsDatesAgainOnEachShow() throws {
+        let url = root.appendingPathComponent("notes.txt")
+        try Data("abc".utf8).write(to: url)
+        let row = Row(name: "notes.txt", folder: root.path, isFolder: false)
+        let pane = DetailsPane(format: us)
+        defer { pane.stopThumbnail() }
+        pane.show(row, scale: 2)
+        let modified = pane.modified.stringValue
+        let created = pane.created.stringValue
+        XCTAssertTrue(modified.hasPrefix("Today at "), modified)
+        XCTAssertTrue(created.hasPrefix("Today at "), created)
+        pane.modified.stringValue = "written yesterday"
+        pane.created.stringValue = "written yesterday"
+        pane.show(row, scale: 2)
+        XCTAssertEqual(pane.modified.stringValue, modified)
+        XCTAssertEqual(pane.created.stringValue, created)
+    }
+
+    func testABrokenLinkAndADotfileAreRead() throws {
+        let link = root.appendingPathComponent("old link")
+        try FileManager.default.createSymbolicLink(
+            at: link, withDestinationURL: root.appendingPathComponent("nowhere"))
+        let broken = Details.read(Row(name: "old link", folder: root.path, isFolder: false))
+        XCTAssertTrue(broken.found, "the link itself is there")
+        XCTAssertTrue(broken.type.conforms(to: .symbolicLink), broken.type.identifier)
+
+        try Data("export A=1\n".utf8).write(to: root.appendingPathComponent(".zshrc"))
+        let dotfile = Details.read(Row(name: ".zshrc", folder: root.path, isFolder: false))
+        XCTAssertTrue(dotfile.found)
+        XCTAssertEqual(dotfile.size, 11)
+        XCTAssertEqual(Details.read(Row(name: ".gone", folder: root.path, isFolder: false)).type, .data)
+    }
+
+    @MainActor
+    private func until(_ done: () -> Bool, file: StaticString = #filePath, line: UInt = #line) async throws {
+        for _ in 0..<500 where !done() { try await Task.sleep(for: .milliseconds(10)) }
+        XCTAssertTrue(done(), file: file, line: line)
     }
 
     func testAFileGoneIsGuessedFromItsName() {
