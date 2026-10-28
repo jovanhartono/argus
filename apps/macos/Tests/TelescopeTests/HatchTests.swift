@@ -32,6 +32,16 @@ final class HatchTests: XCTestCase {
         XCTAssertNil(hatch.take(ticket), "rows are handed over once")
     }
 
+    func testAnAppRowOpensItsBundle() {
+        let app = Row(name: "Visual Studio Code", folder: "/Applications", isFolder: false, isApp: true)
+        XCTAssertEqual(app.path, "/Applications/Visual Studio Code.app")
+        XCTAssertTrue(app.url.hasDirectoryPath)
+        XCTAssertEqual(app.url.path, app.path)
+        let file = Row(name: "Visual Studio Code", folder: "/Applications", isFolder: false)
+        XCTAssertEqual(file.path, "/Applications/Visual Studio Code")
+        XCTAssertFalse(file.url.hasDirectoryPath)
+    }
+
     func testASearchInsideAFolderFindsOnlyWhatIsInIt() async throws {
         let indexed = expectation(description: "indexed")
         var ready: [UInt64: XCTestExpectation] = [:]

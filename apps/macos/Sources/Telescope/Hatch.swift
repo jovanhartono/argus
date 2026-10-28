@@ -6,11 +6,16 @@ struct Row: Equatable {
     let name: String
     let folder: String
     let isFolder: Bool
+    /// Named as Finder shows it, without ".app".
+    var isApp = false
 
     /// The folder you index is listed under its full path, so its name is the path already.
-    var path: String { name.hasPrefix("/") ? name : (folder as NSString).appendingPathComponent(name) }
+    var path: String {
+        if isApp { return (folder as NSString).appendingPathComponent(name + ".app") }
+        return name.hasPrefix("/") ? name : (folder as NSString).appendingPathComponent(name)
+    }
 
-    var url: URL { URL(fileURLWithPath: path, isDirectory: isFolder) }
+    var url: URL { URL(fileURLWithPath: path, isDirectory: isFolder || isApp) }
 }
 
 /// The only file that touches Rust's pointers. Rows are copied into Swift strings and Rust's
@@ -34,7 +39,8 @@ final class Hatch {
     private static var generation: UInt = 0
     /// Rust's side is safe to free from any thread, which is where Swift runs deinit.
     nonisolated(unsafe) private let core: OpaquePointer
-    /// Changes reach Rust from here, never from the main thread.
+    /// Changes and opens reach Rust from here, never from the main thread: each open is saved
+    /// to disk before its call returns.
     private let changes = DispatchQueue(label: "io.github.jovanhartono.telescope.changes")
     nonisolated(unsafe) private var stream: FSEventStreamRef?
     nonisolated(unsafe) private var names: [String: Names] = [:]
@@ -92,6 +98,14 @@ final class Hatch {
         .urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
         .appendingPathComponent("io.github.jovanhartono.telescope/index").path
 
+    /// Where the files and apps you opened are kept, for ranking.
+    nonisolated static let openedList = FileManager.default
+        .urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        .appendingPathComponent("io.github.jovanhartono.telescope/opened").path
+
+    /// The folders apps are installed in, as Finder's Applications folder shows them together.
+    nonisolated static let appFolders = ["/Applications", "/System/Applications", NSHomeDirectory() + "/Applications"]
+
     /// macOS's name for the FSEvents log of the volume `path` is on, or nil when it keeps none.
     nonisolated static func journal(of path: String) -> String? {
         var info = stat()
@@ -138,6 +152,30 @@ final class Hatch {
         if status == TL_PANICKED { Hatch.listener?(.failed(code: 0)) }
         guard status == TL_OK else { return nil }
         return copy(out)
+    }
+
+    /// Reads the apps in `folders` before the next search, so one installed since shows too.
+    func readApps(in folders: [String]) {
+        var bytes: [UInt8] = []
+        for folder in folders {
+            bytes += folder.utf8
+            bytes.append(0)
+        }
+        _ = tl_apps(core, bytes, bytes.count)
+    }
+
+    /// Ranks what you opened often and lately higher, by the opens kept in `file`.
+    func rankOpens(keptIn file: String) {
+        nonisolated(unsafe) let core = core
+        let file = Array(file.utf8)
+        changes.async { _ = tl_frecency_open(core, file, file.count) }
+    }
+
+    /// Counts one open of `path` from the next search on, and keeps it for the next launch.
+    func opened(_ path: String) {
+        nonisolated(unsafe) let core = core
+        let path = Array(path.utf8)
+        changes.async { _ = tl_opened(core, path, path.count) }
     }
 
     /// Builds the list again with the folders macOS guards, now that it lets Telescope in.
@@ -201,7 +239,7 @@ final class Hatch {
             Row(
                 name: text($0.name_start, $0.name_len),
                 folder: text($0.folder_start, $0.folder_len),
-                isFolder: $0.is_folder)
+                isFolder: $0.is_folder, isApp: $0.is_app)
         }
     }
 

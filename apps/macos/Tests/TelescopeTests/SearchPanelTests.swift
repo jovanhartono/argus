@@ -373,6 +373,175 @@ final class SearchPanelTests: XCTestCase {
         XCTAssertGreaterThan(inked, 96 * 96)
     }
 
+    func testAnAppShowsWithItsOwnIcon() async throws {
+        let window = try await opened(access: true, apps: ["/System/Applications"])
+        window.show()
+        defer { window.hide() }
+        let aqua = try XCTUnwrap(NSAppearance(named: .aqua))
+        let generic = try XCTUnwrap(pixels(of: NSWorkspace.shared.icon(for: .applicationBundle), scale: 2, in: aqua))
+        var seen: [String: NSImage] = [:]
+        for name in ["Calculator", "Chess", "Calculator"] {
+            try await type(name.lowercased(), in: window)
+            try await until { window.rows.first?.name == name }
+            try await settled(window)
+            let row = try XCTUnwrap(window.rows.first)
+            XCTAssertTrue(row.isApp)
+            XCTAssertFalse(row.isFolder)
+            XCTAssertEqual(row.path, "/System/Applications/\(name).app")
+            assertOnScreen(window)
+            if let before = seen[name] {
+                XCTAssertTrue(before === cell(window, 0)?.icon.image, "\(name)'s icon is drawn once")
+                continue
+            }
+            let drawn = try await ownIcon(window, row: 0)
+            let mine = try XCTUnwrap(pixels(of: drawn, scale: 2, in: aqua))
+            XCTAssertGreaterThan(mine.filter { $0 != 0 }.count, mine.count / 4, "\(name) is blank")
+            XCTAssertNotEqual(mine, generic, "\(name)'s own icon, not the one every app shares")
+            XCTAssertFalse(seen.values.contains { $0 === drawn })
+            seen[name] = drawn
+        }
+        let calculator = try XCTUnwrap(pixels(of: XCTUnwrap(seen["Calculator"]), scale: 2, in: aqua))
+        XCTAssertNotEqual(calculator, try pixels(of: XCTUnwrap(seen["Chess"]), scale: 2, in: aqua))
+    }
+
+    /// /Applications/Safari.app is a link like this one; read at the link, the icon was a document's.
+    func testAnAppReachedThroughALinkShowsTheAppsIcon() async throws {
+        let apps = realRoot.appendingPathComponent("Applications")
+        let elsewhere = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: elsewhere) }
+        for folder in [apps.appendingPathComponent("Budget Plain.app"), elsewhere.appendingPathComponent("Budget Linked.app")] {
+            try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        }
+        try FileManager.default.createSymbolicLink(
+            at: apps.appendingPathComponent("Budget Linked.app"),
+            withDestinationURL: elsewhere.appendingPathComponent("Budget Linked.app"))
+        let window = try await opened(access: true, apps: [apps.path])
+        window.show()
+        defer { window.hide() }
+        try await type("budget", in: window)
+        try await until { window.rows.filter(\.isApp).count == 2 }
+        try await settled(window)
+        let aqua = try XCTUnwrap(NSAppearance(named: .aqua))
+        var drawn: [[UInt8]] = []
+        for row in window.rows.indices where window.rows[row].isApp {
+            let icon = try await ownIcon(window, row: row)
+            drawn.append(try XCTUnwrap(pixels(of: icon, scale: 2, in: aqua)))
+        }
+        XCTAssertTrue(drawn[0] == drawn[1], "both are plain app folders, so both show the plain app icon")
+    }
+
+    /// Waits for an app row's own icon: one picture at the row's size, a few KB, never macOS's
+    /// whole icon, which first stands in as the icon every app shares.
+    private func ownIcon(_ window: SearchPanel, row: Int) async throws -> NSImage {
+        let side = 32 * Int(window.panel.backingScaleFactor)
+        try await until { cell(window, row)?.icon.image?.representations.first?.pixelsWide == side }
+        let drawn = try XCTUnwrap(cell(window, row)?.icon.image)
+        XCTAssertEqual(drawn.size, NSSize(width: 32, height: 32))
+        XCTAssertEqual(drawn.representations.count, 1)
+        XCTAssertEqual(drawn.representations.first?.pixelsHigh, side)
+        return drawn
+    }
+
+    func testReturnLaunchesAnAppAndItRanksFirstFromTheNextSearch() async throws {
+        // By its real path, as the list holds it, so its bundles show once, as apps.
+        let apps = realRoot.appendingPathComponent("Applications")
+        for name in ["Budget.app", "Budget Planner.app"] {
+            try FileManager.default.createDirectory(
+                at: apps.appendingPathComponent(name), withIntermediateDirectories: true)
+        }
+        let window = try await opened(access: true, apps: [apps.path])
+        window.show()
+        try await type("budget", in: window)
+        try await until { window.rows.map(\.name) == ["Budget", "Budget Planner"] }
+        XCTAssertTrue(window.rows.allSatisfy(\.isApp), "\(window.rows)")
+        down(window)
+        XCTAssertFalse(tab(window), "an app is not a folder to search in")
+        XCTAssertTrue(window.scopes.isEmpty)
+        XCTAssertTrue(window.control(NSTextField(), textView: NSTextView(), doCommandBy: #selector(NSResponder.insertNewline(_:))))
+        XCTAssertEqual(stage.opened.map(\.path), [apps.appendingPathComponent("Budget Planner.app").path])
+        XCTAssertTrue(try XCTUnwrap(stage.opened.first).hasDirectoryPath)
+        XCTAssertFalse(window.shown)
+
+        window.show()
+        defer { window.hide() }
+        try await type("budge", in: window)
+        try await until { window.rows.map(\.name) == ["Budget Planner", "Budget"] }
+    }
+
+    func testAnAppInstalledWhileHiddenIsFoundOnTheNextShow() async throws {
+        let apps = realRoot.appendingPathComponent("Applications")
+        try FileManager.default.createDirectory(at: apps, withIntermediateDirectories: false)
+        let window = try await opened(access: true, apps: [apps.path])
+        window.show()
+        try await type("budget", in: window)
+        try await until { window.answered != 0 }
+        XCTAssertEqual(window.rows, [])
+        window.hide()
+
+        try FileManager.default.createDirectory(
+            at: apps.appendingPathComponent("Budget.app"), withIntermediateDirectories: false)
+        window.show()
+        defer { window.hide() }
+        try await type("budge", in: window)
+        try await until { window.rows.map(\.path) == [apps.appendingPathComponent("Budget.app").path] }
+    }
+
+    func testWithoutAppFoldersNoAppIsFound() async throws {
+        let window = try await opened(access: true)
+        window.show()
+        defer { window.hide() }
+        try await type("calculator", in: window)
+        try await until { window.answered != 0 }
+        XCTAssertEqual(window.rows, [])
+    }
+
+    func testWhatYouOpenOrShowInFinderRanksFirstAndIsKeptForTheNextLaunch() async throws {
+        let notes = root.appendingPathComponent("notes")
+        try FileManager.default.createDirectory(at: notes, withIntermediateDirectories: false)
+        for name in ["budget a.txt", "budget b.txt", "budget c.txt"] {
+            try Data().write(to: notes.appendingPathComponent(name))
+        }
+        let support = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: support) }
+        let file = support.appendingPathComponent("opened").path
+        let window = try await opened(access: true, opens: file)
+        window.show()
+        try await type("budget", in: window)
+        try await until { window.rows.count == 3 }
+        let first = window.rows.map(\.name)
+        let picked = window.rows[2].path
+        down(window)
+        down(window)
+        XCTAssertTrue(window.control(NSTextField(), textView: NSTextView(), doCommandBy: #selector(NSResponder.insertNewline(_:))))
+        XCTAssertEqual(stage.opened.map(\.path), [picked])
+
+        window.show()
+        try await type("budget", in: window)
+        try await until { window.rows.first?.name == first[2] }
+        down(window)
+        let revealed = window.rows[1].name
+        let shown = window.rows[1].path
+        window.showInFinder(nil)
+        XCTAssertEqual(stage.shownInFinder.map(\.path), [shown])
+        XCTAssertEqual(stage.opened.count, 1)
+
+        window.show()
+        try await type("budge", in: window)
+        // One opened, one shown in Finder: both rank above the file never picked.
+        try await until { Set(window.rows.prefix(2).map(\.name)) == [first[2], revealed] }
+        window.hide()
+
+        // Saved in the order picked, so the second one there means both are.
+        let saved = { String(decoding: (try? Data(contentsOf: URL(fileURLWithPath: file))) ?? Data(), as: UTF8.self) }
+        try await until { saved().contains(revealed) }
+        XCTAssertTrue(saved().contains(first[2]))
+        let next = try await opened(access: true, opens: file)
+        next.show()
+        defer { next.hide() }
+        try await type("budget", in: next)
+        try await until { Set(next.rows.prefix(2).map(\.name)) == [first[2], revealed] }
+    }
+
     func testTheMadeUpNamesNeverShowTheLine() async throws {
         setenv("TELESCOPE_STAND_IN", "0", 1)
         defer { unsetenv("TELESCOPE_STAND_IN") }
@@ -1612,6 +1781,11 @@ final class SearchPanelTests: XCTestCase {
         assertFits(window)
     }
 
+    /// `root` under /private/var, as the list holds it; Foundation's own resolving drops /private.
+    private var realRoot: URL {
+        URL(fileURLWithPath: String(cString: realpath(root.path, nil)), isDirectory: true)
+    }
+
     /// Waits out the 0.15 s resize: rows below the window's edge get no view until it grows.
     private func settled(_ window: SearchPanel, file: StaticString = #filePath, line: UInt = #line) async throws {
         let scroll = try XCTUnwrap(window.table.enclosingScrollView, file: file, line: line)
@@ -1643,7 +1817,7 @@ final class SearchPanelTests: XCTestCase {
                 XCTFail("\(item.name) has no icon", file: file, line: line)
                 continue
             }
-            let kind = item.isFolder ? "/" : (item.name as NSString).pathExtension.lowercased()
+            let kind = item.isApp ? item.path : item.isFolder ? "/" : (item.name as NSString).pathExtension.lowercased()
             if let seen = icons[kind] {
                 XCTAssertTrue(seen === icon, "\(item.name) has another \(kind) icon", file: file, line: line)
             } else {
@@ -1775,13 +1949,16 @@ final class SearchPanelTests: XCTestCase {
     }
 
     /// Waits for the scan, so its event can't reach the next test's core.
-    private func opened(access: Bool, on stage: (any Stage)? = nil, saved: String? = nil) async throws -> SearchPanel {
+    private func opened(
+        access: Bool, on stage: (any Stage)? = nil, saved: String? = nil, opens: String? = nil, apps: [String] = []
+    ) async throws -> SearchPanel {
         self.access = access
         let hasAccess = { [unowned self] in
             checks += 1
             return self.access
         }
-        let window = SearchPanel(root: root.path, saved: saved, hasAccess: hasAccess, stage: stage ?? self.stage)
+        let window = SearchPanel(
+            root: root.path, saved: saved, opens: opens, apps: apps, hasAccess: hasAccess, stage: stage ?? self.stage)
         for _ in 0..<500 where !window.indexed { try await Task.sleep(for: .milliseconds(10)) }
         XCTAssertTrue(window.indexed)
         return window

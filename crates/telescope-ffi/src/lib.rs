@@ -26,8 +26,9 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 use telescope_core::{
-    Access, Apps, Boosts, Clutter, Frecency, Hit, Ignore, Index, OpenError, Pages, Refusal, Scope,
-    Searcher, Settings, Ticket, Watch, Within, open_index, remove_old_temps, save_index, unix_now,
+    Access, Apps, Boosts, Clutter, Frecency, Hit, Ignore, Index, Item, OpenError, Pages, Refusal,
+    Scope, Searcher, Settings, Ticket, Watch, Within, open_index, remove_old_temps, save_index,
+    unix_now,
 };
 use telescope_grep::{Found, Grep, Report};
 
@@ -35,7 +36,7 @@ use telescope_grep::{Found, Grep, Report};
 static PAGES: Pages = Pages;
 
 /// Raise this with any change below, so a window built against an older header refuses to start.
-pub const TL_ABI_VERSION: u32 = 9;
+pub const TL_ABI_VERSION: u32 = 10;
 
 pub const TL_OK: u32 = 0;
 /// No rows for that ticket: not ready yet, already taken, or a newer search replaced them.
@@ -87,7 +88,8 @@ const RERANK: Duration = Duration::from_secs(60 * 60);
 /// never wait for it.
 pub type TlEventFn = unsafe extern "C" fn(ctx: *mut c_void, event: u32, value: u64);
 
-/// One result. Its name and folder are byte ranges in `TlRows::text`.
+/// One result. Its name and folder are byte ranges in `TlRows::text`. An app from `tl_apps` is
+/// named without ".app", as Finder shows it, and opens at `<folder>/<name>.app`.
 #[repr(C)]
 pub struct TlRow {
     pub name_start: u32,
@@ -95,6 +97,7 @@ pub struct TlRow {
     pub folder_start: u32,
     pub folder_len: u32,
     pub is_folder: bool,
+    pub is_app: bool,
 }
 
 /// The window copies what it needs, then hands this back to `tl_rows_free` once.
@@ -268,6 +271,8 @@ enum Job {
         took: u32,
     },
     Opened,
+    /// The folders to read apps from, as `Apps::scan_folders` reads them.
+    Apps(Vec<PathBuf>),
     /// Told from the worker, since `on_event` must never run on the window's main thread.
     Note(String),
 }
@@ -1125,18 +1130,17 @@ fn serve(
     notify: &Notify,
     rerank: Duration,
 ) {
-    // The window has no app rows yet.
-    let apps = Apps::default();
+    let mut apps = Apps::default();
     // Each opened file's entry is found once per list or run of opens, never per search, on a
     // copy so `tl_opened` never waits for it.
     // Timed by the wall clock: `Instant` stands still while the Mac sleeps, and scores fade
     // through a three-week sleep all the same.
-    let rank = |index: &Index| {
+    let rank = |index: &Index, apps: &Apps| {
         let frecency = lock(opens).frecency.clone();
         let now = unix_now();
-        (searcher.boosts(&frecency, index, &apps, now), now)
+        (searcher.boosts(&frecency, index, apps, now), now)
     };
-    let (mut boosts, mut ranked): (Boosts, u64) = rank(&index);
+    let (mut boosts, mut ranked): (Boosts, u64) = rank(&index, &apps);
     let mut stale = false;
     // The folder searched inside, worked out once for every keystroke typed there; `None`
     // beside it when the list holds no such folder.
@@ -1147,7 +1151,7 @@ fn serve(
             Err(TryRecvError::Disconnected) => return,
             Err(TryRecvError::Empty) => {
                 if stale {
-                    (boosts, ranked) = rank(&index);
+                    (boosts, ranked) = rank(&index, &apps);
                     stale = false;
                 }
                 let Ok(job) = inbox.recv() else { return };
@@ -1170,6 +1174,15 @@ fn serve(
                 stale = true;
                 continue;
             }
+            // Read on each show, so the same apps found again cost no new boosts.
+            Job::Apps(folders) => {
+                let fresh = Apps::scan_folders(folders);
+                if fresh != apps {
+                    apps = fresh;
+                    stale = true;
+                }
+                continue;
+            }
             Job::Note(note) => {
                 notify.note(&note);
                 continue;
@@ -1181,7 +1194,7 @@ fn serve(
             } => (ticket, query, folder),
         };
         if stale || unix_now().abs_diff(ranked) >= rerank.as_secs() {
-            (boosts, ranked) = rank(&index);
+            (boosts, ranked) = rank(&index, &apps);
             stale = false;
         }
         let search =
@@ -1211,7 +1224,7 @@ fn serve(
         if searcher.newest() != ticket.number() {
             continue;
         }
-        *done.lock().unwrap() = Some((ticket, pack(&index, &hits)));
+        *done.lock().unwrap() = Some((ticket, pack(&index, &apps, &hits)));
         notify.send(TL_EVENT_READY, ticket.number());
     }
 }
@@ -1393,19 +1406,19 @@ fn save(file: &Path, list: &Unsaved) -> io::Result<()> {
     )
 }
 
-fn pack(index: &Index, hits: &[Hit]) -> Packed {
+fn pack(index: &Index, apps: &Apps, hits: &[Hit]) -> Packed {
     let mut packed = Packed {
         rows: Vec::with_capacity(hits.len()),
         text: String::new(),
     };
-    // An app hit would take a row's place yet show nothing; `serve` passes no apps until
-    // TlRow can show one.
-    debug_assert!(hits.iter().all(|hit| hit.entry().is_some()), "{hits:?}");
-    for entry in hits.iter().filter_map(Hit::entry) {
-        let path = index.path(entry);
+    for hit in hits {
+        let (name, path, is_folder) = match hit.item {
+            Item::Entry(entry) => (index.name(entry), index.path(entry), index.is_dir(entry)),
+            Item::App(app) => (apps.name(app), apps.path(app), false),
+        };
         let folder = path.parent().unwrap_or(&path).to_string_lossy();
         let name_start = packed.text.len() as u32;
-        packed.text.push_str(index.name(entry));
+        packed.text.push_str(name);
         let folder_start = packed.text.len() as u32;
         packed.text.push_str(&folder);
         packed.rows.push(TlRow {
@@ -1413,7 +1426,8 @@ fn pack(index: &Index, hits: &[Hit]) -> Packed {
             name_len: folder_start - name_start,
             folder_start,
             folder_len: folder.len() as u32,
-            is_folder: index.is_dir(entry),
+            is_folder,
+            is_app: matches!(hit.item, Item::App(_)),
         });
     }
     packed
@@ -1462,6 +1476,39 @@ pub unsafe extern "C" fn tl_submit(
             .as_ref()
             .is_some_and(|jobs| jobs.send(job).is_ok());
         if sent { ticket.number() } else { 0 }
+    })
+}
+
+/// Reads the apps in `folders`, and in the plain folders directly inside them, in the
+/// background before the next search, which then finds them by name beside the files, as rows
+/// with `is_app`. Replaces the apps read before, so calling this again picks up apps installed
+/// or deleted since. `folders` holds `len` bytes: paths in UTF-8, each ending in a NUL byte;
+/// none (`len` 0) leaves searches without apps. A folder that is missing, unreadable or not
+/// UTF-8 adds nothing. Returns 1 once queued, or 0 once the core has stopped. Safe to call from
+/// any thread.
+///
+/// # Safety
+/// `core` came from `tl_core_new` or `tl_core_new_stand_in`, and `folders` points to `len` bytes
+/// (or `len` is 0).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tl_apps(core: *const TlCore, folders: *const u8, len: usize) -> u32 {
+    guard(0, || {
+        let core = unsafe { &*core };
+        let bytes = match len {
+            0 => &[],
+            _ => unsafe { std::slice::from_raw_parts(folders, len) },
+        };
+        let folders = bytes
+            .split(|&byte| byte == 0)
+            .filter_map(|folder| std::str::from_utf8(folder).ok())
+            .filter(|folder| !folder.is_empty())
+            .map(PathBuf::from)
+            .collect();
+        let sent = core
+            .jobs
+            .as_ref()
+            .is_some_and(|jobs| jobs.send(Job::Apps(folders)).is_ok());
+        u32::from(sent)
     })
 }
 
@@ -1760,6 +1807,7 @@ pub unsafe extern "C" fn tl_watched(core: *const TlCore, out: *mut TlRows, since
                 folder_start: end,
                 folder_len: 0,
                 is_folder: *watch == Watch::Inside,
+                is_app: false,
             });
         }
         unsafe { since.write(*mark) };
@@ -2458,6 +2506,21 @@ mod tests {
     }
 
     fn copy(rows: TlRows) -> Vec<(String, String, bool)> {
+        let copied = copy_all(rows).into_iter();
+        copied
+            .map(|row| (row.name, row.folder, row.is_folder))
+            .collect()
+    }
+
+    #[derive(Debug, PartialEq)]
+    struct Shown {
+        name: String,
+        folder: String,
+        is_folder: bool,
+        is_app: bool,
+    }
+
+    fn copy_all(rows: TlRows) -> Vec<Shown> {
         let text = |start: u32, len: u32| {
             let bytes =
                 unsafe { std::slice::from_raw_parts(rows.text.add(start as usize), len as usize) };
@@ -2465,9 +2528,11 @@ mod tests {
         };
         let copied = unsafe { std::slice::from_raw_parts(rows.rows, rows.count) }
             .iter()
-            .map(|row| {
-                let name = text(row.name_start, row.name_len);
-                (name, text(row.folder_start, row.folder_len), row.is_folder)
+            .map(|row| Shown {
+                name: text(row.name_start, row.name_len),
+                folder: text(row.folder_start, row.folder_len),
+                is_folder: row.is_folder,
+                is_app: row.is_app,
             })
             .collect();
         unsafe { tl_rows_free(rows) };
@@ -2499,19 +2564,165 @@ mod tests {
         assert_eq!(take(&core, ticket), None);
     }
 
-    #[cfg(debug_assertions)]
-    #[test]
-    #[should_panic(expected = "App")]
-    fn app_hits_are_refused_until_a_row_can_show_one() {
+    fn apps(core: &Core, folders: &[&Path]) -> u32 {
+        let mut bytes = Vec::new();
+        for folder in folders {
+            bytes.extend_from_slice(folder.to_str().unwrap().as_bytes());
+            bytes.push(0);
+        }
+        unsafe { tl_apps(core.0, bytes.as_ptr(), bytes.len()) }
+    }
+
+    fn shown(core: &Core, events: &Events, query: &str) -> Vec<Shown> {
+        let ticket = submit(core, query);
+        events.wait_for(TL_EVENT_READY, ticket);
+        let mut rows = std::mem::MaybeUninit::<TlRows>::uninit();
+        assert_eq!(unsafe { tl_take(core.0, ticket, rows.as_mut_ptr()) }, TL_OK);
+        copy_all(unsafe { rows.assume_init() })
+    }
+
+    fn app(name: &str, folder: &Path) -> Shown {
+        let folder = folder.to_str().unwrap().to_owned();
+        let name = name.to_owned();
+        Shown {
+            name,
+            folder,
+            is_folder: false,
+            is_app: true,
+        }
+    }
+
+    fn app_folder(apps: &[&str]) -> (tempfile::TempDir, PathBuf) {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir(dir.path().join("Budget.app")).unwrap();
-        let apps = Apps::scan_folders(vec![dir.path().to_path_buf()]);
-        let index = telescope_core::stand_in(2_000);
-        let searcher = Searcher::with_threads(1);
-        let hits = searcher
-            .search(&index, &apps, "budget", searcher.ticket(), ROWS)
-            .unwrap();
-        pack(&index, &hits);
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        for app in apps {
+            std::fs::create_dir_all(root.join(app)).unwrap();
+        }
+        (dir, root)
+    }
+
+    #[test]
+    fn apps_are_found_by_name_beside_the_files() {
+        let (_dir, root) = app_folder(&[
+            "Budget.app/Contents",
+            "Utilities/Budget Planner.app",
+            "Utilities/Deeper/Budget Deep.app",
+        ]);
+        let events = Events::default();
+        let core = start(2_000, &events);
+        let files = shown(&core, &events, "budget");
+        assert!(files.iter().all(|row| !row.is_app));
+
+        assert_eq!(apps(&core, &[&root]), 1);
+        let rows = shown(&core, &events, "budget");
+        assert_eq!(rows.len(), ROWS);
+        assert_eq!(rows[0], app("Budget", &root));
+        assert!(rows.contains(&app("Budget Planner", &root.join("Utilities"))));
+        assert_eq!(rows.iter().filter(|row| row.is_app).count(), 2, "{rows:?}");
+        // The apps take the places of the weakest files.
+        let rest: Vec<&Shown> = rows.iter().filter(|row| !row.is_app).collect();
+        assert_eq!(rest, files.iter().take(ROWS - 2).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn apps_read_again_follow_installs_and_deletes() {
+        let (_dir, root) = app_folder(&["Budget.app"]);
+        let events = Events::default();
+        let core = start(2_000, &events);
+        let found = |query| {
+            let rows = shown(&core, &events, query);
+            rows.into_iter()
+                .filter(|row| row.is_app)
+                .map(|row| row.name)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(apps(&core, &[&root]), 1);
+        assert_eq!(found("budget"), ["Budget"]);
+
+        std::fs::create_dir(root.join("Budget Tracker.app")).unwrap();
+        std::fs::remove_dir(root.join("Budget.app")).unwrap();
+        assert_eq!(found("budget"), ["Budget"], "until they are read again");
+        assert_eq!(apps(&core, &[&root]), 1);
+        assert_eq!(found("budget"), ["Budget Tracker"]);
+
+        assert_eq!(unsafe { tl_apps(core.0, std::ptr::null(), 0) }, 1);
+        assert!(found("budget").is_empty());
+    }
+
+    #[test]
+    fn an_opened_app_ranks_first_and_stays_first_in_the_next_core() {
+        let (_dir, root) = app_folder(&["Budget.app", "Budget Planner.app"]);
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("frecency");
+        let planner = root.join("Budget Planner.app");
+        for open in [true, false] {
+            let events = Events::default();
+            let core = start(2_000, &events);
+            assert_eq!(frecency_open(&core, &file), u32::from(!open));
+            assert_eq!(apps(&core, &[&root]), 1);
+            if open {
+                assert_eq!(shown(&core, &events, "budget")[0], app("Budget", &root));
+                assert_eq!(opened(&core, &planner), 1);
+            }
+            let rows = shown(&core, &events, "budget");
+            assert_eq!(
+                rows[..2],
+                [app("Budget Planner", &root), app("Budget", &root)]
+            );
+        }
+    }
+
+    /// Apps live outside your folders, so a search inside one shows none.
+    #[test]
+    fn a_search_inside_a_folder_shows_no_apps() {
+        let (_dir, root) = app_folder(&["Budget.app"]);
+        let events = Events::default();
+        let core = start(2_000, &events);
+        assert_eq!(apps(&core, &[&root]), 1);
+        let ticket = submit_in(&core, "budget", "/stand-in");
+        events.wait_for(TL_EVENT_READY, ticket);
+        let mut rows = std::mem::MaybeUninit::<TlRows>::uninit();
+        assert_eq!(unsafe { tl_take(core.0, ticket, rows.as_mut_ptr()) }, TL_OK);
+        let rows = copy_all(unsafe { rows.assume_init() });
+        assert!(!rows.is_empty());
+        assert!(rows.iter().all(|row| !row.is_app), "{rows:?}");
+    }
+
+    #[test]
+    fn folders_it_cannot_read_add_no_apps() {
+        let (_dir, root) = app_folder(&["Budget.app"]);
+        let events = Events::default();
+        let core = start(2_000, &events);
+        let mut bytes = b"\0\0".to_vec();
+        bytes.extend_from_slice(&[b'/', 0xFF, 0]);
+        bytes.extend_from_slice(b"/no/such/folder\0relative\0");
+        // The last folder needs no NUL after it.
+        bytes.extend_from_slice(root.to_str().unwrap().as_bytes());
+        assert_eq!(unsafe { tl_apps(core.0, bytes.as_ptr(), bytes.len()) }, 1);
+        let rows = shown(&core, &events, "budget");
+        let found: Vec<&str> = rows
+            .iter()
+            .filter(|row| row.is_app)
+            .map(|row| &*row.name)
+            .collect();
+        assert_eq!(found, ["Budget"]);
+        assert!(events.notes.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_stopped_core_takes_no_apps() {
+        let dir = tempfile::tempdir().unwrap();
+        let events = Events::default();
+        let core = scan(dir.path().join("gone").to_str().unwrap(), 1, &events);
+        events.wait_for_event(TL_EVENT_FAILED);
+        // The worker is gone once it has told of the failure and returned.
+        for _ in 0..500 {
+            if apps(&core, &[dir.path()]) == 0 {
+                return;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        panic!("the core still takes apps");
     }
 
     #[test]

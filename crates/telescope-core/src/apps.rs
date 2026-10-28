@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 pub type AppId = u32;
 
 /// Every app bundle in the app folders, by the name Finder shows: Safari for Safari.app.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, PartialEq, Eq)]
 pub struct Apps {
     pub(crate) names: Vec<Box<str>>,
     /// The folder each app sits in, by its place in `folders`.
