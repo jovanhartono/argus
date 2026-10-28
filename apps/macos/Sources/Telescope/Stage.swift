@@ -11,6 +11,7 @@ protocol Stage: AnyObject {
     func isKey(_ window: NSWindow) -> Bool
     /// In front of every app, even while another one is active.
     func bringForward(_ window: NSWindow)
+    func putAway(_ window: NSWindow)
     func makeKey(_ window: NSWindow)
     var previewShows: Bool { get }
     var previewIsKey: Bool { get }
@@ -29,6 +30,10 @@ final class Screen: Stage {
 
     func bringForward(_ window: NSWindow) {
         window.orderFrontRegardless()
+    }
+
+    func putAway(_ window: NSWindow) {
+        window.orderOut(nil)
     }
 
     func makeKey(_ window: NSWindow) {

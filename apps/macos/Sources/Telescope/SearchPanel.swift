@@ -151,9 +151,9 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
     func warmUp() {
         panel.alphaValue = 0
         place()
-        panel.orderFrontRegardless()
+        stage.bringForward(panel)
         panel.display()
-        panel.orderOut(nil)
+        stage.putAway(panel)
     }
 
     func show() {
@@ -193,7 +193,8 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
         }
         fade(to: 0) { [weak self] in
             // Shown again while fading out: keep it.
-            if self?.shown == false { self?.panel.orderOut(nil) }
+            guard let self, !shown else { return }
+            stage.putAway(panel)
         }
     }
 

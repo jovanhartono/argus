@@ -9,13 +9,13 @@ final class OffStage: Stage {
     /// The window that has the keys; nil when the preview or another app has them.
     var key: NSWindow?
     private(set) var forward = 0
+    private(set) var away = 0
     private(set) var previewShows = false
     var previewIsKey = false
     private(set) var opens = 0
     private(set) var closes = 0
     private(set) var reloads = 0
-    private var fading = false
-    private var turn = 0
+    private(set) var fading = false
 
     func isKey(_ window: NSWindow) -> Bool {
         key === window
@@ -25,6 +25,11 @@ final class OffStage: Stage {
         forward += 1
     }
 
+    func putAway(_ window: NSWindow) {
+        away += 1
+        if key === window { key = nil }
+    }
+
     func makeKey(_ window: NSWindow) {
         key = window
         previewIsKey = false
@@ -32,28 +37,22 @@ final class OffStage: Stage {
 
     func openPreview() {
         opens += 1
-        turn += 1
         fading = false
         previewShows = true
     }
 
     /// As Quick Look does: it fades out over 0.2 s, and a second close meanwhile keeps it open.
+    /// The test ends the fade with `finishFade()`.
     func closePreview() {
         closes += 1
-        turn += 1
-        guard !fading else {
-            fading = false
-            return
-        }
-        fading = true
-        let mine = turn
-        Task { [weak self] in
-            try? await Task.sleep(for: .milliseconds(200))
-            guard let self, turn == mine else { return }
-            fading = false
-            previewShows = false
-            previewIsKey = false
-        }
+        fading.toggle()
+    }
+
+    func finishFade() {
+        guard fading else { return }
+        fading = false
+        previewShows = false
+        previewIsKey = false
     }
 
     func reloadPreview() {

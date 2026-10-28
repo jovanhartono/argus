@@ -10,6 +10,7 @@ final class SearchPanelTests: XCTestCase {
     private var access = false
     private var checks = 0
     private var stage: OffStage!
+    private var onScreen = false
 
     override func setUp() async throws {
         _ = NSApplication.shared
@@ -20,6 +21,11 @@ final class SearchPanelTests: XCTestCase {
 
     override func tearDown() async throws {
         try? FileManager.default.removeItem(at: root)
+        // Checked before the cleanup below, which would hide a window that slipped past the stand-in.
+        if !onScreen {
+            XCTAssertEqual(NSApp.windows.filter(\.isVisible), [], "a test put a window on the screen")
+            XCTAssertFalse(NSApp.isActive, "a test made the test runner the active app")
+        }
         // Every test shares the one preview; a failed test mustn't leave it up for the next.
         // A close already under way takes about 0.2 s, and a second one would cancel it.
         if QLPreviewPanel.sharedPreviewPanelExists(), let preview = QLPreviewPanel.shared() {
@@ -29,6 +35,13 @@ final class SearchPanelTests: XCTestCase {
             }
             preview.dataSource = nil
             preview.delegate = nil
+        }
+        // The tests after this one run in the same app and expect someone else in front. The search
+        // window is freed before its fade-out ends, so nothing else takes it off the screen.
+        if onScreen {
+            for window in NSApp.windows where window.isVisible { window.orderOut(nil) }
+            NSApp.deactivate()
+            _ = await soon { !NSApp.isActive }
         }
     }
 
@@ -733,7 +746,36 @@ final class SearchPanelTests: XCTestCase {
         XCTAssertFalse(window.panel.isVisible, "the test keeps it off the screen")
         XCTAssertTrue(stage.isKey(window.panel))
         XCTAssertTrue(window.panel.firstResponder === window.field.currentEditor())
-        XCTAssertFalse(stage.isActive, "the window takes the keys without making Telescope the active app")
+        XCTAssertFalse(NSApp.isActive, "the window takes the keys without making Telescope the active app")
+    }
+
+    func testHidingPutsTheWindowAwayWithItsKeys() async throws {
+        let window = try await opened(access: true)
+        window.show()
+        window.hide()
+        try await until { stage.away == 1 }
+        XCTAssertFalse(stage.isKey(window.panel))
+    }
+
+    func testShownAgainWhileFadingOutTheWindowStays() async throws {
+        let window = try await opened(access: true)
+        window.show()
+        defer { window.hide() }
+        window.hide()
+        window.show()
+        try await Task.sleep(for: .seconds(Metric.fade + 0.2))
+        XCTAssertEqual(stage.away, 0)
+        XCTAssertTrue(stage.isKey(window.panel))
+    }
+
+    func testWarmingUpLeavesTheWindowAwayWithoutTheKeys() async throws {
+        let window = try await opened(access: true)
+        window.warmUp()
+        XCTAssertEqual(stage.forward, 1)
+        XCTAssertEqual(stage.away, 1)
+        XCTAssertNil(stage.key)
+        XCTAssertFalse(window.shown)
+        XCTAssertEqual(window.panel.alphaValue, 0)
     }
 
     func testAPreviewClosedWhileTelescopeIsActiveHandsTheKeysBackToTheBox() async throws {
@@ -756,14 +798,35 @@ final class SearchPanelTests: XCTestCase {
         XCTAssertTrue(window.shown, "a click on the preview keeps the window")
         XCTAssertNil(stage.key, "the preview keeps the keys")
 
-        // Esc on the preview: it lets go of the keys and nothing else picks them up.
+        // Esc on the preview: once it has faded out, Quick Look lets go of the window, and
+        // nothing else has picked up the keys.
         window.closePreview()
-        stage.previewIsKey = false
-        window.windowDidResignKey(Notification(name: NSWindow.didResignKeyNotification, object: QLPreviewPanel.shared()))
+        stage.finishFade()
+        window.panel.endPreviewPanelControl(QLPreviewPanel.shared())
         await nextTurn()
         XCTAssertTrue(window.shown)
         XCTAssertTrue(stage.isKey(window.panel))
         XCTAssertTrue(window.panel.firstResponder === window.field.currentEditor())
+    }
+
+    func testAPreviewClosedWhileAnotherAppIsActiveHidesTheWindow() async throws {
+        try Data().write(to: root.appendingPathComponent("budget.txt"))
+        let window = try await opened(access: true)
+        window.show()
+        defer { window.hide() }
+        try await type("budget", in: window)
+        try await until { window.rows.count == 1 }
+        window.quickLook(nil)
+        try await until { window.previewing }
+
+        stage.key = nil
+        window.closePreview()
+        stage.finishFade()
+        window.panel.endPreviewPanelControl(QLPreviewPanel.shared())
+        await nextTurn()
+        XCTAssertFalse(window.shown)
+        XCTAssertNil(stage.key)
+        try await until { stage.away == 1 }
     }
 
     func testOnScreenAPreviewClosedWhileTelescopeIsActiveHandsTheKeysBackToTheBox() async throws {
@@ -772,6 +835,8 @@ final class SearchPanelTests: XCTestCase {
         let window = try await opened(access: false, on: Screen())
         window.show()
         defer { window.hide() }
+        let unlocked = await soon { window.panel.isKeyWindow }
+        try XCTSkipUnless(unlocked, "needs an unlocked screen")
         try await type("budget", in: window)
         try await until { window.rows.count == 1 }
         window.quickLook(nil)
@@ -781,8 +846,7 @@ final class SearchPanelTests: XCTestCase {
 
         // A click on the preview makes Telescope the active app and gives the preview the keys.
         NSApp.activate(ignoringOtherApps: true)
-        let unlocked = await soon { NSApp.isActive }
-        try XCTSkipUnless(unlocked, "needs an unlocked screen")
+        try await until { NSApp.isActive }
         window.panel.makeFirstResponder(window.settings)
         preview.makeKey()
         try await until { preview.isKeyWindow }
@@ -810,7 +874,8 @@ final class SearchPanelTests: XCTestCase {
         // macOS handed the keys back to the window on its own.
         stage.isActive = true
         window.closePreview()
-        window.windowDidResignKey(Notification(name: NSWindow.didResignKeyNotification, object: QLPreviewPanel.shared()))
+        stage.finishFade()
+        window.panel.endPreviewPanelControl(QLPreviewPanel.shared())
         await nextTurn()
         XCTAssertTrue(window.shown)
         XCTAssertTrue(window.panel.firstResponder === window.settings)
@@ -849,6 +914,12 @@ final class SearchPanelTests: XCTestCase {
         window.windowDidResignKey(Notification(name: NSWindow.didResignKeyNotification, object: window.panel))
         XCTAssertTrue(window.shown)
         XCTAssertTrue(window.previewing)
+        stage.key = nil
+        stage.previewIsKey = true
+        await nextTurn()
+        XCTAssertTrue(window.shown, "the preview has the keys by the time it decides")
+        XCTAssertTrue(window.previewing)
+        XCTAssertNil(stage.key)
     }
 
     func testFocusLeavingTheWindowWithoutAPreviewHidesItAtOnce() async throws {
@@ -863,10 +934,10 @@ final class SearchPanelTests: XCTestCase {
         let window = try await opened(access: true)
         window.show()
         window.hide()
-        stage.key = nil
+        try await until { stage.away == 1 }
         stage.isActive = true
         window.panel.makeFirstResponder(window.settings)
-        window.settleKeys()
+        window.panel.endPreviewPanelControl(QLPreviewPanel.shared())
         await nextTurn()
         XCTAssertFalse(window.shown)
         XCTAssertTrue(window.panel.firstResponder === window.settings, "the box isn't handed the keys")
@@ -886,6 +957,7 @@ final class SearchPanelTests: XCTestCase {
 
         window.panel.cancelOperation(nil)
         try await until { !window.previewing }
+        XCTAssertEqual(stage.closes, 1)
         XCTAssertTrue(window.shown)
         window.panel.cancelOperation(nil)
         XCTAssertFalse(window.shown)
@@ -946,6 +1018,8 @@ final class SearchPanelTests: XCTestCase {
         try await until { window.rows.count == 2 }
         await nextTurn()
         XCTAssertFalse(window.previewing, "nothing opens it again")
+        XCTAssertEqual(stage.closes, 1)
+        XCTAssertEqual(stage.opens, 1)
     }
 
     func testHalfTypedJapaneseOpensNoPreview() async throws {
@@ -1004,7 +1078,8 @@ final class SearchPanelTests: XCTestCase {
         // Clearing asks to close from both the empty list and the cleared selection.
         try await type("", in: window)
         XCTAssertFalse(window.previewing)
-        try await until { !stage.previewShows }
+        stage.finishFade()
+        XCTAssertFalse(stage.previewShows)
         XCTAssertEqual(stage.closes, 1, "a second close would keep it open")
         XCTAssertTrue(window.shown)
     }
@@ -1025,11 +1100,31 @@ final class SearchPanelTests: XCTestCase {
         XCTAssertTrue(stage.previewShows)
         XCTAssertTrue(window.control(NSTextField(), textView: NSTextView(), doCommandBy: esc))
         XCTAssertEqual(window.field.stringValue, "")
-        try await until { !stage.previewShows }
+        stage.finishFade()
         await nextTurn()
         XCTAssertFalse(stage.previewShows, "stays closed")
         XCTAssertEqual(stage.closes, 1)
         XCTAssertTrue(window.shown)
+    }
+
+    func testCommandYWhileThePreviewFadesOutOpensItAgain() async throws {
+        try Data("budget\n".utf8).write(to: root.appendingPathComponent("budget.txt"))
+        let window = try await opened(access: true)
+        window.show()
+        defer { window.hide() }
+        try await type("budget", in: window)
+        try await until { window.rows.count == 1 }
+        window.quickLook(nil)
+        try await until { window.previewing }
+
+        window.quickLook(nil)
+        XCTAssertTrue(stage.fading)
+        window.quickLook(nil)
+        XCTAssertTrue(window.previewing)
+        stage.finishFade()
+        XCTAssertTrue(stage.previewShows)
+        XCTAssertEqual(stage.opens, 2)
+        XCTAssertEqual(stage.closes, 1)
     }
 
     func testANewListKeepsPreviewingThePickedFile() async throws {
@@ -1077,6 +1172,7 @@ final class SearchPanelTests: XCTestCase {
         XCTAssertTrue(window.control(NSTextField(), textView: NSTextView(), doCommandBy: #selector(NSResponder.insertNewline(_:))))
         XCTAssertEqual(window.missing, "“\(row.name)” can’t be found.")
         try await until { !window.previewing }
+        XCTAssertEqual(stage.closes, 1)
         XCTAssertTrue(window.shown)
 
         down(window)
@@ -1122,13 +1218,16 @@ final class SearchPanelTests: XCTestCase {
         // Esc in the box closes the preview first and keeps the search.
         XCTAssertTrue(window.control(NSTextField(), textView: NSTextView(), doCommandBy: #selector(NSResponder.cancelOperation(_:))))
         try await until { !window.previewing }
+        XCTAssertEqual(stage.closes, 1)
         XCTAssertEqual(window.field.stringValue, "budget")
         XCTAssertTrue(window.shown)
 
+        stage.finishFade()
         window.quickLook(nil)
         try await until { window.previewing }
         window.quickLook(nil)
         try await until { !window.previewing }
+        XCTAssertEqual(stage.closes, 2)
         XCTAssertTrue(window.shown, "⌘Y again closes only the preview")
     }
 
@@ -1168,13 +1267,16 @@ final class SearchPanelTests: XCTestCase {
         try await type("zzzz", in: window)
         try await until { !window.previewing }
         XCTAssertTrue(window.rows.isEmpty)
+        XCTAssertEqual(stage.closes, 1)
 
+        stage.finishFade()
         try await type("budget", in: window)
         try await until { window.rows.count == 1 }
         window.quickLook(nil)
         try await until { window.previewing }
         window.hide()
         try await until { !window.previewing }
+        XCTAssertEqual(stage.closes, 2)
     }
 
     func testAFileGoneWhileShownClosesThePreviewQuietly() async throws {
@@ -1198,6 +1300,7 @@ final class SearchPanelTests: XCTestCase {
         try FileManager.default.removeItem(atPath: window.rows[1].path)
         down(window)
         try await until { !window.previewing }
+        XCTAssertEqual(stage.closes, 1)
         XCTAssertNil(window.missing)
         XCTAssertEqual(window.selected, window.rows[1])
         window.quickLook(nil)
@@ -1583,6 +1686,7 @@ final class SearchPanelTests: XCTestCase {
         try XCTSkipUnless(
             ProcessInfo.processInfo.environment["TELESCOPE_FOCUS_TESTS"] == "1",
             "takes the screen; run with TELESCOPE_FOCUS_TESTS=1")
+        onScreen = true
         // Started as main.swift starts the app; otherwise none of the runner's ordinary windows,
         // such as the preview, can take the keys.
         if NSApp.activationPolicy() != .accessory {
