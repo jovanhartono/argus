@@ -471,6 +471,55 @@ final class HatchTests: XCTestCase {
         }
     }
 
+    func testVolumesTheCoreRefusesAreLeftOut() async throws {
+        let (root, notes) = try folderWithNotes()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let (hatch, counts) = try await watching(root)
+        for path in ["/", "", "/Volumes", "/System/Volumes/Data", "/Volumes/No Such Drive", root.path, notes.path] {
+            XCTAssertFalse(hatch.volumeAdded(path), path)
+        }
+        XCTAssertFalse(hatch.volumeRemoved("/Volumes/No Such Drive"), "never told of it")
+        try await Task.sleep(for: .milliseconds(300))
+        XCTAssertEqual(counts.heard, 0, "no new list for a volume left out")
+    }
+
+    func testLettingGoOfAVolumeStopsWatchingInsideItAtOnce() async throws {
+        let (root, notes) = try folderWithNotes()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let docs = root.appendingPathComponent("docs")
+        try FileManager.default.createDirectory(at: docs, withIntermediateDirectories: false)
+        let (hatch, counts) = try await watching(root)
+        let watched = try XCTUnwrap(hatch.watching.first { $0.hasSuffix("/notes") })
+        XCTAssertTrue(hatch.watching.contains { $0.hasSuffix("/docs") })
+
+        // Not a volume the core holds, but the watch lets go of it all the same.
+        XCTAssertFalse(hatch.volumeRemoved(watched))
+        XCTAssertFalse(hatch.watching.contains(watched))
+        XCTAssertTrue(hatch.watching.contains { $0.hasSuffix("/docs") }, "a folder beside it stays watched")
+        hatch.watch()
+        XCTAssertFalse(hatch.watching.contains(watched), "a list still holding it doesn't bring it back")
+
+        try Data().write(to: notes.appendingPathComponent("unheard.txt"))
+        try Data().write(to: docs.appendingPathComponent("plan.md"))
+        // The folder, notes, a.txt, docs and plan.md; unheard.txt only once notes is read again.
+        try await counts.reach(5, within: 5)
+        try await Task.sleep(for: .milliseconds(500))
+        XCTAssertEqual(counts.newest, 5)
+
+        XCTAssertFalse(hatch.volumeAdded(watched))
+        hatch.watch()
+        XCTAssertTrue(hatch.watching.contains(watched), "mounted again, it is watched again")
+    }
+
+    func testAPathIsInAFolderOnlyWholeNameByWholeName() {
+        XCTAssertTrue(Hatch.path("/Volumes/Photos", isIn: "/Volumes/Photos"))
+        XCTAssertTrue(Hatch.path("/Volumes/Photos/trips/2024", isIn: "/Volumes/Photos"))
+        XCTAssertFalse(Hatch.path("/Volumes/Photos 2", isIn: "/Volumes/Photos"))
+        XCTAssertFalse(Hatch.path("/Volumes/Photos2/a", isIn: "/Volumes/Photos"))
+        XCTAssertFalse(Hatch.path("/Volumes/Pho", isIn: "/Volumes/Photos"))
+        XCTAssertFalse(Hatch.path("/Users/me", isIn: "/Volumes/Photos"))
+    }
+
     private func folderWithNotes() throws -> (URL, URL) {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         let notes = root.appendingPathComponent("notes")
@@ -512,6 +561,7 @@ final class HatchTests: XCTestCase {
 private final class Counts {
     private var counts: [UInt64] = []
     var heard: Int { counts.count }
+    var newest: UInt64? { counts.last }
 
     func add(_ count: UInt64) { counts.append(count) }
 

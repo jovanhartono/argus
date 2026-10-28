@@ -34,8 +34,18 @@ final class ResultCell: NSTableCellView {
     func show(_ row: Row, icon image: NSImage) {
         if hit != nil || isHeader { reset() }
         if name.stringValue != row.name { name.stringValue = row.name }
-        if folder.stringValue != row.folder { folder.stringValue = row.folder }
+        let place = Self.place(row.folder)
+        if folder.stringValue != place { folder.stringValue = place }
         if icon.image !== image { icon.image = image }
+    }
+
+    /// A folder on a drive leads with the drive's name, "Photos · trips/2024", kept in view
+    /// when a long path is cut in the middle.
+    static func place(_ folder: String) -> String {
+        guard folder.hasPrefix("/Volumes/") else { return folder }
+        let parts = folder.dropFirst("/Volumes/".count).split(separator: "/", maxSplits: 1)
+        guard let drive = parts.first else { return folder }
+        return parts.count == 1 ? String(drive) : "\(drive) · \(parts[1])"
     }
 
     /// "budget.md, line 12 · ~/notes" under the line, the match in bold.
@@ -47,7 +57,7 @@ final class ResultCell: NSTableCellView {
         shown = Self.excerpt(found.text, match: found.match, width: name.frame.width, font: Self.bold)
         paint()
         let file = found.file
-        folder.stringValue = "\(file.name), line \(found.line) · \((file.folder as NSString).abbreviatingWithTildeInPath)"
+        folder.stringValue = "\(file.name), line \(found.line) · \(Self.place((file.folder as NSString).abbreviatingWithTildeInPath))"
         if icon.image !== image { icon.image = image }
     }
 

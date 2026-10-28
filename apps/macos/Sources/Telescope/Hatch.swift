@@ -77,7 +77,9 @@ final class Hatch {
     private let changes = DispatchQueue(label: "io.github.jovanhartono.telescope.changes")
     nonisolated(unsafe) private var stream: FSEventStreamRef?
     nonisolated(unsafe) private var names: [String: Names] = [:]
-    private var watching: [String] = []
+    private(set) var watching: [String] = []
+    /// Drives about to unmount, kept out of the watch even while a list that still holds them is in use.
+    private var ejecting: Set<String> = []
     /// Taken before the first scan starts, so a change made during it still counts.
     private let started: FSEventStreamEventId
 
@@ -300,9 +302,45 @@ final class Hatch {
         var out = TlRows()
         var since: FSEventStreamEventId = 0
         guard tl_watched(core, &out, &since) == TL_OK else { return }
-        let rows = copy(out)
+        let rows = copy(out).filter { row in !ejecting.contains { Hatch.path(row.name, isIn: $0) } }
         watchNames(of: rows.filter { !$0.isFolder }.map(\.name))
-        let folders = rows.filter(\.isFolder).map(\.name)
+        // Replays from before the list's rebuild was asked for, so a change it missed in a folder
+        // watched only from now still counts.
+        watch(rows.filter(\.isFolder).map(\.name), since: since == 0 ? started : since)
+    }
+
+    /// Lists the drive mounted at `path` too, when the core takes it; `.rebuilt` follows once
+    /// it is read. True when the core took it.
+    @discardableResult
+    func volumeAdded(_ path: String) -> Bool {
+        ejecting.remove(path)
+        var path = path
+        return path.withUTF8 { tl_volume_added(core, $0.baseAddress, $0.count, FSEventsGetCurrentEventId()) } == 1
+    }
+
+    /// Lets go of the drive at `path` at once, so Finder can eject it, and drops it from the
+    /// list; `.rebuilt` follows. True when the core had it.
+    @discardableResult
+    func volumeRemoved(_ path: String) -> Bool {
+        var bytes = path
+        let held = bytes.withUTF8 { tl_volume_removed(core, $0.baseAddress, $0.count, FSEventsGetCurrentEventId()) } == 1
+        ejecting.insert(path)
+        for (folder, watch) in names where Hatch.path(folder, isIn: path) {
+            watch.source.cancel()
+            names[folder] = nil
+        }
+        // Picks up where the old watch stopped, so a change at home in between still counts.
+        let from = stream.map { FSEventStreamGetLatestEventId($0) } ?? started
+        watch(watching.filter { !Hatch.path($0, isIn: path) }, since: from)
+        return held
+    }
+
+    nonisolated static func path(_ path: String, isIn folder: String) -> Bool {
+        path.hasPrefix(folder) && (path.count == folder.count || path.dropFirst(folder.count).first == "/")
+    }
+
+    /// Changes are gathered for 0.2 s, so a burst of saves arrives as one call.
+    private func watch(_ folders: [String], since: FSEventStreamEventId) {
         guard folders != watching else { return }
         watching = folders
         if let stream {
@@ -312,12 +350,9 @@ final class Hatch {
         guard !folders.isEmpty else { return }
         var context = FSEventStreamContext(
             version: 0, info: UnsafeMutableRawPointer(core), retain: nil, release: nil, copyDescription: nil)
-        // Replays from before the list's rebuild was asked for, so a change it missed in a folder
-        // watched only from now still counts. Changes are gathered for 0.2 s, so a burst of saves
-        // arrives as one call.
         guard
             let stream = FSEventStreamCreate(
-                nil, changed, &context, folders as CFArray, since == 0 ? started : since, 0.2,
+                nil, changed, &context, folders as CFArray, since, 0.2,
                 FSEventStreamCreateFlags(kFSEventStreamCreateFlagNone))
         else { return }
         FSEventStreamSetDispatchQueue(stream, changes)
