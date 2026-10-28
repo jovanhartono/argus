@@ -17,7 +17,7 @@ final class HatchTests: XCTestCase {
                     answered = ticket
                     ready.fulfill()
                 case .failed: XCTFail("the core stopped")
-                case .rebuilt: XCTFail("nothing changed")
+                case .rebuilt, .opened: XCTFail("nothing changed or saved")
                 }
             })
         await fulfillment(of: [indexed], timeout: 5)
@@ -41,7 +41,7 @@ final class HatchTests: XCTestCase {
                 case .indexed: indexed.fulfill()
                 case .ready(let ticket): ready[ticket]?.fulfill()
                 case .failed: XCTFail("the core stopped")
-                case .rebuilt: XCTFail("nothing changed")
+                case .rebuilt, .opened: XCTFail("nothing changed or saved")
                 }
             })
         await fulfillment(of: [indexed], timeout: 5)
@@ -85,6 +85,7 @@ final class HatchTests: XCTestCase {
                 case .ready: ready.fulfill()
                 case .failed: XCTFail("the scan failed")
                 case .rebuilt: break
+                case .opened: XCTFail("nothing was saved")
                 }
             })
         await fulfillment(of: [indexed], timeout: 5)
@@ -150,6 +151,7 @@ final class HatchTests: XCTestCase {
                 case .rebuilt(let count, _): counts.add(count)
                 case .ready: break
                 case .failed: XCTFail("the scan failed")
+                case .opened: XCTFail("nothing was saved")
                 }
             })
         // The scan may or may not have read them yet; either way the list ends up with them.
@@ -216,20 +218,79 @@ final class HatchTests: XCTestCase {
             UnsafePointer(strdup(path)!)
         }
         defer { paths.forEach { free(UnsafeMutablePointer(mutating: $0)) } }
-        let gather = { (flags: [Int]) in
+        let gather = { (flags: [Int], ids: [FSEventStreamEventId]) in
             let flags = flags.map { FSEventStreamEventFlags($0) }
             return paths.withUnsafeBufferPointer { paths in
-                flags.withUnsafeBufferPointer { gatherChanges(3, paths.baseAddress!, $0.baseAddress!) }
+                flags.withUnsafeBufferPointer { flags in
+                    ids.withUnsafeBufferPointer {
+                        gatherChanges(flags.count, paths.baseAddress!, flags.baseAddress!, $0.baseAddress!)
+                    }
+                }
             }
         }
-        let quiet = gather([kFSEventStreamEventFlagNone, kFSEventStreamEventFlagHistoryDone, 0])
+        let quiet = gather([kFSEventStreamEventFlagNone, kFSEventStreamEventFlagHistoryDone, 0], [40, 90, 41])
         XCTAssertEqual(quiet.bytes, Array("/a/\0/c/\0".utf8))
         XCTAssertFalse(quiet.rescan)
+        XCTAssertEqual(quiet.newest, 41, "the end of a replay is no change")
+        let none = paths.withUnsafeBufferPointer {
+            gatherChanges(0, $0.baseAddress!, [FSEventStreamEventFlags(0)], [FSEventStreamEventId(5)])
+        }
+        let replayed = gather([kFSEventStreamEventFlagHistoryDone], [90])
+        for nothing in [none, replayed] {
+            XCTAssertEqual(nothing.bytes, [])
+            XCTAssertFalse(nothing.rescan)
+            XCTAssertEqual(nothing.newest, 0)
+        }
         for dropped in [
             kFSEventStreamEventFlagMustScanSubDirs, kFSEventStreamEventFlagUserDropped,
             kFSEventStreamEventFlagKernelDropped, kFSEventStreamEventFlagEventIdsWrapped,
         ] {
-            XCTAssertTrue(gather([0, dropped, 0]).rescan)
+            let lost = gather([0, dropped, 0], [7, 9, 8])
+            XCTAssertTrue(lost.rescan)
+            XCTAssertEqual(lost.newest, 9)
+        }
+    }
+
+    func testTheJournalNamesTheFSEventsLogOfAVolume() throws {
+        let home = try XCTUnwrap(Hatch.journal(of: NSHomeDirectory()))
+        XCTAssertNotNil(UUID(uuidString: home), home)
+        XCTAssertEqual(Hatch.journal(of: NSHomeDirectory() + "/Library"), home, "the same volume")
+        XCTAssertNil(Hatch.journal(of: "/nowhere/\(UUID().uuidString)"))
+        XCTAssertNil(Hatch.journal(of: "/dev"), "a volume FSEvents keeps no log for")
+        XCTAssertTrue(Hatch.savedList.hasSuffix("/Library/Application Support/io.github.jovanhartono.telescope/index"))
+    }
+
+    func testAListSavedAtOneLaunchOpensAtTheNextAndKeepsUp() async throws {
+        let (root, notes) = try folderWithNotes()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let support = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: support) }
+        let file = support.appendingPathComponent("io.github.jovanhartono.telescope/index").path
+        do {
+            let (first, _) = try await watching(root, saved: file)
+            // Saved 2 s after the first list.
+            let deadline = ProcessInfo.processInfo.systemUptime + 10
+            while !FileManager.default.fileExists(atPath: file) {
+                guard ProcessInfo.processInfo.systemUptime < deadline else { return XCTFail("never saved") }
+                try await Task.sleep(for: .milliseconds(50))
+            }
+            _ = first
+        }
+        let header = try XCTUnwrap(FileManager.default.contents(atPath: file))
+        let savedAt = header[16..<24].reversed().reduce(UInt64(0)) { $0 << 8 | UInt64($1) }
+        XCTAssertGreaterThan(savedAt, 0)
+        XCTAssertLessThanOrEqual(savedAt, FSEventsGetCurrentEventId())
+
+        // A file made while Telescope is closed is replayed from the saved event. Gone before
+        // `support` is, so no save is under way as the folder goes.
+        do {
+            try Data().write(to: notes.appendingPathComponent("budget.txt"))
+            let (hatch, counts) = try await watching(root, saved: file, opened: true)
+            // The folder, notes, a.txt and budget.txt.
+            try await counts.reach(4, within: 5)
+            try Data().write(to: notes.appendingPathComponent("plan.md"))
+            try await counts.reach(5, within: 5)
+            _ = hatch
         }
     }
 
@@ -258,19 +319,26 @@ final class HatchTests: XCTestCase {
         return (root, notes)
     }
 
-    private func watching(_ root: URL) async throws -> (Hatch, Counts) {
+    /// A core over `root`, keeping its list in `saved` when given, watched once its first list
+    /// is in, scanned or `opened` from the file.
+    private func watching(_ root: URL, saved: String? = nil, opened: Bool = false) async throws -> (Hatch, Counts) {
         let counts = Counts()
-        let indexed = expectation(description: "indexed")
+        let first = expectation(description: opened ? "opened" : "indexed")
         let hatch = try XCTUnwrap(
-            Hatch(root: root.path, fullDisk: true) { event in
+            Hatch(root: root.path, fullDisk: true, saved: saved) { event in
                 switch event {
-                case .indexed: indexed.fulfill()
+                case .indexed:
+                    XCTAssertFalse(opened, "scanned in place of the saved list")
+                    first.fulfill()
+                case .opened:
+                    XCTAssertTrue(opened, "opened a list that shouldn't open")
+                    first.fulfill()
                 case .rebuilt(let count, _): counts.add(count)
                 case .ready: break
                 case .failed: XCTFail("the scan failed")
                 }
             })
-        await fulfillment(of: [indexed], timeout: 5)
+        await fulfillment(of: [first], timeout: 5)
         hatch.watch()
         return (hatch, counts)
     }

@@ -1077,7 +1077,7 @@ mod tests {
                             index,
                             unreadable_folders: 0,
                         };
-                        save_index(&file, &scan, &settings, 0).unwrap();
+                        save_index(&file, &scan.index, 0, &settings, 0).unwrap();
                         let opened = open_index(&file, &settings).unwrap().scan.index;
                         fs::remove_file(file).unwrap();
                         // Counted again from the lists, as an update counted them on the way.
@@ -1521,7 +1521,7 @@ mod tests {
                 index,
                 unreadable_folders: 0,
             };
-            save_index(&file, &scan, &settings, 0).unwrap();
+            save_index(&file, &scan.index, 0, &settings, 0).unwrap();
             index = open_index(&file, &settings).unwrap().scan.index;
         }
         fs::remove_file(file).unwrap();
@@ -1693,7 +1693,7 @@ mod tests {
             index,
             unreadable_folders: 0,
         };
-        save_index(&file, &scan, &settings, 0).unwrap();
+        save_index(&file, &scan.index, 0, &settings, 0).unwrap();
         let opened = open_index(&file, &settings).unwrap().scan.index;
         fs::remove_file(file).unwrap();
         assert!(opened == scan.index);

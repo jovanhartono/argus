@@ -63,11 +63,7 @@ impl Scope {
     /// replaced, as apps do to their settings in the home folder all day. Reads the folder's
     /// names once. Only right while no rebuild is under way, which may hold a newer list.
     pub fn holds(&self, path: &Path, index: &Index) -> bool {
-        if self
-            .list
-            .as_ref()
-            .is_some_and(|list| path.starts_with(list))
-        {
+        if self.changes_rules(path) {
             return false;
         }
         let Some(top) = self.top(path) else {
@@ -117,6 +113,14 @@ impl Scope {
         kept.sort_unstable();
         listed.sort_unstable();
         kept == listed
+    }
+
+    /// Whether a change at `path` may edit your ignore list, so only a new scan, by the new
+    /// rules, is sure to match it.
+    pub fn changes_rules(&self, path: &Path) -> bool {
+        self.list
+            .as_ref()
+            .is_some_and(|list| path.starts_with(list))
     }
 
     fn reach(&self, path: &Path) -> Option<Inside> {
@@ -531,6 +535,12 @@ mod tests {
         assert!(!holds("work/new project"));
         // Your ignore list, even before its folder exists.
         assert!(!holds(".config/telescope"));
+        for folder in [".config/telescope", ".config/telescope/old"] {
+            assert!(scope.changes_rules(&home.join(folder)), "{folder}");
+        }
+        for folder in ["", ".config", ".config/telescope-old", "work"] {
+            assert!(!scope.changes_rules(&home.join(folder)), "{folder}");
+        }
     }
 
     #[test]
