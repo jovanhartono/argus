@@ -360,6 +360,7 @@ dependencies = [
  "crc32fast",
  "frizbee",
  "hashbrown",
+ "libc",
  "rayon",
  "tempfile",
 ]
