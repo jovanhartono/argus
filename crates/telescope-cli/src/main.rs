@@ -8,6 +8,9 @@ use std::time::Instant;
 use telescope_core::{Access, Clutter, Ignore, Index, Opened, Searcher, Settings};
 use telescope_grep::Grep;
 
+#[global_allocator]
+static PAGES: telescope_core::Pages = telescope_core::Pages;
+
 const USAGE: &str = "usage:
   tl index <folder>                            scan and report the index size
   tl search <folder>                           scan, then search each line you type

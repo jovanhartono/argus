@@ -45,7 +45,7 @@ final class Hatch {
     convenience init?(root: String, fullDisk: Bool, onEvent: @escaping (Event) -> Void) {
         var root = root
         self.init(onEvent: onEvent) { tag, callback in
-            root.withUTF8 { tl_core_new($0.baseAddress, $0.count, fullDisk ? 1 : 0, tag, callback) }
+            root.withUTF8 { tl_core_new($0.baseAddress, $0.count, fullDisk ? 1 : 0, 0, tag, callback) }
         }
     }
 

@@ -4,8 +4,8 @@
 use crate::index::{EntryId, Index, IndexBuilder, NO_PARENT, NameId, name_fingerprint};
 use crate::walk::{Kind, Listing, Rules, walk};
 use rayon::prelude::*;
-use std::borrow::Cow;
 use std::cmp::Ordering;
+use std::ffi::OsStr;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
@@ -84,8 +84,8 @@ impl Index {
         let changed: Vec<&Path> = changed.iter().map(AsRef::as_ref).collect();
         let mut targets = self.changed_folders(root, &changed);
         // Parents first, so a folder its parent replaced is not read into the old one.
-        targets.sort_unstable_by_key(|&(folder, _)| folder);
-        targets.dedup_by_key(|&mut (folder, _)| folder);
+        targets.sort_unstable_by_key(|&(folder, ..)| folder);
+        targets.dedup_by_key(|&mut (folder, ..)| folder);
         let mut added = Added {
             builder: IndexBuilder::new(),
             anchors: Vec::new(),
@@ -94,16 +94,17 @@ impl Index {
         for chunk in targets.chunks(READ_CHUNK) {
             let listings: Vec<(Listing, bool)> = chunk
                 .par_iter()
-                .map(|(folder, at)| {
-                    let passage = self.passages.binary_search(folder).is_ok();
-                    let listing = rules.list(at, *folder == 0, passage);
+                .map_init(PathBuf::new, |at, &(folder, depth, below)| {
+                    folder_path(at, root, below, depth);
+                    let passage = self.passages.binary_search(&folder).is_ok();
+                    let listing = rules.list(at, folder == 0, passage);
                     // A folder deleted since it was found lost everything in it.
                     let partial = listing.unreadable
-                        && fs::symlink_metadata(at).is_ok_and(|meta| meta.is_dir());
+                        && fs::symlink_metadata(&at).is_ok_and(|meta| meta.is_dir());
                     (listing, partial)
                 })
                 .collect();
-            for (&(folder, _), (listing, partial)) in chunk.iter().zip(listings) {
+            for (&(folder, ..), (listing, partial)) in chunk.iter().zip(listings) {
                 if folder != 0 && self.entry_parent[folder as usize] == NO_PARENT {
                     continue;
                 }
@@ -125,73 +126,78 @@ impl Index {
         update
     }
 
-    /// For each changed path, the deepest indexed folder on it that is still a folder on disk,
-    /// and that folder's path. A path outside the root has none.
-    fn changed_folders(&self, root: &Path, changed: &[&Path]) -> Vec<(EntryId, PathBuf)> {
-        let mut paths: Vec<(Vec<Cow<str>>, &Path)> = changed
+    /// For each changed folder, the deepest indexed folder on its path that is still a folder
+    /// on disk, how many names below `root` lead to it, and one such path. A path outside the
+    /// root has none. Nothing is copied per path, as a catch-up after a restart may bring many
+    /// thousands.
+    fn changed_folders<'p>(
+        &self,
+        root: &Path,
+        changed: &[&'p Path],
+    ) -> Vec<(EntryId, usize, &'p Path)> {
+        // Each path below the root, beside what is left of it below the folder reached so far.
+        let mut paths: Vec<(&Path, &Path)> = changed
             .iter()
-            .filter_map(|path| {
-                let below = path.strip_prefix(root).ok()?;
-                let names = below
-                    .components()
-                    .map_while(|part| match part {
-                        Component::Normal(name) => Some(name.to_string_lossy()),
-                        _ => None,
-                    })
-                    .collect();
-                Some((names, below))
-            })
+            .filter_map(|path| path.strip_prefix(root).ok())
+            .map(|below| (below, below))
             .collect();
-        // Paths into one folder sit together, so its children are looked up once for them all.
-        paths.sort_unstable();
-        let mut found = Vec::with_capacity(paths.len());
-        self.descend(0, 0, &paths, &mut found);
+        // `Path` sorts name by name, so paths into one folder sit together and its children are
+        // looked up once for them all.
+        paths.sort_unstable_by_key(|&(below, _)| below);
+        let mut found = Vec::new();
+        self.descend(0, 0, &mut paths, &mut found);
+        drop(paths);
         found
             .into_par_iter()
-            .map(|(mut folder, depth, below)| {
-                let mut at = root.to_path_buf();
-                at.extend(below.components().take(depth));
+            .map_init(PathBuf::new, |at, (mut folder, mut depth, below)| {
+                folder_path(at, root, below, depth);
                 // A folder deleted or turned into a file is read from its parent, which lost it.
                 while folder != 0 && !fs::symlink_metadata(&at).is_ok_and(|meta| meta.is_dir()) {
                     folder = self.entry_parent[folder as usize];
                     at.pop();
+                    depth -= 1;
                 }
-                (folder, at)
+                (folder, depth, below)
             })
             .collect()
     }
 
     /// Finds the folder for each of `paths`, which are sorted and all lead through `folder`,
-    /// `depth` names below the root.
+    /// `depth` names below the root. Each folder is found once, however many paths lead to it.
     fn descend<'p>(
         &self,
         folder: EntryId,
         depth: usize,
-        paths: &[(Vec<Cow<str>>, &'p Path)],
+        paths: &mut [(&'p Path, &'p Path)],
         found: &mut Vec<(EntryId, usize, &'p Path)>,
     ) {
-        let ends = paths.partition_point(|(names, _)| names.len() == depth);
-        found.extend(
-            paths[..ends]
-                .iter()
-                .map(|&(_, below)| (folder, depth, below)),
-        );
-        let paths = &paths[ends..];
-        if paths.is_empty() {
-            return;
-        }
-        let mut children: Vec<(&str, EntryId)> = self
-            .run_children(folder)
-            .filter(|&child| self.is_dir(child))
-            .map(|child| (self.name(child), child))
-            .collect();
-        children.sort_unstable();
-        for group in paths.chunk_by(|a, b| a.0[depth] == b.0[depth]) {
-            let name = &*group[0].0[depth];
-            match children.binary_search_by(|&(child, _)| child.cmp(name)) {
-                Ok(at) => self.descend(children[at].1, depth + 1, group, found),
-                Err(_) => found.extend(group.iter().map(|&(_, below)| (folder, depth, below))),
+        let ends = paths.partition_point(|&(_, rest)| first_name(rest).is_none());
+        let mut here = paths[..ends].first().map(|&(below, _)| below);
+        let paths = &mut paths[ends..];
+        if !paths.is_empty() {
+            let mut children: Vec<(&str, EntryId)> = self
+                .run_children(folder)
+                .filter(|&child| self.is_dir(child))
+                .map(|child| (self.name(child), child))
+                .collect();
+            children.sort_unstable();
+            for group in paths.chunk_by_mut(|a, b| first_name(a.1) == first_name(b.1)) {
+                let name = first_name(group[0].1).unwrap_or_default().to_string_lossy();
+                match children.binary_search_by(|&(child, _)| child.cmp(&name)) {
+                    Ok(at) => {
+                        for (_, rest) in group.iter_mut() {
+                            let mut parts = rest.components();
+                            parts.next();
+                            *rest = parts.as_path();
+                        }
+                        self.descend(children[at].1, depth + 1, group, found);
+                    }
+                    Err(_) => here = here.or(Some(group[0].0)),
+                }
             }
+        }
+        if let Some(below) = here {
+            found.push((folder, depth, below));
         }
     }
 
@@ -474,6 +480,25 @@ impl Index {
         (self.removed, self.removed_folders, self.added) = (0, 0, 0);
         self.add_depths_and_letters();
     }
+}
+
+/// The names on the way down from the root, up to anything else, such as a "..".
+fn names(below: &Path) -> impl Iterator<Item = &OsStr> {
+    below.components().map_while(|part| match part {
+        Component::Normal(name) => Some(name),
+        _ => None,
+    })
+}
+
+fn first_name(path: &Path) -> Option<&OsStr> {
+    names(path).next()
+}
+
+/// Sets `at` to the folder `depth` names down `below` from the root.
+fn folder_path(at: &mut PathBuf, root: &Path, below: &Path, depth: usize) {
+    at.as_mut_os_string().clear();
+    at.push(root);
+    at.extend(names(below).take(depth));
 }
 
 /// Lists grow by a sixteenth at a time, not double as `Vec` does, so a few new files never
@@ -968,6 +993,33 @@ mod tests {
             &root,
             "after a rename that changes only case",
         );
+    }
+
+    #[test]
+    fn many_paths_into_one_folder_find_it_once() {
+        let (_dir, root) = temp_root();
+        write(&root, &["a/b/c.txt", "a/d.txt", "a-b/g.txt", "e/f.txt"]);
+        let settings = keep_all(&root);
+        let mut index = settings.scan().unwrap().index;
+        let none: [&Path; 0] = [];
+        settings.update(&mut index, &none);
+        let mut changed: Vec<PathBuf> = (0..50)
+            .flat_map(|i| [format!("a/b/new{i}.txt"), format!("a/gone{i}/x")])
+            .map(|path| root.join(path))
+            .collect();
+        let paths = ["a/b", "e", "a-b/z/q", "a/b/c.txt", "a/b", "a-b"];
+        changed.extend(paths.map(|path| root.join(path)));
+        let mut dotted = root.join("a").into_os_string();
+        dotted.push(format!("{0}..{0}e", std::path::MAIN_SEPARATOR));
+        changed.push(PathBuf::from(dotted));
+        let changed: Vec<&Path> = changed.iter().map(PathBuf::as_path).collect();
+        let mut found: Vec<(&str, usize)> = index
+            .changed_folders(&root, &changed)
+            .into_iter()
+            .map(|(folder, depth, _)| (index.name(folder), depth))
+            .collect();
+        found.sort_unstable();
+        assert_eq!(found, [("a", 1), ("a-b", 1), ("b", 2), ("e", 1)]);
     }
 
     #[test]
