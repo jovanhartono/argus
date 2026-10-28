@@ -97,7 +97,7 @@ footer { border-top: 0.5px solid var(--line); margin-top: 36px; padding-top: 20p
   <div class="chips">
     <span class="chip keep">15 pull requests merged</span>
     <span class="chip keep">20 of 20 golden searches in the top 3</span>
-    <span class="chip open">Restart, home-folder memory, index everything and drives to go</span>
+    <span class="chip open">Restart, home-folder memory and index everything to go</span>
     <span class="chip">Built early, while M2's week runs</span>
     <span class="chip">Swift + Rust</span>
   </div>
@@ -137,7 +137,7 @@ footer { border-top: 0.5px solid var(--line); margin-top: 36px; padding-top: 20p
         <tr><td class="n">Window</td><td class="name">Index health and the Finder hotkey</td><td><kbd>⌘</kbd> <kbd>,</kbd> shows how many entries the list holds, when it was last read and whether it is up to date, with a Rebuild Index button. <kbd>⌘</kbd> <kbd>⇧</kbd> <kbd>⌥</kbd> <kbd>Space</kbd> opens the search already inside the folder the front Finder window shows</td><td class="n"><span class="chip keep">Done</span> <a href="https://github.com/jovanhartono/telescope/pull/59">#59</a></td></tr>
         <tr><td class="n">Docs</td><td class="name">M3 and M4 pages</td><td>This page and the text-search page, with every number taken from the merged pull requests</td><td class="n"><span class="chip keep">Done</span> <a href="https://github.com/jovanhartono/telescope/pull/61">#61</a></td></tr>
         <tr><td class="n">Window</td><td class="name">Index everything switch</td><td>A switch in the health view lists the whole home folder, Library and clutter included: 2,478,045 entries in 10.9 s instead of 48,000. It turns on and off without a relaunch, a spinner shows while the new list is built, and it is kept for the next launch. It waits for Full Disk Access, since without it macOS stops the scan with a pop-up for the Music and Photos libraries</td><td class="n"><span class="chip open">Built</span> <a href="https://github.com/jovanhartono/telescope/issues/21">#21</a>, <a href="https://github.com/jovanhartono/telescope/pull/62">PR #62</a></td></tr>
-        <tr><td class="n">Window</td><td class="name">External drives in the window</td><td>The app tells the core when a drive is plugged in or ejected</td><td class="n"><span class="chip open">To do</span> <a href="https://github.com/jovanhartono/telescope/issues/22">#22</a></td></tr>
+        <tr><td class="n">Window</td><td class="name">External drives in the window</td><td>Plug in a drive and its files show up in results; eject it and they are gone. The core decides which drives count, and drives already plugged in at launch count too. On eject Telescope lets go of the drive in under 1 ms, so Finder ejects it on the first try. A result on a drive reads “Photos · trips/2024” under its name. A 10,103-entry disk image was findable 20-79 ms after it mounted and gone 0-1 ms after the eject began. Still to try: a real USB drive in the installed app</td><td class="n"><span class="chip open">Built</span> <a href="https://github.com/jovanhartono/telescope/issues/22">#22</a></td></tr>
         <tr><td class="n">Core</td><td class="name">Patch without a second copy</td><td>Updates patch a copy of the list while searches use the old one, so with index everything on an update briefly holds two: about 140 MB</td><td class="n"><span class="chip open">To do</span> <a href="https://github.com/jovanhartono/telescope/issues/42">#42</a></td></tr>
         <tr><td class="n">Test</td><td class="name">Damaged saved lists with drives</td><td>Random damaged saved lists that hold drives and removed entries, each refused or opened safely</td><td class="n"><span class="chip open">To do</span> <a href="https://github.com/jovanhartono/telescope/issues/55">#55</a></td></tr>
       </tbody>
@@ -250,7 +250,7 @@ footer { border-top: 0.5px solid var(--line); margin-top: 36px; padding-top: 20p
   <h2>What remains</h2>
   <ul class="prose">
     <li><strong>The index everything switch</strong> (<a href="https://github.com/jovanhartono/telescope/issues/21">#21</a>): the switch is in the health view and works without a relaunch, but with it on ~/Library changes every few seconds, and each change patches a copy of the 2.5-million-entry list. Memory settles at 80 MB and peaked at 152 MB, against 60 and 150 MB, and the patches cost about 3% of one core. Patching without a second copy (<a href="https://github.com/jovanhartono/telescope/issues/42">#42</a>) should bring both down.</li>
-    <li><strong>External drives in the window</strong> (<a href="https://github.com/jovanhartono/telescope/issues/22">#22</a>): the app has to tell the core when a drive is plugged in or ejected. A writable disk image you made yourself is still listed, and Time Machine on APFS may be missed.</li>
+    <li><strong>External drives in the window</strong> (<a href="https://github.com/jovanhartono/telescope/issues/22">#22</a>): built and tested with a disk image; a real USB drive in the installed app is still to try, as the development build doesn't have Full Disk Access. A writable disk image you made yourself is still listed, and Time Machine on APFS may be missed.</li>
     <li><strong>Damaged saved lists with drives</strong> (<a href="https://github.com/jovanhartono/telescope/issues/55">#55</a>): random damage tests that cover drives and removed entries.</li>
     <li><strong>Restart under 300 ms on a quiet Mac</strong>: every launch timing so far ran at load average 11-18.</li>
     <li><strong>Hand checks with the screen unlocked</strong>: the details pane, the folder label, app rows and the health window in light and dark; VoiceOver reading “Search in notes”; <kbd>Return</kbd> on an app; the first macOS question about controlling Finder.</li>
@@ -263,7 +263,7 @@ footer { border-top: 0.5px solid var(--line); margin-top: 36px; padding-top: 20p
     <li>Finish M2 first: the v0.2.0 release (<a href="https://github.com/jovanhartono/telescope/issues/24">#24</a>), the update test (<a href="https://github.com/jovanhartono/telescope/issues/13">#13</a>) and the 7-day run (<a href="https://github.com/jovanhartono/telescope/issues/25">#25</a>). The M3 work rides along in daily use.</li>
     <li>The hand checks above, once, with the screen unlocked.</li>
     <li>Patch the list without a second copy (<a href="https://github.com/jovanhartono/telescope/issues/42">#42</a>), then measure the index everything switch again (<a href="https://github.com/jovanhartono/telescope/issues/21">#21</a>).</li>
-    <li>External drives in the window (<a href="https://github.com/jovanhartono/telescope/issues/22">#22</a>) and the damage tests (<a href="https://github.com/jovanhartono/telescope/issues/55">#55</a>). M3 closes when every check in <a href="#targets">What M3 must prove</a> passes.</li>
+    <li>A real USB drive in the installed app (<a href="https://github.com/jovanhartono/telescope/issues/22">#22</a>) and the damage tests (<a href="https://github.com/jovanhartono/telescope/issues/55">#55</a>). M3 closes when every check in <a href="#targets">What M3 must prove</a> passes.</li>
   </ol>
 </section>
 </main>
