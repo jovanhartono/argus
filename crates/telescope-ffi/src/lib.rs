@@ -36,7 +36,7 @@ use telescope_grep::{Found, Grep, Report};
 static PAGES: Pages = Pages;
 
 /// Raise this with any change below, so a window built against an older header refuses to start.
-pub const TL_ABI_VERSION: u32 = 11;
+pub const TL_ABI_VERSION: u32 = 12;
 
 pub const TL_OK: u32 = 0;
 /// No rows for that ticket: not ready yet, already taken, or a newer search replaced them.
@@ -186,9 +186,10 @@ pub struct TlLines {
 /// `scan_ms` how long reading it took; `scanned_at` is 0 while the list in use is the one saved
 /// at the last launch, patched or not. `changed_at` is when the newest list after the first came
 /// into use, or 0 for none yet. Times are Unix seconds. `busy` is set while a new list is being
-/// built or waits to be. `behind` is set once a rebuild failed, so the list misses a change
-/// until a whole new list reads it. `stopped` is set once the core stopped, as after
-/// `TL_EVENT_FAILED`, and no list will come.
+/// built or waits to be. `building` is set only while that list reads the whole folder, as for
+/// the first list, a Rebuild or the switch, not while changed folders are read again. `behind`
+/// is set once a rebuild failed, so the list misses a change until a whole new list reads it.
+/// `stopped` is set once the core stopped, as after `TL_EVENT_FAILED`, and no list will come.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 #[repr(C)]
 pub struct TlHealth {
@@ -197,6 +198,7 @@ pub struct TlHealth {
     pub scan_ms: u64,
     pub changed_at: u64,
     pub busy: bool,
+    pub building: bool,
     pub behind: bool,
     pub stopped: bool,
 }
@@ -307,6 +309,8 @@ struct Plan {
     wanted: bool,
     /// A rebuild is under way, so the newest list may already be out of date.
     running: bool,
+    /// The rebuild under way reads the whole folder rather than patching the newest list.
+    whole: bool,
     /// The list of the rebuild under way is in use; only its checks of late changes remain.
     listed: bool,
     full_disk: bool,
@@ -376,6 +380,14 @@ impl Plan {
         self.wanted
             || (self.running && !self.listed)
             || self.patching
+            || self.everything != self.everything_listed
+    }
+
+    /// As `busy`, but only for a list read from the whole folder: with everything listed,
+    /// ~/Library changes every few seconds, and a spinner for each patch would never rest.
+    fn building(&self) -> bool {
+        self.wanted
+            || (self.running && self.whole && !self.listed)
             || self.everything != self.everything_listed
     }
 
@@ -1348,6 +1360,7 @@ fn rebuild_loop(live: &Live, clock: &impl Clock, mut last: Instant, mut rebuild:
         }
         plan.wanted = false;
         plan.running = true;
+        plan.whole = whole;
         plan.listed = false;
         let full_disk = std::mem::take(&mut plan.full_disk);
         let mark = [plan.asked.take(), plan.switched, plan.patched.take()];
@@ -1704,13 +1717,14 @@ pub unsafe extern "C" fn tl_changed(
 }
 
 /// Builds the list again with the folders macOS guards, once Full Disk Access is switched on
-/// while the core runs, and lets text searches sent from then on read them too. `mark` is as
-/// for `tl_changed`. Safe to call from any thread.
+/// while the core runs, and lets text searches sent from then on read them too. When
+/// `everything` isn't 0, `tl_index_everything` is switched on in the same step, so that one
+/// list has both. `mark` is as for `tl_changed`. Safe to call from any thread.
 ///
 /// # Safety
 /// `core` came from `tl_core_new` or `tl_core_new_stand_in`.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn tl_grant_full_disk(core: *const TlCore, mark: u64) {
+pub unsafe extern "C" fn tl_grant_full_disk(core: *const TlCore, everything: u32, mark: u64) {
     guard((), || {
         let core = unsafe { &*core };
         if let Some(text) = &core.text {
@@ -1719,6 +1733,7 @@ pub unsafe extern "C" fn tl_grant_full_disk(core: *const TlCore, mark: u64) {
         core.live.plan(|plan| {
             plan.full_disk = true;
             plan.granted = true;
+            plan.everything |= everything != 0;
             plan.want(mark);
         });
     })
@@ -1897,11 +1912,18 @@ pub unsafe extern "C" fn tl_watched(core: *const TlCore, out: *mut TlRows, since
 pub unsafe extern "C" fn tl_health(core: *const TlCore, out: *mut TlHealth) -> u32 {
     guard(TL_PANICKED, || {
         let core = unsafe { &*core };
-        let (stopped, busy, behind) = {
+        let (stopped, busy, building, behind) = {
             let plan = core.live.plan.lock().unwrap();
-            (plan.stopped, plan.busy(), plan.failed.is_some())
+            (
+                plan.stopped,
+                plan.busy(),
+                plan.building(),
+                plan.failed.is_some(),
+            )
         };
         let mut health = *lock(&core.live.health);
+        // The core's own `busy` covers only the first list, which reads the whole folder.
+        health.building = !stopped && (health.busy || building);
         health.busy = !stopped && (health.busy || busy);
         health.behind = behind;
         health.stopped = stopped;
@@ -3190,7 +3212,7 @@ mod tests {
         assert_eq!(health(&core), stopped, "no list, and none coming");
         assert_eq!(changed(&core, &[], 1), 0);
         assert_eq!(health(&core), stopped, "Rebuild does nothing");
-        unsafe { tl_grant_full_disk(core.0, 1) };
+        unsafe { tl_grant_full_disk(core.0, 0, 1) };
         assert_eq!(changed(&core, &[&gone], 0), 0);
         assert_eq!(watched(&core), (Vec::new(), 0));
         drop(core);
@@ -3586,7 +3608,7 @@ mod tests {
         assert_eq!(unsafe { tl_changed(core.0, std::ptr::null(), 0, 1, 1) }, 1);
         assert_eq!(events.wait_for_rebuilt(1), 100);
         // Access changes nothing for them, but costs no more than one more rebuild.
-        unsafe { tl_grant_full_disk(core.0, 1) };
+        unsafe { tl_grant_full_disk(core.0, 0, 1) };
         assert_eq!(events.wait_for_rebuilt(2), 100);
     }
 
@@ -3666,7 +3688,7 @@ mod tests {
         assert_eq!(changed(&core, &[&documents], 0), 0);
         assert_eq!(watched_inside(&core), std::slice::from_ref(&list));
 
-        unsafe { tl_grant_full_disk(core.0, 9) };
+        unsafe { tl_grant_full_disk(core.0, 0, 9) };
         assert_eq!(events.wait_for_rebuilt(1), 3);
         let documents_text = documents.to_string_lossy().into_owned();
         assert_eq!(watched_inside(&core), [list, documents_text]);
@@ -3867,7 +3889,7 @@ mod tests {
         let events = Events::default();
         let (core, _dirs, [_, volume]) = home_and_volume(0, &events);
         assert_eq!(mounted(&core, &volume, 2), 0);
-        unsafe { tl_grant_full_disk(core.0, 3) };
+        unsafe { tl_grant_full_disk(core.0, 0, 3) };
         assert_eq!(events.wait_for_rebuilt(1), 6);
         assert_eq!(found(&core, &events, "beach"), ["beach.jpg"]);
     }
@@ -3878,7 +3900,7 @@ mod tests {
         let (core, _dirs, [_, volume]) = home_and_volume(0, &events);
         assert_eq!(mounted(&core, &volume, 2), 0);
         assert_eq!(unmounted(&core, &volume, 3), 0);
-        unsafe { tl_grant_full_disk(core.0, 4) };
+        unsafe { tl_grant_full_disk(core.0, 0, 4) };
         assert_eq!(events.wait_for_rebuilt(1), 3);
     }
 
@@ -4054,7 +4076,7 @@ mod tests {
         // Told first: remembered, and the list access brings reads it.
         assert_eq!(mounted(&core, &photos, 1), 0);
         live.plan(|plan| assert_eq!(plan.volumes(), (Vec::new(), Vec::new())));
-        unsafe { tl_grant_full_disk(core.0, 2) };
+        unsafe { tl_grant_full_disk(core.0, 0, 2) };
         live.plan(|plan| {
             assert!(plan.wanted && plan.granted);
             assert_eq!(plan.volumes().0, std::slice::from_ref(&photos));
@@ -4073,7 +4095,7 @@ mod tests {
         let (_dir, home) = home_with(&["Documents/budget.pdf"]);
         let events = Events::default();
         let core = scan(home.to_str().unwrap(), 0, &events);
-        unsafe { tl_grant_full_disk(core.0, 1) };
+        unsafe { tl_grant_full_disk(core.0, 0, 1) };
         events.wait_for_event(TL_EVENT_INDEXED);
         assert_eq!(events.wait_for_rebuilt(1), 3);
     }
@@ -5448,7 +5470,7 @@ mod tests {
             ..Report::default()
         };
         assert_eq!(grep_all(&core, &events, named), (Vec::new(), unread));
-        unsafe { tl_grant_full_disk(core.0, 1) };
+        unsafe { tl_grant_full_disk(core.0, 0, 1) };
         let full = grep(&core, &[&home], "budget");
         assert_eq!(grep_all(&core, &events, full).1.lines_found, 1);
     }
@@ -5459,7 +5481,7 @@ mod tests {
         let core = start(100, &events);
         let text = unsafe { &*core.0 }.text.as_ref().unwrap();
         assert!(!text.full_disk.load(Ordering::Relaxed));
-        unsafe { tl_grant_full_disk(core.0, 1) };
+        unsafe { tl_grant_full_disk(core.0, 0, 1) };
         assert!(text.full_disk.load(Ordering::Relaxed));
     }
 
@@ -6072,6 +6094,49 @@ mod tests {
     }
 
     #[test]
+    fn only_a_list_read_from_the_whole_folder_counts_as_building() {
+        assert!(!Plan::default().building());
+        let building: [fn(&mut Plan); 3] = [
+            |plan| plan.want(1),
+            |plan| (plan.running, plan.whole) = (true, true),
+            |plan| plan.everything = true,
+        ];
+        for (at, make) in building.iter().enumerate() {
+            let mut plan = Plan::default();
+            make(&mut plan);
+            assert!(plan.building() && plan.busy(), "{at}");
+        }
+        let patches: [fn(&mut Plan); 2] = [|plan| plan.patch(1), |plan| plan.running = true];
+        for (at, make) in patches.iter().enumerate() {
+            let mut plan = Plan::default();
+            make(&mut plan);
+            assert!(plan.busy() && !plan.building(), "{at}");
+        }
+        let listed = Plan {
+            running: true,
+            whole: true,
+            listed: true,
+            ..Plan::default()
+        };
+        assert!(!listed.building(), "its list is in use");
+    }
+
+    #[test]
+    fn health_tells_a_patch_from_a_whole_new_list() {
+        let live = live(Duration::from_secs(3600));
+        let core = idle_core(&live);
+        live.plan(|plan| plan.patch(1));
+        let patching = health(&core);
+        assert!(patching.busy && !patching.building, "{patching:?}");
+        live.plan(|plan| plan.want(2));
+        let building = health(&core);
+        assert!(building.busy && building.building, "{building:?}");
+        live.plan(|plan| plan.stopped = true);
+        let stopped = health(&core);
+        assert!(!stopped.busy && !stopped.building, "{stopped:?}");
+    }
+
+    #[test]
     fn only_a_plan_with_nothing_waiting_or_running_is_idle() {
         assert!(Plan::default().idle());
         let busy: [fn(&mut Plan); 6] = [
@@ -6110,11 +6175,31 @@ mod tests {
         assert_eq!(rebuilds.step(), starts(0, 0));
 
         // Granted while that one runs, so it reaches the one after.
-        unsafe { tl_grant_full_disk(core.0, 5) };
+        unsafe { tl_grant_full_disk(core.0, 0, 5) };
         assert_eq!(rebuilds.step(), told(5));
         assert_eq!(rebuilds.step(), Step::Waits(None));
         live.plan(|plan| plan.want(6));
         assert_eq!(rebuilds.step(), starts(0, 6));
+        rebuilds.stop(&live);
+    }
+
+    /// The window turns the switch on as access comes, kept from the last launch, and the
+    /// rebuild thread may wake between two calls: one list must bring both.
+    #[test]
+    fn full_disk_access_with_the_switch_on_reaches_one_list() {
+        let live = live(Duration::ZERO);
+        let core = idle_core(&live);
+        let rebuilds = rebuilds(&live, LONG_AGO);
+        unsafe { tl_grant_full_disk(core.0, 1, 5) };
+        let both = Step::Starts {
+            at: Duration::ZERO,
+            full_disk: true,
+            mark: 5,
+            clutter: Some(Clutter::Keep),
+        };
+        assert_eq!(rebuilds.step(), both);
+        assert_eq!(rebuilds.step(), Step::Waits(None), "no second list");
+        assert_eq!(switch(&core, 1, 6), 0, "already on");
         rebuilds.stop(&live);
     }
 
@@ -6339,7 +6424,7 @@ mod tests {
         assert_eq!(changed_at(&core, &[], 1, 1), 1);
         assert_eq!(next_start(), Ok((false, Some(Clutter::Skip), 1)));
         asleep();
-        unsafe { tl_grant_full_disk(core.0, 2) };
+        unsafe { tl_grant_full_disk(core.0, 0, 2) };
         assert_eq!(next_start(), Ok((true, Some(Clutter::Skip), 2)));
         asleep();
         assert_eq!(switch(&core, 1, 3), 1);

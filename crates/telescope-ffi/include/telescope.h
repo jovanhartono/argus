@@ -7,7 +7,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-static const uint32_t TL_ABI_VERSION = 11;
+static const uint32_t TL_ABI_VERSION = 12;
 
 static const uint32_t TL_OK = 0;
 static const uint32_t TL_GONE = 1;
@@ -85,6 +85,7 @@ typedef struct TlHealth {
     uint64_t scan_ms;
     uint64_t changed_at;
     bool busy;
+    bool building;
     bool behind;
     bool stopped;
 } TlHealth;
@@ -95,7 +96,7 @@ TlCore *tl_core_new_stand_in(uint64_t count, void *ctx, TlEventFn on_event);
 uint64_t tl_submit(const TlCore *core, const uint8_t *query, size_t len, const uint8_t *folder, size_t folder_len);
 uint32_t tl_apps(const TlCore *core, const uint8_t *folders, size_t len);
 uint32_t tl_changed(const TlCore *core, const uint8_t *paths, size_t len, uint32_t rescan, uint64_t mark);
-void tl_grant_full_disk(const TlCore *core, uint64_t mark);
+void tl_grant_full_disk(const TlCore *core, uint32_t everything, uint64_t mark);
 uint32_t tl_index_everything(const TlCore *core, uint32_t on, uint64_t mark);
 uint32_t tl_volume_added(const TlCore *core, const uint8_t *path, size_t len, uint64_t mark);
 uint32_t tl_volume_removed(const TlCore *core, const uint8_t *path, size_t len, uint64_t mark);

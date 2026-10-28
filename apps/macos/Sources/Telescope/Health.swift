@@ -9,6 +9,8 @@ struct Health: Equatable {
     /// Nil until a list after the first comes into use.
     var changedAt: Date?
     var busy = false
+    /// Busy reading the whole folder, not just the folders that changed.
+    var building = false
     /// A rebuild failed, so the list misses a change until a whole new one reads it.
     var behind = false
     /// Search stopped working, or never started, and no list will come.
@@ -46,6 +48,13 @@ struct HealthFormat {
         fullDisk ? "On" : "Off: Desktop, Documents, Downloads and cloud drives are left out"
     }
 
+    /// A whole home folder held 2,478,045 entries on the Mac this was measured on.
+    func everything(_ fullDisk: Bool) -> String {
+        let count = 2_500_000.formatted(.number.notation(.compactName).locale(locale))
+        let what = "Includes Library and clutter, about \(count) items."
+        return fullDisk ? what : what + " Needs Full Disk Access."
+    }
+
     /// Under a minute, or a clock set back, reads "Just now".
     func ago(_ date: Date, now: Date) -> String {
         guard now.timeIntervalSince(date) >= 60 else { return "Just now" }
@@ -79,8 +88,8 @@ final class HealthPanel: NSPanel {
 }
 
 /// ⌘,'s window: how many entries the list holds, when it was last read in full and last
-/// changed, whether Telescope may read every folder, a button to build the list again, and
-/// the folders whose files' text a search looks inside.
+/// changed, whether Telescope may read every folder, a button to build the list again, the
+/// switch to list everything, and the folders whose files' text a search looks inside.
 @MainActor
 final class HealthWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, NSTableViewDelegate {
     let panel = HealthPanel(
@@ -93,6 +102,10 @@ final class HealthWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, NST
     let state = NSTextField(labelWithString: "")
     let settings = KeyButton(title: "Open Settings", target: nil, action: nil)
     let rebuild = KeyButton(title: "Rebuild Index", target: nil, action: nil)
+    let everything = NSButton(checkboxWithTitle: "Index everything", target: nil, action: nil)
+    /// Spins while a whole new list is built, as after flipping the switch: 10 to 20 s.
+    let progress = NSProgressIndicator()
+    let everythingHint = NSTextField(wrappingLabelWithString: "")
     let grid = NSGridView()
     let folderList = NSTableView()
     let folderButtons = NSSegmentedControl(
@@ -104,6 +117,8 @@ final class HealthWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, NST
     private let read: () -> Health
     private let hasAccess: () -> Bool
     private let onRebuild: () -> Void
+    private let isEverything: () -> Bool
+    private let onEverything: (Bool) -> Void
     private let stage: any Stage
     private let format: HealthFormat
     private let tick: TimeInterval
@@ -114,13 +129,16 @@ final class HealthWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, NST
 
     init(
         read: @escaping () -> Health, hasAccess: @escaping () -> Bool, rebuild: @escaping () -> Void,
-        stage: any Stage, folders: TextFolders = TextFolders(), format: HealthFormat = HealthFormat(),
+        stage: any Stage, folders: TextFolders = TextFolders(), everything: @escaping () -> Bool = { false },
+        indexEverything: @escaping (Bool) -> Void = { _ in }, format: HealthFormat = HealthFormat(),
         tick: TimeInterval = 1
     ) {
         self.folders = folders
         self.read = read
         self.hasAccess = hasAccess
         onRebuild = rebuild
+        isEverything = everything
+        onEverything = indexEverything
         self.stage = stage
         self.format = format
         self.tick = tick
@@ -138,10 +156,12 @@ final class HealthWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, NST
             [label("Full Disk Access:"), access],
             [NSGridCell.emptyContentView, settings],
             [NSGridCell.emptyContentView, rebuild],
+            [NSGridCell.emptyContentView, everythingBox()],
             [label("Search inside files in:"), folderBox()],
         ]
         for row in rows { grid.addRow(with: row) }
         grid.row(at: 7).topPadding = 12
+        grid.row(at: 8).topPadding = 12
         panel.title = "Index Health"
         panel.level = .floating
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
@@ -173,11 +193,36 @@ final class HealthWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, NST
         panel.contentView = content
         panel.initialFirstResponder = rebuild
         rebuild.nextKeyView = settings
-        settings.nextKeyView = folderList
+        settings.nextKeyView = everything
+        everything.nextKeyView = folderList
         folderList.nextKeyView = folderButtons
         folderButtons.nextKeyView = rebuild
         panel.setContentSize(content.fittingSize)
         panel.center()
+    }
+
+    private func everythingBox() -> NSView {
+        everything.target = self
+        everything.action = #selector(switchEverything(_:))
+        progress.style = .spinning
+        progress.controlSize = .small
+        progress.isHidden = true
+        progress.setAccessibilityLabel("Building the index")
+        everythingHint.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
+        everythingHint.textColor = .secondaryLabelColor
+        everythingHint.preferredMaxLayoutWidth = 260
+        let line = NSStackView(views: [everything, progress])
+        line.spacing = 6
+        let box = NSStackView(views: [line, everythingHint])
+        box.orientation = .vertical
+        box.alignment = .leading
+        box.spacing = 2
+        return box
+    }
+
+    @objc func switchEverything(_ sender: Any?) {
+        onEverything(everything.state == .on)
+        refresh()
     }
 
     private func folderBox() -> NSView {
@@ -290,7 +335,21 @@ final class HealthWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, NST
         changed.toolTip = health.changedAt.map(dates.date)
         state.stringValue = format.state(health)
         access.stringValue = format.access(fullDisk)
-        rebuild.isEnabled = !health.busy && !health.stopped
+        let building = health.building && !health.stopped
+        rebuild.isEnabled = !building && !health.stopped
+        let on = isEverything()
+        everything.state = on ? .on : .off
+        // Without access it can still be turned off, just not on.
+        everything.isEnabled = (fullDisk || on) && !health.stopped
+        everythingHint.stringValue = format.everything(fullDisk)
+        if building == progress.isHidden {
+            progress.isHidden = !building
+            building ? progress.startAnimation(nil) : progress.stopAnimation(nil)
+            let words = building ? "Building the index" : "Index built"
+            NSAccessibility.post(
+                element: progress, notification: .announcementRequested,
+                userInfo: [.announcement: words, .priority: NSAccessibilityPriorityLevel.high.rawValue])
+        }
         guard grid.row(at: 5).isHidden != fullDisk else { return }
         grid.row(at: 5).isHidden = fullDisk
         fitKeepingTop()
