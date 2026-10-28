@@ -101,11 +101,15 @@ final class SearchPanelTests: XCTestCase {
                 try await Task.sleep(for: .milliseconds(10))
             }
             XCTAssertTrue(FileManager.default.fileExists(atPath: file))
-            _ = first
+            XCTAssertFalse(first.reopened)
         }
-        let window = try await opened(access: true, saved: file)
-        try await type("budget", in: window)
-        try await until { window.rows.map(\.name) == ["budget.pdf"] }
+        // Gone before `support` is, so no save is under way as the folder goes.
+        do {
+            let window = try await opened(access: true, saved: file)
+            XCTAssertTrue(window.reopened)
+            try await type("budget", in: window)
+            try await until { window.rows.map(\.name) == ["budget.pdf"] }
+        }
     }
 
     func testANewListKeepsTheSelectedFileSelected() async throws {

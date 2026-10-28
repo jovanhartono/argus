@@ -35,6 +35,7 @@ use std::fmt;
 use std::fs::{self, File};
 use std::io::{self, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 const MAGIC: [u8; 8] = *b"TL-INDEX";
 const VERSION: u32 = 4;
@@ -266,6 +267,34 @@ pub fn save_index(
         let _ = fs::remove_file(&temp);
     }
     saved
+}
+
+/// Removes what saves cut short left beside `file`, as when the app quits mid-save, once
+/// `age` old: a save still running in another copy of the app is younger.
+pub fn remove_old_temps(file: &Path, age: Duration) {
+    let (Some(folder), Some(name)) = (file.parent(), file.file_name()) else {
+        return;
+    };
+    let Ok(entries) = fs::read_dir(folder) else {
+        return;
+    };
+    let name = name.as_encoded_bytes();
+    for entry in entries.flatten() {
+        let left = entry.file_name();
+        let process = left
+            .as_encoded_bytes()
+            .strip_prefix(name)
+            .and_then(|rest| rest.strip_prefix(b"."))
+            .and_then(|rest| rest.strip_suffix(b".tmp"));
+        let temp = process.is_some_and(|id| !id.is_empty() && id.iter().all(u8::is_ascii_digit));
+        let old = || {
+            let modified = entry.metadata().and_then(|meta| meta.modified());
+            modified.is_ok_and(|at| at.elapsed().is_ok_and(|since| since >= age))
+        };
+        if temp && old() {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
 }
 
 fn write(
@@ -1318,6 +1347,43 @@ mod tests {
         let nowhere = dir.path().join("missing").join("index");
         assert!(save_index(&nowhere, &index, 0, &settings, 1).is_err());
         assert!(!dir.path().join("missing").exists());
+    }
+
+    #[test]
+    fn removes_only_old_temporary_files_of_its_own_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("index");
+        let hour = Duration::from_secs(3600);
+        let names = [
+            "index.4123.tmp",
+            "index.4124.tmp",
+            "index",
+            "index.tmp",
+            "index.12a.tmp",
+            "index.4125.tmp.old",
+            "other.4123.tmp",
+            "indexes.4123.tmp",
+        ];
+        for name in names {
+            let made = File::create(dir.path().join(name)).unwrap();
+            if name != "index.4124.tmp" {
+                made.set_modified(std::time::SystemTime::now() - 2 * hour)
+                    .unwrap();
+            }
+        }
+        remove_old_temps(&file, hour);
+        let mut left: Vec<_> = fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect();
+        left.sort();
+        // Another copy of the app may still be writing the one an hour hasn't passed for.
+        let mut kept = names[1..].to_vec();
+        kept.sort();
+        assert_eq!(left, kept);
+
+        remove_old_temps(&dir.path().join("missing/index"), hour);
+        remove_old_temps(Path::new("/"), hour);
     }
 
     #[test]

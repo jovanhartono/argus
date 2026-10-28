@@ -27,7 +27,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 use telescope_core::{
     Access, Apps, Boosts, Clutter, Frecency, Hit, Ignore, Index, OpenError, Pages, Refusal, Scope,
-    Searcher, Settings, Ticket, Watch, Within, open_index, save_index, unix_now,
+    Searcher, Settings, Ticket, Watch, Within, open_index, remove_old_temps, save_index, unix_now,
 };
 use telescope_grep::{Found, Grep, Report};
 
@@ -70,11 +70,15 @@ const LINES: usize = 100;
 /// one rebuild: about 0.15 s for a home folder.
 const GAP: Duration = Duration::from_millis(500);
 
-/// A new list is saved once files have stopped changing this long, so a burst of saves
-/// writes the file once,
+/// A burst of changes writes the saved list once, after files stay still this long, or at
+/// the latest `SAVE_WITHIN` after its first new list.
 const SAVE_AFTER: Duration = Duration::from_secs(2);
-/// or this long after the first list not yet saved, while files never stop changing.
 const SAVE_WITHIN: Duration = Duration::from_secs(60);
+/// Edits that change no names bring no new list, so the saved one is written again this
+/// often at most, only so the next launch has less to replay.
+const RESAVE: Duration = Duration::from_secs(60 * 60);
+/// No save takes this long, so a temporary file this old was left by a quit mid-save.
+const LEFT_FOR: Duration = Duration::from_secs(60 * 60);
 
 /// Scores fade about 2% a day, so boosts worked out an hour ago are still right.
 const RERANK: Duration = Duration::from_secs(60 * 60);
@@ -189,6 +193,7 @@ pub struct TlCore {
     worker: Option<JoinHandle<()>>,
     /// Only for a core given a file to save to.
     saver: Option<JoinHandle<()>>,
+    saved_in: Option<PathBuf>,
     /// None only for a core a test built without threads.
     text: Option<Text>,
     /// Which volumes join the list, by their real paths; none for made-up names.
@@ -303,6 +308,9 @@ struct Plan {
     /// The newest FSEvents event id whose change is in the plan, or needed nothing, so a
     /// list started now is current to it.
     delivered: u64,
+    /// The mark of the first change a failed rebuild was to read. Lists from then on miss
+    /// it, so none is saved, and the next change builds the whole list again.
+    failed: Option<u64>,
 }
 
 impl Plan {
@@ -320,9 +328,16 @@ impl Plan {
         self.asked = Some(self.asked.map_or(mark, |asked| asked.min(mark)));
     }
 
-    /// The change with event id `mark` is in the plan, or needs nothing.
     fn heard(&mut self, mark: u64) {
         self.delivered = self.delivered.max(mark);
+    }
+
+    /// Nothing waits or runs, so the newest list is current to `delivered`.
+    fn idle(&self) -> bool {
+        !(self.wanted || self.running || self.patching)
+            && self.everything == self.everything_listed
+            && self.recheck.is_none()
+            && self.failed.is_none()
     }
 
     /// The setting for the list about to be built, which brings any switch waiting.
@@ -353,8 +368,10 @@ impl Plan {
         self.patched = Some(self.patched.map_or(mark, |patched| patched.min(mark)));
     }
 
-    /// Folders the newest list holds to read again, unless a new list will anyway.
     fn reread(&mut self, paths: Vec<PathBuf>, mark: u64) {
+        if let Some(failed) = self.failed {
+            self.want(failed);
+        }
         if self.wanted {
             self.want(mark);
             return;
@@ -439,9 +456,9 @@ struct Live {
     saves: Mutex<()>,
     /// Counts volumes taken out, so a scan of one stops at once and never holds up its eject.
     ejected: AtomicU64,
-    /// How long files stay still before a new list is saved, and how late it may be at most.
     save_after: Duration,
     save_within: Duration,
+    resave: Duration,
     saving: Mutex<Saving>,
     save: Condvar,
 }
@@ -459,6 +476,7 @@ impl Default for Live {
             ejected: AtomicU64::default(),
             save_after: SAVE_AFTER,
             save_within: SAVE_WITHIN,
+            resave: RESAVE,
             saving: Mutex::default(),
             save: Condvar::new(),
         }
@@ -470,7 +488,16 @@ impl Default for Live {
 struct Saving {
     file: Option<PathBuf>,
     waiting: Option<Unsaved>,
+    kept: Option<Kept>,
     stopped: bool,
+}
+
+struct Kept {
+    settings: Arc<Settings>,
+    unreadable: usize,
+    event_id: u64,
+    /// When it was handed to the saver, or `None` for the list opened at launch.
+    at: Option<Instant>,
 }
 
 struct Unsaved {
@@ -508,8 +535,6 @@ impl Live {
         index
     }
 
-    /// Hands a new list, current to `event_id`, to the saver, in place of any older one
-    /// still waiting.
     fn keep(&self, index: &Arc<Index>, source: &Source, event_id: u64) {
         let Some((settings, unreadable)) = source.saving() else {
             return;
@@ -520,6 +545,12 @@ impl Live {
         }
         let now = Instant::now();
         let first = saving.waiting.as_ref().map_or(now, |waiting| waiting.first);
+        saving.kept = Some(Kept {
+            settings: Arc::clone(&settings),
+            unreadable,
+            event_id,
+            at: Some(now),
+        });
         saving.waiting = Some(Unsaved {
             index: Arc::clone(index),
             settings,
@@ -529,6 +560,50 @@ impl Live {
             last: now,
         });
         drop(saving);
+        self.save.notify_all();
+    }
+
+    fn opened(&self, source: &Source, event_id: u64) {
+        let Some((settings, unreadable)) = source.saving() else {
+            return;
+        };
+        self.saving.lock().unwrap().kept = Some(Kept {
+            settings,
+            unreadable,
+            event_id,
+            at: None,
+        });
+    }
+
+    /// For a change the newest list needed nothing for, while nothing else waited: without
+    /// this, a week of edits that change no names would all be replayed at the next launch.
+    fn caught_up(&self, event_id: u64) {
+        let mut guard = self.saving.lock().unwrap();
+        let saving = &mut *guard;
+        if let Some(waiting) = &mut saving.waiting {
+            waiting.event_id = waiting.event_id.max(event_id);
+            return;
+        }
+        let due = |kept: &&mut Kept| {
+            kept.event_id < event_id && kept.at.is_none_or(|at| at.elapsed() >= self.resave)
+        };
+        let Some(kept) = saving.kept.as_mut().filter(due) else {
+            return;
+        };
+        let Some((_, index)) = self.newest.lock().unwrap().clone() else {
+            return;
+        };
+        let now = Instant::now();
+        (kept.event_id, kept.at) = (event_id, Some(now));
+        saving.waiting = Some(Unsaved {
+            index,
+            settings: Arc::clone(&kept.settings),
+            unreadable: kept.unreadable,
+            event_id,
+            first: now,
+            last: now,
+        });
+        drop(guard);
         self.save.notify_all();
     }
 
@@ -653,7 +728,6 @@ impl Source {
         }
     }
 
-    /// What a new list is saved with, once one was built.
     fn saving(&self) -> Option<(Arc<Settings>, usize)> {
         match self {
             Self::Home {
@@ -828,11 +902,12 @@ pub unsafe extern "C" fn tl_core_new(
         if let Some(saved) = unsafe { saved.as_ref() } {
             let file = unsafe { path_from(saved.file, saved.file_len) };
             let named = match saved.journal_len {
-                0 => &[],
-                len => unsafe { std::slice::from_raw_parts(saved.journal, len) },
+                0 => Some(&[][..]),
+                _ if saved.journal.is_null() => None,
+                len => Some(unsafe { std::slice::from_raw_parts(saved.journal, len) }),
             };
             let file = file.filter(|file| !file.as_os_str().is_empty());
-            let (Some(file), Ok(named)) = (file, std::str::from_utf8(named)) else {
+            let (Some(file), Some(Ok(named))) = (file, named.map(std::str::from_utf8)) else {
                 return std::ptr::null_mut();
             };
             journal = Some(named.as_bytes().to_vec());
@@ -922,6 +997,10 @@ fn start(
         notify,
         started: OnceLock::new(),
     };
+    let saved_in = resume
+        .as_ref()
+        .and_then(|(file, _)| file.parent())
+        .map(|folder| std::fs::canonicalize(folder).unwrap_or_else(|_| folder.to_path_buf()));
     let saver = resume.is_some().then(|| {
         let live = Arc::clone(&live);
         thread::Builder::new()
@@ -944,13 +1023,12 @@ fn start(
         live,
         worker: Some(worker),
         saver,
+        saved_in,
         text: Some(text),
         judge,
     }))
 }
 
-/// The first list: the one saved in the core's file when it opens, else a new one. Returns
-/// it and whether it was opened.
 fn first_list(source: &mut Source, live: &Live, notify: &Notify) -> io::Result<(Arc<Index>, bool)> {
     let (clutter, now) = {
         let mut plan = live.plan.lock().unwrap();
@@ -962,6 +1040,9 @@ fn first_list(source: &mut Source, live: &Live, notify: &Notify) -> io::Result<(
         // from, so a new list follows, as after a change macOS lost track of.
         let caught_up = saved_at != 0 && saved_at <= now;
         let index = live.publish(built, if caught_up { saved_at } else { 0 });
+        if caught_up {
+            live.opened(source, saved_at);
+        }
         live.plan(|plan| {
             if caught_up {
                 plan.delivered = saved_at;
@@ -1226,6 +1307,7 @@ fn rebuild(source: &mut Source, pass: Pass, live: &Live, swaps: &Sender<Job>, no
         *access = Access::Full;
     }
     let started = Instant::now();
+    let whole = pass.clutter.is_some();
     let built = panic::catch_unwind(AssertUnwindSafe(|| {
         let built = match pass.clutter {
             Some(clutter) => source.build(clutter, &pass.volumes, live, notify).map(Some),
@@ -1237,19 +1319,38 @@ fn rebuild(source: &mut Source, pass: Pass, live: &Live, swaps: &Sender<Job>, no
     match built {
         Ok(Some(index)) => {
             let took = started.elapsed().as_millis().min(u32::MAX.into()) as u32;
-            live.keep(&index, source, pass.current);
+            let missing = {
+                let mut plan = live.plan.lock().unwrap();
+                if whole {
+                    plan.failed = None;
+                }
+                plan.failed.is_some()
+            };
+            if !missing {
+                live.keep(&index, source, pass.current);
+            }
             // Fails only once the worker has stopped.
             let _ = swaps.send(Job::Swap { index, took });
         }
         Ok(None) => {}
-        Err(error) => notify.note(&format!("the list could not be built again: {error}")),
+        Err(error) => {
+            live.plan(|plan| {
+                plan.failed = Some(
+                    plan.failed
+                        .map_or(pass.mark, |failed| failed.min(pass.mark)),
+                );
+            });
+            notify.note(&format!("the list could not be built again: {error}"));
+        }
     }
 }
 
-/// Saves each list `Live::keep` hands over, once it has been the newest for `save_after`, or
-/// `save_within` after the first one not saved, until the core stops. One that fails is told
-/// as a note, and the next list tries again.
+/// A save that fails is told as a note, and the next list tries again.
 fn save_loop(live: &Live, notify: Notify) {
+    let file = live.saving.lock().unwrap().file.clone();
+    if let Some(file) = file {
+        remove_old_temps(&file, LEFT_FOR);
+    }
     let mut saving = live.saving.lock().unwrap();
     loop {
         if saving.stopped {
@@ -1395,6 +1496,10 @@ pub unsafe extern "C" fn tl_changed(
                 return 0;
             }
             let mark = if mark == 0 { plan.delivered } else { mark };
+            if let (Some(failed), false) = (plan.failed, plan.running) {
+                plan.want(failed);
+                live.wake.notify_all();
+            }
             // A rebuild not started yet will read every change made before it starts.
             if plan.wanted {
                 plan.want(mark);
@@ -1407,10 +1512,13 @@ pub unsafe extern "C" fn tl_changed(
             0 => &[],
             _ => unsafe { std::slice::from_raw_parts(paths, len) },
         };
+        // With your Library in the list, each save would otherwise bring a new list to save.
+        let saver_own = |path: &Path| core.saved_in.as_deref() == Some(path);
         let paths: Option<Vec<&Path>> = bytes
             .split(|&byte| byte == 0)
             .filter(|path| !path.is_empty())
             .map(|path| std::str::from_utf8(path).ok().map(Path::new))
+            .filter(|path| !path.is_some_and(saver_own))
             .collect();
         let newest = live.newest.lock().unwrap().clone();
         let wanted = match (paths, newest) {
@@ -1468,8 +1576,14 @@ pub unsafe extern "C" fn tl_changed(
             plan.want(mark);
             drop(plan);
             live.wake.notify_all();
+            return 1;
         }
-        u32::from(wanted)
+        let (idle, delivered) = (plan.idle(), plan.delivered);
+        drop(plan);
+        if idle {
+            live.caught_up(delivered);
+        }
+        0
     })
 }
 
@@ -2728,9 +2842,15 @@ mod tests {
             file: std::ptr::null(),
             ..saved_at(file.as_bytes(), b"", 1)
         };
-        let refused =
-            unsafe { tl_core_new(home.as_ptr(), home.len(), 1, 0, &missing, ctx, Some(record)) };
-        assert!(refused.is_null());
+        let no_journal = TlSaved {
+            journal: std::ptr::null(),
+            ..saved_at(file.as_bytes(), b"5F2A", 1)
+        };
+        for saved in [missing, no_journal] {
+            let refused =
+                unsafe { tl_core_new(home.as_ptr(), home.len(), 1, 0, &saved, ctx, Some(record)) };
+            assert!(refused.is_null());
+        }
     }
 
     /// Where a core saves its list; an empty `journal` may come without a pointer.
@@ -2871,6 +2991,7 @@ mod tests {
             live: Arc::default(),
             worker: None,
             saver: None,
+            saved_in: None,
             text: None,
             judge: None,
         })));
@@ -3412,6 +3533,21 @@ mod tests {
     /// A core over `home` that saves its list to `file` under `journal` 20 ms after each new
     /// list, started when the newest FSEvents event id was `now`.
     fn saving_core(home: &Path, file: &Path, journal: &[u8], now: u64, events: &Events) -> Core {
+        let live = Live {
+            save_after: Duration::from_millis(20),
+            ..Live::default()
+        };
+        saving_core_over(live, home, file, journal, now, events)
+    }
+
+    fn saving_core_over(
+        live: Live,
+        home: &Path,
+        file: &Path,
+        journal: &[u8],
+        now: u64,
+        events: &Events,
+    ) -> Core {
         let ctx = events as *const Events as *mut c_void;
         let source = Source::Home {
             root: home.to_path_buf(),
@@ -3420,10 +3556,6 @@ mod tests {
             settings: None,
             journal: Some(journal.to_vec()),
             unreadable: 0,
-        };
-        let live = Live {
-            save_after: Duration::from_millis(20),
-            ..Live::default()
         };
         let resume = Some((file.to_path_buf(), now));
         let core = super::start(ctx, Some(record), source, false, resume, live);
@@ -3481,9 +3613,17 @@ mod tests {
         assert_eq!(changed_at(&core, &[&notes], 0, 55), 1);
         assert_eq!(events.wait_for_rebuilt(1), 6);
         wait_until("the save after a change", || saved_event(&file) == Some(55));
-        // Saved over, so nothing to read again, and no new list to save.
+        // Saved over, so nothing to read again, and no new list to save within the hour.
         std::fs::write(notes.join("todo.md"), "edited").unwrap();
         assert_eq!(changed_at(&core, &[&notes], 0, 58), 0);
+        assert!(
+            unsafe { &(*core.0).live }
+                .saving
+                .lock()
+                .unwrap()
+                .waiting
+                .is_none()
+        );
         drop(core);
         assert_eq!(saved_event(&file), Some(55));
         assert!(events.notes.lock().unwrap().is_empty());
@@ -3582,6 +3722,165 @@ mod tests {
         let _core = scan_saving(home.to_str().unwrap(), 0, 0, &saved, &events);
         events.wait_for(TL_EVENT_INDEXED, 3);
         assert_eq!(events.count(TL_EVENT_OPENED, 3), 0);
+        assert!(events.notes.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_list_saved_at_the_newest_event_opens_with_nothing_to_build() {
+        let (_dir, home) = home_with(&["notes/budget.txt"]);
+        let support = tempfile::tempdir().unwrap();
+        let file = support.path().join("index");
+        {
+            let events = Events::default();
+            let _core = saving_core(&home, &file, b"5F2A", 50, &events);
+            wait_until("the first save", || saved_event(&file) == Some(50));
+        }
+        let events = Events::default();
+        let core = saving_core(&home, &file, b"5F2A", 50, &events);
+        events.wait_for(TL_EVENT_OPENED, 3);
+        assert_eq!(watched(&core).1, 50);
+        thread::sleep(2 * GAP);
+        assert!(events.rebuilt().is_empty());
+        assert!(
+            unsafe { &(*core.0).live }
+                .saving
+                .lock()
+                .unwrap()
+                .waiting
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn a_list_an_older_release_saved_is_scanned_again_without_a_note() {
+        let (_dir, home) = home_with(&["notes/budget.txt"]);
+        let support = tempfile::tempdir().unwrap();
+        let file = support.path().join("index");
+        {
+            let events = Events::default();
+            let _core = saving_core(&home, &file, b"5F2A", 50, &events);
+            wait_until("the first save", || saved_event(&file) == Some(50));
+        }
+        let mut bytes = std::fs::read(&file).unwrap();
+        bytes[8..12].copy_from_slice(&2u32.to_le_bytes());
+        std::fs::write(&file, bytes).unwrap();
+        let events = Events::default();
+        let _core = saving_core(&home, &file, b"5F2A", 60, &events);
+        events.wait_for(TL_EVENT_INDEXED, 3);
+        wait_until("the save in its place", || saved_event(&file) == Some(60));
+        assert!(events.notes.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_rebuild_that_failed_is_tried_again_whole_at_the_next_change() {
+        let (dir, home) = home_with(&["notes/budget.txt", "work/plan.md"]);
+        let support = tempfile::tempdir().unwrap();
+        let file = support.path().join("index");
+        let events = Events::default();
+        let core = saving_core(&home, &file, b"5F2A", 50, &events);
+        events.wait_for(TL_EVENT_INDEXED, 5);
+        wait_until("the first save", || saved_event(&file) == Some(50));
+
+        // macOS lost track of a change while the home folder couldn't be read.
+        let away = dir.path().with_extension("away");
+        std::fs::rename(&home, &away).unwrap();
+        std::fs::write(away.join("work/new.md"), "").unwrap();
+        assert_eq!(changed_at(&core, &[], 1, 60), 1);
+        events.wait_for_note("could not be built again");
+        std::fs::rename(&away, &home).unwrap();
+        let live = unsafe { &(*core.0).live };
+        wait_until("the rebuild to end", || !live.plan.lock().unwrap().running);
+        assert_eq!(live.plan.lock().unwrap().failed, Some(60));
+
+        // A change elsewhere brings the whole list, with the change it missed.
+        let notes = home.join("notes");
+        std::fs::write(notes.join("todo.md"), "").unwrap();
+        assert_eq!(changed_at(&core, &[&notes], 0, 70), 1);
+        assert_eq!(events.wait_for_rebuilt(1), 7);
+        assert_eq!(found(&core, &events, "new"), ["new.md"]);
+        wait_until("the save", || saved_event(&file) == Some(70));
+        assert_eq!(live.plan.lock().unwrap().failed, None);
+    }
+
+    #[test]
+    fn a_folder_read_again_after_a_failed_rebuild_brings_a_whole_one() {
+        let mut plan = Plan {
+            failed: Some(4),
+            ..Plan::default()
+        };
+        plan.reread(vec!["/home/notes".into()], 6);
+        assert!(plan.wanted && !plan.patching);
+        assert_eq!(plan.asked, Some(4));
+        assert!(plan.changes.is_empty());
+    }
+
+    #[test]
+    fn the_saver_clears_what_a_quit_mid_save_left() {
+        let (_dir, home) = home_with(&["notes/budget.txt"]);
+        let support = tempfile::tempdir().unwrap();
+        let file = support.path().join("index");
+        let left = support.path().join("index.99999.tmp");
+        let writing = support.path().join("index.99998.tmp");
+        std::fs::File::create(&left)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() - 2 * LEFT_FOR)
+            .unwrap();
+        std::fs::write(&writing, "").unwrap();
+        let events = Events::default();
+        let _core = saving_core(&home, &file, b"5F2A", 50, &events);
+        wait_until("the first save", || saved_event(&file) == Some(50));
+        assert!(!left.exists());
+        assert!(writing.exists(), "another copy of the app may be saving");
+    }
+
+    #[test]
+    fn edits_that_change_no_names_move_the_saved_event_on() {
+        let (_dir, home) = home_with(&["notes/budget.txt"]);
+        let support = tempfile::tempdir().unwrap();
+        let file = support.path().join("index");
+        let notes = home.join("notes");
+        let live = Live {
+            save_after: Duration::from_millis(20),
+            resave: Duration::ZERO,
+            ..Live::default()
+        };
+        let events = Events::default();
+        let core = saving_core_over(live, &home, &file, b"5F2A", 50, &events);
+        events.wait_for(TL_EVENT_INDEXED, 3);
+        wait_until("the first save", || saved_event(&file) == Some(50));
+        std::fs::write(notes.join("budget.txt"), "edited").unwrap();
+        assert_eq!(changed_at(&core, &[&notes], 0, 58), 0);
+        wait_until("the save at the edit", || saved_event(&file) == Some(58));
+        // A mark FSEvents didn't give moves nothing on.
+        assert_eq!(changed_at(&core, &[&notes], 0, 0), 0);
+        assert!(
+            unsafe { &(*core.0).live }
+                .saving
+                .lock()
+                .unwrap()
+                .waiting
+                .is_none()
+        );
+        assert!(events.rebuilt().is_empty());
+    }
+
+    #[test]
+    fn the_saver_writing_its_own_folder_asks_for_no_new_list() {
+        let (_dir, home) = home_with(&["notes/budget.txt", "support/readme.txt"]);
+        let support = home.join("support");
+        let file = support.join("index");
+        let events = Events::default();
+        let core = saving_core(&home, &file, b"5F2A", 50, &events);
+        events.wait_for(TL_EVENT_INDEXED, 5);
+        wait_until("the first save", || saved_event(&file) == Some(50));
+        assert_eq!(changed_at(&core, &[&support], 0, 60), 0);
+
+        let notes = home.join("notes");
+        std::fs::write(notes.join("todo.md"), "").unwrap();
+        assert_eq!(changed_at(&core, &[&support, &notes], 0, 61), 1);
+        assert_eq!(events.wait_for_rebuilt(1), 6);
+        assert_eq!(found(&core, &events, "todo"), ["todo.md"]);
+        assert_eq!(found(&core, &events, "readme"), ["readme.txt"]);
     }
 
     #[test]
@@ -3653,12 +3952,19 @@ mod tests {
         let events = Events::default();
         let source = home_source(&home, &live, &notify_to(&events));
         let index = live.newest.lock().unwrap().clone().unwrap().1;
+        // Kept before the saver starts, so only one list can be written.
+        for event_id in 1..=3 {
+            live.keep(&index, &source, event_id);
+            thread::sleep(Duration::from_millis(20));
+        }
+        {
+            let saving = live.saving.lock().unwrap();
+            let waiting = saving.waiting.as_ref().unwrap();
+            assert_eq!(waiting.event_id, 3);
+            // The cap counts from the first.
+            assert!(waiting.last - waiting.first >= Duration::from_millis(40));
+        }
         with_saver(&live, &events, || {
-            for event_id in 1..=3 {
-                live.keep(&index, &source, event_id);
-            }
-            // Still within the second files must stay still for.
-            assert!(!file.exists());
             wait_until("the save", || saved_event(&file) == Some(3));
             assert!(live.saving.lock().unwrap().waiting.is_none());
         });
@@ -3676,12 +3982,73 @@ mod tests {
         let source = home_source(&home, &live, &notify_to(&events));
         let index = live.newest.lock().unwrap().clone().unwrap().1;
         with_saver(&live, &events, || {
-            live.keep(&index, &source, 1);
-            wait_until("the save", || saved_event(&file) == Some(1));
-            // One still waiting when the core stops goes unsaved, without waiting the hour.
-            live.keep(&index, &source, 2);
+            let mut event_id = 0;
+            while saved_event(&file).is_none() {
+                assert!(event_id < 6_000, "never saved while lists kept coming");
+                event_id += 1;
+                live.keep(&index, &source, event_id);
+                thread::sleep(Duration::from_millis(10));
+            }
         });
-        assert_eq!(saved_event(&file), Some(1));
+        assert!(events.notes.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_list_still_waiting_when_the_core_stops_goes_unsaved() {
+        let (_h, home) = home_with(&["notes/a.txt"]);
+        let support = tempfile::tempdir().unwrap();
+        let file = support.path().join("index");
+        let hour = Duration::from_secs(3600);
+        let live = saving_live(&file, hour, hour);
+        let events = Events::default();
+        let source = home_source(&home, &live, &notify_to(&events));
+        let index = live.newest.lock().unwrap().clone().unwrap().1;
+        // Stopped without waiting the hour.
+        with_saver(&live, &events, || live.keep(&index, &source, 1));
+        assert!(!file.exists());
+    }
+
+    #[test]
+    fn a_change_that_needs_nothing_moves_on_the_list_to_save() {
+        let (_h, home) = home_with(&["notes/a.txt"]);
+        let support = tempfile::tempdir().unwrap();
+        let file = support.path().join("index");
+        let hour = Duration::from_secs(3600);
+        let events = Events::default();
+        let waiting = |live: &Live| {
+            let saving = live.saving.lock().unwrap();
+            saving.waiting.as_ref().map(|waiting| waiting.event_id)
+        };
+
+        let live = saving_live(&file, hour, hour);
+        let source = home_source(&home, &live, &notify_to(&events));
+        let index = live.newest.lock().unwrap().clone().unwrap().1;
+        live.caught_up(3);
+        assert_eq!(waiting(&live), None, "nothing kept yet");
+        live.keep(&index, &source, 5);
+        live.caught_up(9);
+        live.caught_up(7);
+        assert_eq!(waiting(&live), Some(9));
+        // Saved since, and kept too lately to save again.
+        live.saving.lock().unwrap().waiting = None;
+        live.caught_up(12);
+        assert_eq!(waiting(&live), None);
+        // Opened at launch, so it may be saved again at once.
+        live.opened(&source, 5);
+        live.caught_up(5);
+        assert_eq!(waiting(&live), None, "already current to it");
+        live.caught_up(13);
+        assert_eq!(waiting(&live), Some(13));
+
+        let live = Live {
+            resave: Duration::ZERO,
+            ..saving_live(&file, hour, hour)
+        };
+        let source = home_source(&home, &live, &notify_to(&events));
+        live.keep(&index, &source, 5);
+        live.saving.lock().unwrap().waiting = None;
+        live.caught_up(12);
+        assert_eq!(waiting(&live), Some(12));
     }
 
     #[test]
@@ -4682,6 +5049,8 @@ mod tests {
         at: Mutex<Duration>,
         steps: Sender<Step>,
         go: Mutex<Receiver<()>>,
+        /// The event id each rebuild's list is current to, in turn.
+        currents: Mutex<Vec<u64>>,
     }
 
     impl Manual {
@@ -4732,6 +5101,7 @@ mod tests {
             at: Mutex::default(),
             steps: tell,
             go: Mutex::new(wait),
+            currents: Mutex::default(),
         });
         let thread = {
             let (live, clock) = (Arc::clone(live), Arc::clone(&clock));
@@ -4739,6 +5109,7 @@ mod tests {
             thread::spawn(move || {
                 rebuild_loop(&live, &*clock, last, |pass| {
                     let at = clock.now() - clock.zero;
+                    clock.currents.lock().unwrap().push(pass.current);
                     clock.tell(Step::Starts {
                         at,
                         full_disk: pass.full_disk,
@@ -4979,6 +5350,66 @@ mod tests {
     }
 
     #[test]
+    fn a_list_is_current_to_the_changes_heard_before_its_rebuild_started() {
+        let live = live(Duration::ZERO);
+        let core = idle_core(&live);
+        let rebuilds = rebuilds(&live, LONG_AGO);
+        live.plan(|plan| {
+            plan.heard(7);
+            plan.want(7);
+        });
+        assert_eq!(rebuilds.step(), starts(0, 7));
+        // Heard while that one runs, so only the next one reads it.
+        assert_eq!(changed_at(&core, &[], 1, 9), 1);
+        assert_eq!(rebuilds.step(), starts(0, 9));
+        assert_eq!(rebuilds.step(), Step::Waits(None));
+        assert_eq!(*rebuilds.clock.currents.lock().unwrap(), [7, 9]);
+        rebuilds.stop(&live);
+    }
+
+    #[test]
+    fn an_ignore_list_edited_during_a_rebuild_brings_a_whole_one() {
+        let (_dir, home) = home_with(&["notes/a.txt"]);
+        let rules = home.join(".config/telescope");
+        let live = live(Duration::ZERO);
+        let settings = Settings::new(&home, &home, Clutter::Skip, Ignore::default(), Access::Full);
+        let index = settings.scan().unwrap().index;
+        let scope = Some(settings.scope(&index));
+        live.publish(Built { index, scope }, 0);
+        let core = idle_core(&live);
+        let rebuilds = rebuilds(&live, LONG_AGO);
+        live.plan(|plan| plan.want(1));
+        assert_eq!(rebuilds.step(), starts(0, 1));
+        assert_eq!(changed_at(&core, &[&rules], 0, 2), 1);
+        assert_eq!(
+            live.plan.lock().unwrap().recheck,
+            Some((vec![rules.clone()], 2))
+        );
+        // By the new rules, not the folder read again.
+        assert_eq!(rebuilds.step(), starts(0, 2));
+        assert_eq!(rebuilds.step(), Step::Waits(None));
+        rebuilds.stop(&live);
+    }
+
+    #[test]
+    fn only_a_plan_with_nothing_waiting_or_running_is_idle() {
+        assert!(Plan::default().idle());
+        let busy: [fn(&mut Plan); 6] = [
+            |plan| plan.want(1),
+            |plan| plan.running = true,
+            |plan| plan.patch(1),
+            |plan| plan.everything = true,
+            |plan| plan.recheck = Some((Vec::new(), 1)),
+            |plan| plan.failed = Some(1),
+        ];
+        for (at, make) in busy.iter().enumerate() {
+            let mut plan = Plan::default();
+            make(&mut plan);
+            assert!(!plan.idle(), "{at}");
+        }
+    }
+
+    #[test]
     fn full_disk_access_reaches_one_rebuild() {
         let live = live(Duration::ZERO);
         let core = idle_core(&live);
@@ -5016,6 +5447,7 @@ mod tests {
             live: Arc::clone(live),
             worker: None,
             saver: None,
+            saved_in: None,
             text: None,
             judge: None,
         })))

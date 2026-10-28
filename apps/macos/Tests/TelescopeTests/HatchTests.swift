@@ -222,7 +222,9 @@ final class HatchTests: XCTestCase {
             let flags = flags.map { FSEventStreamEventFlags($0) }
             return paths.withUnsafeBufferPointer { paths in
                 flags.withUnsafeBufferPointer { flags in
-                    ids.withUnsafeBufferPointer { gatherChanges(3, paths.baseAddress!, flags.baseAddress!, $0.baseAddress!) }
+                    ids.withUnsafeBufferPointer {
+                        gatherChanges(flags.count, paths.baseAddress!, flags.baseAddress!, $0.baseAddress!)
+                    }
                 }
             }
         }
@@ -230,6 +232,15 @@ final class HatchTests: XCTestCase {
         XCTAssertEqual(quiet.bytes, Array("/a/\0/c/\0".utf8))
         XCTAssertFalse(quiet.rescan)
         XCTAssertEqual(quiet.newest, 41, "the end of a replay is no change")
+        let none = paths.withUnsafeBufferPointer {
+            gatherChanges(0, $0.baseAddress!, [FSEventStreamEventFlags(0)], [FSEventStreamEventId(5)])
+        }
+        let replayed = gather([kFSEventStreamEventFlagHistoryDone], [90])
+        for nothing in [none, replayed] {
+            XCTAssertEqual(nothing.bytes, [])
+            XCTAssertFalse(nothing.rescan)
+            XCTAssertEqual(nothing.newest, 0)
+        }
         for dropped in [
             kFSEventStreamEventFlagMustScanSubDirs, kFSEventStreamEventFlagUserDropped,
             kFSEventStreamEventFlagKernelDropped, kFSEventStreamEventFlagEventIdsWrapped,
@@ -243,8 +254,9 @@ final class HatchTests: XCTestCase {
     func testTheJournalNamesTheFSEventsLogOfAVolume() throws {
         let home = try XCTUnwrap(Hatch.journal(of: NSHomeDirectory()))
         XCTAssertNotNil(UUID(uuidString: home), home)
-        XCTAssertEqual(Hatch.journal(of: NSTemporaryDirectory()), home, "the same volume")
+        XCTAssertEqual(Hatch.journal(of: NSHomeDirectory() + "/Library"), home, "the same volume")
         XCTAssertNil(Hatch.journal(of: "/nowhere/\(UUID().uuidString)"))
+        XCTAssertNil(Hatch.journal(of: "/dev"), "a volume FSEvents keeps no log for")
         XCTAssertTrue(Hatch.savedList.hasSuffix("/Library/Application Support/io.github.jovanhartono.telescope/index"))
     }
 
@@ -264,15 +276,22 @@ final class HatchTests: XCTestCase {
             }
             _ = first
         }
+        let header = try XCTUnwrap(FileManager.default.contents(atPath: file))
+        let savedAt = header[16..<24].reversed().reduce(UInt64(0)) { $0 << 8 | UInt64($1) }
+        XCTAssertGreaterThan(savedAt, 0)
+        XCTAssertLessThanOrEqual(savedAt, FSEventsGetCurrentEventId())
 
-        // A file made while Telescope is closed is replayed from the saved event.
-        try Data().write(to: notes.appendingPathComponent("budget.txt"))
-        let (hatch, counts) = try await watching(root, saved: file, opened: true)
-        // The folder, notes, a.txt and budget.txt.
-        try await counts.reach(4, within: 5)
-        try Data().write(to: notes.appendingPathComponent("plan.md"))
-        try await counts.reach(5, within: 5)
-        _ = hatch
+        // A file made while Telescope is closed is replayed from the saved event. Gone before
+        // `support` is, so no save is under way as the folder goes.
+        do {
+            try Data().write(to: notes.appendingPathComponent("budget.txt"))
+            let (hatch, counts) = try await watching(root, saved: file, opened: true)
+            // The folder, notes, a.txt and budget.txt.
+            try await counts.reach(4, within: 5)
+            try Data().write(to: notes.appendingPathComponent("plan.md"))
+            try await counts.reach(5, within: 5)
+            _ = hatch
+        }
     }
 
     func testChangesOutsideTheListAreIgnored() async throws {
