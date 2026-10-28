@@ -1,0 +1,257 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Telescope Text Search</title>
+<style>
+:root {
+  --bg: #f5f5f7; --surface: #ffffff; --ink: #1d1d1f; --muted: #6e6e73; --line: #d2d2d7;
+  --accent: #0066cc; --accent-soft: #e8f0fb; --good: #1d7a4b; --good-soft: #e3f4ea;
+  --warn: #8f5400; --warn-soft: #fbefd9;
+  --font: -apple-system, BlinkMacSystemFont, system-ui, "Segoe UI", sans-serif;
+  --font-mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  color-scheme: light;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #000000; --surface: #1c1c1e; --ink: #f5f5f7; --muted: #98989d; --line: #38383a;
+    --accent: #2997ff; --accent-soft: #10243d; --good: #5ccb91; --good-soft: #12301f;
+    --warn: #f0b35a; --warn-soft: #33260e;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #000000; --surface: #1c1c1e; --ink: #f5f5f7; --muted: #98989d; --line: #38383a;
+  --accent: #2997ff; --accent-soft: #10243d; --good: #5ccb91; --good-soft: #12301f;
+  --warn: #f0b35a; --warn-soft: #33260e;
+  color-scheme: dark;
+}
+*, *::before, *::after { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--ink); font-family: var(--font); font-size: 17px; line-height: 1.55; -webkit-font-smoothing: antialiased; }
+.wrap { max-width: 980px; margin: 0 auto; padding: 56px max(16px, env(safe-area-inset-right, 0px)) 80px max(16px, env(safe-area-inset-left, 0px)); overflow-x: clip; }
+a { color: var(--accent); text-decoration: none; }
+a:hover { text-decoration: underline; }
+a:focus-visible, .term:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 2px; }
+h1, h2 { font-weight: 700; letter-spacing: -0.02em; text-wrap: balance; }
+h1 { font-size: clamp(2.2rem, 6vw, 3.4rem); line-height: 1.05; margin: 6px 0 12px; }
+h2 { font-size: clamp(1.5rem, 3.2vw, 2rem); line-height: 1.15; margin: 0 0 10px; }
+h3 { font-size: 1.05rem; font-weight: 600; margin: 8px 0 0; }
+p { margin: 0 0 12px; }
+.prose { max-width: 66ch; }
+.lede { font-size: 1.2rem; color: var(--muted); max-width: 60ch; }
+.eyebrow { font-size: 0.8rem; font-weight: 600; color: var(--muted); }
+header { display: grid; gap: 4px; padding-bottom: 32px; }
+.chips { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
+.chip { font-size: 0.78rem; font-weight: 500; padding: 3px 11px; border-radius: 999px; white-space: nowrap; background: var(--surface); color: var(--muted); border: 0.5px solid var(--line); }
+.chip.keep { background: var(--good-soft); color: var(--good); border-color: transparent; }
+.chip.open { background: var(--warn-soft); color: var(--warn); border-color: transparent; }
+nav.toc { display: flex; flex-wrap: wrap; gap: 6px 20px; font-size: 0.92rem; padding-top: 16px; }
+section { border-top: 0.5px solid var(--line); padding-block: 48px 12px; display: grid; gap: 18px; }
+section > * { min-width: 0; }
+ul, ol { margin: 0; padding-left: 1.25rem; }
+li { margin-bottom: 6px; }
+li:last-child { margin-bottom: 0; }
+.table-wrap { overflow-x: auto; border-radius: 12px; background: var(--surface); }
+table { border-collapse: collapse; width: 100%; font-size: 0.9rem; line-height: 1.5; }
+.table-wrap table { min-width: 640px; }
+th, td { text-align: left; vertical-align: top; padding: 11px 16px; border-bottom: 0.5px solid var(--line); }
+tr:last-child td { border-bottom: 0; }
+th { font-size: 0.78rem; color: var(--muted); font-weight: 600; white-space: nowrap; }
+td.name { font-weight: 600; white-space: nowrap; }
+td.n { white-space: nowrap; font-variant-numeric: tabular-nums; }
+td .sub { display: block; color: var(--muted); font-size: 0.82rem; }
+.mono { font-family: var(--font-mono); font-size: 0.82rem; }
+kbd { font-family: var(--font); font-size: 0.8rem; padding: 1px 7px; border-radius: 5px; background: var(--surface); border: 0.5px solid var(--line); box-shadow: 0 1px 0 var(--line); white-space: nowrap; }
+figure { margin: 0; display: grid; gap: 12px; }
+figcaption { font-size: 0.88rem; color: var(--muted); max-width: 66ch; }
+footer { border-top: 0.5px solid var(--line); margin-top: 36px; padding-top: 20px; font-size: 0.85rem; color: var(--muted); }
+
+.fig-wrap { overflow-x: auto; background: var(--surface); border-radius: 12px; padding: 16px 12px; }
+.fig-wrap svg { display: block; width: 100%; height: auto; min-width: 640px; }
+.s-text { fill: var(--ink); font-family: var(--font); font-size: 13px; }
+.s-small { fill: var(--muted); font-family: var(--font); font-size: 12px; }
+.s-title { fill: var(--ink); font-family: var(--font); font-size: 13px; font-weight: 600; }
+.s-box { fill: var(--bg); stroke: var(--line); stroke-width: 1; }
+.s-box-hi { fill: var(--accent-soft); stroke: var(--accent); stroke-width: 1; }
+.s-lane { fill: none; stroke: var(--line); stroke-width: 1; stroke-dasharray: 4 5; }
+.s-arrow { stroke: var(--muted); stroke-width: 1.4; fill: none; }
+.s-head { fill: var(--muted); }
+
+.term { border-bottom: 1.5px dotted var(--accent); cursor: help; position: relative; }
+.term:focus { outline: none; }
+.term::after {
+  content: attr(data-tip); position: absolute; bottom: calc(100% + 8px); left: 50%; transform: translateX(-50%);
+  width: max-content; max-width: min(260px, 80vw); background: var(--ink); color: var(--bg);
+  font-size: 0.8rem; line-height: 1.45; font-weight: 400; padding: 0.45rem 0.65rem; border-radius: 8px;
+  opacity: 0; visibility: hidden; transition: opacity 0.15s; pointer-events: none; z-index: 10;
+}
+.term:hover::after, .term:focus::after { opacity: 1; visibility: visible; }
+@media (prefers-reduced-motion: reduce) { .term::after { transition: none; } }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <span class="eyebrow">Milestone M4 · steps and plan · updated 28 Oct 2026</span>
+  <h1>Telescope text search</h1>
+  <p class="lede">The steps of milestone M4. Below the files found by name, the window lists lines found inside the files of folders you choose, without ever slowing the names or downloading a cloud file.</p>
+  <div class="chips">
+    <span class="chip keep">4 of 4 steps merged</span>
+    <span class="chip keep">Names never wait</span>
+    <span class="chip open">Hand checks to go</span>
+    <span class="chip">Built early, while M2's week runs</span>
+    <span class="chip">Swift + Rust</span>
+  </div>
+  <nav class="toc" aria-label="Sections">
+    <a href="#steps">Steps</a>
+    <a href="#how">Names first, then text</a>
+    <a href="#cloud">Cloud files</a>
+    <a href="#targets">M4 targets</a>
+    <a href="#decide">Decisions</a>
+    <a href="#left">What remains</a>
+    <a href="#next">Next steps</a>
+  </nav>
+</header>
+
+<main>
+<section id="steps">
+  <h2>Steps</h2>
+  <p class="prose">M4 was built early, on 27-28 Oct 2026, alongside M3. The engine came first as its own Rust <span class="term" tabindex="0" data-tip="A crate is a Rust package, like an npm package.">crate</span>, tested from the command line, then the <span class="term" tabindex="0" data-tip="A handful of plain functions Swift can call into Rust, written in C style because that's the one format both languages understand.">hatch</span> calls, then the window. The window step also has a longer row, with every number, on the <a href="m2-daily-driver.html#steps">M2 page</a>.</p>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Part</th><th>Step</th><th>What you get</th><th>Status</th></tr></thead>
+      <tbody>
+        <tr><td class="n">Core</td><td class="name">The engine</td><td>A new crate, <span class="mono">telescope-grep</span>, reads the files of a folder on several threads and hands back each matching line as it is found, with no index of the text kept anywhere. Lower-case text matches any case, in any alphabet; text with a capital matches exactly. Binary files, files over 8 MB and cloud-only files are skipped and counted. A newer search stops the older one. <span class="mono">tl grep &lt;folder&gt; &lt;text&gt;</span> runs it from Terminal: no match over ~/Documents, reading 24,237 files, in 287-299 ms</td><td class="n"><span class="chip keep">Done</span> <a href="https://github.com/jovanhartono/telescope/pull/31">#31</a></td></tr>
+        <tr><td class="n">Core</td><td class="name">Background priority and a bench</td><td>Text search threads run at macOS's lowest <span class="term" tabindex="0" data-tip="macOS's way of ranking threads. Low-priority work runs on the power-saving cores and waits for anything more urgent.">priority</span>, so name search keeps its speed while one runs: 2.5 ms for 95% of name searches alone and 2.5 ms with a text search running, against 10.8 ms at the next level up. <span class="mono">tl grep-bench</span> times text searches from Terminal</td><td class="n"><span class="chip keep">Done</span> <a href="https://github.com/jovanhartono/telescope/pull/33">#33</a></td></tr>
+        <tr><td class="n">Hatch</td><td class="name">Text search through the C calls</td><td>Four new calls let the app start a text search, take the lines found so far, and stop it. Text search gets its own threads, started on first use, so a Mac that never searches text pays nothing; at most 100 lines per search. Freeing the core 20 ms into a search now takes 0.28 ms instead of 39 ms</td><td class="n"><span class="chip keep">Done</span> <a href="https://github.com/jovanhartono/telescope/pull/38">#38</a></td></tr>
+        <tr><td class="n">Window</td><td class="name">Text search in the window</td><td>An “Inside Files” section under the names lists lines with the match in bold, the file's name and line number under it. Folders are chosen in the Index Health window (<kbd>⌘</kbd> <kbd>,</kbd>) with + and − and kept between launches. <kbd>Return</kbd>, Quick Look, the details pane, Show in Finder and Copy Path all work on a line's file</td><td class="n"><span class="chip keep">Done</span> <a href="https://github.com/jovanhartono/telescope/pull/60">#60</a></td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<section id="how">
+  <h2>Names first, then text</h2>
+  <p class="prose">Finding a file by name means comparing what you typed with a list already in memory: a few milliseconds. Finding a line inside files means opening and reading every one of them: hundreds of milliseconds for a big folder. Done on the same threads at the same time, the slow job would make every keystroke feel slow.</p>
+  <p class="prose">Think of a librarian with two jobs. Asked for a book, she first reads the titles off the catalogue cards and hands you that list at once. Only then does she send an assistant to the shelves you pointed at, to leaf through the books for your words. If you ask something new, she calls the assistant back straight away.</p>
+  <ul class="prose">
+    <li><strong>The catalogue.</strong> Each keystroke runs the name search as in M3. Only once those names are on screen does the text search start.</li>
+    <li><strong>The assistant.</strong> Text search runs on threads of its own, at macOS's lowest priority, so it uses the power-saving cores and gives way to anything more urgent. Lines arrive in small batches and are added under the names, up to 100.</li>
+    <li><strong>Calling back.</strong> A new keystroke stops the text search at once, and any line found for the older search is thrown away rather than shown. Hiding the window stops it too.</li>
+    <li><strong>The shelves you pointed at.</strong> Only folders you add in Index Health are read; none are by default. Inside a folder you tabbed into, only the part of those folders inside it is read.</li>
+  </ul>
+  <figure>
+    <div class="fig-wrap">
+      <svg viewBox="0 0 900 260" role="img" aria-label="A keystroke runs the name search and draws names in about 6 milliseconds; then the text search starts on low-priority threads and lines arrive in batches, the first after about 14 milliseconds; a new keystroke stops the text search">
+        <defs><marker id="h" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="s-head" d="M0,0 L10,5 L0,10 z"/></marker></defs>
+        <text class="s-small" x="20" y="22">Name search, every keystroke</text>
+        <rect class="s-lane" x="10" y="30" width="880" height="80" rx="10"/>
+        <text class="s-small" x="20" y="152">Text search, low-priority threads, chosen folders only</text>
+        <rect class="s-lane" x="10" y="160" width="880" height="80" rx="10"/>
+        <rect class="s-box" x="24" y="44" width="150" height="52" rx="9"/>
+        <text class="s-title" x="38" y="66">Keystroke</text>
+        <text class="s-small" x="38" y="84">“budget”</text>
+        <rect class="s-box-hi" x="230" y="44" width="200" height="52" rx="9"/>
+        <text class="s-title" x="244" y="66">Names drawn</text>
+        <text class="s-small" x="244" y="84">about 6 ms typical</text>
+        <rect class="s-box" x="330" y="174" width="200" height="52" rx="9"/>
+        <text class="s-title" x="344" y="196">Read the files</text>
+        <text class="s-small" x="344" y="214">skip binary and cloud-only</text>
+        <rect class="s-box" x="600" y="174" width="270" height="52" rx="9"/>
+        <text class="s-title" x="614" y="196">Lines under “Inside Files”</text>
+        <text class="s-small" x="614" y="214">in batches, first at about 14 ms</text>
+        <rect class="s-box" x="600" y="44" width="270" height="52" rx="9"/>
+        <text class="s-title" x="614" y="66">Next keystroke</text>
+        <text class="s-small" x="614" y="84">names again; text search stopped</text>
+        <line class="s-arrow" x1="174" y1="70" x2="228" y2="70" marker-end="url(#h)"/>
+        <path class="s-arrow" d="M330 96 L410 172" marker-end="url(#h)"/>
+        <text class="s-small" x="380" y="130">only then</text>
+        <line class="s-arrow" x1="530" y1="200" x2="598" y2="200" marker-end="url(#h)"/>
+        <path class="s-arrow" d="M650 96 L500 172" marker-end="url(#h)"/>
+        <text class="s-small" x="590" y="140">stop</text>
+      </svg>
+    </div>
+    <figcaption>Measured in the window's own code with ~/Documents/projects/telescope chosen, 10 searches typed at 8 letters a second: names drawn 6.5 ms typical, 9.9 ms for 95%; the first line 14 ms typical and 20-22 ms for 95% after the keystroke (28 Oct, load average 3-9).</figcaption>
+  </figure>
+</section>
+
+<section id="cloud">
+  <h2>Cloud files are never downloaded</h2>
+  <p class="prose">iCloud Drive and OneDrive can keep a file's name on your Mac while its contents stay online. Opening such a file to read it makes macOS download it. A text search that opened every file would quietly pull gigabytes down and fill your disk.</p>
+  <p class="prose">Think of a library whose shelves hold some empty book covers, each with a slip saying the book is in storage. The assistant reads the slip before opening the cover and moves on.</p>
+  <ul class="prose">
+    <li><strong>The slip.</strong> macOS marks a cloud-only file with a <span class="term" tabindex="0" data-tip="A yes-or-no mark the file system keeps on each file. This one says the contents are online, not on your Mac.">flag</span>. Telescope checks it before opening, and counts the file as cloud-only instead of reading it.</li>
+    <li><strong>Belt and braces.</strong> The text search threads also tell macOS not to download anything for them, so a file that goes online in the middle of a search is skipped, not fetched.</li>
+    <li><strong>Checked.</strong> Over iCloud Drive with 3,913 cloud-only files, <span class="mono">tl grep</span> skipped them, and 3,913 were still cloud-only afterwards (<a href="https://github.com/jovanhartono/telescope/pull/31">#31</a>).</li>
+  </ul>
+</section>
+
+<section id="targets">
+  <h2>What M4 must prove</h2>
+  <p class="prose">The milestone's checks from the research plan's <a href="research.html#milestones">milestones</a>, plus the plan's <a href="research.html#targets">final targets</a> that text search could break.</p>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Check</th><th>Target</th><th>Measured on your Mac</th></tr></thead>
+      <tbody>
+        <tr><td class="name">Names never wait</td><td>Name results as fast with text search on as without</td><td><span class="chip keep">Pass</span> In the window's own code, 10 searches typed at 8 letters a second, names drawn for 95% of keystrokes: 9.5-11.6 ms before this milestone, 8.8-9.3 ms with no folder chosen, 9.9 ms while a text search runs over ~/Documents/projects/telescope (28 Oct, load average 3-9, <a href="https://github.com/jovanhartono/telescope/pull/60">#60</a>). From Terminal, default folders: 2.5 ms for 95% of name searches alone and 2.5 ms with a text search looping beside them (<a href="https://github.com/jovanhartono/telescope/pull/33">#33</a>). On a whole home folder of 2.4 million entries they still slow, 25.9 ms to 38.6 ms, which needs a re-measure on an idle Mac</td></tr>
+        <tr><td class="name">Never downloads cloud files</td><td>No cloud-only file opened</td><td><span class="chip keep">Pass</span> 3,913 cloud-only files in iCloud Drive before and after a search over it (<a href="https://github.com/jovanhartono/telescope/pull/31">#31</a>)</td></tr>
+        <tr><td class="name">Live search in folders you choose</td><td>Lines as you type, no text index</td><td><span class="chip keep">Pass</span> ~/Documents/projects/telescope, 89 files: the first line 14 ms typical, 20-22 ms for 95% after the keystroke. All of ~/Documents, 23 GB: the first line after 0.72-0.77 s typical and up to 1.5 s, because the folder is listed afresh for each search (<a href="https://github.com/jovanhartono/telescope/pull/60">#60</a>)</td></tr>
+        <tr><td class="name">A new key stops the old search</td><td>No line from an older search shown</td><td><span class="chip keep">Pass</span> Tested in Rust and Swift. A replaced search stops in 0.13-0.29 ms at normal priority and 8-24 ms typical at a lower priority on a busy Mac, load average 12-16 (<a href="https://github.com/jovanhartono/telescope/pull/31">#31</a>); its late lines are dropped, never drawn</td></tr>
+        <tr><td class="name">Idle memory</td><td class="n">under 60 MB</td><td><span class="chip keep">Pass</span> The app opened normally: 14-15 MB hidden, 18 MB with the Index Health window open (<a href="https://github.com/jovanhartono/telescope/pull/60">#60</a>). One text search over the whole home folder adds about 6.2 MB and 8 threads; after 10 more, 6.6 MB in all (<a href="https://github.com/jovanhartono/telescope/pull/38">#38</a>)</td></tr>
+        <tr><td class="name">App size</td><td class="n">under 6 MB for both chips</td><td><span class="chip keep">Pass</span> The engine adds 0.29 MB per chip to <span class="mono">tl</span> (<a href="https://github.com/jovanhartono/telescope/pull/31">#31</a>) and the core library goes from 1.53 MB to 1.83 MB per chip (<a href="https://github.com/jovanhartono/telescope/pull/38">#38</a>). The app is 2.8 MB for this Mac's chip, against 2.5 MB before the window step (28 Oct, built for this page)</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<section id="decide">
+  <h2>Decisions</h2>
+  <p class="prose">Taken on 27-28 Oct 2026 while the steps were built. The research plan left these open; each was measured where a number could settle it.</p>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>#</th><th>Question</th><th>Decided</th><th>Not chosen</th></tr></thead>
+      <tbody>
+        <tr><td class="n">1</td><td>Index the text, or read it live</td><td>Read the files live on every search, in folders you choose</td><td>A text index: disk and memory for every word of every file, and kept in step with every save. An optional per-folder index stays in v2</td></tr>
+        <tr><td class="n">2</td><td>Which folders by default</td><td>None until you add one in Index Health</td><td>The whole home folder: 3.4-5.3 s to read it once, on every search</td></tr>
+        <tr><td class="n">3</td><td>Matching library</td><td>ripgrep's file reader with a small plain-text matcher: 1.79 MB for <span class="mono">tl</span> per chip, at the same speed</td><td>ripgrep's full pattern library: 3.36 MB per chip, for patterns nobody types into a launcher</td></tr>
+        <tr><td class="n">4</td><td>Thread priority</td><td>macOS's lowest, background: names stay at 2.5 ms for 95% while text runs</td><td>One level up, utility: names slow to 10.8 ms. Utility with 2 threads: 6.5 ms. The cost: text search is about twice as slow over many tiny files, and a lower priority stops a replaced search later, 8-24 ms on a busy Mac instead of 0.3 ms</td></tr>
+        <tr><td class="n">5</td><td>When text search starts</td><td>After the names for that keystroke are on screen</td><td>Both at once: text reading would compete with the names for the same cores</td></tr>
+        <tr><td class="n">6</td><td>Which files to read</td><td>List the chosen folders afresh for each search, with the name list's skip rules: listing home takes 80-90 ms against 3.4-5.3 s to read its files</td><td>Keeping the listing between searches: about 3% of the time saved, for a list that goes stale. Reusing the live name list: it trails a save by up to a second and leaves out ~/Library and folders outside home</td></tr>
+        <tr><td class="n">7</td><td>What to skip</td><td>Files with a zero byte (binary), over 8 MB, or with a line over 1 MB; each line cut to 200 bytes around the match; 100 lines in all</td><td>A 128 KB line cap: peak memory from about 10 MB to 5 MB, but 27 more files skipped in ~/Documents</td></tr>
+        <tr><td class="n">8</td><td>What <kbd>Return</kbd> does on a line</td><td>Opens the file</td><td>Opening at the line: every editor takes the line its own way, and there is no one cheap call for all of them</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<section id="left">
+  <h2>What remains</h2>
+  <ul class="prose">
+    <li><strong>Big folders are slow to the first line</strong>: 0.7-1.5 s for all of ~/Documents, because the folder is listed again for each search. Keeping the listing between keystrokes of one search is the follow-up to try.</li>
+    <li><strong>Whole-home name search beside text search</strong>: 25.9 ms to 38.6 ms for 95% from Terminal on a busy Mac. Needs a re-measure on an idle Mac, and with nothing cached after a restart.</li>
+    <li><strong>VoiceOver</strong>: the “Inside Files” title isn't announced as a group yet; the first try changed row heights and was taken out.</li>
+    <li><strong>A licence notice</strong>: one library the engine uses, encoding_rs, carries a BSD-3-Clause part that needs a notice in shipped apps before a release carries text search.</li>
+    <li><strong>Hand checks with the screen unlocked</strong>: the results window with lines in light and dark, and the + button's folder picker.</li>
+  </ul>
+</section>
+
+<section id="next">
+  <h2>Next steps</h2>
+  <ol class="prose">
+    <li>Finish M2 first: the v0.2.0 release, the update test and the 7-day run, all on the <a href="m2-daily-driver.html#next">M2 page</a>.</li>
+    <li>Add one folder you search often in Index Health and use text search during the week; the hand checks above, once.</li>
+    <li>Add the licence notice before the release that first ships text search.</li>
+    <li>Try keeping the folder listing between keystrokes, measured on ~/Documents before and after. M4 closes when every check in <a href="#targets">What M4 must prove</a> passes and the hand checks are done.</li>
+  </ol>
+</section>
+</main>
+
+<footer>
+  Steps built on 27-28 Oct 2026. Final targets and the full plan: <a href="research.html">research.html</a>. Built alongside: <a href="m3-beats-spotlight.html">m3-beats-spotlight.html</a>. The window it builds on: <a href="m2-daily-driver.html">m2-daily-driver.html</a>.
+</footer>
+
+</div>
+</body>
+</html>
