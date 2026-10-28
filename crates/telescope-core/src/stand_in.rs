@@ -124,7 +124,13 @@ mod tests {
         let index = stand_in(5_000);
         let searcher = Searcher::with_threads(2);
         let hits = searcher
-            .search(&index, "budget", searcher.ticket(), 50)
+            .search(
+                &index,
+                &crate::Apps::default(),
+                "budget",
+                searcher.ticket(),
+                50,
+            )
             .unwrap();
         assert_eq!(hits.len(), 50);
     }

@@ -1,7 +1,8 @@
 //! Search: the letter check, fuzzy matching per word, and dropping searches nobody wants any more.
 
+use crate::apps::{AppId, Apps};
 use crate::index::{EntryId, Index, NO_PARENT, NameId, letter, letters};
-use frizbee::{Config, Matcher, Matching, Pattern, Scoring, SortStrategy};
+use frizbee::{Config, Match, Matcher, Matching, Pattern, Scoring, SortStrategy};
 use rayon::prelude::*;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -18,9 +19,26 @@ const RARER_BY: usize = 4;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Hit {
-    pub entry: EntryId,
+    pub item: Item,
     pub score: u32,
     name_len: u32,
+}
+
+/// Apps come first so an app wins a full tie with a file.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Item {
+    App(AppId),
+    Entry(EntryId),
+}
+
+impl Hit {
+    /// The index entry found, unless this is an app.
+    pub fn entry(&self) -> Option<EntryId> {
+        match self.item {
+            Item::Entry(entry) => Some(entry),
+            Item::App(_) => None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -69,6 +87,9 @@ struct Scratch {
     possible: Vec<AtomicU64>,
     /// One bit per folder already climbed while marking `possible`.
     walked: Vec<AtomicU64>,
+    app_words: Vec<u8>,
+    app_held: Vec<u8>,
+    app_score: Vec<u16>,
     /// Tests turn the short-word shortcuts off to check they never change what a search finds.
     #[cfg(test)]
     no_shortcuts: bool,
@@ -125,10 +146,12 @@ impl Searcher {
         self.tickets.newest()
     }
 
-    /// The best `limit` hits, or `None` when a newer ticket arrived first.
+    /// The best `limit` hits among the files and the apps, or `None` when a newer ticket
+    /// arrived first.
     pub fn search(
         &self,
         index: &Index,
+        apps: &Apps,
         query: &str,
         ticket: Ticket,
         limit: usize,
@@ -140,7 +163,7 @@ impl Searcher {
         }
         let scratch = &mut *turn;
         self.pool.install(|| {
-            let hits = run(index, query, limit, scratch, &stale)?;
+            let hits = run(index, apps, query, limit, scratch, &stale)?;
             (!stale()).then_some(hits)
         })
     }
@@ -148,6 +171,7 @@ impl Searcher {
 
 fn run(
     index: &Index,
+    apps: &Apps,
     query: &str,
     limit: usize,
     scratch: &mut Scratch,
@@ -173,11 +197,14 @@ fn run(
         }
         words.push(word);
     }
-    let limit = limit.min(index.len());
+    let limit = limit.min(index.len() + apps.len());
     if wanted == 0 || limit == 0 {
         return Some(Vec::new());
     }
 
+    let mut app_hits = Vec::new();
+    let (app_matched, app_held) =
+        match_apps(apps, &words, wanted, unwanted, 0, scratch, &mut app_hits);
     let later = common_words(index, &words, wanted, typo_ready);
     // "38" fits a third of all names, mostly hashes that only scatter its letters. Names where
     // it starts the name or a word go first, and the rest only when those cannot fill the list.
@@ -199,8 +226,21 @@ fn run(
         stale,
     )?;
     // The file you want almost always holds each word you type, letter for letter. A word no
-    // name holds is probably misspelled, like "desing", so it may take one typo.
-    let unsure = wanted & typo_ready & !held;
+    // name holds is probably misspelled, like "desing", so it may take one typo. An app's
+    // name counts, so "safari" finds Safari, not files a typo away from it.
+    let unsure = wanted & typo_ready & !(held | app_held);
+    if unsure != 0 && wanted & !app_matched & !unsure == 0 {
+        app_hits.clear();
+        match_apps(
+            apps,
+            &words,
+            wanted,
+            unwanted,
+            unsure,
+            scratch,
+            &mut app_hits,
+        );
+    }
     if unsure != 0 && wanted & !later & !matched & !unsure == 0 {
         (matched, _) = match_names(
             index,
@@ -218,6 +258,14 @@ fn run(
         mark_possible(index, wanted & !later, unwanted, scratch, stale)?;
         matched |= match_names(index, &words, later, wanted, Pass::Possible, scratch, stale)?.0;
     }
+    // Room for the bundles an app hit may hide, so `limit` files are left once they are
+    // dropped. Only apps inside the indexed folder have one, like those in ~/Applications.
+    keep_best(&mut app_hits, limit);
+    let inside = |hit: &&Hit| match hit.item {
+        Item::App(app) => index.len() > 0 && apps.folder(app).starts_with(index.name(0)),
+        Item::Entry(_) => false,
+    };
+    let wide = limit + app_hits.iter().filter(inside).count();
     // A word found in a folder above counts as a clean match of that word, so "synergy readme"
     // ranks synergy-core/README.md above a long name that scatters the letters of both words.
     let match_score = u32::from(Config::default().scoring.match_score);
@@ -234,43 +282,28 @@ fn run(
         // every plain name five folders deep, "l59" would read every entry twice, so skip ahead.
         let deep = u32::from(ceiling) + 4 * DEPTH_PENALTY;
         let mut winners = scratch.name_score.iter().filter(|&&s| u32::from(s) > deep);
-        if winners.nth(limit - 1).is_some() {
-            let hits = best(
-                index,
-                scratch,
-                wanted,
-                unwanted,
-                &folder_bonus,
-                limit,
-                stale,
-            )?;
+        if winners.nth(wide - 1).is_some() {
+            let hits = best(index, scratch, wanted, unwanted, &folder_bonus, wide, stale)?;
             // Every entry sits at least one folder deep, which costs a plain name a little more.
             let plain_best = u32::from(ceiling).saturating_sub(DEPTH_PENALTY);
-            if hits.len() == limit && hits[limit - 1].score > plain_best {
+            if hits.len() == wide && hits[wide - 1].score > plain_best {
                 #[cfg(test)]
                 {
                     scratch.early_stops += 1;
                 }
-                return Some(hits);
+                return Some(with_apps(index, apps, hits, app_hits, limit));
             }
         }
         matched |= match_names(index, &words, wanted, wanted, Pass::Rest, scratch, stale)?.0;
     }
     if wanted & !matched != 0 {
-        return Some(Vec::new());
+        return Some(with_apps(index, apps, Vec::new(), app_hits, limit));
     }
     if uses_folders(wanted, unwanted) {
         words_above(index, scratch, stale)?;
     }
-    best(
-        index,
-        scratch,
-        wanted,
-        unwanted,
-        &folder_bonus,
-        limit,
-        stale,
-    )
+    let hits = best(index, scratch, wanted, unwanted, &folder_bonus, wide, stale)?;
+    Some(with_apps(index, apps, hits, app_hits, limit))
 }
 
 /// One word must be in the name itself; more words, or an exclusion, also look at the folders.
@@ -330,7 +363,7 @@ fn best(
                     continue;
                 }
                 let hit = Hit {
-                    entry: (first + i) as EntryId,
+                    item: Item::Entry((first + i) as EntryId),
                     score,
                     name_len: index.name_len(name),
                 };
@@ -353,11 +386,128 @@ fn best(
     Some(hits)
 }
 
+/// The best `limit` of the files and apps found. A bundle the index holds too, like Gmail.app
+/// in ~/Applications, shows once, as the app, and only when the app itself was found.
+fn with_apps(
+    index: &Index,
+    apps: &Apps,
+    mut hits: Vec<Hit>,
+    app_hits: Vec<Hit>,
+    limit: usize,
+) -> Vec<Hit> {
+    if !app_hits.is_empty() {
+        hits.retain(|hit| !shown_as_app(index, apps, hit, &app_hits));
+        hits.extend(app_hits);
+    }
+    keep_best(&mut hits, limit);
+    hits
+}
+
+fn shown_as_app(index: &Index, apps: &Apps, hit: &Hit, app_hits: &[Hit]) -> bool {
+    let Item::Entry(entry) = hit.item else {
+        return false;
+    };
+    let Some(name) = index.name(entry).strip_suffix(".app") else {
+        return false;
+    };
+    // Paths are built only for a name an app hit shares, a few at most per search.
+    app_hits.iter().any(|app_hit| match app_hit.item {
+        Item::App(app) => apps.name(app) == name && apps.path(app) == index.path(entry),
+        Item::Entry(_) => false,
+    })
+}
+
+/// Apps are matched on their names alone: each wanted word in the name and no unwanted one.
+/// With no folders above them, they lose nothing for depth, so an app ranks above a file whose
+/// name matches as well. Returns the words that matched at least one app, and the words the
+/// apps found hold letter for letter.
+fn match_apps(
+    apps: &Apps,
+    words: &[Pattern],
+    wanted: u8,
+    unwanted: u8,
+    typos: u8,
+    scratch: &mut Scratch,
+    hits: &mut Vec<Hit>,
+) -> (u8, u8) {
+    if apps.is_empty() {
+        return (0, 0);
+    }
+    let config = matcher_config();
+    let Scratch {
+        app_words,
+        app_held,
+        app_score,
+        ..
+    } = scratch;
+    for list in [&mut *app_words, &mut *app_held] {
+        list.clear();
+        list.resize(apps.len(), 0);
+    }
+    app_score.clear();
+    app_score.resize(apps.len(), 0);
+    let mut matched = 0u8;
+    for (w, word) in words.iter().enumerate() {
+        let word = word.clone().max_typos(Some(u16::from(typos >> w & 1)));
+        for found in Matcher::new(word, &config).match_list(&apps.names) {
+            let n = found.index as usize;
+            app_words[n] |= 1 << w;
+            matched |= 1 << w;
+            if wanted >> w & 1 == 1 {
+                let name = &apps.names[n];
+                let (score, holds) = points(found, name, &words[w].needle, 0, &config.scoring);
+                app_held[n] |= u8::from(holds) << w;
+                app_score[n] = app_score[n].saturating_add(score);
+            }
+        }
+    }
+    // Photos holding "photos" says nothing about the spelling of "photos trip" when Photos
+    // lacks "trip", so only the apps found count.
+    let mut held = 0u8;
+    for (n, &own) in app_words.iter().enumerate() {
+        if own & wanted == wanted && own & unwanted == 0 {
+            held |= app_held[n];
+            hits.push(Hit {
+                item: Item::App(n as AppId),
+                score: u32::from(app_score[n]),
+                name_len: apps.names[n].len() as u32,
+            });
+        }
+    }
+    (matched, held)
+}
+
 fn matcher_config() -> Config {
     let mut config = Config::default().sort(SortStrategy::IndexAsc);
     // Typing in lower case must not favour lower-case names over NIB.pdf.
     config.scoring.matching_case_bonus = 0;
     config
+}
+
+/// A name's points for one word, and whether it holds the word letter for letter. Below
+/// `floor` it cannot, so the name is not read again.
+fn points(found: Match, name: &str, word: &str, floor: u16, scoring: &Scoring) -> (u16, bool) {
+    let score = found.score;
+    let how = if score < floor {
+        Held::No
+    } else {
+        held_in(name, word)
+    };
+    match how {
+        how @ (Held::Whole | Held::Alone) => {
+            let exact = if matches!(how, Held::Whole) && !found.exact {
+                scoring.exact_match_bonus
+            } else {
+                0
+            };
+            (
+                score.saturating_add(exact).saturating_add(WHOLE_WORD_BONUS),
+                true,
+            )
+        }
+        Held::Inside => (score, true),
+        Held::No => (score, false),
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -482,24 +632,10 @@ fn match_names(
                         bits[n] |= 1 << w;
                         matched |= 1 << w;
                         if wanted >> w & 1 == 1 {
-                            let mut score = found.score;
-                            let how = if score < floors[w] {
-                                Held::No
-                            } else {
-                                held_in(texts[found.index as usize], &words[w].needle)
-                            };
-                            match how {
-                                how @ (Held::Whole | Held::Alone) => {
-                                    if matches!(how, Held::Whole) && !found.exact {
-                                        score =
-                                            score.saturating_add(config.scoring.exact_match_bonus);
-                                    }
-                                    score = score.saturating_add(WHOLE_WORD_BONUS);
-                                    held |= 1 << w;
-                                }
-                                Held::Inside => held |= 1 << w,
-                                Held::No => {}
-                            }
+                            let text = texts[found.index as usize];
+                            let (score, holds) =
+                                points(found, text, &words[w].needle, floors[w], &config.scoring);
+                            held |= u8::from(holds) << w;
                             scores[n] = scores[n].saturating_add(score);
                         }
                     }
@@ -747,7 +883,7 @@ fn order(a: &Hit, b: &Hit) -> std::cmp::Ordering {
     b.score
         .cmp(&a.score)
         .then(a.name_len.cmp(&b.name_len))
-        .then(a.entry.cmp(&b.entry))
+        .then(a.item.cmp(&b.item))
 }
 
 fn keep_best(hits: &mut Vec<Hit>, limit: usize) {
@@ -762,6 +898,7 @@ fn keep_best(hits: &mut Vec<Hit>, limit: usize) {
 mod tests {
     use super::*;
     use crate::index::{IndexBuilder, word_starts};
+    use std::path::Path;
 
     #[test]
     fn a_common_word_still_counts_in_any_folder_above() {
@@ -801,28 +938,29 @@ mod tests {
         builder.finish()
     }
 
-    fn paths(index: &Index, query: &str) -> Vec<String> {
+    /// Best first, apps by their bundle's path.
+    fn ranked(index: &Index, apps: &Apps, query: &str) -> Vec<String> {
         let searcher = Searcher::with_threads(2);
         let hits = searcher
-            .search(index, query, searcher.ticket(), 10)
+            .search(index, apps, query, searcher.ticket(), 10)
             .unwrap();
-        let mut found: Vec<String> = hits
-            .iter()
-            .map(|hit| index.path(hit.entry).to_string_lossy().replace('\\', "/"))
-            .collect();
+        hits.iter()
+            .map(|hit| match hit.item {
+                Item::Entry(entry) => index.path(entry),
+                Item::App(app) => apps.path(app),
+            })
+            .map(|path| path.to_string_lossy().replace('\\', "/"))
+            .collect()
+    }
+
+    fn paths(index: &Index, query: &str) -> Vec<String> {
+        let mut found = ranked(index, &Apps::default(), query);
         found.sort();
         found
     }
 
     fn first(index: &Index, query: &str) -> String {
-        let searcher = Searcher::with_threads(2);
-        let hits = searcher
-            .search(index, query, searcher.ticket(), 10)
-            .unwrap();
-        index
-            .path(hits[0].entry)
-            .to_string_lossy()
-            .replace('\\', "/")
+        ranked(index, &Apps::default(), query).swap_remove(0)
     }
 
     /// A small xorshift, so the property tests need no extra crate and fail the same way twice.
@@ -1026,30 +1164,41 @@ mod tests {
             }
         }
         let index = builder.finish();
+        let names: Vec<String> = (0..30)
+            .map(|i| format!("{}{i}", rng.text(&parts, 5)))
+            .collect();
+        let names: Vec<&str> = names.iter().map(String::as_str).collect();
         let searcher = Searcher::with_threads(2);
-        for query in ["3", "38", "x8", "38x", "y"] {
-            let all = searcher
-                .search(&index, query, searcher.ticket(), 1_000)
-                .unwrap();
-            assert!(all.len() > 20, "{query:?}");
-            for limit in 1..=all.len() {
-                let few = searcher
-                    .search(&index, query, searcher.ticket(), limit)
+        for apps in [Apps::default(), applications(&names)] {
+            for query in ["3", "38", "x8", "38x", "y"] {
+                let all = searcher
+                    .search(&index, &apps, query, searcher.ticket(), 1_000)
                     .unwrap();
-                assert_eq!(few, all[..limit], "{query:?} limit {limit}");
+                assert!(all.len() > 20, "{query:?}");
+                for limit in 1..=all.len() {
+                    let few = searcher
+                        .search(&index, &apps, query, searcher.ticket(), limit)
+                        .unwrap();
+                    assert_eq!(few, all[..limit], "{query:?} limit {limit}");
+                }
             }
         }
     }
 
     /// The search with and without the short-word shortcuts, which must agree.
-    fn with_and_without_shortcuts(index: &Index, query: &str, limit: usize) -> (Vec<Hit>, usize) {
+    fn with_and_without_shortcuts(
+        index: &Index,
+        apps: &Apps,
+        query: &str,
+        limit: usize,
+    ) -> (Vec<Hit>, usize) {
         let mut fast = Scratch::default();
         let mut slow = Scratch {
             no_shortcuts: true,
             ..Scratch::default()
         };
-        let hits = run(index, query, limit, &mut fast, &|| false).unwrap();
-        let expected = run(index, query, limit, &mut slow, &|| false).unwrap();
+        let hits = run(index, apps, query, limit, &mut fast, &|| false).unwrap();
+        let expected = run(index, apps, query, limit, &mut slow, &|| false).unwrap();
         assert_eq!(hits, expected, "{query:?} limit {limit}");
         (hits, fast.early_stops)
     }
@@ -1079,13 +1228,21 @@ mod tests {
                     folders.push(entry);
                 }
             }
+            // Every other round, apps, some of them also bundles in the index.
+            let names: Vec<String> = (0..6 * (round % 2)).map(|_| rng.name(parts, 6)).collect();
+            let applications = builder.push("Applications", root, true);
+            for name in &names[..names.len() / 2] {
+                builder.push(&format!("{name}.app"), applications, true);
+            }
             let index = builder.finish();
+            let names: Vec<&str> = names.iter().map(String::as_str).collect();
+            let apps = Apps::from_names(Path::new("/home/Applications"), &names);
             for query in [
                 "c", "3", "38", "x8", "38x", "'c", "'38", "^c", "c$", "C", ".c", "c a", "38 c",
                 "a !b", "cab",
             ] {
                 for limit in [1, 3, 10, 40, 1_000] {
-                    early_stops += with_and_without_shortcuts(&index, query, limit).1;
+                    early_stops += with_and_without_shortcuts(&index, &apps, query, limit).1;
                 }
             }
         }
@@ -1113,7 +1270,7 @@ mod tests {
         let index = builder.finish();
         assert!(paths(&index, "z").is_empty());
         assert_eq!(paths(&index, "c"), ["/home/café.txt"]);
-        let (hits, _) = with_and_without_shortcuts(&index, "c", 10);
+        let (hits, _) = with_and_without_shortcuts(&index, &Apps::default(), "c", 10);
         assert_eq!(hits.len(), 1);
     }
 
@@ -1137,7 +1294,11 @@ mod tests {
         let index = sample();
         let checks = AtomicU64::new(0);
         let stale = || checks.fetch_add(1, Ordering::Relaxed) > 0;
-        assert_eq!(run(&index, "re", 10, &mut Scratch::default(), &stale), None);
+        let apps = applications(&["Reminders"]);
+        assert_eq!(
+            run(&index, &apps, "re", 10, &mut Scratch::default(), &stale),
+            None
+        );
         assert_eq!(checks.load(Ordering::Relaxed), 2);
     }
 
@@ -1303,7 +1464,8 @@ mod tests {
         let searcher = Searcher::with_threads(2);
         let old = searcher.ticket();
         let _new = searcher.ticket();
-        assert_eq!(searcher.search(&index, "readme", old, 10), None);
+        let apps = Apps::default();
+        assert_eq!(searcher.search(&index, &apps, "readme", old, 10), None);
     }
 
     #[test]
@@ -1312,8 +1474,9 @@ mod tests {
         let checks = AtomicU64::new(0);
         // Still wanted at the first check, replaced by the second.
         let stale = || checks.fetch_add(1, Ordering::Relaxed) > 0;
+        let apps = Apps::default();
         assert_eq!(
-            run(&index, "readme", 10, &mut Scratch::default(), &stale),
+            run(&index, &apps, "readme", 10, &mut Scratch::default(), &stale),
             None
         );
         assert_eq!(checks.load(Ordering::Relaxed), 2);
@@ -1329,24 +1492,477 @@ mod tests {
             builder.push(&format!("p{i}-l-a-n"), folder, false);
         }
         let index = builder.finish();
+        let names: Vec<String> = (0..40).map(|i| format!("Plan{i}")).collect();
+        let names: Vec<&str> = names.iter().map(String::as_str).collect();
         let searcher = Searcher::with_threads(2);
-        let all = searcher
-            .search(&index, "plan", searcher.ticket(), 1000)
-            .unwrap();
-        let few = searcher
-            .search(&index, "plan", searcher.ticket(), 5)
-            .unwrap();
-        assert_eq!(few, all[..5]);
+        for apps in [
+            Apps::default(),
+            Apps::from_names(Path::new("/Applications"), &names),
+        ] {
+            let all = searcher
+                .search(&index, &apps, "plan", searcher.ticket(), 1000)
+                .unwrap();
+            let few = searcher
+                .search(&index, &apps, "plan", searcher.ticket(), 5)
+                .unwrap();
+            assert_eq!(few, all[..5]);
+            assert_eq!(all.len(), 600 + apps.len());
+        }
     }
 
     #[test]
     fn searches_in_a_row_do_not_leak_into_each_other() {
         let index = sample();
+        let apps = Apps::from_names(Path::new("/Applications"), &["Synergy", "Readme"]);
         let searcher = Searcher::with_threads(2);
-        searcher.search(&index, "synergy readme", searcher.ticket(), 10);
-        let hits = searcher
-            .search(&index, "plan", searcher.ticket(), 10)
+        let search = |searcher: &Searcher, query| {
+            searcher
+                .search(&index, &apps, query, searcher.ticket(), 10)
+                .unwrap()
+        };
+        search(&searcher, "synergy readme");
+        assert_eq!(search(&searcher, "plan").len(), 1);
+        search(&searcher, "synergy readme");
+        let after = search(&searcher, "synergy");
+        assert_eq!(after, search(&Searcher::with_threads(2), "synergy"));
+        assert_eq!(after.len(), 2);
+    }
+
+    fn applications(names: &[&str]) -> Apps {
+        Apps::from_names(Path::new("/Applications"), names)
+    }
+
+    #[test]
+    fn an_app_ranks_above_a_file_or_folder_of_the_same_name() {
+        let mut builder = IndexBuilder::new();
+        let root = builder.push("/home", NO_PARENT, true);
+        builder.push("Notes", root, true);
+        builder.push("Notes.md", root, false);
+        let deep = builder.push("a", root, true);
+        builder.push("notes", deep, false);
+        let index = builder.finish();
+        let apps = applications(&["Notes", "Notes Helper"]);
+        // A capital letter typed must be matched, so "Notes" leaves out a/notes.
+        for (query, count) in [("notes", 5), ("Notes", 4), ("note", 5), ("nts", 5)] {
+            let found = ranked(&index, &apps, query);
+            assert_eq!(found[0], "/Applications/Notes.app", "{query}");
+            assert_eq!(found.len(), count, "{query}");
+        }
+    }
+
+    #[test]
+    fn an_app_beats_the_file_with_its_name_for_every_query_that_finds_both() {
+        let names = [
+            "plan",
+            "Budget",
+            "Visual Studio Code",
+            "Xcode",
+            "Photo Booth",
+            "café",
+            "Go2",
+            "my-app",
+            "NIB",
+            "a",
+        ];
+        for name in names {
+            let mut builder = IndexBuilder::new();
+            let root = builder.push("/home", NO_PARENT, true);
+            builder.push(name, root, false);
+            builder.push(&format!("{name}.txt"), root, false);
+            builder.push("unrelated.md", root, false);
+            let index = builder.finish();
+            let apps = applications(&[name, "Unrelated"]);
+            let app = format!("/Applications/{name}.app");
+            let file = format!("/home/{name}");
+            let letters: Vec<char> = name.chars().collect();
+            let mut queries: Vec<String> = vec![name.to_owned(), name.to_lowercase()];
+            queries.extend(name.split(' ').map(str::to_owned));
+            queries.extend((1..=letters.len()).map(|n| letters[..n].iter().collect()));
+            queries.push(format!("{name}!"));
+            queries.push(format!("{name} !zzz"));
+            queries.push(format!("^{name}"));
+            queries.push(format!("{name}$"));
+            queries.push(format!("'{name}"));
+            // Spread out, like "vsc" for Visual Studio Code.
+            let first = name.split(' ').filter_map(|word| word.chars().next());
+            queries.push(first.chain(letters.last().copied()).collect());
+            if letters.len() >= 4 {
+                let mut typo = letters.clone();
+                typo.swap(letters.len() - 2, letters.len() - 1);
+                queries.push(typo.into_iter().collect());
+            }
+            for query in &queries {
+                let found = ranked(&index, &apps, query);
+                let at = |path: &str| found.iter().position(|found| found == path);
+                // The same text, matched the same way, wherever it lives.
+                assert_eq!(
+                    at(&app).is_some(),
+                    at(&file).is_some(),
+                    "{query:?} {found:?}"
+                );
+                if let (Some(app), Some(file)) = (at(&app), at(&file)) {
+                    assert!(app < file, "{query:?} {found:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn an_app_is_found_exactly_when_the_file_of_its_name_is() {
+        let mut rng = Rng(0xa995);
+        let parts = [
+            "a", "b", "e", "s", "z", "A", "B", "S", "0", "7", " ", "-", "é", "ab", "se",
+        ];
+        let searcher = Searcher::with_threads(2);
+        let mut found = 0;
+        for _ in 0..400 {
+            let name = rng.text(&parts, 12).trim().to_owned();
+            if name.is_empty() {
+                continue;
+            }
+            let mut builder = IndexBuilder::new();
+            let root = builder.push("/home", NO_PARENT, true);
+            builder.push(&name, root, false);
+            let index = builder.finish();
+            let apps = applications(&[&name]);
+            let mut letters: Vec<char> = name.chars().collect();
+            let start = rng.below(letters.len());
+            letters.drain(..start);
+            letters.truncate(rng.below(letters.len()) + 1);
+            if letters.len() > 2 && rng.below(3) == 0 {
+                letters.remove(rng.below(letters.len()));
+            }
+            if letters.len() > 3 && rng.below(4) == 0 {
+                let at = rng.below(letters.len() - 1);
+                letters.swap(at, at + 1);
+            }
+            let mut query: String = letters.into_iter().collect();
+            if rng.below(3) == 0 {
+                query = query.to_lowercase();
+            }
+            let hits = searcher
+                .search(&index, &apps, &query, searcher.ticket(), 10)
+                .unwrap();
+            let file = hits.iter().any(|hit| matches!(hit.item, Item::Entry(_)));
+            let app = hits.iter().any(|hit| matches!(hit.item, Item::App(_)));
+            assert_eq!(file, app, "{name:?} {query:?}");
+            if app {
+                found += 1;
+                assert!(matches!(hits[0].item, Item::App(_)), "{name:?} {query:?}");
+            }
+        }
+        assert!(found > 200, "{found}");
+    }
+
+    #[test]
+    fn the_app_holding_every_word_beats_a_file_holding_one_in_its_folder() {
+        let mut builder = IndexBuilder::new();
+        let root = builder.push("/home", NO_PARENT, true);
+        let visual = builder.push("visual", root, true);
+        builder.push("code.md", visual, false);
+        let index = builder.finish();
+        let apps = applications(&["Visual Studio Code"]);
+        assert_eq!(
+            ranked(&index, &apps, "visual code"),
+            [
+                "/Applications/Visual Studio Code.app",
+                "/home/visual/code.md"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_word_only_a_failing_app_holds_still_lets_files_take_a_typo() {
+        let mut builder = IndexBuilder::new();
+        let root = builder.push("/home", NO_PARENT, true);
+        builder.push("Photo trip 2024.zip", root, false);
+        let index = builder.finish();
+        let apps = applications(&["Photos"]);
+        assert_eq!(
+            ranked(&index, &apps, "photos trip"),
+            ["/home/Photo trip 2024.zip"]
+        );
+        // Found, Photos does hold the word, so the file is not taken for a typo of it.
+        assert_eq!(
+            ranked(&index, &apps, "photos"),
+            ["/Applications/Photos.app"]
+        );
+    }
+
+    #[test]
+    fn apps_alone_are_trimmed_to_the_limit() {
+        let index = IndexBuilder::new().finish();
+        let names: Vec<String> = (0..40).map(|i| format!("Safari{i}")).collect();
+        let names: Vec<&str> = names.iter().map(String::as_str).collect();
+        let apps = applications(&names);
+        let searcher = Searcher::with_threads(2);
+        let all = searcher
+            .search(&index, &apps, "safari", searcher.ticket(), 1_000)
             .unwrap();
-        assert_eq!(hits.len(), 1);
+        let few = searcher
+            .search(&index, &apps, "safari", searcher.ticket(), 5)
+            .unwrap();
+        assert_eq!(all.len(), 40);
+        assert_eq!(few, all[..5]);
+    }
+
+    #[test]
+    fn an_app_typo_pass_starts_over() {
+        let index = sample();
+        let apps = applications(&["Desk Insight Gallery", "Design"]);
+        let mut found = ranked(&index, &apps, "desing");
+        found.sort();
+        assert_eq!(
+            found,
+            [
+                "/Applications/Design.app",
+                "/Applications/Desk Insight Gallery.app"
+            ]
+        );
+    }
+
+    #[test]
+    fn an_app_may_take_a_typo_in_any_word() {
+        let index = sample();
+        let apps = applications(&["Visual Studio Code", "Safari"]);
+        assert_eq!(
+            ranked(&index, &apps, "visual cdoe"),
+            ["/Applications/Visual Studio Code.app"]
+        );
+        // No app matches "plan", so none takes a typo for "safarri".
+        assert!(ranked(&index, &apps, "safarri plan").is_empty());
+    }
+
+    #[test]
+    fn a_newer_ticket_cancels_a_search_only_apps_answer() {
+        let index = sample();
+        let apps = applications(&["Safari"]);
+        let searcher = Searcher::with_threads(2);
+        let old = searcher.ticket();
+        let _new = searcher.ticket();
+        assert_eq!(searcher.search(&index, &apps, "safari", old, 10), None);
+    }
+
+    #[test]
+    fn an_app_wins_a_full_tie() {
+        let app = Hit {
+            item: Item::App(9),
+            score: 50,
+            name_len: 6,
+        };
+        let entry = Hit {
+            item: Item::Entry(0),
+            ..app
+        };
+        assert!(order(&app, &entry).is_lt());
+        let mut hits = vec![entry, app];
+        keep_best(&mut hits, 1);
+        assert_eq!(hits, [app]);
+    }
+
+    #[test]
+    fn every_word_must_be_in_the_app_name() {
+        let index = sample();
+        let apps = applications(&["Visual Studio Code", "Xcode", "Safari"]);
+        assert_eq!(
+            ranked(&index, &apps, "visual code"),
+            ["/Applications/Visual Studio Code.app"]
+        );
+        assert_eq!(
+            ranked(&index, &apps, "code !visual"),
+            ["/Applications/Xcode.app"]
+        );
+        assert!(ranked(&index, &apps, "safari readme").is_empty());
+        assert_eq!(
+            ranked(&index, &apps, "safari"),
+            ["/Applications/Safari.app"]
+        );
+        // Files still need their words; an app matching one does not bring them in.
+        assert_eq!(
+            ranked(&index, &apps, "other readme"),
+            ["/home/other/README.md"]
+        );
+    }
+
+    #[test]
+    fn an_app_holding_the_word_leaves_files_no_typo() {
+        let mut builder = IndexBuilder::new();
+        let root = builder.push("/home", NO_PARENT, true);
+        builder.push("safri.txt", root, false);
+        let index = builder.finish();
+        assert_eq!(paths(&index, "safari"), ["/home/safri.txt"]);
+        let apps = applications(&["Safari"]);
+        assert_eq!(
+            ranked(&index, &apps, "safari"),
+            ["/Applications/Safari.app"]
+        );
+    }
+
+    #[test]
+    fn an_app_may_take_one_typo_when_nothing_holds_the_word() {
+        let index = sample();
+        let apps = applications(&["Safari", "Calendar"]);
+        assert_eq!(
+            ranked(&index, &apps, "safarri"),
+            ["/Applications/Safari.app"]
+        );
+        assert_eq!(
+            ranked(&index, &apps, "safarri !cal"),
+            ["/Applications/Safari.app"]
+        );
+        assert!(ranked(&index, &apps, "^safarri").is_empty());
+        assert!(ranked(&index, &apps, "safarri !saf").is_empty());
+        // A file holds "plan" letter for letter, so no app gets a typo for it.
+        assert_eq!(ranked(&index, &apps, "plan"), ["/home/other/plan.md"]);
+    }
+
+    #[test]
+    fn an_app_in_the_home_folder_shows_once() {
+        let mut builder = IndexBuilder::new();
+        let root = builder.push("/home", NO_PARENT, true);
+        let folder = builder.push("Applications", root, true);
+        builder.push("Gmail.app", folder, true);
+        builder.push("Gmail notes.txt", folder, false);
+        let elsewhere = builder.push("old", root, true);
+        builder.push("Gmail.app", elsewhere, true);
+        let index = builder.finish();
+        let apps = Apps::from_names(Path::new("/home/Applications"), &["Gmail"]);
+        assert_eq!(
+            ranked(&index, &apps, "gmail"),
+            [
+                "/home/Applications/Gmail.app",
+                "/home/old/Gmail.app",
+                "/home/Applications/Gmail notes.txt"
+            ]
+        );
+        // Outside the index, nothing is left out.
+        let apps = applications(&["Gmail"]);
+        assert_eq!(ranked(&index, &apps, "gmail").len(), 4);
+    }
+
+    #[test]
+    fn a_bundle_is_left_out_only_when_its_app_is_found() {
+        let mut builder = IndexBuilder::new();
+        let root = builder.push("/home", NO_PARENT, true);
+        let folder = builder.push("Applications", root, true);
+        builder.push("Gmail.app", folder, true);
+        builder.push("notes.app", folder, false);
+        builder.push(".Hidden.app", folder, true);
+        builder.push("Broken.app", folder, false);
+        let index = builder.finish();
+        let apps = Apps::from_names(Path::new("/home/Applications"), &["Gmail"]);
+        // The app's name lacks ".app" and the folder's name, so only the bundle is found.
+        for query in ["gmail.app", "applications gmail"] {
+            assert_eq!(
+                ranked(&index, &apps, query),
+                ["/home/Applications/Gmail.app"],
+                "{query}"
+            );
+        }
+        // Bundles the app list skipped are files like any other.
+        for (query, path) in [
+            ("notes", "/home/Applications/notes.app"),
+            ("hidden", "/home/Applications/.Hidden.app"),
+            ("broken", "/home/Applications/Broken.app"),
+        ] {
+            assert_eq!(ranked(&index, &apps, query), [path], "{query}");
+        }
+    }
+
+    #[test]
+    fn every_limit_keeps_the_head_when_a_bundle_outranks_its_app() {
+        // "a" sits inside Hat but starts the "app" of Hat.app, so one folder down the bundle
+        // ranks above the app, and so do files a little weaker than the bundle.
+        let mut builder = IndexBuilder::new();
+        let root = builder.push("/home/Applications", NO_PARENT, true);
+        let names = ["Gmail", "Hat", "Mail", "Slack"];
+        for name in names {
+            builder.push(&format!("{name}.app"), root, true);
+        }
+        let mut parent = root;
+        for depth in 0..3 {
+            for name in ["xa", "x-a", "x-a-long", "a", "x a"] {
+                builder.push(&format!("{name}{depth}"), parent, false);
+            }
+            parent = builder.push(&format!("d{depth}"), parent, true);
+        }
+        let index = builder.finish();
+        let apps = Apps::from_names(Path::new("/home/Applications"), &names);
+        let searcher = Searcher::with_threads(2);
+        for query in ["a", "ap", "l", "p"] {
+            let all = searcher
+                .search(&index, &apps, query, searcher.ticket(), 1_000)
+                .unwrap();
+            for limit in 1..=all.len() {
+                let few = searcher
+                    .search(&index, &apps, query, searcher.ticket(), limit)
+                    .unwrap();
+                assert_eq!(few, all[..limit], "{query:?} limit {limit}");
+            }
+        }
+    }
+
+    #[test]
+    fn an_app_folder_as_the_index_root_shows_each_app_once() {
+        let mut builder = IndexBuilder::new();
+        let root = builder.push("/home/Applications", NO_PARENT, true);
+        builder.push("Gmail.app", root, true);
+        let index = builder.finish();
+        let apps = Apps::from_names(Path::new("/home/Applications"), &["Gmail"]);
+        assert_eq!(
+            ranked(&index, &apps, "gmail"),
+            ["/home/Applications/Gmail.app"]
+        );
+
+        let mut builder = IndexBuilder::new();
+        let root = builder.push("/", NO_PARENT, true);
+        let applications = builder.push("Applications", root, true);
+        let utilities = builder.push("Utilities", applications, true);
+        builder.push("Terminal.app", utilities, true);
+        let index = builder.finish();
+        let apps = Apps::from_names(Path::new("/Applications/Utilities"), &["Terminal"]);
+        assert_eq!(
+            ranked(&index, &apps, "terminal"),
+            ["/Applications/Utilities/Terminal.app"]
+        );
+    }
+
+    #[test]
+    fn apps_in_several_folders_show_once_each() {
+        let dir = tempfile::tempdir().unwrap();
+        let top = dir.path().join("Applications");
+        std::fs::create_dir_all(top.join("Xylophone.app")).unwrap();
+        std::fs::create_dir_all(top.join("Utilities/Yodel.app")).unwrap();
+        let apps = Apps::scan_folders(vec![top]);
+        assert_eq!(apps.len(), 2);
+        let mut builder = IndexBuilder::new();
+        let root = builder.push(dir.path().to_str().unwrap(), NO_PARENT, true);
+        let applications = builder.push("Applications", root, true);
+        builder.push("Xylophone.app", applications, true);
+        let utilities = builder.push("Utilities", applications, true);
+        builder.push("Yodel.app", utilities, true);
+        let index = builder.finish();
+        for query in ["xylophone", "yodel"] {
+            let searcher = Searcher::with_threads(1);
+            let hits = searcher
+                .search(&index, &apps, query, searcher.ticket(), 10)
+                .unwrap();
+            assert_eq!(hits.len(), 1, "{query}");
+            assert!(matches!(hits[0].item, Item::App(_)), "{query}");
+        }
+    }
+
+    #[test]
+    fn apps_are_found_with_an_empty_index() {
+        let index = IndexBuilder::new().finish();
+        let mut builder = IndexBuilder::new();
+        builder.push("/home", NO_PARENT, true);
+        let root_only = builder.finish();
+        let apps = applications(&["Maps", "Mail"]);
+        for index in [&index, &root_only] {
+            assert_eq!(ranked(index, &apps, "maps"), ["/Applications/Maps.app"]);
+            assert_eq!(ranked(index, &apps, "ma").len(), 2);
+            assert!(ranked(index, &Apps::default(), "maps").is_empty());
+        }
     }
 }
