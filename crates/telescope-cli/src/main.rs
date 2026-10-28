@@ -5,7 +5,9 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::OnceLock;
 use std::time::Instant;
-use telescope_core::{Access, Apps, Clutter, Hit, Ignore, Index, Item, Opened, Searcher, Settings};
+use telescope_core::{
+    Access, Apps, Clutter, Hit, Ignore, Index, Item, Opened, Searcher, Settings, Within,
+};
 use telescope_grep::Grep;
 
 #[global_allocator]
@@ -25,6 +27,7 @@ add --load <file> to open a saved index instead of scanning (it scans when the f
 damaged or built with other settings, and does not catch up on changes made since it was saved),
 --changes <file> to then read again each folder listed in it, one real absolute path per line
 as FSEvents reports them, and --save <file> to save the index afterwards
+add --in <folder> to search and bench to search only inside that folder of the index
 put -- before text that starts with --, like: tl grep ~ -- --all
 
 your own ignore list, ~/.config/telescope/ignore, takes one folder per line
@@ -45,6 +48,7 @@ struct Options {
     load: Option<PathBuf>,
     changes: Option<PathBuf>,
     save: Option<PathBuf>,
+    within: Option<PathBuf>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -123,6 +127,7 @@ fn parse(mut args: Vec<OsString>) -> Option<(Command, Options)> {
     let load = take(&mut args, "--load")?;
     let changes = take(&mut args, "--changes")?;
     let save = take(&mut args, "--save")?;
+    let within = take(&mut args, "--in")?;
     args.extend(after_dashes);
     let command = match args.as_slice() {
         [flag] if flag == "--version" => Command::Version,
@@ -152,6 +157,10 @@ fn parse(mut args: Vec<OsString>) -> Option<(Command, Options)> {
         },
         _ => return None,
     };
+    // `tl grep ~ todo --in ~/work` would quietly grep all of ~.
+    if within.is_some() && !matches!(command, Command::Search(_) | Command::Bench { .. }) {
+        return None;
+    }
     Some((
         command,
         Options {
@@ -159,6 +168,7 @@ fn parse(mut args: Vec<OsString>) -> Option<(Command, Options)> {
             load,
             changes,
             save,
+            within,
         },
     ))
 }
@@ -351,18 +361,44 @@ fn rank(index: &Index, apps: &Apps, hits: &[Hit], expected: &Path) -> Option<usi
     })
 }
 
+/// The folder `--in` names, worked out once; `Some(None)` searches the whole index.
+fn within(index: &Index, options: &Options) -> Option<Option<Within>> {
+    let Some(folder) = &options.within else {
+        return Some(None);
+    };
+    let started = Instant::now();
+    // The index holds real paths, as the scan resolved them.
+    let real = std::fs::canonicalize(folder).unwrap_or_else(|_| folder.clone());
+    let Some(within) = Within::folder(index, &real) else {
+        eprintln!("tl: {} is not a folder in the index", folder.display());
+        return None;
+    };
+    println!("inside {}, found in {:.2} ms", real.display(), ms(started));
+    Some(Some(within))
+}
+
 fn search(folder: &Path, options: &Options) -> ExitCode {
     let Some(index) = load(folder, options) else {
         return ExitCode::FAILURE;
     };
     let apps = apps();
+    let Some(within) = within(&index, options) else {
+        return ExitCode::FAILURE;
+    };
     let searcher = Searcher::default();
     eprintln!("type a search and press Enter; Ctrl-D quits");
     for line in std::io::stdin().lock().lines() {
         let Ok(query) = line else { break };
         let started = Instant::now();
         let hits = searcher
-            .search(&index, &apps, &query, searcher.ticket(), 10)
+            .search_in(
+                &index,
+                &apps,
+                within.as_ref(),
+                &query,
+                searcher.ticket(),
+                10,
+            )
             .unwrap_or_default();
         println!("{query:?} in {:.1} ms", ms(started));
         for hit in hits {
@@ -406,13 +442,17 @@ fn bench(folder: &Path, options: &Options, query_file: &Path, threads: Option<us
         return ExitCode::FAILURE;
     };
     let apps = apps();
+    let Some(within) = within(&index, options) else {
+        return ExitCode::FAILURE;
+    };
+    let within = within.as_ref();
     let searcher = threads.map_or_else(Searcher::default, Searcher::with_threads);
 
     let mut times: Vec<(f64, &str)> = Vec::new();
     for query in &queries {
         for typed in keystrokes(query) {
             let started = Instant::now();
-            searcher.search(&index, &apps, typed, searcher.ticket(), 50);
+            searcher.search_in(&index, &apps, within, typed, searcher.ticket(), 50);
             times.push((ms(started), typed));
         }
     }
@@ -447,7 +487,10 @@ fn bench(folder: &Path, options: &Options, query_file: &Path, threads: Option<us
                     let query = typed[i.min(typed.len() - 1)];
                     let ticket = searcher.ticket();
                     let (searcher, index, apps) = (&searcher, &index, &apps);
-                    scope.spawn(move || searcher.search(index, apps, query, ticket, 50).is_some())
+                    scope.spawn(move || {
+                        let hits = searcher.search_in(index, apps, within, query, ticket, 50);
+                        hits.is_some()
+                    })
                 })
                 .collect();
             running
@@ -869,6 +912,7 @@ mod tests {
                 load: Some("a.idx".into()),
                 changes: None,
                 save: None,
+                within: None,
             }
         );
         let (_, options) = parse(args("grep ~ todo --save b.idx --changes c.txt")).unwrap();
@@ -879,8 +923,24 @@ mod tests {
                 load: None,
                 changes: Some("c.txt".into()),
                 save: Some("b.idx".into()),
+                within: None,
             }
         );
+        let (found, options) = parse(args("bench ~ --in ~/work q.txt")).unwrap();
+        assert!(matches!(found, Command::Bench { .. }));
+        assert_eq!(options.within, Some("~/work".into()));
+        assert!(parse(args("search ~ --in")).is_none());
+        assert!(parse(args("search ~ --in a --in b")).is_none());
+        for line in [
+            "grep ~ todo --in a",
+            "golden ~ g.tsv --in a",
+            "index ~ --in a",
+            "grep-bench ~ q --in a",
+        ] {
+            assert!(parse(args(line)).is_none(), "{line}");
+        }
+        let (found, _) = parse(args("grep ~ -- --in")).unwrap();
+        assert!(matches!(found, Command::Grep { .. }));
         let (_, options) = parse(args("index ~ --load a.idx --save a.idx")).unwrap();
         assert_eq!(options.load, Some("a.idx".into()));
         assert_eq!(options.save, Some("a.idx".into()));
@@ -984,6 +1044,7 @@ mod tests {
             load: load.map(PathBuf::from),
             changes: changes.map(PathBuf::from),
             save: save.map(PathBuf::from),
+            within: None,
         };
         let same = options(Some("i"), None, Some("i"));
         assert!(unchanged_since_opened(&same, true));

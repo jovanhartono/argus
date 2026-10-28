@@ -22,6 +22,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 use telescope_core::{
     Access, Apps, Clutter, Hit, Ignore, Index, Pages, Scope, Searcher, Settings, Ticket, Watch,
+    Within,
 };
 use telescope_grep::{Found, Grep, Report};
 
@@ -29,7 +30,7 @@ use telescope_grep::{Found, Grep, Report};
 static PAGES: Pages = Pages;
 
 /// Raise this with any change below, so a window built against an older header refuses to start.
-pub const TL_ABI_VERSION: u32 = 5;
+pub const TL_ABI_VERSION: u32 = 6;
 
 pub const TL_OK: u32 = 0;
 /// No rows for that ticket: not ready yet, already taken, or a newer search replaced them.
@@ -204,12 +205,11 @@ enum Job {
     Search {
         ticket: Ticket,
         query: String,
+        /// Only what is inside this folder, a full path.
+        folder: Option<String>,
     },
     /// A list built again, and the milliseconds that took.
-    Swap {
-        index: Arc<Index>,
-        took: u32,
-    },
+    Swap { index: Arc<Index>, took: u32 },
 }
 
 /// What the rebuild thread waits on.
@@ -582,21 +582,48 @@ fn serve(
 ) {
     // The window has no app rows yet.
     let apps = Apps::default();
+    // The folder searched inside, worked out once for every keystroke typed there; `None`
+    // beside it when the list holds no such folder.
+    let mut inside: Option<(String, Option<Within>)> = None;
     while let Ok(job) = inbox.recv() {
-        let (ticket, query) = match job {
+        let (ticket, query, folder) = match job {
             // Searches sent before this one ran on the old list; the old list is freed here.
             Job::Swap { index: fresh, took } => {
                 index = fresh;
+                inside = None;
                 notify.send(
                     TL_EVENT_REBUILT,
                     u64::from(took) << 32 | index.entry_count() as u64,
                 );
                 continue;
             }
-            Job::Search { ticket, query } => (ticket, query),
+            Job::Search {
+                ticket,
+                query,
+                folder,
+            } => (ticket, query, folder),
+        };
+        let hits = match folder {
+            None => {
+                inside = None;
+                searcher.search(&index, &apps, &query, ticket, ROWS)
+            }
+            Some(folder) => {
+                if inside.as_ref().is_none_or(|(path, _)| *path != folder) {
+                    let within = Within::folder(&index, Path::new(&folder));
+                    inside = Some((folder, within));
+                }
+                match inside.as_ref().and_then(|(_, within)| within.as_ref()) {
+                    Some(within) => {
+                        searcher.search_in(&index, &apps, Some(within), &query, ticket, ROWS)
+                    }
+                    // Gone since you went into it: nothing is inside.
+                    None => Some(Vec::new()),
+                }
+            }
         };
         // A search replaced by a newer keystroke gives up and is never shown.
-        let Some(hits) = searcher.search(&index, &apps, &query, ticket, ROWS) else {
+        let Some(hits) = hits else {
             continue;
         };
         // A key pressed just as the search finished: skip rows the window would refuse.
@@ -742,13 +769,22 @@ fn pack(index: &Index, hits: &[Hit]) -> Packed {
     packed
 }
 
-/// Starts a search and returns its ticket, or 0 on failure. Every older search gives up.
+/// Starts a search and returns its ticket, or 0 on failure. Every older search gives up. With a
+/// `folder`, a full path as the rows give it, only what is inside that folder is found, ranked
+/// as in a search of everything; a folder the list doesn't hold finds nothing. Without one
+/// (`folder_len` 0), everything is searched.
 ///
 /// # Safety
-/// `core` came from `tl_core_new` or `tl_core_new_stand_in`, and `query` points to `len` bytes of UTF-8
-/// (or `len` is 0).
+/// `core` came from `tl_core_new` or `tl_core_new_stand_in`, `query` points to `len` bytes of
+/// UTF-8 (or `len` is 0), and `folder` to `folder_len` (or `folder_len` is 0).
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn tl_submit(core: *const TlCore, query: *const u8, len: usize) -> u64 {
+pub unsafe extern "C" fn tl_submit(
+    core: *const TlCore,
+    query: *const u8,
+    len: usize,
+    folder: *const u8,
+    folder_len: usize,
+) -> u64 {
     guard(0, || {
         let core = unsafe { &*core };
         // An empty search box can arrive as a null pointer, which a slice must never hold.
@@ -756,13 +792,25 @@ pub unsafe extern "C" fn tl_submit(core: *const TlCore, query: *const u8, len: u
             0 => &[],
             _ => unsafe { std::slice::from_raw_parts(query, len) },
         };
+        let folder = match folder_len {
+            0 => None,
+            _ => {
+                let bytes = unsafe { std::slice::from_raw_parts(folder, folder_len) };
+                Some(String::from_utf8_lossy(bytes).into_owned())
+            }
+        };
         let ticket = core.searcher.ticket();
         let query = String::from_utf8_lossy(bytes).into_owned();
+        let job = Job::Search {
+            ticket,
+            query,
+            folder,
+        };
         // Sending fails only once the worker has stopped, which it reported as TL_EVENT_FAILED.
         let sent = core
             .jobs
             .as_ref()
-            .is_some_and(|jobs| jobs.send(Job::Search { ticket, query }).is_ok());
+            .is_some_and(|jobs| jobs.send(job).is_ok());
         if sent { ticket.number() } else { 0 }
     })
 }
@@ -1459,7 +1507,20 @@ mod tests {
     }
 
     fn submit(core: &Core, query: &str) -> u64 {
-        unsafe { tl_submit(core.0, query.as_ptr(), query.len()) }
+        unsafe { tl_submit(core.0, query.as_ptr(), query.len(), std::ptr::null(), 0) }
+    }
+
+    fn submit_in(core: &Core, query: &str, folder: &str) -> u64 {
+        let (at, len) = (folder.as_ptr(), folder.len());
+        unsafe { tl_submit(core.0, query.as_ptr(), query.len(), at, len) }
+    }
+
+    /// The names a search inside `folder` finds, once its rows are ready.
+    fn found_in(core: &Core, events: &Events, query: &str, folder: &Path) -> Vec<String> {
+        let ticket = submit_in(core, query, folder.to_str().unwrap());
+        events.wait_for(TL_EVENT_READY, ticket);
+        let rows = take(core, ticket).unwrap();
+        rows.into_iter().map(|(name, ..)| name).collect()
     }
 
     fn take(core: &Core, ticket: u64) -> Option<Vec<(String, String, bool)>> {
@@ -1595,9 +1656,102 @@ mod tests {
     fn an_empty_search_box_needs_no_pointer() {
         let events = Events::default();
         let core = start(100, &events);
-        let ticket = unsafe { tl_submit(core.0, std::ptr::null(), 0) };
+        let ticket = unsafe { tl_submit(core.0, std::ptr::null(), 0, std::ptr::null(), 0) };
         events.wait_for(TL_EVENT_READY, ticket);
         assert_eq!(take(&core, ticket), Some(Vec::new()));
+        let folder = "/stand-in";
+        let ticket = unsafe { tl_submit(core.0, std::ptr::null(), 0, folder.as_ptr(), 6) };
+        events.wait_for(TL_EVENT_READY, ticket);
+        assert_eq!(take(&core, ticket), Some(Vec::new()));
+    }
+
+    #[test]
+    fn a_search_inside_a_folder_comes_back_as_its_rows() {
+        let events = Events::default();
+        let core = start(20_000, &events);
+        let index = telescope_core::stand_in(20_000);
+        let searcher = Searcher::with_threads(1);
+        let apps = Apps::default();
+        let mut checked = 0;
+        for entry in (1..2_000).filter(|&entry| index.is_dir(entry)).step_by(97) {
+            let folder = index.path(entry);
+            let within = Some(Within::folder(&index, &folder).unwrap());
+            for query in ["budget", "re", "notes md", "tax !pdf"] {
+                let ticket = searcher.ticket();
+                let expected: Vec<String> = searcher
+                    .search_in(&index, &apps, within.as_ref(), query, ticket, ROWS)
+                    .unwrap()
+                    .iter()
+                    .map(|hit| index.name(hit.entry().unwrap()).to_owned())
+                    .collect();
+                checked += expected.len();
+                assert_eq!(
+                    found_in(&core, &events, query, &folder),
+                    expected,
+                    "{folder:?}"
+                );
+            }
+        }
+        assert!(checked > 100, "{checked}");
+        // Back out, everything is searched again.
+        let folder = index.path((1..).find(|&entry| index.is_dir(entry)).unwrap());
+        assert!(!found_in(&core, &events, "budget", &folder).is_empty());
+        let ticket = submit(&core, "budget");
+        events.wait_for(TL_EVENT_READY, ticket);
+        let rows = take(&core, ticket).unwrap();
+        assert_eq!(rows.len(), ROWS);
+        let outside = |(_, at, _): &(String, String, bool)| !Path::new(at).starts_with(&folder);
+        assert!(rows.iter().any(outside), "{folder:?}");
+    }
+
+    #[test]
+    fn a_folder_the_list_does_not_hold_finds_nothing() {
+        let events = Events::default();
+        let core = start(2_000, &events);
+        for folder in [
+            "/stand-in/nowhere",
+            "/elsewhere",
+            "stand-in",
+            "/stand-in/..",
+        ] {
+            assert!(found_in(&core, &events, "budget", Path::new(folder)).is_empty());
+        }
+        let bytes = [0xff, 0xfe];
+        let ticket = unsafe { tl_submit(core.0, "budget".as_ptr(), 6, bytes.as_ptr(), 2) };
+        events.wait_for(TL_EVENT_READY, ticket);
+        assert_eq!(take(&core, ticket), Some(Vec::new()));
+    }
+
+    #[test]
+    fn a_search_inside_a_folder_sees_the_new_list() {
+        let (_dir, home) = home_with(&["notes/budget a.txt", "work/budget w.txt"]);
+        let events = Events::default();
+        let core = scan(home.to_str().unwrap(), 1, &events);
+        events.wait_for(TL_EVENT_INDEXED, 5);
+        let notes = home.join("notes");
+        assert_eq!(found_in(&core, &events, "budget", &notes), ["budget a.txt"]);
+
+        std::fs::write(notes.join("budget b.txt"), "").unwrap();
+        assert_eq!(changed(&core, &[&notes], 0), 1);
+        assert_eq!(events.wait_for_rebuilt(1), 6);
+        let mut found = found_in(&core, &events, "budget", &notes);
+        found.sort();
+        assert_eq!(found, ["budget a.txt", "budget b.txt"]);
+
+        std::fs::remove_dir_all(&notes).unwrap();
+        assert_eq!(changed(&core, &[&home], 0), 1);
+        assert_eq!(events.wait_for_rebuilt(2), 3);
+        assert!(found_in(&core, &events, "budget", &notes).is_empty());
+        let work = home.join("work");
+        assert_eq!(found_in(&core, &events, "budget", &work), ["budget w.txt"]);
+
+        // A folder gone and made again is found once the new list arrives.
+        assert!(found_in(&core, &events, "budget", &notes).is_empty());
+        std::fs::create_dir(&notes).unwrap();
+        std::fs::write(notes.join("budget c.txt"), "").unwrap();
+        assert_eq!(changed(&core, &[&home], 0), 1);
+        assert_eq!(events.wait_for_rebuilt(3), 5);
+        assert_eq!(found_in(&core, &events, "budget", &notes), ["budget c.txt"]);
     }
 
     fn scan(home: &str, full_disk: u32, events: &Events) -> Core {
@@ -1733,7 +1887,13 @@ mod tests {
         let (jobs, inbox) = mpsc::channel();
         let ticket = searcher.ticket();
         let query = "budget".to_owned();
-        jobs.send(Job::Search { ticket, query }).unwrap();
+        let folder = None;
+        jobs.send(Job::Search {
+            ticket,
+            query,
+            folder,
+        })
+        .unwrap();
 
         work(
             Source::StandIn(2_000),
@@ -2166,6 +2326,7 @@ mod tests {
         jobs.send(Job::Search {
             ticket: before,
             query: query.clone(),
+            folder: None,
         })
         .unwrap();
         jobs.send(Job::Swap {
@@ -2195,6 +2356,7 @@ mod tests {
         jobs.send(Job::Search {
             ticket: after,
             query,
+            folder: None,
         })
         .unwrap();
         drop(jobs);

@@ -93,7 +93,9 @@ pub fn stand_in(count: usize) -> Index {
             builder.push(name, parent, false);
         }
     }
-    builder.finish()
+    let mut index = builder.finish();
+    index.children_apart = true;
+    index
 }
 
 #[cfg(test)]

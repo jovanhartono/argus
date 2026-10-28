@@ -364,6 +364,248 @@ final class SearchPanelTests: XCTestCase {
         XCTAssertFalse(full.control(NSTextField(), textView: NSTextView(), doCommandBy: #selector(NSResponder.insertTab(_:))))
     }
 
+    func testTabOnAFolderSearchesInsideItAndBackspaceStepsBackOut() async throws {
+        for path in ["notes/budget a.txt", "notes/deep/budget d.txt", "work/budget w.txt"] {
+            let file = root.appendingPathComponent(path)
+            try FileManager.default.createDirectory(
+                at: file.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try Data().write(to: file)
+        }
+        let window = try await opened(access: true)
+        window.show()
+        defer { window.hide() }
+        XCTAssertTrue(window.chip.isHidden)
+        let wide = window.field.frame
+
+        try await type("notes", in: window)
+        try await until { window.rows.first?.name == "notes" }
+        XCTAssertTrue(tab(window))
+        XCTAssertEqual(window.scopes.map(\.name), ["notes"])
+        XCTAssertEqual(window.field.stringValue, "")
+        XCTAssertFalse(window.chip.isHidden)
+        XCTAssertEqual(window.chipText.stringValue, "notes")
+        XCTAssertEqual(window.field.placeholderString, "Search in notes")
+        XCTAssertGreaterThan(window.field.frame.minX, window.chip.frame.maxX)
+        XCTAssertEqual(window.field.frame.maxX, wide.maxX)
+        // An empty box shows no list, once the window has shrunk back.
+        try await until { window.panel.frame.height == Metric.field }
+
+        try await type("budget", in: window)
+        try await until { Set(window.rows.map(\.name)) == ["budget a.txt", "budget d.txt"] }
+        XCTAssertFalse(backspace(window), "with text in the box, Backspace deletes a letter")
+
+        try await type("deep", in: window)
+        try await until { window.rows.map(\.name) == ["deep"] }
+        XCTAssertTrue(tab(window))
+        XCTAssertEqual(window.chipText.stringValue, "notes › deep")
+        try await type("budget", in: window)
+        try await until { window.rows.map(\.name) == ["budget d.txt"] }
+
+        try await type("", in: window)
+        XCTAssertTrue(backspace(window))
+        XCTAssertEqual(window.scopes.map(\.name), ["notes"])
+        try await type("budget", in: window)
+        try await until { window.rows.count == 2 }
+
+        try await type("", in: window)
+        XCTAssertTrue(backspace(window))
+        XCTAssertTrue(window.scopes.isEmpty)
+        XCTAssertTrue(window.chip.isHidden)
+        XCTAssertEqual(window.field.frame, wide)
+        XCTAssertEqual(window.field.placeholderString, "Search")
+        XCTAssertFalse(backspace(window), "nothing left to step out of")
+        try await type("budget", in: window)
+        try await until { window.rows.count == 3 }
+    }
+
+    func testTabOnAFileOrNoResultsIsLeftAlone() async throws {
+        try Data().write(to: root.appendingPathComponent("budget.txt"))
+        let window = try await opened(access: true)
+        XCTAssertFalse(tab(window), "an empty box")
+        try await type("budget", in: window)
+        try await until { window.rows.count == 1 }
+        XCTAssertFalse(tab(window))
+        try await type("zzzzqqq", in: window)
+        try await until { window.rows.isEmpty && window.panel.frame.height > Metric.field }
+        XCTAssertFalse(tab(window))
+        XCTAssertTrue(window.scopes.isEmpty)
+    }
+
+    func testTabOnAFileStillReachesOpenSettings() async throws {
+        try Data().write(to: root.appendingPathComponent("budget.txt"))
+        let window = try await opened(access: false)
+        try await type("budget", in: window)
+        try await until { window.rows.count == 1 }
+        window.panel.makeFirstResponder(nil)
+        XCTAssertTrue(tab(window))
+        XCTAssertTrue(window.panel.firstResponder === window.settings)
+        XCTAssertTrue(window.scopes.isEmpty)
+    }
+
+    func testTabPressedBeforeTheResultsArriveWaitsForThem() async throws {
+        try FileManager.default.createDirectory(
+            at: root.appendingPathComponent("notes/inner"), withIntermediateDirectories: true)
+        let window = try await opened(access: true)
+        try await type("notes", in: window)
+        XCTAssertTrue(tab(window), "Tab waits for the results for what you typed")
+        try await until { window.scopes.map(\.name) == ["notes"] }
+        try await type("inner", in: window)
+        try await until { window.rows.map(\.name) == ["inner"] }
+
+        // Typing on cancels a Tab still waiting.
+        try await type("", in: window)
+        XCTAssertTrue(backspace(window))
+        try await type("note", in: window)
+        XCTAssertTrue(tab(window))
+        try await type("notes", in: window)
+        try await until { window.rows.first?.name == "notes" }
+        XCTAssertTrue(window.scopes.isEmpty)
+    }
+
+    func testInsideAFolderTheSearchRunsAgainOnANewList() async throws {
+        let notes = root.appendingPathComponent("notes")
+        try FileManager.default.createDirectory(at: notes, withIntermediateDirectories: false)
+        try Data().write(to: notes.appendingPathComponent("budget a.txt"))
+        try Data().write(to: root.appendingPathComponent("budget top.txt"))
+        let window = try await opened(access: true)
+        window.show()
+        defer { window.hide() }
+        try await type("notes", in: window)
+        try await until { window.rows.first?.name == "notes" }
+        XCTAssertTrue(tab(window))
+        try await type("budget", in: window)
+        try await until { window.rows.map(\.name) == ["budget a.txt"] }
+
+        try Data().write(to: notes.appendingPathComponent("budget b.txt"))
+        try await until { window.rows.count == 2 }
+        XCTAssertEqual(Set(window.rows.map(\.name)), ["budget a.txt", "budget b.txt"])
+
+        try FileManager.default.removeItem(at: notes)
+        try await until { window.rows.isEmpty }
+        XCTAssertEqual(window.scopes.map(\.name), ["notes"], "a folder gone keeps its chip until you leave it")
+    }
+
+    func testTheChipKeepsLongNamesInsideItsWidth() async throws {
+        let long = String(repeating: "quarterly report ", count: 6).trimmingCharacters(in: .whitespaces)
+        try FileManager.default.createDirectory(
+            at: root.appendingPathComponent(long), withIntermediateDirectories: false)
+        let window = try await opened(access: true)
+        try await type("quarterly", in: window)
+        try await until { window.rows.first?.name == long }
+        XCTAssertTrue(tab(window))
+        XCTAssertLessThanOrEqual(window.chip.frame.width, Metric.chip)
+        XCTAssertGreaterThan(window.field.frame.width, Metric.width / 2)
+        XCTAssertEqual(window.chip.toolTip, window.scopes.last?.path)
+    }
+
+    func testTabPressedBeforeAFileArrivesStillReachesOpenSettings() async throws {
+        try Data().write(to: root.appendingPathComponent("budget.txt"))
+        let window = try await opened(access: false)
+        try await type("budget", in: window)
+        window.panel.makeFirstResponder(nil)
+        XCTAssertTrue(tab(window), "Tab waits for the results for what you typed")
+        try await until { window.panel.firstResponder === window.settings }
+        XCTAssertTrue(window.scopes.isEmpty)
+    }
+
+    func testTabEntersTheFolderYouPicked() async throws {
+        for name in ["plan a.txt", "plan b.txt"] {
+            try Data().write(to: root.appendingPathComponent(name))
+        }
+        for name in ["plan c", "plan d"] {
+            try FileManager.default.createDirectory(
+                at: root.appendingPathComponent(name), withIntermediateDirectories: false)
+        }
+        let window = try await opened(access: true)
+        try await type("plan", in: window)
+        try await until { window.rows.count == 4 }
+        let move = { (row: Int) in
+            while let at = window.rows.firstIndex(where: { $0.path == window.selected?.path }), at != row {
+                let way = at < row ? #selector(NSResponder.moveDown(_:)) : #selector(NSResponder.moveUp(_:))
+                XCTAssertTrue(window.control(NSTextField(), textView: NSTextView(), doCommandBy: way))
+            }
+        }
+        move(try XCTUnwrap(window.rows.lastIndex { !$0.isFolder }))
+        XCTAssertFalse(tab(window), "a file")
+        let folder = try XCTUnwrap(window.rows.lastIndex { $0.isFolder })
+        XCTAssertGreaterThan(folder, 0)
+        move(folder)
+        let picked = window.rows[folder]
+        XCTAssertTrue(tab(window))
+        XCTAssertEqual(window.scopes, [picked])
+    }
+
+    func testHoldingBackspaceStopsAtTheEmptyBox() async throws {
+        try FileManager.default.createDirectory(
+            at: root.appendingPathComponent("notes/inner"), withIntermediateDirectories: true)
+        let window = try await opened(access: true)
+        for name in ["notes", "inner"] {
+            try await type(name, in: window)
+            try await until { window.rows.first?.name == name }
+            XCTAssertTrue(tab(window))
+        }
+        defer { clearCurrentEvent() }
+        try currentKey(repeating: true)
+        XCTAssertTrue(backspace(window), "a held key is used up")
+        XCTAssertEqual(window.scopes.map(\.name), ["notes", "inner"])
+        try currentKey(repeating: false)
+        XCTAssertTrue(backspace(window))
+        XCTAssertEqual(window.scopes.map(\.name), ["notes"])
+    }
+
+    func testHalfTypedJapaneseKeepsTabAndBackspaceForTheInputMethod() async throws {
+        try FileManager.default.createDirectory(
+            at: root.appendingPathComponent("notes"), withIntermediateDirectories: false)
+        let window = try await opened(access: true)
+        window.show()
+        defer { window.hide() }
+        try await type("notes", in: window)
+        try await until { window.rows.first?.name == "notes" }
+        window.panel.makeFirstResponder(window.field)
+        let editor = try XCTUnwrap(window.field.currentEditor() as? NSTextView)
+        let nowhere = NSRange(location: NSNotFound, length: 0)
+        editor.setMarkedText("か", selectedRange: NSRange(location: 1, length: 0), replacementRange: nowhere)
+        XCTAssertFalse(tab(window))
+        XCTAssertTrue(window.scopes.isEmpty)
+
+        editor.unmarkText()
+        try await type("notes", in: window)
+        XCTAssertTrue(tab(window))
+        try await until { window.scopes.map(\.name) == ["notes"] }
+        editor.setMarkedText("か", selectedRange: NSRange(location: 1, length: 0), replacementRange: nowhere)
+        XCTAssertTrue(editor.hasMarkedText())
+        XCTAssertFalse(backspace(window))
+        XCTAssertEqual(window.scopes.map(\.name), ["notes"])
+    }
+
+    func testAFolderWithAccentsAndJapaneseIsSearchedInside() async throws {
+        let folder = root.appendingPathComponent("notes é/会議")
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        try Data().write(to: folder.appendingPathComponent("budget.txt"))
+        try Data().write(to: root.appendingPathComponent("budget top.txt"))
+        let window = try await opened(access: true)
+        try await type("会議", in: window)
+        try await until { window.rows.first?.name == "会議" }
+        XCTAssertTrue(tab(window))
+        try await type("budget", in: window)
+        try await until { window.rows.map(\.name) == ["budget.txt"] }
+    }
+
+    func testTheFolderIsStillSearchedAfterHidingAndShowing() async throws {
+        try FileManager.default.createDirectory(
+            at: root.appendingPathComponent("notes"), withIntermediateDirectories: false)
+        let window = try await opened(access: true)
+        window.show()
+        try await type("notes", in: window)
+        try await until { window.rows.first?.name == "notes" }
+        XCTAssertTrue(tab(window))
+        window.hide()
+        window.show()
+        defer { window.hide() }
+        XCTAssertEqual(window.scopes.map(\.name), ["notes"], "the window comes back as you left it")
+        XCTAssertFalse(window.chip.isHidden)
+    }
+
     func testARowsURLIsItsPathAndKnowsAFolder() {
         let file = Row(name: "budget.txt", folder: "/Users/me/notes", isFolder: false)
         XCTAssertEqual(file.url, URL(fileURLWithPath: "/Users/me/notes/budget.txt"))
@@ -1267,6 +1509,36 @@ final class SearchPanelTests: XCTestCase {
     private func type(_ text: String, in window: SearchPanel) async throws {
         window.field.stringValue = text
         window.controlTextDidChange(Notification(name: NSControl.textDidChangeNotification))
+    }
+
+    private func tab(_ window: SearchPanel) -> Bool {
+        window.control(NSTextField(), textView: NSTextView(), doCommandBy: #selector(NSResponder.insertTab(_:)))
+    }
+
+    /// Makes a Backspace, held down or not, the event the app is handling.
+    private func currentKey(repeating: Bool) throws {
+        let event = try XCTUnwrap(
+            NSEvent.keyEvent(
+                with: .keyDown, location: .zero, modifierFlags: [], timestamp: 0, windowNumber: 0, context: nil,
+                characters: "\u{7F}", charactersIgnoringModifiers: "\u{7F}", isARepeat: repeating, keyCode: 51))
+        NSApp.postEvent(event, atStart: true)
+        _ = NSApp.nextEvent(matching: .keyDown, until: .distantPast, inMode: .default, dequeue: true)
+        XCTAssertEqual(NSApp.currentEvent?.isARepeat, repeating)
+    }
+
+    /// Later tests must not see a keystroke at time 0 as the one that started their search.
+    private func clearCurrentEvent() {
+        guard
+            let event = NSEvent.otherEvent(
+                with: .applicationDefined, location: .zero, modifierFlags: [], timestamp: 0, windowNumber: 0,
+                context: nil, subtype: 0, data1: 0, data2: 0)
+        else { return }
+        NSApp.postEvent(event, atStart: true)
+        _ = NSApp.nextEvent(matching: .applicationDefined, until: .distantPast, inMode: .default, dequeue: true)
+    }
+
+    private func backspace(_ window: SearchPanel) -> Bool {
+        window.control(NSTextField(), textView: NSTextView(), doCommandBy: #selector(NSResponder.deleteBackward(_:)))
     }
 
     private func down(_ window: SearchPanel) {

@@ -2,6 +2,7 @@
 
 use crate::apps::{AppId, Apps};
 use crate::index::{EntryId, Index, NO_PARENT, NameId, letter, letters};
+use crate::within::Within;
 use frizbee::{Config, Match, Matcher, Matching, Pattern, Scoring, SortStrategy};
 use rayon::prelude::*;
 use std::sync::Mutex;
@@ -96,6 +97,10 @@ struct Scratch {
     no_shortcuts: bool,
     #[cfg(test)]
     early_stops: usize,
+    #[cfg(test)]
+    outside_checks: usize,
+    #[cfg(test)]
+    later_passes: usize,
 }
 
 impl Scratch {
@@ -157,6 +162,20 @@ impl Searcher {
         ticket: Ticket,
         limit: usize,
     ) -> Option<Vec<Hit>> {
+        self.search_in(index, apps, None, query, ticket, limit)
+    }
+
+    /// As `search`, keeping only the files inside `within`, which was made from this `index`.
+    /// They rank as they would in a search of everything, so the folder only filters.
+    pub fn search_in(
+        &self,
+        index: &Index,
+        apps: &Apps,
+        within: Option<&Within>,
+        query: &str,
+        ticket: Ticket,
+        limit: usize,
+    ) -> Option<Vec<Hit>> {
         let stale = || self.tickets.is_stale(ticket);
         let mut turn = self.turn.lock().unwrap();
         if stale() {
@@ -164,7 +183,7 @@ impl Searcher {
         }
         let scratch = &mut *turn;
         self.pool.install(|| {
-            let hits = run(index, apps, query, limit, scratch, &stale)?;
+            let hits = run(index, apps, query, limit, within, scratch, &stale)?;
             (!stale()).then_some(hits)
         })
     }
@@ -175,9 +194,11 @@ fn run(
     apps: &Apps,
     query: &str,
     limit: usize,
+    within: Option<&Within>,
     scratch: &mut Scratch,
     stale: &(impl Fn() -> bool + Sync),
 ) -> Option<Vec<Hit>> {
+    let names = within.map(|within| within.names.as_slice());
     let mut parsed = Pattern::parse_query(query);
     // Past eight words, extra search words are dropped before any exclusion.
     parsed.sort_by_key(|word| !word.negated);
@@ -216,6 +237,7 @@ fn run(
     let (mut matched, held) = match_names(
         index,
         &words,
+        names,
         !later,
         wanted,
         if ceiling.is_some() {
@@ -229,8 +251,20 @@ fn run(
     // The file you want almost always holds each word you type, letter for letter. A word no
     // name holds is probably misspelled, like "desing", so it may take one typo. An app's
     // name counts, so "safari" finds Safari, not files a typo away from it.
-    let unsure = wanted & typo_ready & !(held | app_held);
-    if unsure != 0 && wanted & !app_matched & !unsure == 0 {
+    let mut unsure = wanted & typo_ready & !(held | app_held);
+    if unsure != 0 && names.is_some() {
+        // "desing" in a folder of design.pdf finds nothing when desing.txt sits elsewhere.
+        #[cfg(test)]
+        {
+            scratch.outside_checks += 1;
+        }
+        let pass = Pass::Outside;
+        unsure &= !match_names(index, &words, names, unsure, unsure, pass, scratch, stale)?.1;
+    }
+    if within.is_some() {
+        // Apps live outside the user's folders, so a search inside one shows none.
+        app_hits.clear();
+    } else if unsure != 0 && wanted & !app_matched & !unsure == 0 {
         app_hits.clear();
         match_apps(
             apps,
@@ -246,6 +280,7 @@ fn run(
         (matched, _) = match_names(
             index,
             &words,
+            names,
             !later,
             wanted,
             Pass::Everywhere { typos: unsure },
@@ -256,8 +291,13 @@ fn run(
     if later != 0 && wanted & !later & !matched == 0 {
         // Folder words without the common ones yet; they are worked out again below.
         words_above(index, scratch, stale)?;
-        mark_possible(index, wanted & !later, unwanted, scratch, stale)?;
-        matched |= match_names(index, &words, later, wanted, Pass::Possible, scratch, stale)?.0;
+        mark_possible(index, within, wanted & !later, unwanted, scratch, stale)?;
+        #[cfg(test)]
+        {
+            scratch.later_passes += 1;
+        }
+        let pass = Pass::Possible;
+        matched |= match_names(index, &words, names, later, wanted, pass, scratch, stale)?.0;
     }
     // Room for the bundles an app hit may hide, so `limit` files are left once they are
     // dropped. Only apps inside the indexed folder have one, like those in ~/Applications.
@@ -288,7 +328,16 @@ fn run(
         let deep = u32::from(ceiling) + 4 * DEPTH_PENALTY;
         let mut winners = scratch.name_score.iter().filter(|&&s| u32::from(s) > deep);
         if winners.nth(wide - 1).is_some() {
-            let hits = best(index, scratch, wanted, unwanted, &folder_bonus, wide, stale)?;
+            let hits = best(
+                index,
+                within,
+                scratch,
+                wanted,
+                unwanted,
+                &folder_bonus,
+                wide,
+                stale,
+            )?;
             // Every entry sits at least one folder deep, which costs a plain name a little more.
             let plain_best = u32::from(ceiling).saturating_sub(DEPTH_PENALTY);
             if hits.len() == wide && hits[wide - 1].score > plain_best {
@@ -299,7 +348,8 @@ fn run(
                 return Some(with_apps(index, apps, hits, app_hits, limit));
             }
         }
-        matched |= match_names(index, &words, wanted, wanted, Pass::Rest, scratch, stale)?.0;
+        let pass = Pass::Rest;
+        matched |= match_names(index, &words, names, wanted, wanted, pass, scratch, stale)?.0;
     }
     if wanted & !matched != 0 {
         return Some(with_apps(index, apps, Vec::new(), app_hits, limit));
@@ -307,7 +357,16 @@ fn run(
     if uses_folders(wanted, unwanted) {
         words_above(index, scratch, stale)?;
     }
-    let hits = best(index, scratch, wanted, unwanted, &folder_bonus, wide, stale)?;
+    let hits = best(
+        index,
+        within,
+        scratch,
+        wanted,
+        unwanted,
+        &folder_bonus,
+        wide,
+        stale,
+    )?;
     Some(with_apps(index, apps, hits, app_hits, limit))
 }
 
@@ -317,8 +376,13 @@ fn uses_folders(wanted: u8, unwanted: u8) -> bool {
 }
 
 /// The best `limit` entries whose path holds every `wanted` word and no `unwanted` one.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one search's state, split for the borrow checker"
+)]
 fn best(
     index: &Index,
+    within: Option<&Within>,
     scratch: &Scratch,
     wanted: u8,
     unwanted: u8,
@@ -333,17 +397,18 @@ fn best(
         folder_words,
         ..
     } = scratch;
-    let chunks: Vec<Vec<Hit>> = index
-        .entry_name
+    let entries = within.map_or(0..index.len(), |within| within.entries.clone());
+    let start = entries.start;
+    let chunks: Vec<Vec<Hit>> = index.entry_name[entries.clone()]
         .par_chunks(ENTRY_CHUNK)
-        .zip(index.entry_parent.par_chunks(ENTRY_CHUNK))
-        .zip(index.entry_depth.par_chunks(ENTRY_CHUNK))
+        .zip(index.entry_parent[entries.clone()].par_chunks(ENTRY_CHUNK))
+        .zip(index.entry_depth[entries].par_chunks(ENTRY_CHUNK))
         .enumerate()
         .map(|(chunk, ((names, parents), depths))| {
             if stale() {
                 return None;
             }
-            let first = chunk * ENTRY_CHUNK;
+            let first = start + chunk * ENTRY_CHUNK;
             let mut hits = Vec::with_capacity((2 * limit).min(names.len()));
             // Once `limit` hits are kept, anything ranking below the weakest is skipped,
             // so a one-letter search does not collect two million hits to keep 50.
@@ -352,6 +417,9 @@ fn best(
             for (i, ((&name, &parent), &depth)) in entries {
                 let own = name_words[name as usize];
                 if own & wanted == 0 || parent == NO_PARENT {
+                    continue;
+                }
+                if within.is_some_and(|within| !within.holds(parent)) {
                     continue;
                 }
                 let mut path = own;
@@ -525,13 +593,21 @@ enum Pass {
     Rest,
     /// Only the names marked possible, adding to what the earlier pass found.
     Possible,
+    /// Only the names left out of `names`, to learn which words a name there holds.
+    Outside,
 }
 
-/// Each distinct name is matched once, however many folders hold it, for the `active` words.
-/// Returns the words that matched at least one name, and the search words some name holds.
+/// Each distinct name is matched once, however many folders hold it, for the `active` words;
+/// only those set in `names` when given, or for `Pass::Outside` those not set. Returns the words that matched at least one name, and
+/// the search words some name holds.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one search's state, split for the borrow checker"
+)]
 fn match_names(
     index: &Index,
     words: &[Pattern],
+    names: Option<&[u64]>,
     active: u8,
     wanted: u8,
     pass: Pass,
@@ -541,7 +617,7 @@ fn match_names(
     let config = matcher_config();
     let typo_words = match pass {
         Pass::Everywhere { typos } => typos,
-        Pass::Strong | Pass::Rest | Pass::Possible => 0,
+        Pass::Strong | Pass::Rest | Pass::Possible | Pass::Outside => 0,
     };
     let typos = |w: usize| u16::from(typo_words >> w & 1);
     let needed: Vec<u64> = words.iter().map(|word| letters(&word.needle)).collect();
@@ -560,6 +636,7 @@ fn match_names(
         ..
     } = scratch;
     let only_possible = matches!(pass, Pass::Possible);
+    let outside = matches!(pass, Pass::Outside);
     if matches!(pass, Pass::Everywhere { .. } | Pass::Strong) {
         name_words.clear();
         name_words.resize(index.distinct_names(), 0);
@@ -599,6 +676,11 @@ fn match_names(
                         if only_possible && !is_marked(possible, n) {
                             continue;
                         }
+                        if names
+                            .is_some_and(|names| (names[n / 64] >> (n % 64) & 1 == 1) == outside)
+                        {
+                            continue;
+                        }
                         let have = index.name_letters[n];
                         if (needed[w] & !have).count_ones() > u32::from(typos(w)) {
                             continue;
@@ -608,7 +690,7 @@ fn match_names(
                         let skip = match pass {
                             Pass::Strong => plain(),
                             Pass::Rest => !plain(),
-                            Pass::Everywhere { .. } | Pass::Possible => false,
+                            Pass::Everywhere { .. } | Pass::Possible | Pass::Outside => false,
                         };
                         if skip {
                             continue;
@@ -796,6 +878,7 @@ fn common_words(index: &Index, words: &[Pattern], wanted: u8, typo_ready: u8) ->
 /// and no `unwanted` one, and each folder above one.
 fn mark_possible(
     index: &Index,
+    within: Option<&Within>,
     rare: u8,
     unwanted: u8,
     scratch: &mut Scratch,
@@ -811,16 +894,16 @@ fn mark_possible(
     reset(possible, index.distinct_names());
     reset(walked, index.len());
     let (possible, walked) = (&*possible, &*walked);
-    index
-        .entry_name
+    let entries = within.map_or(0..index.len(), |within| within.entries.clone());
+    index.entry_name[entries.clone()]
         .par_chunks(ENTRY_CHUNK)
-        .zip(index.entry_parent.par_chunks(ENTRY_CHUNK))
+        .zip(index.entry_parent[entries].par_chunks(ENTRY_CHUNK))
         .try_for_each(|(names, parents)| {
             if stale() {
                 return None;
             }
             for (&name, &parent) in names.iter().zip(parents) {
-                if parent == NO_PARENT {
+                if parent == NO_PARENT || within.is_some_and(|within| !within.holds(parent)) {
                     continue;
                 }
                 let path = name_words[name as usize] | folder_words[parent as usize];
@@ -1202,8 +1285,8 @@ mod tests {
             no_shortcuts: true,
             ..Scratch::default()
         };
-        let hits = run(index, apps, query, limit, &mut fast, &|| false).unwrap();
-        let expected = run(index, apps, query, limit, &mut slow, &|| false).unwrap();
+        let hits = run(index, apps, query, limit, None, &mut fast, &|| false).unwrap();
+        let expected = run(index, apps, query, limit, None, &mut slow, &|| false).unwrap();
         assert_eq!(hits, expected, "{query:?} limit {limit}");
         (hits, fast.early_stops)
     }
@@ -1254,6 +1337,231 @@ mod tests {
         assert!(early_stops > 100, "{early_stops}");
     }
 
+    fn is_inside(index: &Index, entry: EntryId, folder: EntryId) -> bool {
+        let mut at = index.entry_parent[entry as usize];
+        while at != NO_PARENT {
+            if at == folder {
+                return true;
+            }
+            at = index.entry_parent[at as usize];
+        }
+        false
+    }
+
+    /// The search inside `folder`, against a search of everything with the apps and what lies
+    /// outside dropped, for each limit; with and without the short-word shortcuts. Returns how
+    /// many hits lie inside, and the scratch of the searches with shortcuts.
+    fn assert_scoped_is_filtered(
+        index: &Index,
+        apps: &Apps,
+        folder: EntryId,
+        query: &str,
+    ) -> (usize, Scratch) {
+        let within = Within::new(index, folder);
+        let all = run(
+            index,
+            apps,
+            query,
+            index.len() + apps.len(),
+            None,
+            &mut Scratch::default(),
+            &|| false,
+        );
+        let kept: Vec<Hit> = all
+            .unwrap()
+            .into_iter()
+            .filter(|hit| {
+                hit.entry()
+                    .is_some_and(|entry| is_inside(index, entry, folder))
+            })
+            .collect();
+        let mut scratch = Scratch::default();
+        let mut slow = Scratch {
+            no_shortcuts: true,
+            ..Scratch::default()
+        };
+        let within = Some(&within);
+        for limit in [1, 3, 10, kept.len() + 1] {
+            let expected = &kept[..limit.min(kept.len())];
+            let found = run(index, apps, query, limit, within, &mut scratch, &|| false).unwrap();
+            assert_eq!(found, expected, "{query:?} in {folder} limit {limit}");
+            let found = run(index, apps, query, limit, within, &mut slow, &|| false).unwrap();
+            assert_eq!(
+                found, expected,
+                "{query:?} in {folder} limit {limit}, no shortcuts"
+            );
+        }
+        (kept.len(), scratch)
+    }
+
+    #[test]
+    fn a_search_inside_a_folder_finds_what_a_search_of_everything_finds_there() {
+        let mut rng = Rng(0x7ab);
+        let rich = [
+            "3", "8", "c", "a", "b", "x", "C", "A", "-", ".", " ", "é", "_", "3", "c",
+        ];
+        // A name with an accent counts as holding every letter, so only these let "c" fit far
+        // more names than "zq".
+        let ascii = &rich[..11];
+        let (mut found, mut early_stops, mut later, mut outside_checks) = (0, 0, 0, 0);
+        let mut check = |index: &Index, apps: &Apps, folder: EntryId, query: &str| {
+            let (kept, scratch) = assert_scoped_is_filtered(index, apps, folder, query);
+            found += kept;
+            early_stops += scratch.early_stops;
+            later += scratch.later_passes;
+            outside_checks += scratch.outside_checks;
+        };
+        for round in 0..12 {
+            let mut builder = IndexBuilder::new();
+            let root = builder.push("/home", NO_PARENT, true);
+            let mut folders = vec![root];
+            // Folders and files in random order, so a folder's children sit apart, as in
+            // made-up names and after an update.
+            let parts: &[&str] = if round % 2 == 0 { &rich } else { ascii };
+            for i in 0..400 {
+                let parent = folders[rng.below(folders.len())];
+                let mut name = rng.name(parts, 8);
+                if rng.below(10) == 0 {
+                    name.insert(0, '.');
+                }
+                // A word few names hold, so "zq c" matches "c" last.
+                if rng.below(8) == 0 {
+                    name.push_str(" zq");
+                }
+                let is_dir = rng.below(4) == 0 || i < 8 * round;
+                let entry = builder.push(&name, parent, is_dir);
+                if is_dir {
+                    folders.push(entry);
+                }
+            }
+            let index = builder.finish();
+            // Every other round, apps, whose names also decide whether a word may take a typo.
+            let names: Vec<String> = (0..20 * (round / 2 % 2))
+                .map(|_| rng.name(parts, 8))
+                .collect();
+            let names: Vec<&str> = names.iter().map(String::as_str).collect();
+            let apps = applications(&names);
+            let queries = [
+                "c", "3", "38", "x8", "38x", "'c", "^c", "c$", "C", ".c", "c a", "38 c", "a !b",
+                "cab", "c3a8x", "a b c", "!c", "zq c", "zq 38 !b",
+            ];
+            for _ in 0..6 {
+                let folder = folders[rng.below(folders.len())];
+                for query in queries {
+                    check(&index, &apps, folder, query);
+                }
+                // Words cut from real names, some with two letters swapped, so a word is held
+                // letter for letter in one folder and needs a typo in another.
+                for _ in 0..6 {
+                    let name: Vec<char> = index
+                        .name(rng.below(index.len()) as EntryId)
+                        .chars()
+                        .collect();
+                    if name.len() < 5 {
+                        continue;
+                    }
+                    let start = rng.below(name.len() - 4);
+                    let mut word: Vec<char> = name[start..start + 4 + rng.below(2)].to_vec();
+                    if rng.below(2) == 0 {
+                        word.swap(1, 2);
+                    }
+                    let word: String = word.into_iter().filter(|c| *c != ' ').collect();
+                    check(&index, &apps, folder, &word);
+                    check(&index, &apps, folder, &format!("c {word}"));
+                }
+            }
+            for query in queries {
+                check(&index, &apps, root, query);
+            }
+        }
+        assert!(found > 10_000, "{found}");
+        // Each shortcut was taken inside a folder, not just allowed.
+        assert!(early_stops > 100, "{early_stops}");
+        assert!(later > 100, "{later}");
+        assert!(outside_checks > 100, "{outside_checks}");
+    }
+
+    /// Whether "desing" may take a typo is decided by every name, so a folder holding only
+    /// design.pdf finds what a search of everything shows there: nothing, as desing.txt elsewhere
+    /// holds the word letter for letter.
+    #[test]
+    fn a_typo_inside_a_folder_is_decided_by_every_name() {
+        let mut builder = IndexBuilder::new();
+        let root = builder.push("/home", NO_PARENT, true);
+        let work = builder.push("work", root, true);
+        builder.push("design.pdf", work, false);
+        builder.push("designer notes.md", work, false);
+        let other = builder.push("other", root, true);
+        builder.push("desing.txt", other, false);
+        let index = builder.finish();
+        let found_with = |apps: &Apps, folder: EntryId, query: &str| {
+            let (kept, _) = assert_scoped_is_filtered(&index, apps, folder, query);
+            let mut scratch = Scratch::default();
+            let within = Some(Within::new(&index, folder));
+            run(
+                &index,
+                apps,
+                query,
+                10,
+                within.as_ref(),
+                &mut scratch,
+                &|| false,
+            );
+            (kept, scratch.outside_checks)
+        };
+        let found = |folder: EntryId, query: &str| found_with(&Apps::default(), folder, query);
+        // An app's name counts as well, as it does in a search of everything.
+        let apps = applications(&["Dseign"]);
+        assert_eq!(found_with(&apps, work, "dseign"), (0, 0));
+        assert_eq!(found_with(&apps, work, "desing"), (0, 1));
+        // Only a word no name inside holds makes the search look at the names outside.
+        assert_eq!(found(work, "desing"), (0, 1));
+        assert_eq!(found(other, "desing"), (1, 0));
+        assert_eq!(found(work, "design"), (2, 0));
+        assert_eq!(found(work, "work desing"), (0, 1));
+        // No name anywhere holds these, so they take a typo inside the folder too.
+        assert_eq!(found(work, "dseign"), (2, 1));
+        assert_eq!(found(work, "notes desgn"), (1, 1));
+        assert_eq!(found(work, "notes desgner"), (1, 1));
+        assert_eq!(found(work, "!desing notes"), (1, 0));
+    }
+
+    #[test]
+    fn a_search_inside_a_folder_skips_the_folder_itself_and_its_neighbours() {
+        let mut builder = IndexBuilder::new();
+        let root = builder.push("/home", NO_PARENT, true);
+        let plans = builder.push("plans", root, true);
+        let file = builder.push("plan.md", root, false);
+        let old = builder.push("old", plans, true);
+        builder.push("plan.md", old, false);
+        let other = builder.push("other plans", root, true);
+        builder.push("plan.md", other, false);
+        builder.push("plan.pdf", plans, false);
+        let index = builder.finish();
+        let searcher = Searcher::with_threads(2);
+        let apps = applications(&["Plan"]);
+        let paths = |folder: EntryId, query: &str| -> Vec<String> {
+            let within = Some(Within::new(&index, folder));
+            let ticket = searcher.ticket();
+            let hits = searcher.search_in(&index, &apps, within.as_ref(), query, ticket, 10);
+            hits.unwrap()
+                .iter()
+                .map(|hit| hit.entry().expect("no app inside a folder"))
+                .map(|entry| index.path(entry).to_string_lossy().replace('\\', "/"))
+                .collect()
+        };
+        assert_eq!(
+            paths(plans, "plan"),
+            ["/home/plans/plan.pdf", "/home/plans/old/plan.md"]
+        );
+        assert_eq!(paths(old, "plan"), ["/home/plans/old/plan.md"]);
+        assert_eq!(paths(old, "old"), Vec::<String>::new());
+        // The folder's own name counts for what is inside it, as in a search of everything.
+        assert_eq!(paths(plans, "plans old"), ["/home/plans/old"]);
+        assert!(paths(plans, "").is_empty());
+        assert!(paths(file, "plan").is_empty());
+    }
+
     #[test]
     fn a_short_word_inside_names_is_still_found() {
         let mut builder = IndexBuilder::new();
@@ -1300,10 +1608,8 @@ mod tests {
         let checks = AtomicU64::new(0);
         let stale = || checks.fetch_add(1, Ordering::Relaxed) > 0;
         let apps = applications(&["Reminders"]);
-        assert_eq!(
-            run(&index, &apps, "re", 10, &mut Scratch::default(), &stale),
-            None
-        );
+        let scratch = &mut Scratch::default();
+        assert_eq!(run(&index, &apps, "re", 10, None, scratch, &stale), None);
         assert_eq!(checks.load(Ordering::Relaxed), 2);
     }
 
@@ -1527,6 +1833,30 @@ mod tests {
     }
 
     #[test]
+    fn a_search_inside_a_folder_gives_up_at_any_check_when_replaced() {
+        let index = sample();
+        let within = Some(Within::new(&index, 2));
+        let within = within.as_ref();
+        let apps = applications(&["Reminders"]);
+        for query in ["re", "readme", "plna", "other plna", "md !plan"] {
+            let checks = AtomicU64::new(0);
+            let count = || checks.fetch_add(1, Ordering::Relaxed) == u64::MAX;
+            let scratch = &mut Scratch::default();
+            assert!(run(&index, &apps, query, 10, within, scratch, &count).is_some());
+            let total = checks.load(Ordering::Relaxed);
+            assert!(total >= 2, "{query:?} {total}");
+            assert_eq!(scratch.outside_checks, usize::from(query.contains("plna")));
+            for replaced_at in 0..total {
+                let checks = AtomicU64::new(0);
+                let stale = || checks.fetch_add(1, Ordering::Relaxed) >= replaced_at;
+                let scratch = &mut Scratch::default();
+                let hits = run(&index, &apps, query, 10, within, scratch, &stale);
+                assert_eq!(hits, None, "{query:?} replaced at check {replaced_at}");
+            }
+        }
+    }
+
+    #[test]
     fn a_search_gives_up_partway_when_replaced() {
         let index = sample();
         let checks = AtomicU64::new(0);
@@ -1534,7 +1864,15 @@ mod tests {
         let stale = || checks.fetch_add(1, Ordering::Relaxed) > 0;
         let apps = Apps::default();
         assert_eq!(
-            run(&index, &apps, "readme", 10, &mut Scratch::default(), &stale),
+            run(
+                &index,
+                &apps,
+                "readme",
+                10,
+                None,
+                &mut Scratch::default(),
+                &stale
+            ),
             None
         );
         assert_eq!(checks.load(Ordering::Relaxed), 2);

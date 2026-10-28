@@ -15,6 +15,8 @@ enum Metric {
     static let pane: CGFloat = 260
     static let thumb: CGFloat = 128
     static let details: CGFloat = 286
+    static let chip: CGFloat = 240
+    static let chipHeight: CGFloat = 24
 }
 
 /// Read with `log show --last 5m --predicate 'subsystem == "io.github.jovanhartono.telescope"'`.
@@ -75,6 +77,10 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
         backing: .buffered, defer: false)
     private let glass = NSImageView(frame: NSRect(x: 18, y: 16, width: 24, height: 24))
     let field = NSTextField(frame: NSRect(x: 50, y: 13, width: Metric.width - 68, height: 30))
+    /// The folders Tab went into, outermost first, shown before the box.
+    let chip = NSBox()
+    let chipText = NSTextField(labelWithString: "")
+    private(set) var scopes: [Row] = []
     private let line = NSBox(frame: NSRect(x: 0, y: Metric.field, width: Metric.width, height: 1))
     private let scroll = NSScrollView()
     let table = NSTableView()
@@ -214,6 +220,17 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
         field.cell?.lineBreakMode = .byTruncatingTail
         field.delegate = self
 
+        chip.boxType = .custom
+        chip.titlePosition = .noTitle
+        chip.borderWidth = 0
+        chip.cornerRadius = 6
+        chip.fillColor = .quaternaryLabelColor
+        chip.contentViewMargins = .zero
+        chip.isHidden = true
+        chipText.font = .systemFont(ofSize: NSFont.systemFontSize, weight: .medium)
+        chipText.lineBreakMode = .byTruncatingHead
+        chip.contentView?.addSubview(chipText)
+
         line.boxType = .separator
         line.autoresizingMask = [.width]
 
@@ -265,7 +282,7 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
 
         // Starting at the window's size, the views that stretch with it start at the right width.
         let content = TopDown(frame: NSRect(x: 0, y: 0, width: Metric.width, height: Metric.field))
-        for view in [glass, field, line, scroll, message, bar, pane] { content.addSubview(view) }
+        for view in [glass, chip, field, line, scroll, message, bar, pane] { content.addSubview(view) }
         panel.contentView = content
     }
 
@@ -440,7 +457,7 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
             follow()
         }
         guard let hatch, indexed, !composing, !field.stringValue.isEmpty else { return fit() }
-        newest = hatch.submit(field.stringValue)
+        newest = hatch.submit(field.stringValue, in: scopes.last?.path)
         sentAt[newest] = typed
         fit()
     }
@@ -449,8 +466,64 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
     private func runAgain() {
         stale = false
         guard let hatch, indexed, !composing, !field.stringValue.isEmpty else { return }
-        newest = hatch.submit(field.stringValue)
+        newest = hatch.submit(field.stringValue, in: scopes.last?.path)
         rerun = newest
+    }
+
+    /// Pressed a moment after typing, Tab waits for the results for what you typed, as Return
+    /// does; if they start with a file, it still reaches Open Settings.
+    private func tabIntoFolder() -> Bool {
+        guard indexed, !composing, !field.stringValue.isEmpty else { return false }
+        if newest == answered && selected?.isFolder != true { return false }
+        onceAnswered { [weak self] in
+            guard let self else { return }
+            if let row = selected, row.isFolder {
+                enter(row)
+            } else {
+                _ = reachSettings()
+            }
+        }
+        return true
+    }
+
+    private func reachSettings() -> Bool {
+        guard notice != nil else { return false }
+        panel.makeFirstResponder(settings)
+        return true
+    }
+
+    private func enter(_ folder: Row) {
+        scopes.append(folder)
+        field.stringValue = ""
+        showScopes()
+        search()
+    }
+
+    private func leaveFolder() -> Bool {
+        guard !scopes.isEmpty, !composing, field.stringValue.isEmpty else { return false }
+        // Holding Backspace to clear the box stops there instead of leaving every folder too.
+        if let event = NSApp.currentEvent, event.type == .keyDown, event.isARepeat { return true }
+        scopes.removeLast()
+        showScopes()
+        search()
+        return true
+    }
+
+    private func showScopes() {
+        chip.isHidden = scopes.isEmpty
+        chipText.stringValue = scopes.map(\.name).joined(separator: " › ")
+        chip.toolTip = scopes.last?.path
+        chipText.setAccessibilityLabel(scopes.last.map { "Searching in \($0.name)" })
+        field.placeholderString = scopes.last.map { "Search in \($0.name)" } ?? "Search"
+        let padding: CGFloat = 8
+        let size = chipText.intrinsicContentSize
+        let text = min(size.width, Metric.chip - 2 * padding)
+        let height = size.height
+        chipText.frame = NSRect(x: padding, y: (Metric.chipHeight - height) / 2, width: text, height: height)
+        chip.frame = NSRect(
+            x: 50, y: (Metric.field - Metric.chipHeight) / 2, width: text + 2 * padding, height: Metric.chipHeight)
+        let x = scopes.isEmpty ? 50 : chip.frame.maxX + 8
+        field.frame = NSRect(x: x, y: 13, width: Metric.width - 18 - x, height: 30)
     }
 
     private func take(_ ticket: UInt64) {
@@ -647,9 +720,12 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
             }
         case #selector(NSResponder.insertNewline(_:)):
             onceAnswered { [weak self] in self?.open(revealing: false) }
+        case #selector(NSResponder.insertTab(_:)) where tabIntoFolder():
+            break
+        case #selector(NSResponder.deleteBackward(_:)):
+            return leaveFolder()
         case #selector(NSResponder.insertTab(_:)), #selector(NSResponder.insertBacktab(_:)):
-            guard notice != nil else { return false }
-            panel.makeFirstResponder(settings)
+            return reachSettings()
         default:
             return false
         }
