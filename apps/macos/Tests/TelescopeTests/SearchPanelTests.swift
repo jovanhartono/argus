@@ -1150,6 +1150,63 @@ final class SearchPanelTests: XCTestCase {
         XCTAssertTrue(window.health === health, "one view, shown again")
     }
 
+    func testTheHealthViewsSwitchListsCachesLiveAndIsKept() async throws {
+        let caches = root.appendingPathComponent("Library/Caches")
+        try FileManager.default.createDirectory(at: caches, withIntermediateDirectories: true)
+        try Data().write(to: caches.appendingPathComponent("cached.db"))
+        let name = "telescope-tests-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: name))
+        defer { defaults.removePersistentDomain(forName: name) }
+        let window = try await opened(access: true, everything: IndexEverything(defaults: defaults))
+        window.showHealth(nil)
+        let health = try XCTUnwrap(window.health)
+        defer { health.hide() }
+        XCTAssertEqual(health.everything.state, .off)
+        XCTAssertEqual(health.entries.stringValue, "2", "the folder and Library")
+
+        health.everything.performClick(nil)
+        XCTAssertTrue(IndexEverything(defaults: defaults).isOn, "kept for the next launch")
+        // The folder, Library, Caches and cached.db.
+        try await until { health.health.entries == 4 && !health.health.busy }
+        XCTAssertTrue(health.progress.isHidden)
+
+        health.everything.performClick(nil)
+        XCTAssertFalse(IndexEverything(defaults: defaults).isOn)
+        try await until { health.health.entries == 2 && !health.health.busy }
+    }
+
+    func testTheSwitchKeptOnListsCachesFromLaunch() async throws {
+        let caches = root.appendingPathComponent("Library/Caches")
+        try FileManager.default.createDirectory(at: caches, withIntermediateDirectories: true)
+        try Data().write(to: caches.appendingPathComponent("cached.db"))
+        let everything = IndexEverything()
+        everything.isOn = true
+        let window = try await opened(access: true, everything: everything)
+        window.showHealth(nil)
+        let health = try XCTUnwrap(window.health)
+        defer { health.hide() }
+        XCTAssertEqual(health.everything.state, .on)
+        XCTAssertEqual(health.entries.stringValue, "4")
+    }
+
+    func testTheSwitchWaitsForFullDiskAccessThenListsCaches() async throws {
+        let caches = root.appendingPathComponent("Library/Caches")
+        try FileManager.default.createDirectory(at: caches, withIntermediateDirectories: true)
+        try Data().write(to: caches.appendingPathComponent("cached.db"))
+        let everything = IndexEverything()
+        everything.isOn = true
+        let window = try await opened(access: false, everything: everything)
+        window.showHealth(nil)
+        let health = try XCTUnwrap(window.health)
+        defer { health.hide() }
+        XCTAssertEqual(health.entries.stringValue, "2", "the folder and Library, without the caches")
+        XCTAssertFalse(health.everything.isEnabled)
+
+        access = true
+        try await until { health.health.entries == 4 && !health.health.busy }
+        XCTAssertTrue(health.everything.isEnabled)
+    }
+
     func testARowsURLIsItsPathAndKnowsAFolder() {
         let file = Row(name: "budget.txt", folder: "/Users/me/notes", isFolder: false)
         XCTAssertEqual(file.url, URL(fileURLWithPath: "/Users/me/notes/budget.txt"))
@@ -2648,7 +2705,8 @@ final class SearchPanelTests: XCTestCase {
     /// Never the real Finder, which would ask whether the test runner may control it.
     private func opened(
         access: Bool, on stage: (any Stage)? = nil, saved: String? = nil, opens: String? = nil, apps: [String] = [],
-        textFolders: [String] = [], finder: @escaping @Sendable () -> FinderFolder = { .none }
+        textFolders: [String] = [], everything: IndexEverything = IndexEverything(),
+        finder: @escaping @Sendable () -> FinderFolder = { .none }
     ) async throws -> SearchPanel {
         self.access = access
         let hasAccess = { [unowned self] in
@@ -2658,8 +2716,8 @@ final class SearchPanelTests: XCTestCase {
         let folders = TextFolders()
         folders.add(textFolders)
         let window = SearchPanel(
-            root: root.path, saved: saved, opens: opens, apps: apps, textFolders: folders, hasAccess: hasAccess,
-            stage: stage ?? self.stage, finder: finder)
+            root: root.path, saved: saved, opens: opens, apps: apps, textFolders: folders, everything: everything,
+            hasAccess: hasAccess, stage: stage ?? self.stage, finder: finder)
         for _ in 0..<500 where !window.indexed { try await Task.sleep(for: .milliseconds(10)) }
         XCTAssertTrue(window.indexed)
         return window

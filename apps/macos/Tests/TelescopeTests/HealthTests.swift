@@ -65,6 +65,9 @@ final class HealthFormatTests: XCTestCase {
         XCTAssertEqual(english.state(Health(busy: true, behind: true, stopped: true)), english.state(Health(stopped: true)))
         XCTAssertEqual(english.access(true), "On")
         XCTAssertEqual(english.access(false), "Off: Desktop, Documents, Downloads and cloud drives are left out")
+        XCTAssertEqual(english.everything(true), "Includes Library and clutter, about 2.4M items.")
+        XCTAssertEqual(
+            english.everything(false), "Includes Library and clutter, about 2.4M items. Needs Full Disk Access.")
     }
 }
 
@@ -76,6 +79,7 @@ final class HealthWindowTests: XCTestCase {
     private var fullDisk = true
     private var health = Health(entries: 48_127, scannedAt: Date(), scanMs: 90)
     private var folders: TextFolders!
+    private var switched: [Bool] = []
 
     override func setUp() async throws {
         _ = NSApplication.shared
@@ -92,7 +96,7 @@ final class HealthWindowTests: XCTestCase {
         XCTAssertTrue(done(), file: file, line: line)
     }
 
-    private func window(tick: TimeInterval = 1) -> HealthWindow {
+    private func window(tick: TimeInterval = 1, everything: Bool = false) -> HealthWindow {
         HealthWindow(
             read: { [unowned self] in
                 reads += 1
@@ -103,7 +107,69 @@ final class HealthWindowTests: XCTestCase {
                 rebuilds += 1
                 health.busy = true
             },
-            stage: stage, folders: folders, format: HealthFormat(locale: Locale(identifier: "en_US")), tick: tick)
+            stage: stage, folders: folders, everything: everything,
+            indexEverything: { [unowned self] in
+                switched.append($0)
+                health.busy = true
+            },
+            format: HealthFormat(locale: Locale(identifier: "en_US")), tick: tick)
+    }
+
+    func testIndexEverythingStartsAsSavedAndSpinsWhileTheNewListIsBuilt() {
+        let window = window()
+        window.show()
+        defer { window.hide() }
+        XCTAssertEqual(window.everything.state, .off)
+        XCTAssertTrue(window.everything.isEnabled)
+        XCTAssertTrue(window.progress.isHidden, "nothing is being built")
+
+        window.everything.performClick(nil)
+        XCTAssertEqual(switched, [true])
+        XCTAssertFalse(window.progress.isHidden)
+        XCTAssertEqual(window.state.stringValue, "Updating…")
+        XCTAssertFalse(window.rebuild.isEnabled)
+        XCTAssertTrue(window.everything.isEnabled, "it can be switched back before the list is in")
+
+        window.everything.performClick(nil)
+        XCTAssertEqual(switched, [true, false])
+        health.busy = false
+        window.refresh()
+        XCTAssertTrue(window.progress.isHidden)
+        XCTAssertEqual(window.state.stringValue, "Up to date")
+
+        let on = self.window(everything: true)
+        XCTAssertEqual(on.everything.state, .on)
+    }
+
+    /// Reading all of ~/Library without access stops on a macOS pop-up for each media library.
+    func testWithoutAccessTheSwitchWaitsAndSaysWhy() {
+        fullDisk = false
+        let window = window(everything: true)
+        window.show()
+        defer { window.hide() }
+        XCTAssertFalse(window.everything.isEnabled)
+        XCTAssertEqual(window.everything.state, .on, "kept as saved, for when access comes")
+        XCTAssertTrue(window.everythingHint.stringValue.hasSuffix("Needs Full Disk Access."))
+
+        fullDisk = true
+        window.refresh()
+        XCTAssertTrue(window.everything.isEnabled)
+        XCTAssertEqual(window.everythingHint.stringValue, "Includes Library and clutter, about 2.4M items.")
+    }
+
+    func testAStoppedCoreTakesNoSwitchAndShowsNoSpinner() {
+        health = Health(busy: true, stopped: true)
+        let window = window()
+        window.show()
+        defer { window.hide() }
+        XCTAssertFalse(window.everything.isEnabled)
+        XCTAssertTrue(window.progress.isHidden)
+    }
+
+    func testTabReachesTheSwitch() {
+        let window = window()
+        XCTAssertTrue(window.settings.nextKeyView === window.everything)
+        XCTAssertTrue(window.everything.nextKeyView === window.folderList)
     }
 
     func testShowingReadsTheCoreAndTakesTheKeysOffStage() {
@@ -333,6 +399,34 @@ private final class HeldStage: Stage {
     func chooseFolders(on window: NSWindow, _ done: @escaping @MainActor ([URL]) -> Void) { self.done = done }
     func handBack() {}
     func answer(_ urls: [URL]) { done?(urls) }
+}
+
+@MainActor
+final class IndexEverythingTests: XCTestCase {
+    func testOffAtFirstAndKeptAcrossLaunches() throws {
+        let name = "telescope-tests-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: name))
+        defer { defaults.removePersistentDomain(forName: name) }
+        let setting = IndexEverything(defaults: defaults)
+        XCTAssertFalse(setting.isOn)
+        setting.isOn = true
+        XCTAssertTrue(IndexEverything(defaults: defaults).isOn)
+        setting.isOn = false
+        XCTAssertFalse(IndexEverything(defaults: defaults).isOn)
+        let loose = IndexEverything()
+        loose.isOn = true
+        XCTAssertFalse(IndexEverything().isOn, "without defaults nothing is kept")
+    }
+
+    func testAValueThatIsNoBooleanReadsAsOff() throws {
+        let name = "telescope-tests-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: name))
+        defer { defaults.removePersistentDomain(forName: name) }
+        defaults.set("maybe", forKey: "indexEverything")
+        XCTAssertFalse(IndexEverything(defaults: defaults).isOn)
+        defaults.set("YES", forKey: "indexEverything")
+        XCTAssertTrue(IndexEverything(defaults: defaults).isOn, "as `defaults write … -string YES` would")
+    }
 }
 
 @MainActor

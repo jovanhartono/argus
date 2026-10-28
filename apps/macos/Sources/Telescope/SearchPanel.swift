@@ -131,6 +131,7 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
     private var sentAt: [UInt64: TimeInterval] = [:]
     private(set) var rows: [Row] = []
     let textFolders: TextFolders
+    let everything: IndexEverything
     private(set) var hits: [TextHit] = []
     private(set) var textTicket: UInt64 = 0
     private var textAsked: TextAsk?
@@ -164,14 +165,15 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
 
     /// With `saved`, the list kept in that file at the last launch shows at once. With `opens`,
     /// what you open ranks higher, kept in that file. The apps in `apps` are found by name, and
-    /// words inside the files in `textFolders`.
+    /// words inside the files in `textFolders`. With `everything` on, clutter is listed too.
     init(
         root: String = NSHomeDirectory(), saved: String? = nil, opens: String? = nil, apps: [String] = [],
-        textFolders: TextFolders = TextFolders(),
+        textFolders: TextFolders = TextFolders(), everything: IndexEverything = IndexEverything(),
         hasAccess: @escaping () -> Bool = { Hatch.hasFullDiskAccess() }, stage: any Stage = Screen(),
         finder: @escaping @Sendable () -> FinderFolder = FinderFolder.ask
     ) {
         self.textFolders = textFolders
+        self.everything = everything
         self.hasAccess = hasAccess
         self.stage = stage
         self.finder = finder
@@ -187,7 +189,11 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
         } else {
             lacksAccess = !hasAccess()
             post(lacksAccess ? .needsAccess : nil)
-            hatch = Hatch(root: root, fullDisk: !lacksAccess, saved: saved, onEvent: onEvent)
+            // Without Full Disk Access, reading all of ~/Library and the media folders stops on
+            // a macOS pop-up for each of several libraries, so the switch waits for access.
+            hatch = Hatch(
+                root: root, fullDisk: !lacksAccess, everything: everything.isOn && !lacksAccess, saved: saved,
+                onEvent: onEvent)
         }
         if hatch == nil { problem = "Search couldn't start. Rebuild Telescope." }
         if let opens { hatch?.rankOpens(keptIn: opens) }
@@ -309,7 +315,13 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
                     recheckAccess()
                     return !lacksAccess
                 },
-                rebuild: { [weak self] in self?.hatch?.rebuild() }, stage: stage, folders: textFolders)
+                rebuild: { [weak self] in self?.hatch?.rebuild() }, stage: stage, folders: textFolders,
+                everything: everything.isOn,
+                indexEverything: { [weak self] on in
+                    guard let self else { return }
+                    everything.isOn = on
+                    if !lacksAccess { hatch?.indexEverything(on) }
+                })
         }
         health?.show()
     }
@@ -415,6 +427,7 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
         lacksAccess = false
         if notice == .needsAccess { post(nil) }
         hatch?.grantFullDisk()
+        if everything.isOn { hatch?.indexEverything(true) }
         fit()
     }
 

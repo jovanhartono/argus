@@ -83,22 +83,27 @@ final class Hatch {
 
     /// Scans `root` as a home folder in the background. Without Full Disk Access, the folders
     /// macOS guards with a pop-up each are left out, so none appears. With `saved`, the list
-    /// kept in that file at the last launch opens instead, and each new list is kept there.
-    convenience init?(root: String, fullDisk: Bool, saved: String? = nil, onEvent: @escaping (Event) -> Void) {
+    /// kept in that file at the last launch opens instead, and each new list is kept there. With
+    /// `everything`, clutter and the ignore list's folders are listed too.
+    convenience init?(
+        root: String, fullDisk: Bool, everything: Bool = false, saved: String? = nil,
+        onEvent: @escaping (Event) -> Void
+    ) {
         var root = root
         // A volume FSEvents keeps no log for can't catch up after a relaunch, so nothing is saved.
         let journal = saved == nil ? nil : Hatch.journal(of: root)
+        let (full, all): (UInt32, UInt32) = (fullDisk ? 1 : 0, everything ? 1 : 0)
         self.init(onEvent: onEvent) { tag, callback, now in
             root.withUTF8 { root in
                 guard var file = saved, var journal else {
-                    return tl_core_new(root.baseAddress, root.count, fullDisk ? 1 : 0, 0, nil, tag, callback)
+                    return tl_core_new(root.baseAddress, root.count, full, all, nil, tag, callback)
                 }
                 return file.withUTF8 { file in
                     journal.withUTF8 { journal in
                         var saved = TlSaved(
                             file: file.baseAddress, file_len: file.count, journal: journal.baseAddress,
                             journal_len: journal.count, now: now)
-                        return tl_core_new(root.baseAddress, root.count, fullDisk ? 1 : 0, 0, &saved, tag, callback)
+                        return tl_core_new(root.baseAddress, root.count, full, all, &saved, tag, callback)
                     }
                 }
             }
@@ -257,6 +262,13 @@ final class Hatch {
     /// Builds the list again with the folders macOS guards, now that it lets Telescope in.
     func grantFullDisk() {
         tl_grant_full_disk(core, FSEventsGetCurrentEventId())
+    }
+
+    /// Lists clutter and the ignore list's folders from the next list on, or leaves them out
+    /// again. True when that builds a new list, which `.rebuilt` brings.
+    @discardableResult
+    func indexEverything(_ on: Bool) -> Bool {
+        tl_index_everything(core, on ? 1 : 0, FSEventsGetCurrentEventId()) == 1
     }
 
     /// Never waits for a scan or a search.

@@ -368,6 +368,54 @@ final class HatchTests: XCTestCase {
         _ = hatch
     }
 
+    func testIndexEverythingListsCachesWithoutARelaunchAndLeavesThemOutAgain() async throws {
+        let (root, _) = try folderWithNotes()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let caches = root.appendingPathComponent("Library/Caches/telescope-test")
+        try FileManager.default.createDirectory(at: caches, withIntermediateDirectories: true)
+        try Data().write(to: caches.appendingPathComponent("found.txt"))
+        let (hatch, counts) = try await watching(root)
+        XCTAssertFalse(hatch.indexEverything(false), "already off")
+        XCTAssertTrue(hatch.indexEverything(true))
+        XCTAssertFalse(hatch.indexEverything(true), "asked once")
+        // The folder, notes, a.txt, Library, Caches, telescope-test and found.txt.
+        try await counts.reach(7, within: 10)
+        hatch.watch()
+        let on = try await names(hatch, "found")
+        XCTAssertEqual(on, ["found.txt"])
+
+        XCTAssertTrue(hatch.indexEverything(false))
+        // Library itself stays listed.
+        try await counts.reach(4, within: 10)
+        let off = try await names(hatch, "found")
+        XCTAssertEqual(off, [])
+    }
+
+    func testIndexEverythingAtLaunchListsCachesFromTheFirstList() async throws {
+        let (root, _) = try folderWithNotes()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let caches = root.appendingPathComponent("Library/Caches")
+        try FileManager.default.createDirectory(at: caches, withIntermediateDirectories: true)
+        try Data().write(to: caches.appendingPathComponent("found.txt"))
+        let (hatch, counts) = try await watching(root, everything: true)
+        let found = try await names(hatch, "found")
+        XCTAssertEqual(found, ["found.txt"])
+        XCTAssertFalse(hatch.indexEverything(true), "the first list has it already")
+        XCTAssertTrue(hatch.indexEverything(false))
+        try await counts.reach(4, within: 10)
+    }
+
+    /// The names a search for `query` finds, once its answer comes.
+    private func names(_ hatch: Hatch, _ query: String) async throws -> [String] {
+        let ticket = hatch.submit(query)
+        let deadline = ProcessInfo.processInfo.systemUptime + 5
+        while true {
+            if let rows = hatch.take(ticket) { return rows.map(\.name) }
+            guard ProcessInfo.processInfo.systemUptime < deadline else { throw CancellationError() }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+    }
+
     private func folderWithNotes() throws -> (URL, URL) {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         let notes = root.appendingPathComponent("notes")
@@ -378,11 +426,13 @@ final class HatchTests: XCTestCase {
 
     /// A core over `root`, keeping its list in `saved` when given, watched once its first list
     /// is in, scanned or `opened` from the file.
-    private func watching(_ root: URL, saved: String? = nil, opened: Bool = false) async throws -> (Hatch, Counts) {
+    private func watching(
+        _ root: URL, everything: Bool = false, saved: String? = nil, opened: Bool = false
+    ) async throws -> (Hatch, Counts) {
         let counts = Counts()
         let first = expectation(description: opened ? "opened" : "indexed")
         let hatch = try XCTUnwrap(
-            Hatch(root: root.path, fullDisk: true, saved: saved) { event in
+            Hatch(root: root.path, fullDisk: true, everything: everything, saved: saved) { event in
                 switch event {
                 case .indexed:
                     XCTAssertFalse(opened, "scanned in place of the saved list")
