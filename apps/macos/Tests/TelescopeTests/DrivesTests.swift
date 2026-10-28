@@ -7,16 +7,25 @@ import XCTest
 final class DrivesTests: XCTestCase {
     private let center = NotificationCenter()
     private var heard: [String] = []
+    private var stillMounted: Set<String> = []
 
     private func drives(mounted: [String] = []) -> Drives {
         Drives(
-            center: center, mounted: mounted, added: { [unowned self] in heard.append("+" + $0) },
+            center: center, mounted: mounted, isMounted: { [unowned self] in stillMounted.contains($0) },
+            settle: .milliseconds(50), added: { [unowned self] in heard.append("+" + $0) },
             removing: { [unowned self] in heard.append("-" + $0) })
     }
 
-    private func post(_ name: Notification.Name, _ path: String?) {
-        let info = path.map { [NSWorkspace.volumeURLUserInfoKey: URL(fileURLWithPath: $0, isDirectory: true)] }
+    private func post(_ name: Notification.Name, _ path: String?, old: String? = nil) {
+        var info: [AnyHashable: Any] = [:]
+        info[NSWorkspace.volumeURLUserInfoKey] = path.map { URL(fileURLWithPath: $0, isDirectory: true) }
+        info[NSWorkspace.oldVolumeURLUserInfoKey] = old.map { URL(fileURLWithPath: $0, isDirectory: true) }
         center.post(name: name, object: NSWorkspace.shared, userInfo: info)
+    }
+
+    /// Past the settle time given above.
+    private func settled() async throws {
+        try await Task.sleep(for: .milliseconds(200))
     }
 
     func testVolumesMountedAtLaunchArePassedOnFirstInOrder() {
@@ -25,13 +34,70 @@ final class DrivesTests: XCTestCase {
         _ = drives
     }
 
-    func testAPluggedInDriveIsAddedAndAnEjectedOneLetGoBeforeItUnmounts() {
+    func testAPluggedInDriveIsAddedAndAnEjectedOneLetGoBeforeItUnmounts() async throws {
         let drives = drives()
         post(NSWorkspace.didMountNotification, "/Volumes/Photos")
         post(NSWorkspace.willUnmountNotification, "/Volumes/Photos")
         post(NSWorkspace.didUnmountNotification, "/Volumes/Photos")
-        XCTAssertEqual(heard, ["+/Volumes/Photos", "-/Volumes/Photos"], "nothing left to do once it is gone")
+        try await settled()
+        XCTAssertEqual(heard, ["+/Volumes/Photos", "-/Volumes/Photos"], "let go of once")
+        XCTAssertEqual(drives.leaving, [])
+    }
+
+    func testADrivePulledOutWithoutAnEjectIsLetGo() {
+        let drives = drives()
+        post(NSWorkspace.didMountNotification, "/Volumes/Photos")
+        post(NSWorkspace.didUnmountNotification, "/Volumes/Photos")
+        post(NSWorkspace.didMountNotification, "/Volumes/Photos")
+        XCTAssertEqual(heard, ["+/Volumes/Photos", "-/Volumes/Photos", "+/Volumes/Photos"])
         _ = drives
+    }
+
+    func testADriveStillMountedAfterAnEjectIsListedAgain() async throws {
+        let drives = drives()
+        stillMounted = ["/Volumes/Photos"]
+        post(NSWorkspace.willUnmountNotification, "/Volumes/Photos")
+        XCTAssertEqual(heard, ["-/Volumes/Photos"])
+        try await settled()
+        XCTAssertEqual(heard, ["-/Volumes/Photos", "+/Volumes/Photos"], "a file on it was open, so it stayed")
+        XCTAssertEqual(drives.leaving, [])
+    }
+
+    func testADriveGoneWithoutAnUnmountNoteIsNotListedAgain() async throws {
+        let drives = drives()
+        post(NSWorkspace.willUnmountNotification, "/Volumes/Photos")
+        try await settled()
+        XCTAssertEqual(heard, ["-/Volumes/Photos"])
+        XCTAssertEqual(drives.leaving, [])
+    }
+
+    func testADriveMountedAgainBeforeTheCheckIsListedOnce() async throws {
+        let drives = drives()
+        stillMounted = ["/Volumes/Photos"]
+        post(NSWorkspace.willUnmountNotification, "/Volumes/Photos")
+        post(NSWorkspace.didUnmountNotification, "/Volumes/Photos")
+        post(NSWorkspace.didMountNotification, "/Volumes/Photos")
+        try await settled()
+        XCTAssertEqual(heard, ["-/Volumes/Photos", "+/Volumes/Photos"])
+        _ = drives
+    }
+
+    func testARenamedDriveMovesToItsNewName() {
+        let drives = drives()
+        post(NSWorkspace.didRenameVolumeNotification, "/Volumes/Pics", old: "/Volumes/Photos")
+        post(NSWorkspace.didRenameVolumeNotification, "/Volumes/Pics")
+        XCTAssertEqual(heard, ["-/Volumes/Photos", "+/Volumes/Pics"], "no old name, nothing to move")
+        _ = drives
+    }
+
+    func testNoTimerOutlivesDrives() async throws {
+        var drives: Drives? = drives()
+        stillMounted = ["/Volumes/Photos"]
+        post(NSWorkspace.willUnmountNotification, "/Volumes/Photos")
+        drives = nil
+        try await settled()
+        XCTAssertNil(drives)
+        XCTAssertEqual(heard, ["-/Volumes/Photos"])
     }
 
     func testANameWithSpacesAndAccentsComesThroughWhole() {
@@ -65,8 +131,12 @@ final class DrivesTests: XCTestCase {
 
     func testAFolderOnADriveLeadsWithTheDrivesName() {
         XCTAssertEqual(ResultCell.place("/Volumes/Photos"), "Photos")
-        XCTAssertEqual(ResultCell.place("/Volumes/Photos/trips"), "Photos · trips")
-        XCTAssertEqual(ResultCell.place("/Volumes/My Drive/trips/2024 summer"), "My Drive · trips/2024 summer")
+        XCTAssertEqual(ResultCell.place("/Volumes/Photos/trips"), "Photos › trips")
+        XCTAssertEqual(ResultCell.place("/Volumes/My Drive/trips/2024 summer"), "My Drive › trips/2024 summer")
+        let home = "/Volumes/Data/Users/me"
+        XCTAssertEqual(ResultCell.place("/Volumes/Data/Users/me/notes", home: home), "/Volumes/Data/Users/me/notes")
+        XCTAssertEqual(ResultCell.place(home, home: home), home)
+        XCTAssertEqual(ResultCell.place("/Volumes/Data/Users/you", home: home), "Data › Users/you")
         XCTAssertEqual(ResultCell.place("/Users/me/notes"), "/Users/me/notes")
         XCTAssertEqual(ResultCell.place("~/notes"), "~/notes")
         XCTAssertEqual(ResultCell.place("/Volumes"), "/Volumes")
@@ -78,23 +148,38 @@ final class DrivesTests: XCTestCase {
     func testARowOnADriveShowsTheDrivesName() {
         let cell = ResultCell()
         cell.show(Row(name: "beach.jpg", folder: "/Volumes/Photos/trips", isFolder: false), icon: NSImage())
-        XCTAssertEqual(cell.folder.stringValue, "Photos · trips")
+        XCTAssertEqual(cell.folder.stringValue, "Photos › trips")
         cell.show(
             TextHit(path: "/Volumes/Photos/notes/plan.txt", text: "plan", match: NSRange(location: 0, length: 4), line: 3),
             icon: NSImage())
-        XCTAssertEqual(cell.folder.stringValue, "plan.txt, line 3 · Photos · notes")
+        XCTAssertEqual(cell.folder.stringValue, "plan.txt, line 3 · Photos › notes")
     }
 
-    func testTheWindowLeavesOutWhatTheCoreRefuses() throws {
+    func testTheWindowLeavesOutWhatTheCoreRefuses() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: root) }
         let window = SearchPanel(root: root.path, hasAccess: { true }, stage: OffStage())
+        for _ in 0..<500 where !window.indexed { try await Task.sleep(for: .milliseconds(10)) }
+        XCTAssertTrue(window.indexed)
         for path in ["/", "/Volumes/No Such Drive", root.path] {
             window.driveMounted(path)
             window.driveUnmounting(path)
         }
-        XCTAssertNil(window.driveTold, "no list follows, so nothing waits to be timed")
+        XCTAssertEqual(window.drivesTold, [:], "no list follows, so nothing waits to be timed")
+    }
+
+    func testADriveIsTimedOnlyOnceAListHoldingItIsInUse() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let window = SearchPanel(root: root.path, hasAccess: { true }, stage: OffStage())
+        window.drivesTold = ["/Volumes/Photos": 1, "/Volumes/Music": 2]
+        // A change at home lands first.
+        window.timeDrives(watching: ["/Users/me", "/Users/me/notes"])
+        XCTAssertEqual(window.drivesTold, ["/Volumes/Photos": 1, "/Volumes/Music": 2])
+        window.timeDrives(watching: ["/Users/me", "/Volumes/Photos"])
+        XCTAssertEqual(window.drivesTold, ["/Volumes/Music": 2], "the other drive still being read")
+        window.timeDrives(watching: ["/Users/me", "/Volumes/Music", "/Volumes/Photos"])
+        XCTAssertEqual(window.drivesTold, [:])
     }
 }
 

@@ -142,8 +142,8 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
     /// window doesn't shrink and grow back.
     private var replacing = false
     private var filesChangedAt: TimeInterval = 0
-    /// A drive plugged in or ejected, and when macOS told, until the list that follows is in use.
-    private(set) var driveTold: (change: String, at: TimeInterval)?
+    /// When macOS told of each drive plugged in, until a list holding it is in use.
+    var drivesTold: [String: TimeInterval] = [:]
     /// When the key behind the text search under way went down; nil for a search run again.
     private var textTypedAt: TimeInterval?
     private var textStartedAt: TimeInterval = 0
@@ -328,19 +328,25 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
         health?.show()
     }
 
-    /// A volume mounted: a drive is found once the core has read it.
     func driveMounted(_ path: String) {
         let told = ProcessInfo.processInfo.systemUptime
-        guard hatch?.volumeAdded(path) == true else { return }
-        if indexed { driveTold = ("findable", told) }
+        guard hatch?.volumeAdded(path) == true, indexed else { return }
+        drivesTold[path] = told
     }
 
-    /// A volume about to unmount: let go of it before macOS checks whether anything holds it.
     func driveUnmounting(_ path: String) {
         let told = ProcessInfo.processInfo.systemUptime
         guard hatch?.volumeRemoved(path) == true else { return }
+        drivesTold[path] = nil
         timing.notice("let go of a drive \(ms(since: told), format: .fixed(precision: 2)) ms after macOS told")
-        if indexed { driveTold = ("gone", told) }
+    }
+
+    /// A list built for a change at home can land first, so only one holding the drive counts.
+    func timeDrives(watching: [String]) {
+        for (path, told) in drivesTold where watching.contains(path) {
+            timing.notice("drive findable \(ms(since: told), format: .fixed(precision: 0)) ms after macOS told")
+            drivesTold[path] = nil
+        }
     }
 
     private func build() {
@@ -606,11 +612,8 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
             health?.refresh()
         case .rebuilt(let count, let took):
             timing.notice("rebuilt \(count) entries in \(took) ms after a change")
-            if let driveTold {
-                timing.notice("drive \(driveTold.change, privacy: .public) \(ms(since: driveTold.at), format: .fixed(precision: 0)) ms after macOS told")
-                self.driveTold = nil
-            }
             hatch?.watch()
+            if !drivesTold.isEmpty, let hatch { timeDrives(watching: hatch.watching) }
             filesChangedAt = ProcessInfo.processInfo.systemUptime
             textWhole = false
             if shown { runAgain() } else { stale = true }

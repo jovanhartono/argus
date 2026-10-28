@@ -78,8 +78,6 @@ final class Hatch {
     nonisolated(unsafe) private var stream: FSEventStreamRef?
     nonisolated(unsafe) private var names: [String: Names] = [:]
     private(set) var watching: [String] = []
-    /// Drives about to unmount, kept out of the watch even while a list that still holds them is in use.
-    private var ejecting: Set<String> = []
     /// Taken before the first scan starts, so a change made during it still counts.
     private let started: FSEventStreamEventId
 
@@ -299,48 +297,44 @@ final class Hatch {
     /// Watches the folders the newest list reads. Called after each new list, as the folders
     /// may change.
     func watch() {
+        watch(replaying: nil)
+    }
+
+    private func watch(replaying from: FSEventStreamEventId?) {
         var out = TlRows()
         var since: FSEventStreamEventId = 0
         guard tl_watched(core, &out, &since) == TL_OK else { return }
-        let rows = copy(out).filter { row in !ejecting.contains { Hatch.path(row.name, isIn: $0) } }
+        let rows = copy(out)
         watchNames(of: rows.filter { !$0.isFolder }.map(\.name))
         // Replays from before the list's rebuild was asked for, so a change it missed in a folder
         // watched only from now still counts.
-        watch(rows.filter(\.isFolder).map(\.name), since: since == 0 ? started : since)
+        watch(rows.filter(\.isFolder).map(\.name), since: from ?? (since == 0 ? started : since))
     }
 
-    /// Lists the drive mounted at `path` too, when the core takes it; `.rebuilt` follows once
-    /// it is read. True when the core took it.
+    /// True when the core takes the drive; `.rebuilt` follows once it is read.
     @discardableResult
     func volumeAdded(_ path: String) -> Bool {
-        ejecting.remove(path)
         var path = path
         return path.withUTF8 { tl_volume_added(core, $0.baseAddress, $0.count, FSEventsGetCurrentEventId()) } == 1
     }
 
-    /// Lets go of the drive at `path` at once, so Finder can eject it, and drops it from the
-    /// list; `.rebuilt` follows. True when the core had it.
+    /// True when the core had the drive. Its watch ends at once, before macOS checks whether
+    /// anything holds it, so Finder ejects it on the first try.
     @discardableResult
     func volumeRemoved(_ path: String) -> Bool {
-        var bytes = path
-        let held = bytes.withUTF8 { tl_volume_removed(core, $0.baseAddress, $0.count, FSEventsGetCurrentEventId()) } == 1
-        ejecting.insert(path)
-        for (folder, watch) in names where Hatch.path(folder, isIn: path) {
-            watch.source.cancel()
-            names[folder] = nil
-        }
-        // Picks up where the old watch stopped, so a change at home in between still counts.
-        let from = stream.map { FSEventStreamGetLatestEventId($0) } ?? started
-        watch(watching.filter { !Hatch.path($0, isIn: path) }, since: from)
+        var path = path
+        let held = path.withUTF8 { tl_volume_removed(core, $0.baseAddress, $0.count, FSEventsGetCurrentEventId()) } == 1
+        // From where the old watch stopped, so a change at home during the swap still counts.
+        if held { watch(replaying: heardUpTo) }
         return held
     }
 
-    nonisolated static func path(_ path: String, isIn folder: String) -> Bool {
-        path.hasPrefix(folder) && (path.count == folder.count || path.dropFirst(folder.count).first == "/")
+    var heardUpTo: FSEventStreamEventId {
+        stream.map { FSEventStreamGetLatestEventId($0) } ?? started
     }
 
     /// Changes are gathered for 0.2 s, so a burst of saves arrives as one call.
-    private func watch(_ folders: [String], since: FSEventStreamEventId) {
+    func watch(_ folders: [String], since: FSEventStreamEventId) {
         guard folders != watching else { return }
         watching = folders
         if let stream {
