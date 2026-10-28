@@ -1,6 +1,7 @@
 //! Search: the letter check, fuzzy matching per word, and dropping searches nobody wants any more.
 
 use crate::apps::{AppId, Apps};
+use crate::frecency::{Boosts, Frecency};
 use crate::index::{EntryId, Index, NO_PARENT, NameId, letter, letters};
 use frizbee::{Config, Match, Matcher, Matching, Pattern, Scoring, SortStrategy};
 use rayon::prelude::*;
@@ -157,6 +158,25 @@ impl Searcher {
         ticket: Ticket,
         limit: usize,
     ) -> Option<Vec<Hit>> {
+        self.search_with(index, apps, query, ticket, limit, &Boosts::default())
+    }
+
+    /// `frecency.boosts` on the search threads, so a rescan filling rayon's shared threads
+    /// never holds up the next search for seconds.
+    pub fn boosts(&self, frecency: &Frecency, index: &Index, apps: &Apps, now: u64) -> Boosts {
+        self.pool.install(|| frecency.boosts(index, apps, now))
+    }
+
+    /// As `search`, with each file's and app's boost from `Searcher::boosts` added to its score.
+    pub fn search_with(
+        &self,
+        index: &Index,
+        apps: &Apps,
+        query: &str,
+        ticket: Ticket,
+        limit: usize,
+        boosts: &Boosts,
+    ) -> Option<Vec<Hit>> {
         let stale = || self.tickets.is_stale(ticket);
         let mut turn = self.turn.lock().unwrap();
         if stale() {
@@ -164,7 +184,7 @@ impl Searcher {
         }
         let scratch = &mut *turn;
         self.pool.install(|| {
-            let hits = run(index, apps, query, limit, scratch, &stale)?;
+            let hits = run(index, apps, query, limit, boosts, scratch, &stale)?;
             (!stale()).then_some(hits)
         })
     }
@@ -175,6 +195,7 @@ fn run(
     apps: &Apps,
     query: &str,
     limit: usize,
+    boosts: &Boosts,
     scratch: &mut Scratch,
     stale: &(impl Fn() -> bool + Sync),
 ) -> Option<Vec<Hit>> {
@@ -259,6 +280,9 @@ fn run(
         mark_possible(index, wanted & !later, unwanted, scratch, stale)?;
         matched |= match_names(index, &words, later, wanted, Pass::Possible, scratch, stale)?.0;
     }
+    for hit in &mut app_hits {
+        hit.score = hit.score.saturating_add(boosts.get(hit.item));
+    }
     // Room for the bundles an app hit may hide, so `limit` files are left once they are
     // dropped. Only apps inside the indexed folder have one, like those in ~/Applications.
     keep_best(&mut app_hits, limit);
@@ -288,10 +312,54 @@ fn run(
         let deep = u32::from(ceiling) + 4 * DEPTH_PENALTY;
         let mut winners = scratch.name_score.iter().filter(|&&s| u32::from(s) > deep);
         if winners.nth(wide - 1).is_some() {
-            let hits = best(index, scratch, wanted, unwanted, &folder_bonus, wide, stale)?;
+            let mut hits = best(
+                index,
+                scratch,
+                wanted,
+                unwanted,
+                &folder_bonus,
+                wide,
+                boosts,
+                stale,
+            )?;
             // Every entry sits at least one folder deep, which costs a plain name a little more.
-            let plain_best = u32::from(ceiling).saturating_sub(DEPTH_PENALTY);
-            if hits.len() == wide && hits[wide - 1].score > plain_best {
+            let ceiling = u32::from(ceiling);
+            if hits.len() == wide && hits[wide - 1].score > ceiling.saturating_sub(DEPTH_PENALTY) {
+                // A file opened often may still climb in by its boost when its name is plain
+                // too. Scoring just those few names is far cheaper than every plain name.
+                let weakest = hits[wide - 1].score;
+                let needed = letters(&words[0].needle);
+                let climbers: Vec<(EntryId, NameId, u32)> = boosts
+                    .iter()
+                    .filter_map(|(entry, boost)| {
+                        let at = entry as usize;
+                        let name = *index.entry_name.get(at)?;
+                        let plain = needed & !index.name_letters[name as usize] == 0
+                            && index.name_word_starts[name as usize] & needed == 0;
+                        let depth = DEPTH_PENALTY * u32::from(index.entry_depth[at]);
+                        let could = plain && ceiling.saturating_sub(depth) + boost >= weakest;
+                        could.then_some((entry, name, boost))
+                    })
+                    .collect();
+                if !climbers.is_empty() {
+                    reset(&mut scratch.possible, index.distinct_names());
+                    for &(_, name, _) in &climbers {
+                        mark(&scratch.possible, name as usize);
+                    }
+                    match_names(
+                        index,
+                        &words,
+                        wanted,
+                        wanted,
+                        Pass::Possible,
+                        scratch,
+                        stale,
+                    )?;
+                    let climbers = climbers.iter().map(|&(entry, _, boost)| (entry, boost));
+                    let bonus = &folder_bonus;
+                    push_boosted(index, scratch, wanted, unwanted, bonus, climbers, &mut hits);
+                    keep_best(&mut hits, wide);
+                }
                 #[cfg(test)]
                 {
                     scratch.early_stops += 1;
@@ -307,7 +375,16 @@ fn run(
     if uses_folders(wanted, unwanted) {
         words_above(index, scratch, stale)?;
     }
-    let hits = best(index, scratch, wanted, unwanted, &folder_bonus, wide, stale)?;
+    let hits = best(
+        index,
+        scratch,
+        wanted,
+        unwanted,
+        &folder_bonus,
+        wide,
+        boosts,
+        stale,
+    )?;
     Some(with_apps(index, apps, hits, app_hits, limit))
 }
 
@@ -317,6 +394,10 @@ fn uses_folders(wanted: u8, unwanted: u8) -> bool {
 }
 
 /// The best `limit` entries whose path holds every `wanted` word and no `unwanted` one.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one search's working state, passed twice"
+)]
 fn best(
     index: &Index,
     scratch: &Scratch,
@@ -324,6 +405,7 @@ fn best(
     unwanted: u8,
     folder_bonus: &[u32; 1 << MAX_WORDS],
     limit: usize,
+    boosts: &Boosts,
     stale: &(impl Fn() -> bool + Sync),
 ) -> Option<Vec<Hit>> {
     let use_folders = uses_folders(wanted, unwanted);
@@ -388,7 +470,67 @@ fn best(
 
     let mut hits: Vec<Hit> = chunks.into_iter().flatten().collect();
     keep_best(&mut hits, limit);
+    if !boosts.is_empty() {
+        // Only a boosted entry can climb past the best `limit` hits found without boosts, so
+        // the result is still exactly the best.
+        for hit in &mut hits {
+            hit.score = hit.score.saturating_add(boosts.get(hit.item));
+        }
+        push_boosted(
+            index,
+            scratch,
+            wanted,
+            unwanted,
+            folder_bonus,
+            boosts.iter(),
+            &mut hits,
+        );
+        hits.sort_unstable_by_key(|hit| hit.item);
+        hits.dedup_by_key(|hit| hit.item);
+        keep_best(&mut hits, limit);
+    }
     Some(hits)
+}
+
+/// Adds each `boosted` entry that matches, scored as `best`'s loop scores every entry. The loop
+/// keeps its own copy: calling this from it cost 1.3% more instructions per search.
+fn push_boosted(
+    index: &Index,
+    scratch: &Scratch,
+    wanted: u8,
+    unwanted: u8,
+    folder_bonus: &[u32; 1 << MAX_WORDS],
+    boosted: impl Iterator<Item = (EntryId, u32)>,
+    hits: &mut Vec<Hit>,
+) {
+    let use_folders = uses_folders(wanted, unwanted);
+    for (entry, boost) in boosted {
+        let at = entry as usize;
+        // Boosts worked out for an older list may point past this one.
+        let (Some(&name), Some(&parent)) = (index.entry_name.get(at), index.entry_parent.get(at))
+        else {
+            continue;
+        };
+        let own = scratch.name_words[name as usize];
+        if own & wanted == 0 || parent == NO_PARENT {
+            continue;
+        }
+        let mut path = own;
+        if use_folders {
+            path |= scratch.folder_words[parent as usize];
+        }
+        if path & wanted != wanted || path & unwanted != 0 {
+            continue;
+        }
+        let score = (u32::from(scratch.name_score[name as usize])
+            + folder_bonus[usize::from(wanted & !own)])
+        .saturating_sub(DEPTH_PENALTY * u32::from(index.entry_depth[at]));
+        hits.push(Hit {
+            item: Item::Entry(entry),
+            score: score.saturating_add(boost),
+            name_len: index.name_len(name),
+        });
+    }
 }
 
 /// The best `limit` of the files and apps found. A bundle the index holds too, like Gmail.app
@@ -1196,14 +1338,15 @@ mod tests {
         apps: &Apps,
         query: &str,
         limit: usize,
+        boosts: &Boosts,
     ) -> (Vec<Hit>, usize) {
         let mut fast = Scratch::default();
         let mut slow = Scratch {
             no_shortcuts: true,
             ..Scratch::default()
         };
-        let hits = run(index, apps, query, limit, &mut fast, &|| false).unwrap();
-        let expected = run(index, apps, query, limit, &mut slow, &|| false).unwrap();
+        let hits = run(index, apps, query, limit, boosts, &mut fast, &|| false).unwrap();
+        let expected = run(index, apps, query, limit, boosts, &mut slow, &|| false).unwrap();
         assert_eq!(hits, expected, "{query:?} limit {limit}");
         (hits, fast.early_stops)
     }
@@ -1216,7 +1359,7 @@ mod tests {
         ];
         // Only lower case and digits, so a word mostly sits inside a name, not at a word start.
         let flat = ["3", "8", "c", "a", "b", "x", "q"];
-        let mut early_stops = 0;
+        let (mut early_stops, mut boosted_stops) = (0, 0);
         for round in 0..24 {
             let parts: &[&str] = if round % 2 == 0 { &rich } else { &flat };
             let mut builder = IndexBuilder::new();
@@ -1242,16 +1385,26 @@ mod tests {
             let index = builder.finish();
             let names: Vec<&str> = names.iter().map(String::as_str).collect();
             let apps = Apps::from_names(Path::new("/home/Applications"), &names);
+            // Files and apps opened from anywhere, the plain names the shortcuts skip included.
+            let boosts = (0..rng.below(40))
+                .map(|_| (rng.below(index.len()) as EntryId, 1 + rng.below(48) as u32))
+                .collect::<Boosts>()
+                .with_apps((0..names.len() as AppId).map(|app| (app, rng.below(49) as u32)));
             for query in [
                 "c", "3", "38", "x8", "38x", "'c", "'38", "^c", "c$", "C", ".c", "c a", "38 c",
                 "a !b", "cab", "cab 38x",
             ] {
                 for limit in [1, 3, 10, 40, 1_000] {
-                    early_stops += with_and_without_shortcuts(&index, &apps, query, limit).1;
+                    let none = Boosts::default();
+                    let stops = with_and_without_shortcuts(&index, &apps, query, limit, &none).1;
+                    early_stops += stops;
+                    let stops = with_and_without_shortcuts(&index, &apps, query, limit, &boosts).1;
+                    boosted_stops += stops;
                 }
             }
         }
         assert!(early_stops > 100, "{early_stops}");
+        assert!(boosted_stops > 100, "{boosted_stops}");
     }
 
     #[test]
@@ -1275,7 +1428,8 @@ mod tests {
         let index = builder.finish();
         assert!(paths(&index, "z").is_empty());
         assert_eq!(paths(&index, "c"), ["/home/café.txt"]);
-        let (hits, _) = with_and_without_shortcuts(&index, &Apps::default(), "c", 10);
+        let (apps, none) = (Apps::default(), Boosts::default());
+        let (hits, _) = with_and_without_shortcuts(&index, &apps, "c", 10, &none);
         assert_eq!(hits.len(), 1);
     }
 
@@ -1299,11 +1453,10 @@ mod tests {
         let index = sample();
         let checks = AtomicU64::new(0);
         let stale = || checks.fetch_add(1, Ordering::Relaxed) > 0;
-        let apps = applications(&["Reminders"]);
-        assert_eq!(
-            run(&index, &apps, "re", 10, &mut Scratch::default(), &stale),
-            None
-        );
+        let (apps, none) = (applications(&["Reminders"]), Boosts::default());
+        let mut scratch = Scratch::default();
+        let ran = run(&index, &apps, "re", 10, &none, &mut scratch, &stale);
+        assert_eq!(ran, None);
         assert_eq!(checks.load(Ordering::Relaxed), 2);
     }
 
@@ -1532,11 +1685,10 @@ mod tests {
         let checks = AtomicU64::new(0);
         // Still wanted at the first check, replaced by the second.
         let stale = || checks.fetch_add(1, Ordering::Relaxed) > 0;
-        let apps = Apps::default();
-        assert_eq!(
-            run(&index, &apps, "readme", 10, &mut Scratch::default(), &stale),
-            None
-        );
+        let (apps, none) = (Apps::default(), Boosts::default());
+        let mut scratch = Scratch::default();
+        let ran = run(&index, &apps, "readme", 10, &none, &mut scratch, &stale);
+        assert_eq!(ran, None);
         assert_eq!(checks.load(Ordering::Relaxed), 2);
     }
 
@@ -1565,6 +1717,301 @@ mod tests {
                 .unwrap();
             assert_eq!(few, all[..5]);
             assert_eq!(all.len(), 600 + apps.len());
+        }
+    }
+
+    fn boosted(index: &Index, query: &str, limit: usize, boosts: &Boosts) -> Vec<Hit> {
+        boosted_with(index, &Apps::default(), query, limit, boosts)
+    }
+
+    fn boosted_with(
+        index: &Index,
+        apps: &Apps,
+        query: &str,
+        limit: usize,
+        boosts: &Boosts,
+    ) -> Vec<Hit> {
+        let searcher = Searcher::with_threads(2);
+        let ticket = searcher.ticket();
+        searcher
+            .search_with(index, apps, query, ticket, limit, boosts)
+            .unwrap()
+    }
+
+    fn entries(hits: &[Hit]) -> Vec<EntryId> {
+        hits.iter().filter_map(Hit::entry).collect()
+    }
+
+    #[test]
+    fn a_file_opened_often_climbs_past_a_slightly_better_match() {
+        let mut builder = IndexBuilder::new();
+        let root = builder.push("/home", NO_PARENT, true);
+        let a = builder.push("a", root, true);
+        let b = builder.push("b", a, true);
+        let deep = builder.push("plan.md", b, false);
+        builder.push("plan.md", root, false);
+        let index = builder.finish();
+        assert_eq!(first(&index, "plan"), "/home/plan.md");
+        let boosts: Boosts = [(deep, 12)].into_iter().collect();
+        let hits = boosted(&index, "plan", 10, &boosts);
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].item, Item::Entry(deep));
+        assert!(boosted(&index, "zzz", 10, &boosts).is_empty());
+    }
+
+    #[test]
+    fn an_opened_file_below_the_limit_still_climbs_into_it() {
+        let mut builder = IndexBuilder::new();
+        let root = builder.push("/home", NO_PARENT, true);
+        for i in 0..200 {
+            builder.push(&format!("plan {i}.md"), root, false);
+        }
+        let deep = builder.push("deep", root, true);
+        let opened = builder.push("plan 7.md", deep, false);
+        let index = builder.finish();
+        let unboosted = boosted(&index, "plan", 5, &Boosts::default());
+        assert!(!entries(&unboosted).contains(&opened));
+        let boosts: Boosts = [(opened, 48)].into_iter().collect();
+        let hits = boosted(&index, "plan", 5, &boosts);
+        assert_eq!(hits.len(), 5);
+        assert_eq!(hits[0].item, Item::Entry(opened));
+        assert_eq!(hits[1..], unboosted[..4]);
+    }
+
+    #[test]
+    fn a_boost_never_brings_in_what_the_search_leaves_out() {
+        let index = sample();
+        let boosts: Boosts = (1..index.len() as EntryId).map(|e| (e, 48)).collect();
+        let found = |query: &str| {
+            let hits = boosted(&index, query, 10, &boosts);
+            let mut found: Vec<String> = entries(&hits)
+                .into_iter()
+                .map(|entry| index.path(entry).to_string_lossy().replace('\\', "/"))
+                .collect();
+            found.sort();
+            found
+        };
+        for query in [
+            "readme",
+            "synergy readme",
+            "readme !synergy",
+            "plna",
+            "home",
+        ] {
+            assert_eq!(found(query), paths(&index, query), "{query}");
+        }
+    }
+
+    #[test]
+    fn boosts_for_another_list_are_harmless() {
+        let index = sample();
+        let past_the_end = index.len() as EntryId;
+        let boosts: Boosts = [(past_the_end, 48), (EntryId::MAX, 48), (0, 48)]
+            .into_iter()
+            .collect();
+        let hits = boosted(&index, "readme", 10, &boosts);
+        assert_eq!(hits, boosted(&index, "readme", 10, &Boosts::default()));
+    }
+
+    #[test]
+    fn of_two_files_opened_the_one_opened_more_ranks_first() {
+        let mut builder = IndexBuilder::new();
+        let root = builder.push("/home", NO_PARENT, true);
+        let a = builder.push("a", root, true);
+        let b = builder.push("b", root, true);
+        let less = builder.push("plan.md", a, false);
+        let more = builder.push("plan.md", b, false);
+        let index = builder.finish();
+        let boosts: Boosts = [(less, 12), (more, 24)].into_iter().collect();
+        let hits = boosted(&index, "plan", 10, &boosts);
+        assert_eq!(entries(&hits), [more, less]);
+        assert_eq!(hits[0].score, hits[1].score + 12);
+    }
+
+    /// More names start with "pl" than the limit, so the search stops early, and still a
+    /// deeper file holding it only inside its name climbs in by its boost.
+    #[test]
+    fn an_opened_file_with_the_word_inside_its_name_climbs_past_an_early_stop() {
+        let mut builder = IndexBuilder::new();
+        let root = builder.push("/home", NO_PARENT, true);
+        for i in 0..20 {
+            builder.push(&format!("plan {i}.md"), root, false);
+        }
+        let deep = builder.push("deep", root, true);
+        let inside = builder.push("xplx.md", deep, false);
+        let index = builder.finish();
+        let (apps, none) = (Apps::default(), Boosts::default());
+        let (unboosted, stops) = with_and_without_shortcuts(&index, &apps, "pl", 5, &none);
+        assert_eq!(stops, 1);
+        assert!(!entries(&unboosted).contains(&inside));
+        let boosts: Boosts = [(inside, 48)].into_iter().collect();
+        let (hits, stops) = with_and_without_shortcuts(&index, &apps, "pl", 5, &boosts);
+        assert_eq!(stops, 1);
+        assert_eq!(hits[0].item, Item::Entry(inside), "{hits:?}");
+        assert_eq!(hits[1..], unboosted[..4]);
+    }
+
+    /// Every hit scores exactly its score without boosts plus its own boost, and appears once.
+    #[test]
+    fn a_boost_adds_to_the_score_and_nothing_else() {
+        let index = crate::stand_in(5_000);
+        let mut rng = Rng(0xB005_7ED5);
+        for pass in 0..10 {
+            let boosts: Boosts = (0..rng.below(300))
+                .map(|_| (rng.below(index.len()) as EntryId, 1 + rng.below(48) as u32))
+                .collect();
+            for query in ["budget", "plan notes", "re", "md !tax", "c"] {
+                let all = index.len();
+                let unboosted = boosted(&index, query, all, &Boosts::default());
+                let base: std::collections::BTreeMap<Item, u32> =
+                    unboosted.iter().map(|hit| (hit.item, hit.score)).collect();
+                let hits = boosted(&index, query, all, &boosts);
+                let items: std::collections::BTreeSet<Item> =
+                    hits.iter().map(|hit| hit.item).collect();
+                assert_eq!(items.len(), hits.len(), "pass {pass} {query:?}");
+                assert_eq!(hits.len(), base.len(), "pass {pass} {query:?}");
+                for hit in &hits {
+                    let expected = base[&hit.item] + boosts.get(hit.item);
+                    assert_eq!(hit.score, expected, "pass {pass} {query:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_searcher_works_out_the_same_boosts() {
+        let index = crate::stand_in(5_000);
+        let mut frecency = Frecency::default();
+        for entry in (1..index.len() as EntryId).step_by(97) {
+            frecency.record(&index.path(entry), 1_790_000_000);
+        }
+        let searcher = Searcher::with_threads(2);
+        let apps = Apps::default();
+        let boosts = searcher.boosts(&frecency, &index, &apps, 1_790_000_000);
+        assert!(boosts.len() > 40, "{}", boosts.len());
+        assert_eq!(boosts, frecency.boosts(&index, &apps, 1_790_000_000));
+    }
+
+    /// The best `limit` hits with boosts are the first `limit` of all hits with boosts, so
+    /// checking only the boosted entries past the limit loses nothing.
+    #[test]
+    fn boosted_hits_are_the_best_whatever_the_limit() {
+        let index = crate::stand_in(5_000);
+        let mut seed = 0x9E37_79B9_7F4A_7C15_u64;
+        let mut next = |below: usize| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % below as u64) as usize
+        };
+        for pass in 0..20 {
+            let boosts: Boosts = (0..next(300))
+                .map(|_| (next(index.len()) as EntryId, 1 + next(48) as u32))
+                .collect();
+            for query in ["budget", "plan notes", "re", "md !tax", "readme"] {
+                let all = boosted(&index, query, index.len(), &boosts);
+                for limit in [1, 5, 50] {
+                    let few = boosted(&index, query, limit, &boosts);
+                    let best = &all[..limit.min(all.len())];
+                    assert_eq!(few, best, "pass {pass} {query:?} limit {limit}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_boosted_file_beats_an_equal_match_with_apps_found_too() {
+        let mut builder = IndexBuilder::new();
+        let root = builder.push("/home", NO_PARENT, true);
+        let a = builder.push("a", root, true);
+        let b = builder.push("b", root, true);
+        let first = builder.push("plan.md", a, false);
+        let opened = builder.push("plan.md", b, false);
+        let index = builder.finish();
+        let apps = applications(&["Plan", "Planner"]);
+        let none = Boosts::default();
+        let unboosted = boosted_with(&index, &apps, "plan", 10, &none);
+        assert_eq!(entries(&unboosted), [first, opened]);
+        let boosts: Boosts = [(opened, 1)].into_iter().collect();
+        let hits = boosted_with(&index, &apps, "plan", 10, &boosts);
+        assert_eq!(entries(&hits), [opened, first]);
+        let apps_found = |hits: &[Hit]| -> Vec<Hit> {
+            let apps = hits.iter().filter(|hit| matches!(hit.item, Item::App(_)));
+            apps.copied().collect()
+        };
+        assert_eq!(apps_found(&hits), apps_found(&unboosted));
+        assert_eq!(apps_found(&hits).len(), 2);
+    }
+
+    /// Opening an app counts by its bundle's path, so the app row climbs, and the bundle the
+    /// index holds too stays hidden behind it.
+    #[test]
+    fn an_opened_app_climbs_past_a_better_named_one() {
+        let mut builder = IndexBuilder::new();
+        let root = builder.push("/home", NO_PARENT, true);
+        let folder = builder.push("Applications", root, true);
+        builder.push("Gmail.app", folder, true);
+        builder.push("Gmail Helper.app", folder, true);
+        builder.push("Gmail notes.txt", folder, false);
+        let index = builder.finish();
+        let apps = Apps::from_names(Path::new("/home/Applications"), &["Gmail", "Gmail Helper"]);
+        let path = |hit: &Hit| match hit.item {
+            Item::Entry(entry) => index.path(entry),
+            Item::App(app) => apps.path(app),
+        };
+        let none = Boosts::default();
+        let unboosted = boosted_with(&index, &apps, "gmail", 10, &none);
+        assert_eq!(unboosted[0].item, Item::App(0));
+        assert_eq!(unboosted[1].item, Item::App(1));
+
+        let mut frecency = Frecency::default();
+        let helper = Path::new("/home/Applications/Gmail Helper.app");
+        frecency.record(helper, 1_790_000_000);
+        frecency.record(helper, 1_790_000_000);
+        let boosts = frecency.boosts(&index, &apps, 1_790_000_000);
+        let hits = boosted_with(&index, &apps, "gmail", 10, &boosts);
+        assert_eq!(hits[0].item, Item::App(1), "{hits:?}");
+        assert_eq!(hits[0].score, unboosted[1].score + boosts.get(Item::App(1)));
+        let shown: Vec<std::path::PathBuf> = hits.iter().map(path).collect();
+        assert_eq!(shown.iter().filter(|shown| **shown == helper).count(), 1);
+        assert_eq!(hits.len(), unboosted.len());
+    }
+
+    /// Bundles in the index widen the early stop, and a file climbing in by its boost takes a
+    /// place in that wider list, so every limit still keeps the head of the full list.
+    #[test]
+    fn the_early_stop_holds_with_apps_and_climbing_files() {
+        let mut builder = IndexBuilder::new();
+        let root = builder.push("/home", NO_PARENT, true);
+        for i in 0..20 {
+            builder.push(&format!("plan {i}.md"), root, false);
+        }
+        let folder = builder.push("Applications", root, true);
+        builder.push("Plato.app", folder, true);
+        builder.push("Pluto.app", folder, true);
+        let deep = builder.push("deep", root, true);
+        let inside = builder.push("xplx.md", deep, false);
+        let index = builder.finish();
+        let apps = Apps::from_names(Path::new("/home/Applications"), &["Plato", "Pluto"]);
+        let none = Boosts::default();
+        let (unboosted, stops) = with_and_without_shortcuts(&index, &apps, "pl", 5, &none);
+        assert_eq!(stops, 1);
+        let (plato, pluto) = (Item::App(0), Item::App(1));
+        let items = |hits: &[Hit]| -> Vec<Item> { hits.iter().map(|hit| hit.item).collect() };
+        assert!(!entries(&unboosted).contains(&inside));
+        assert_eq!(items(&unboosted)[..2], [plato, pluto]);
+        let boosts = [(inside, 48)]
+            .into_iter()
+            .collect::<Boosts>()
+            .with_apps([(1, 30)]);
+        let (hits, stops) = with_and_without_shortcuts(&index, &apps, "pl", 5, &boosts);
+        assert_eq!(stops, 1);
+        assert!(entries(&hits).contains(&inside), "{hits:?}");
+        assert_eq!(items(&hits)[..3], [Item::Entry(inside), pluto, plato]);
+        let all = boosted_with(&index, &apps, "pl", 1_000, &boosts);
+        for limit in 1..=all.len() {
+            let (few, _) = with_and_without_shortcuts(&index, &apps, "pl", limit, &boosts);
+            assert_eq!(few, all[..limit], "limit {limit}");
         }
     }
 

@@ -154,6 +154,190 @@ fn an_index_opened_from_the_file_it_is_saved_to_is_not_saved_again() {
     assert!(!saved_line(&out), "{out}");
 }
 
+#[test]
+fn a_file_opened_often_climbs_the_golden_list_only_with_frecency() {
+    let dir = tempfile::tempdir().unwrap();
+    let files = dir.path().join("files");
+    fs::create_dir_all(files.join("a/b")).unwrap();
+    fs::write(files.join("plan.md"), "").unwrap();
+    fs::write(files.join("a/b/plan.md"), "").unwrap();
+    let deep = path(&files, "a/b/plan.md");
+    let golden = path(dir.path(), "golden.tsv");
+    fs::write(&golden, format!("plan\t{deep}\n")).unwrap();
+    let (files, list) = (
+        path(dir.path(), "files"),
+        path(dir.path(), "opens/frecency"),
+    );
+
+    let output = tl(&["open-record", &deep, "--frecency", &list]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(stdout(&output).contains(": score 1.00, one of 1 files opened in "));
+    let output = tl(&["open-record", &deep, "--frecency", &list]);
+    assert!(stdout(&output).contains(": score 2.00, one of 1 files opened in "));
+
+    let without = stdout(&tl(&["golden", &files, &golden, "--all"]));
+    assert!(without.contains("   2  plan\n"), "{without}");
+    assert!(without.contains("in the top 3: 1 of 1"), "{without}");
+    let with = stdout(&tl(&[
+        "golden",
+        &files,
+        &golden,
+        "--all",
+        "--frecency",
+        &list,
+    ]));
+    assert!(
+        with.contains("frecency: 1 of 1 files opened are in the index"),
+        "{with}"
+    );
+    assert!(with.contains("   1  plan\n"), "{with}");
+}
+
+#[test]
+fn open_record_refuses_a_path_that_is_not_there() {
+    let dir = tempfile::tempdir().unwrap();
+    let list = path(dir.path(), "frecency");
+    let output = tl(&[
+        "open-record",
+        &path(dir.path(), "missing"),
+        "--frecency",
+        &list,
+    ]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        stderr(&output).contains("cannot find"),
+        "{}",
+        stderr(&output)
+    );
+    assert!(!dir.path().join("frecency").exists());
+}
+
+#[test]
+fn a_damaged_list_starts_again() {
+    let dir = folder();
+    let (files, list) = (path(dir.path(), "files"), path(dir.path(), "frecency"));
+    assert!(
+        tl(&["open-record", &files, "--frecency", &list])
+            .status
+            .success()
+    );
+    let bytes = fs::read(&list).unwrap();
+    fs::write(&list, &bytes[..bytes.len() - 1]).unwrap();
+    let output = tl(&["open-record", &files, "--frecency", &list]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains("starting a new list"),
+        "{}",
+        stderr(&output)
+    );
+    assert!(stdout(&output).contains(": score 1.00, one of 1 files opened"));
+    let output = tl(&["open-record", &files, "--frecency", &list]);
+    assert_eq!(stderr(&output), "");
+    assert!(stdout(&output).contains(": score 2.00, one of 1 files opened"));
+}
+
+#[test]
+fn a_file_that_is_not_a_list_is_left_as_it_is() {
+    let dir = folder();
+    let list = path(dir.path(), "frecency");
+    fs::write(&list, "garbage").unwrap();
+    let output = tl(&[
+        "open-record",
+        &path(dir.path(), "files"),
+        "--frecency",
+        &list,
+    ]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        stderr(&output).contains("left as it is"),
+        "{}",
+        stderr(&output)
+    );
+    assert_eq!(fs::read(&list).unwrap(), b"garbage");
+}
+
+#[test]
+fn open_record_needs_a_list() {
+    let dir = folder();
+    let output = tl(&["open-record", &path(dir.path(), "files")]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(stderr(&output).starts_with("usage:"));
+}
+
+#[test]
+fn a_missing_list_ranks_nothing_and_says_nothing() {
+    let dir = folder();
+    let list = path(dir.path(), "missing");
+    let queries = path(dir.path(), "queries.txt");
+    let files = path(dir.path(), "files");
+    let output = tl(&["bench", &files, &queries, "1", "--all", "--frecency", &list]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(
+        !stderr(&output).contains("cannot open"),
+        "{}",
+        stderr(&output)
+    );
+    assert!(
+        stdout(&output).contains("frecency: 0 of 0 files opened are in the index"),
+        "{}",
+        stdout(&output)
+    );
+    assert!(!Path::new(&list).exists());
+}
+
+/// A link counts as the link the scan lists, not the file it points to, and a relative path
+/// as the real one; the search then ranks the opened link above a file of the same name
+/// higher up.
+#[cfg(unix)]
+#[test]
+fn open_record_counts_a_link_itself_and_resolves_its_folder() {
+    use std::io::Write;
+    use std::process::Stdio;
+    let dir = folder();
+    let files = dir.path().join("files");
+    fs::write(files.join("link.txt"), "").unwrap();
+    fs::create_dir(files.join("deep")).unwrap();
+    std::os::unix::fs::symlink(files.join("a.txt"), files.join("deep/link.txt")).unwrap();
+    let list = path(dir.path(), "frecency");
+    let output = Command::new(env!("CARGO_BIN_EXE_tl"))
+        .args(["open-record", "deep/../deep/link.txt", "--frecency", &list])
+        .current_dir(&files)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", stderr(&output));
+    let link = fs::canonicalize(&files).unwrap().join("deep/link.txt");
+    assert!(
+        stdout(&output).starts_with(&format!("{}: score 1.00", link.display())),
+        "{}",
+        stdout(&output)
+    );
+
+    let search = |more: &[&str]| {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_tl"))
+            .args(["search", files.to_str().unwrap(), "--all"])
+            .args(more)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child.stdin.take().unwrap().write_all(b"link\n").unwrap();
+        stdout(&child.wait_with_output().unwrap())
+    };
+    let first = |out: &str| {
+        let mut lines = out.lines().skip_while(|line| !line.starts_with("\"link\""));
+        lines.nth(1).unwrap().ends_with(&link.display().to_string())
+    };
+    let out = search(&[]);
+    assert!(!first(&out), "{out}");
+    let out = search(&["--frecency", &list]);
+    assert!(
+        out.contains("frecency: 1 of 1 files opened are in the index"),
+        "{out}"
+    );
+    assert!(first(&out), "{out}");
+}
+
 /// Rust ignores SIGPIPE, so without restoring it every print to a closed pipe panics.
 #[cfg(unix)]
 #[test]

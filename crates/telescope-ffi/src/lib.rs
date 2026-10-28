@@ -16,12 +16,13 @@ use std::io;
 use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 use telescope_core::{
-    Access, Apps, Clutter, Hit, Ignore, Index, Pages, Scope, Searcher, Settings, Ticket, Watch,
+    Access, Apps, Boosts, Clutter, Frecency, Hit, Ignore, Index, Pages, Scope, Searcher, Settings,
+    Ticket, Watch, unix_now,
 };
 use telescope_grep::{Found, Grep, Report};
 
@@ -29,7 +30,7 @@ use telescope_grep::{Found, Grep, Report};
 static PAGES: Pages = Pages;
 
 /// Raise this with any change below, so a window built against an older header refuses to start.
-pub const TL_ABI_VERSION: u32 = 5;
+pub const TL_ABI_VERSION: u32 = 6;
 
 pub const TL_OK: u32 = 0;
 /// No rows for that ticket: not ready yet, already taken, or a newer search replaced them.
@@ -43,8 +44,8 @@ pub const TL_EVENT_READY: u32 = 2;
 /// The folder couldn't be scanned, or the worker hit a bug; no more results will come.
 /// `value` is the scan's OS error number (errno on a Mac), or 0.
 pub const TL_EVENT_FAILED: u32 = 3;
-/// A problem with your ignore list. `value` is the address of its text, NUL-terminated UTF-8,
-/// readable only until `on_event` returns.
+/// A problem with your ignore list or the list of opened files. `value` is the address of its
+/// text, NUL-terminated UTF-8, readable only until `on_event` returns.
 pub const TL_EVENT_NOTE: u32 = 4;
 /// A list built again after a change is in use. `value` holds its entry count in the low 32
 /// bits and the milliseconds the rebuild took in the high 32.
@@ -61,6 +62,9 @@ const LINES: usize = 100;
 /// doesn't keep a core busy. A change is findable within FSEvents' 0.2 s, plus this, plus
 /// one rebuild: about 0.15 s for a home folder.
 const GAP: Duration = Duration::from_millis(500);
+
+/// Scores fade about 2% a day, so boosts worked out an hour ago are still right.
+const RERANK: Duration = Duration::from_secs(60 * 60);
 
 /// Runs on Rust threads, at times several at once, never the window's main thread, and must
 /// never wait for it.
@@ -162,6 +166,21 @@ pub struct TlCore {
     text: Option<Text>,
 }
 
+/// The files opened from the window, for ranking, and the file they are kept in, if any.
+#[derive(Default)]
+struct Opens {
+    frecency: Frecency,
+    file: Option<PathBuf>,
+}
+
+impl TlCore {
+    fn send(&self, job: Job) {
+        if let Some(jobs) = &self.jobs {
+            let _ = jobs.send(job);
+        }
+    }
+}
+
 /// What text search needs. Its threads start with the first search, so a window that never
 /// searches inside files never pays for them.
 struct Text {
@@ -210,6 +229,9 @@ enum Job {
         index: Arc<Index>,
         took: u32,
     },
+    Opened,
+    /// Told from the worker, since `on_event` must never run on the window's main thread.
+    Note(String),
 }
 
 /// What the rebuild thread waits on.
@@ -274,6 +296,10 @@ struct Live {
     /// None for made-up names, or before the first list.
     newest: Mutex<Newest>,
     watched: Mutex<Watched>,
+    opens: Mutex<Opens>,
+    /// Taken around each read or save of the opens' file, so it never goes back to an older
+    /// list, while searches never wait for the disk.
+    saves: Mutex<()>,
 }
 
 impl Live {
@@ -548,7 +574,7 @@ fn work(
             .expect("start the rebuild thread")
     };
     let served = panic::catch_unwind(AssertUnwindSafe(|| {
-        serve(index, searcher, inbox, done, &notify);
+        serve(index, searcher, inbox, done, &live.opens, &notify, RERANK);
     }));
     if served.is_err() {
         live.plan(|plan| plan.stopped = true);
@@ -563,11 +589,36 @@ fn serve(
     searcher: &Searcher,
     inbox: &Receiver<Job>,
     done: &Done,
+    opens: &Mutex<Opens>,
     notify: &Notify,
+    rerank: Duration,
 ) {
     // The window has no app rows yet.
     let apps = Apps::default();
-    while let Ok(job) = inbox.recv() {
+    // Each opened file's entry is found once per list or run of opens, never per search, on a
+    // copy so `tl_opened` never waits for it.
+    let rank = |index: &Index| {
+        let frecency = opens.lock().unwrap().frecency.clone();
+        (
+            searcher.boosts(&frecency, index, &apps, unix_now()),
+            Instant::now(),
+        )
+    };
+    let (mut boosts, mut ranked): (Boosts, Instant) = rank(&index);
+    let mut stale = false;
+    loop {
+        let job = match inbox.try_recv() {
+            Ok(job) => job,
+            Err(TryRecvError::Disconnected) => return,
+            Err(TryRecvError::Empty) => {
+                if stale {
+                    (boosts, ranked) = rank(&index);
+                    stale = false;
+                }
+                let Ok(job) = inbox.recv() else { return };
+                job
+            }
+        };
         let (ticket, query) = match job {
             // Searches sent before this one ran on the old list; the old list is freed here.
             Job::Swap { index: fresh, took } => {
@@ -576,12 +627,25 @@ fn serve(
                     TL_EVENT_REBUILT,
                     u64::from(took) << 32 | index.entry_count() as u64,
                 );
+                stale = true;
+                continue;
+            }
+            Job::Opened => {
+                stale = true;
+                continue;
+            }
+            Job::Note(note) => {
+                notify.note(&note);
                 continue;
             }
             Job::Search { ticket, query } => (ticket, query),
         };
+        if stale || ranked.elapsed() > rerank {
+            (boosts, ranked) = rank(&index);
+            stale = false;
+        }
         // A search replaced by a newer keystroke gives up and is never shown.
-        let Some(hits) = searcher.search(&index, &apps, &query, ticket, ROWS) else {
+        let Some(hits) = searcher.search_with(&index, &apps, &query, ticket, ROWS, &boosts) else {
             continue;
         };
         // A key pressed just as the search finished: skip rows the window would refuse.
@@ -936,6 +1000,90 @@ pub unsafe extern "C" fn tl_rows_free(rows: TlRows) {
     })
 }
 
+/// Ranks files opened often and lately higher, by the opens kept in `file`: read now, in place
+/// of any opens counted so far, and written again by each `tl_opened`. A missing file starts an
+/// empty list; so does a damaged one, told as a `TL_EVENT_NOTE`, which the next open replaces.
+/// One that can't be read or comes from a newer build is told too, and left as it is: opens
+/// then count until the core is freed. Returns how many files the list holds, or 0 for an empty
+/// `file` or one that isn't UTF-8, which leaves the list as it was. Safe to call from any thread.
+///
+/// # Safety
+/// `core` came from `tl_core_new` or `tl_core_new_stand_in`, and `file` points to `len` bytes
+/// (or `len` is 0).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tl_frecency_open(core: *const TlCore, file: *const u8, len: usize) -> u32 {
+    guard(0, || {
+        let core = unsafe { &*core };
+        let bytes = match len {
+            0 => return 0,
+            _ => unsafe { std::slice::from_raw_parts(file, len) },
+        };
+        let Ok(file) = std::str::from_utf8(bytes).map(PathBuf::from) else {
+            return 0;
+        };
+        let _turn = core.live.saves.lock().unwrap();
+        let (frecency, file) = match Frecency::open(&file) {
+            Ok(frecency) => (frecency, Some(file)),
+            Err(why) => {
+                let (then, file) = if why.is_damaged() {
+                    ("starts again", Some(file))
+                } else {
+                    ("is left as it is", None)
+                };
+                let note = format!("the list of opened files could not be read and {then}: {why}");
+                core.send(Job::Note(note));
+                (Frecency::default(), file)
+            }
+        };
+        let count = frecency.len() as u32;
+        *core.live.opens.lock().unwrap() = Opens { frecency, file };
+        core.send(Job::Opened);
+        count
+    })
+}
+
+/// Counts one open of `path`, a real path in UTF-8 of a file or folder the window opened, so it
+/// ranks higher from the next search on. With a file from `tl_frecency_open`, the list is saved
+/// there before this returns, so call it off the main thread; a save that fails is told as a
+/// `TL_EVENT_NOTE`, and the open still counts until the core is freed. Returns 1 once counted,
+/// or 0 for a path that is empty, isn't UTF-8 or is longer than 4096 bytes. Safe to call from
+/// any thread.
+///
+/// # Safety
+/// `core` came from `tl_core_new` or `tl_core_new_stand_in`, and `path` points to `len` bytes
+/// (or `len` is 0).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tl_opened(core: *const TlCore, path: *const u8, len: usize) -> u32 {
+    guard(0, || {
+        let core = unsafe { &*core };
+        let bytes = match len {
+            0 => return 0,
+            _ => unsafe { std::slice::from_raw_parts(path, len) },
+        };
+        let Ok(path) = std::str::from_utf8(bytes) else {
+            return 0;
+        };
+        let _turn = core.live.saves.lock().unwrap();
+        let mut opens = core.live.opens.lock().unwrap();
+        if !opens.frecency.record(Path::new(path), unix_now()) {
+            return 0;
+        }
+        let saving = opens
+            .file
+            .clone()
+            .map(|file| (opens.frecency.clone(), file));
+        drop(opens);
+        core.send(Job::Opened);
+        if let Some((frecency, file)) = saving
+            && let Err(error) = frecency.save(&file)
+        {
+            let note = format!("the list of opened files could not be saved: {error}");
+            core.send(Job::Note(note));
+        }
+        1
+    })
+}
+
 impl Text {
     fn search(&self) -> &TextSearch {
         self.started.get_or_init(|| {
@@ -1279,6 +1427,7 @@ mod tests {
     struct Events {
         seen: Mutex<Vec<(u32, u64)>>,
         notes: Mutex<Vec<String>>,
+        noted: Condvar,
         changed: Condvar,
         /// While true, a text search thread telling of lines waits in `on_event`.
         hold_lines: Mutex<bool>,
@@ -1294,6 +1443,7 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push(text.to_str().unwrap().to_owned());
+            events.noted.notify_all();
             return;
         }
         events.seen.lock().unwrap().push((event, value));
@@ -1359,6 +1509,19 @@ mod tests {
                 .unwrap();
             assert!(!waited.timed_out(), "no event {event}");
             seen.iter().find(|(e, _)| *e == event).unwrap().1
+        }
+
+        /// Waits for a note holding `part`, and returns every note so far.
+        fn wait_for_note(&self, part: &str) -> Vec<String> {
+            let notes = self.notes.lock().unwrap();
+            let (notes, waited) = self
+                .noted
+                .wait_timeout_while(notes, Duration::from_secs(60), |notes| {
+                    !notes.iter().any(|note| note.contains(part))
+                })
+                .unwrap();
+            assert!(!waited.timed_out(), "no note with {part:?}: {notes:?}");
+            notes.clone()
         }
 
         fn ready(&self) -> Vec<u64> {
@@ -2101,7 +2264,8 @@ mod tests {
         })
         .unwrap();
         drop(jobs);
-        serve(old, &searcher, &inbox, &done, &notify);
+        let opens = Mutex::default();
+        serve(old, &searcher, &inbox, &done, &opens, &notify, RERANK);
         assert_eq!(found(&done), 0);
         let mut seen = std::mem::take(&mut *events.seen.lock().unwrap());
         assert_eq!(
@@ -2126,7 +2290,7 @@ mod tests {
         .unwrap();
         drop(jobs);
         let (_dir, unused) = index_of(&[]);
-        serve(unused, &searcher, &inbox, &done, &notify);
+        serve(unused, &searcher, &inbox, &done, &opens, &notify, RERANK);
         assert_eq!(found(&done), 2);
         seen = std::mem::take(&mut *events.seen.lock().unwrap());
         assert_eq!(
@@ -2136,6 +2300,263 @@ mod tests {
                 (TL_EVENT_READY, after.number())
             ]
         );
+    }
+
+    /// Rows as the window shows them: name and folder joined back into a path.
+    fn found_paths(core: &Core, events: &Events, query: &str) -> Vec<PathBuf> {
+        let ticket = submit(core, query);
+        events.wait_for(TL_EVENT_READY, ticket);
+        let rows = take(core, ticket).unwrap();
+        rows.into_iter()
+            .map(|(name, folder, _)| Path::new(&folder).join(name))
+            .collect()
+    }
+
+    fn opened(core: &Core, path: &Path) -> u32 {
+        let path = path.to_str().unwrap();
+        unsafe { tl_opened(core.0, path.as_ptr(), path.len()) }
+    }
+
+    fn frecency_open(core: &Core, file: &Path) -> u32 {
+        let file = file.to_str().unwrap();
+        unsafe { tl_frecency_open(core.0, file.as_ptr(), file.len()) }
+    }
+
+    #[test]
+    fn a_file_opened_ranks_first_from_the_next_search() {
+        let events = Events::default();
+        let core = start(2_000, &events);
+        let before = found_paths(&core, &events, "budget");
+        let last = before.last().unwrap();
+        assert_eq!(opened(&core, last), 1);
+        assert_eq!(opened(&core, last), 1);
+        let after = found_paths(&core, &events, "budget");
+        assert_eq!(after[0], *last);
+        assert_eq!(after[1..], before[..ROWS - 1]);
+    }
+
+    #[test]
+    fn opens_are_saved_and_rank_again_in_the_next_core() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("io.example/frecency");
+        let events = Events::default();
+        let core = start(2_000, &events);
+        assert_eq!(frecency_open(&core, &file), 0);
+        let last = found_paths(&core, &events, "budget").pop().unwrap();
+        assert_eq!(opened(&core, &last), 1);
+        drop(core);
+        assert_eq!(Frecency::open(&file).unwrap().len(), 1);
+
+        let events = Events::default();
+        let core = start(2_000, &events);
+        assert_ne!(found_paths(&core, &events, "budget")[0], last);
+        assert_eq!(frecency_open(&core, &file), 1);
+        assert_eq!(found_paths(&core, &events, "budget")[0], last);
+        assert!(events.notes.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_damaged_list_is_told_and_starts_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("frecency");
+        let mut list = Frecency::default();
+        list.record(Path::new("/stand-in/old.md"), unix_now());
+        list.save(&file).unwrap();
+        let bytes = std::fs::read(&file).unwrap();
+        std::fs::write(&file, &bytes[..bytes.len() - 1]).unwrap();
+        let events = Events::default();
+        let core = start(100, &events);
+        assert_eq!(frecency_open(&core, &file), 0);
+        let notes = events.wait_for_note("could not be read and starts again");
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert_eq!(opened(&core, Path::new("/stand-in/a.md")), 1);
+        assert_eq!(Frecency::open(&file).unwrap().len(), 1);
+    }
+
+    /// Another kind of file, or a list from a newer build, is never saved over.
+    #[test]
+    fn a_list_it_cannot_read_is_told_and_left_as_it_is() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("frecency");
+        let events = Events::default();
+        let core = start(2_000, &events);
+        let last = found_paths(&core, &events, "budget").pop().unwrap();
+        let mut newer = Vec::from(*b"TL-OPENS");
+        newer.extend_from_slice(&2_u32.to_le_bytes());
+        newer.extend_from_slice(&[0; 12]);
+        for kept in [b"not a list of opened files".as_slice(), &newer] {
+            std::fs::write(&file, kept).unwrap();
+            assert_eq!(frecency_open(&core, &file), 0);
+            assert_eq!(opened(&core, &last), 1);
+            assert_eq!(found_paths(&core, &events, "budget")[0], last);
+            assert_eq!(std::fs::read(&file).unwrap(), kept);
+        }
+        let notes = events.notes.lock().unwrap().clone();
+        assert_eq!(notes.len(), 2, "{notes:?}");
+        assert!(notes[0].contains("is left as it is: not a Telescope list"));
+        assert!(notes[1].contains("is left as it is: saved as version 2"));
+    }
+
+    #[test]
+    fn an_open_that_cannot_be_saved_is_told_and_still_counts() {
+        let dir = tempfile::tempdir().unwrap();
+        let events = Events::default();
+        let core = start(2_000, &events);
+        assert_eq!(frecency_open(&core, &dir.path().join("taken/frecency")), 0);
+        std::fs::write(dir.path().join("taken"), "").unwrap();
+        let last = found_paths(&core, &events, "budget").pop().unwrap();
+        assert_eq!(opened(&core, &last), 1);
+        events.wait_for_note("could not be saved");
+        assert_eq!(found_paths(&core, &events, "budget")[0], last);
+    }
+
+    /// The list read replaces every open counted before, and reading it again changes nothing.
+    #[test]
+    fn a_list_read_replaces_the_opens_counted_so_far() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("frecency");
+        let events = Events::default();
+        let core = start(2_000, &events);
+        let before = found_paths(&core, &events, "budget");
+        let (early, saved) = (&before[ROWS - 1], &before[ROWS - 2]);
+        assert_eq!(opened(&core, early), 1);
+        assert_eq!(found_paths(&core, &events, "budget")[0], *early);
+        let mut list = Frecency::default();
+        list.record(saved, unix_now());
+        list.save(&file).unwrap();
+        for _ in 0..2 {
+            assert_eq!(frecency_open(&core, &file), 1);
+            let after = found_paths(&core, &events, "budget");
+            assert_eq!(after[0], *saved);
+            assert!(!after[..ROWS - 1].contains(early), "{after:?}");
+        }
+        assert!(events.notes.lock().unwrap().is_empty());
+    }
+
+    /// Opens from several threads at once each count, and the file ends up with all of them.
+    #[test]
+    fn opens_from_several_threads_all_count_and_are_all_saved() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("frecency");
+        let events = Events::default();
+        let core = start(2_000, &events);
+        assert_eq!(frecency_open(&core, &file), 0);
+        let found = found_paths(&core, &events, "budget");
+        let shared = core.0 as usize;
+        thread::scope(|threads| {
+            for paths in found.chunks(10) {
+                threads.spawn(move || {
+                    for path in paths {
+                        let path = path.to_str().unwrap();
+                        let core = shared as *const TlCore;
+                        assert_eq!(unsafe { tl_opened(core, path.as_ptr(), path.len()) }, 1);
+                    }
+                });
+            }
+        });
+        let saved = Frecency::open(&file).unwrap();
+        assert_eq!(saved.len(), found.len());
+        let now = unix_now();
+        assert!(found.iter().all(|path| saved.score(path, now) > 0.9));
+        assert!(events.notes.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn refuses_paths_and_files_it_cannot_use() {
+        let events = Events::default();
+        let core = start(100, &events);
+        let broken = [b'/', 0xFF];
+        unsafe {
+            assert_eq!(tl_opened(core.0, broken.as_ptr(), broken.len()), 0);
+            assert_eq!(tl_opened(core.0, std::ptr::null(), 0), 0);
+            assert_eq!(tl_frecency_open(core.0, broken.as_ptr(), broken.len()), 0);
+            assert_eq!(tl_frecency_open(core.0, std::ptr::null(), 0), 0);
+        }
+        let long = format!("/{}", "a".repeat(4096));
+        assert_eq!(opened(&core, Path::new(&long)), 0);
+        assert!(events.notes.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_rebuilt_list_is_ranked_by_the_opens_before_its_first_search() {
+        let (_old_dir, old) = index_of(&["plan.md"]);
+        let (_new_dir, new) = index_of(&["plan.md", "a/b/plan.md"]);
+        let deep = new
+            .ids()
+            .map(|entry| new.path(entry))
+            .find(|path| path.ends_with("a/b/plan.md"))
+            .unwrap();
+        let mut frecency = Frecency::default();
+        frecency.record(&deep, unix_now());
+        let opens = Mutex::new(Opens {
+            frecency,
+            file: None,
+        });
+        let events = Events::default();
+        let notify = Notify {
+            ctx: &events as *const Events as *mut c_void,
+            on_event: record,
+        };
+        let searcher = Searcher::with_threads(1);
+        let done = Done::default();
+        let (jobs, inbox) = mpsc::channel();
+        jobs.send(Job::Swap {
+            index: new,
+            took: 1,
+        })
+        .unwrap();
+        let ticket = searcher.ticket();
+        let query = "plan".to_owned();
+        jobs.send(Job::Search { ticket, query }).unwrap();
+        drop(jobs);
+        serve(old, &searcher, &inbox, &done, &opens, &notify, RERANK);
+        let (_, packed) = done.lock().unwrap().take().unwrap();
+        let row = &packed.rows[0];
+        let folder = row.folder_start as usize..(row.folder_start + row.folder_len) as usize;
+        assert_eq!(Path::new(&packed.text[folder]), deep.parent().unwrap());
+    }
+
+    /// Scores fade, so boosts older than `rerank` are worked out again before the next search,
+    /// with no open or new list since.
+    #[test]
+    fn old_boosts_are_worked_out_again_before_a_search() {
+        let (_dir, index) = index_of(&["plan.md", "a/b/plan.md"]);
+        let deep = index
+            .ids()
+            .map(|entry| index.path(entry))
+            .find(|path| path.ends_with("a/b/plan.md"))
+            .unwrap();
+        let events = Events::default();
+        let notify = Notify {
+            ctx: &events as *const Events as *mut c_void,
+            on_event: record,
+        };
+        let searcher = Searcher::with_threads(1);
+        for (rerank, climbs) in [(RERANK, false), (Duration::ZERO, true)] {
+            let opens = Mutex::<Opens>::default();
+            let done = Done::default();
+            let (jobs, inbox) = mpsc::channel();
+            let search = |jobs: &Sender<Job>| {
+                let ticket = searcher.ticket();
+                let query = "plan".to_owned();
+                jobs.send(Job::Search { ticket, query }).unwrap();
+                events.wait_for(TL_EVENT_READY, ticket.number());
+            };
+            thread::scope(|threads| {
+                let (index, searcher, done, opens) = (Arc::clone(&index), &searcher, &done, &opens);
+                threads.spawn(move || serve(index, searcher, &inbox, done, opens, &notify, rerank));
+                search(&jobs);
+                // Behind the worker's back, as an hour of fading would be.
+                opens.lock().unwrap().frecency.record(&deep, unix_now());
+                search(&jobs);
+                drop(jobs);
+            });
+            let (_, packed) = done.lock().unwrap().take().unwrap();
+            let row = &packed.rows[0];
+            let folder = row.folder_start as usize..(row.folder_start + row.folder_len) as usize;
+            let first = Path::new(&packed.text[folder]);
+            assert_eq!(first == deep.parent().unwrap(), climbs, "{first:?}");
+        }
     }
 
     /// A line as the window would copy it: the file's path, the line number, the line, and
