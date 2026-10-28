@@ -69,7 +69,7 @@ typedef struct TlLines {
 } TlLines;
 
 uint32_t tl_abi_version(void);
-TlCore *tl_core_new(const uint8_t *root, size_t root_len, uint32_t full_disk, void *ctx, TlEventFn on_event);
+TlCore *tl_core_new(const uint8_t *root, size_t root_len, uint32_t full_disk, uint32_t everything, void *ctx, TlEventFn on_event);
 TlCore *tl_core_new_stand_in(uint64_t count, void *ctx, TlEventFn on_event);
 uint64_t tl_submit(const TlCore *core, const uint8_t *query, size_t len);
 uint32_t tl_changed(const TlCore *core, const uint8_t *paths, size_t len, uint32_t rescan, uint64_t mark);
