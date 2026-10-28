@@ -15,6 +15,7 @@ const MAX_WORDS: usize = 8;
 /// Ranking weights, in frizbee's units, where a matched letter is worth 12.
 const WHOLE_WORD_BONUS: u16 = 24;
 const DEPTH_PENALTY: u32 = 2;
+const FOLDER_WORD_PENALTY: u32 = 4;
 const RARER_BY: usize = 4;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -266,16 +267,20 @@ fn run(
         Item::Entry(_) => false,
     };
     let wide = limit + app_hits.iter().filter(inside).count();
-    // A word found in a folder above counts as a clean match of that word, so "willow readme"
-    // ranks willow-core/README.md above a long name that scatters the letters of both words.
+    // A word found in a folder above counts almost as a clean match of that word, so
+    // "willow readme" ranks willow-core/README.md above a long name that scatters the letters
+    // of both words, while for "shop workspace" Shop.xcworkspace still beats
+    // shop-web/.idea/workspace.xml.
     let match_score = u32::from(Config::default().scoring.match_score);
+    let mut credit = [0u32; MAX_WORDS];
+    for (credit, word) in credit.iter_mut().zip(&words) {
+        *credit =
+            (match_score * word.needle.chars().count() as u32).saturating_sub(FOLDER_WORD_PENALTY);
+    }
     let mut folder_bonus = [0u32; 1 << MAX_WORDS];
-    for (mask, bonus) in folder_bonus.iter_mut().enumerate() {
-        for (w, word) in words.iter().enumerate() {
-            if mask >> w & 1 == 1 {
-                *bonus += match_score * word.needle.chars().count() as u32;
-            }
-        }
+    for mask in 1..folder_bonus.len() {
+        folder_bonus[mask] =
+            folder_bonus[mask & (mask - 1)] + credit[mask.trailing_zeros() as usize];
     }
     if let Some(ceiling) = ceiling {
         // Most files sit several folders down. With fewer than `limit` names that would beat
@@ -1170,7 +1175,7 @@ mod tests {
         let names: Vec<&str> = names.iter().map(String::as_str).collect();
         let searcher = Searcher::with_threads(2);
         for apps in [Apps::default(), applications(&names)] {
-            for query in ["3", "38", "x8", "38x", "y"] {
+            for query in ["3", "38", "x8", "38x", "y", "38 x", "x 3", "3 !yy"] {
                 let all = searcher
                     .search(&index, &apps, query, searcher.ticket(), 1_000)
                     .unwrap();
@@ -1239,7 +1244,7 @@ mod tests {
             let apps = Apps::from_names(Path::new("/home/Applications"), &names);
             for query in [
                 "c", "3", "38", "x8", "38x", "'c", "'38", "^c", "c$", "C", ".c", "c a", "38 c",
-                "a !b", "cab",
+                "a !b", "cab", "cab 38x",
             ] {
                 for limit in [1, 3, 10, 40, 1_000] {
                     early_stops += with_and_without_shortcuts(&index, &apps, query, limit).1;
@@ -1363,6 +1368,59 @@ mod tests {
         assert_eq!(
             first(&index, "willow readme"),
             "/home/willow-core/README.md"
+        );
+    }
+
+    /// Worth two folder levels: a name one folder deeper still wins, two deeper ties on score.
+    #[test]
+    fn a_word_in_the_name_beats_the_same_word_in_a_folder_up_to_one_level_deeper() {
+        let mut rng = Rng(0x5_0b0);
+        // Separate letters, so neither word turns up in the other's name or in the folders.
+        let ones = ["f", "g", "j", "k", "n"];
+        let twos = ["q", "r", "t", "u", "v", "y", "z"];
+        let mut pairs = vec![("shop".to_owned(), "workspace".to_owned())];
+        for _ in 0..40 {
+            let one = format!("{}{}", rng.text(&ones, 1), rng.text(&ones, 7));
+            let two = format!("{}{}", rng.text(&twos, 1), rng.text(&twos, 7));
+            pairs.push((one, two));
+        }
+        for (one, two) in &pairs {
+            let query = format!("{one} {two}");
+            let mut capital = one.clone();
+            capital[..1].make_ascii_uppercase();
+            for extra in [false, true] {
+                let mut builder = IndexBuilder::new();
+                let root = builder.push("/home", NO_PARENT, true);
+                let web = builder.push(&format!("{one}-web"), root, true);
+                let idea = builder.push(".idea", web, true);
+                builder.push(&format!("{two}.xml"), idea, false);
+                let app = builder.push(&format!("{one}-app"), root, true);
+                let mut ios = builder.push("ios", app, true);
+                if extra {
+                    ios = builder.push("0", ios, true);
+                }
+                let name = format!("{capital}.xc{two}");
+                builder.push(&name, ios, false);
+                let index = builder.finish();
+                assert!(
+                    first(&index, &query).ends_with(&name),
+                    "{query:?} extra {extra}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_one_letter_word_in_a_folder_still_beats_the_letter_inside_a_name() {
+        let mut builder = IndexBuilder::new();
+        let root = builder.push("/home", NO_PARENT, true);
+        builder.push("cv-backup.pdf", root, false);
+        let a = builder.push("a", root, true);
+        builder.push("cv.pdf", a, false);
+        let index = builder.finish();
+        assert_eq!(
+            ranked(&index, &Apps::default(), "cv a"),
+            ["/home/a/cv.pdf", "/home/cv-backup.pdf"]
         );
     }
 
