@@ -578,11 +578,17 @@ impl Live {
             .as_ref()
             .map(|scope| scope.watched(&index))
             .unwrap_or_default();
+        // A list read before a drive was ejected still holds it; its watch must not come back.
+        let plan = self.plan.lock().unwrap();
         let watched = watched
             .into_iter()
+            .filter(|(path, _)| {
+                plan.volumes.contains(path) || !index.volumes().any(|volume| volume == path)
+            })
             .map(|(path, watch)| (path.to_string_lossy().into_owned(), watch))
             .collect();
         *self.watched.lock().unwrap() = (watched, mark);
+        drop(plan);
         *self.newest.lock().unwrap() = built
             .scope
             .map(|scope| (Arc::new(scope), Arc::clone(&index)));
@@ -1815,9 +1821,9 @@ pub unsafe extern "C" fn tl_volume_added(
 
 /// Tells the core the volume at `path`, by its real path, is going away, so the
 /// newest list drops it and everything on it without the home folder being read again;
-/// `TL_EVENT_REBUILT` follows. Call it once macOS says the volume will unmount: a new list
-/// stops naming it in `tl_watched`, and a scan of it under way stops at once, so it never
-/// keeps the volume busy. Returns 1 when that work was queued, else 0, as for a volume the
+/// `TL_EVENT_REBUILT` follows. Call it once macOS says the volume will unmount, or has
+/// unmounted without warning: `tl_watched` stops naming it at once, even for a list read
+/// before, and a scan of it under way stops at once, so it never keeps the volume busy. Returns 1 when that work was queued, else 0, as for a volume the
 /// core was never told of. `mark` is as for `tl_changed`. Safe to call from any thread, and
 /// never touches the volume.
 ///
@@ -1840,6 +1846,9 @@ pub unsafe extern "C" fn tl_volume_removed(
             return 0;
         }
         core.live.ejected.fetch_add(1, Ordering::Relaxed);
+        let mut watched = core.live.watched.lock().unwrap();
+        watched.0.retain(|(held, _)| Path::new(held) != path);
+        drop(watched);
         if plan.stopped || !plan.granted {
             return 0;
         }
@@ -3869,6 +3878,10 @@ mod tests {
         assert_eq!(watched(&core).1, 6);
 
         assert_eq!(unmounted(&core, &volume, 7), 1);
+        assert!(
+            !watched_inside(&core).contains(&volume_text),
+            "let go of before the list without it is built"
+        );
         assert_eq!(unmounted(&core, &volume, 8), 0, "already gone");
         assert_eq!(events.wait_for_rebuilt(3), 3);
         assert!(found(&core, &events, "beach").is_empty());
@@ -3984,6 +3997,35 @@ mod tests {
             plan.forget(&volume);
         });
         assert_eq!(graft(&source, &live, &notify), None);
+    }
+
+    #[test]
+    fn a_list_read_before_an_eject_leaves_the_drive_unwatched() {
+        let (_h, home) = home_with(&["notes/a.txt"]);
+        let (_a, photos) = home_with(&["beach.jpg"]);
+        let (_b, music) = home_with(&["song.mp3"]);
+        let (live, events) = (Live::default(), Events::default());
+        let notify = notify_to(&events);
+        let source = home_source(&home, &live, &notify);
+        live.plan(|plan| plan.volumes = vec![photos.clone(), music.clone()]);
+        let (volumes, changes) = live.plan.lock().unwrap().volumes();
+        let built = source.graft(&volumes, &changes, &live, &notify).unwrap();
+        live.plan(|plan| assert!(plan.forget(&photos)));
+        live.publish(built, 0);
+        let watched: Vec<String> = live
+            .watched
+            .lock()
+            .unwrap()
+            .0
+            .iter()
+            .map(|(path, _)| path.clone())
+            .collect();
+        assert!(!watched.contains(&photos.to_string_lossy().into_owned()));
+        assert!(
+            watched.contains(&music.to_string_lossy().into_owned()),
+            "still mounted"
+        );
+        assert!(watched.contains(&home.to_string_lossy().into_owned()));
     }
 
     #[test]

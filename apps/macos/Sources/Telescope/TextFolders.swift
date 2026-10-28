@@ -50,7 +50,7 @@ struct TextAsk: Equatable {
 }
 
 extension String {
-    fileprivate func isInside(_ folder: String) -> Bool {
+    func isInside(_ folder: String) -> Bool {
         self == folder || hasPrefix(folder.hasSuffix("/") ? folder : folder + "/")
     }
 }

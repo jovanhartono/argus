@@ -471,6 +471,51 @@ final class HatchTests: XCTestCase {
         }
     }
 
+    func testVolumesTheCoreRefusesAreLeftOut() async throws {
+        let (root, notes) = try folderWithNotes()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let (hatch, counts) = try await watching(root)
+        for path in ["/", "", "/Volumes", "/System/Volumes/Data", "/Volumes/No Such Drive", root.path, notes.path] {
+            XCTAssertFalse(hatch.volumeAdded(path), path)
+        }
+        XCTAssertFalse(hatch.volumeRemoved("/Volumes/No Such Drive"), "never told of it")
+        // Lists start at least 0.5 s apart, so one queued by mistake would be in by now.
+        try await Task.sleep(for: .milliseconds(1200))
+        XCTAssertEqual(counts.heard, 0, "no new list for a volume left out")
+    }
+
+    func testLettingGoOfADriveTheCoreNeverHeldLeavesTheWatchAlone() async throws {
+        let (root, _) = try folderWithNotes()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let (hatch, _) = try await watching(root)
+        let before = hatch.watching
+        let notes = try XCTUnwrap(before.first { $0.hasSuffix("/notes") })
+        XCTAssertFalse(hatch.volumeRemoved(notes))
+        XCTAssertFalse(hatch.volumeRemoved(root.path))
+        XCTAssertEqual(hatch.watching, before)
+    }
+
+    func testAChangeAtHomeDuringASwapOfTheWatchStillCounts() async throws {
+        let (root, notes) = try folderWithNotes()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let docs = root.appendingPathComponent("docs")
+        try FileManager.default.createDirectory(at: docs, withIntermediateDirectories: false)
+        let (hatch, counts) = try await watching(root)
+        let watched = try XCTUnwrap(hatch.watching.first { $0.hasSuffix("/notes") })
+
+        try Data().write(to: docs.appendingPathComponent("plan.md"))
+        // Within the 0.2 s the old watch gathers changes for, so it never handed this one on.
+        try await Task.sleep(for: .milliseconds(100))
+        hatch.watch(hatch.watching.filter { $0 != watched }, since: hatch.heardUpTo)
+        XCTAssertFalse(hatch.watching.contains(watched))
+        // The folder, notes, a.txt, docs and plan.md.
+        try await counts.reach(5, within: 5)
+
+        try Data().write(to: notes.appendingPathComponent("unheard.txt"))
+        try await Task.sleep(for: .milliseconds(1200))
+        XCTAssertEqual(counts.newest, 5, "notes is no longer watched")
+    }
+
     private func folderWithNotes() throws -> (URL, URL) {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         let notes = root.appendingPathComponent("notes")
@@ -512,6 +557,7 @@ final class HatchTests: XCTestCase {
 private final class Counts {
     private var counts: [UInt64] = []
     var heard: Int { counts.count }
+    var newest: UInt64? { counts.last }
 
     func add(_ count: UInt64) { counts.append(count) }
 
