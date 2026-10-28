@@ -79,9 +79,10 @@ final class HealthPanel: NSPanel {
 }
 
 /// ⌘,'s window: how many entries the list holds, when it was last read in full and last
-/// changed, whether Telescope may read every folder, and a button to build the list again.
+/// changed, whether Telescope may read every folder, a button to build the list again, and
+/// the folders whose files' text a search looks inside.
 @MainActor
-final class HealthWindow: NSObject, NSWindowDelegate {
+final class HealthWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, NSTableViewDelegate {
     let panel = HealthPanel(
         contentRect: NSRect(x: 0, y: 0, width: 460, height: 200),
         styleMask: [.titled, .closable, .nonactivatingPanel], backing: .buffered, defer: true)
@@ -93,6 +94,14 @@ final class HealthWindow: NSObject, NSWindowDelegate {
     let settings = KeyButton(title: "Open Settings", target: nil, action: nil)
     let rebuild = KeyButton(title: "Rebuild Index", target: nil, action: nil)
     let grid = NSGridView()
+    let folderList = NSTableView()
+    /// Add and remove, under the list, as in System Settings' own lists.
+    let folderButtons = NSSegmentedControl(
+        images: [NSImage(named: NSImage.addTemplateName)!, NSImage(named: NSImage.removeTemplateName)!],
+        trackingMode: .momentary, target: nil, action: nil)
+    let folders: TextFolders
+    /// The open panel takes the keys meanwhile, which must not close this window.
+    private(set) var choosing = false
     private let read: () -> Health
     private let hasAccess: () -> Bool
     private let onRebuild: () -> Void
@@ -106,8 +115,10 @@ final class HealthWindow: NSObject, NSWindowDelegate {
 
     init(
         read: @escaping () -> Health, hasAccess: @escaping () -> Bool, rebuild: @escaping () -> Void,
-        stage: any Stage, format: HealthFormat = HealthFormat(), tick: TimeInterval = 1
+        stage: any Stage, folders: TextFolders = TextFolders(), format: HealthFormat = HealthFormat(),
+        tick: TimeInterval = 1
     ) {
+        self.folders = folders
         self.read = read
         self.hasAccess = hasAccess
         onRebuild = rebuild
@@ -128,8 +139,10 @@ final class HealthWindow: NSObject, NSWindowDelegate {
             [label("Full Disk Access:"), access],
             [NSGridCell.emptyContentView, settings],
             [NSGridCell.emptyContentView, rebuild],
+            [label("Search inside files in:"), folderBox()],
         ]
         for row in rows { grid.addRow(with: row) }
+        grid.row(at: 7).topPadding = 12
         panel.title = "Index Health"
         panel.level = .floating
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
@@ -161,9 +174,87 @@ final class HealthWindow: NSObject, NSWindowDelegate {
         panel.contentView = content
         panel.initialFirstResponder = rebuild
         rebuild.nextKeyView = settings
-        settings.nextKeyView = rebuild
+        settings.nextKeyView = folderList
+        folderList.nextKeyView = folderButtons
+        folderButtons.nextKeyView = rebuild
         panel.setContentSize(content.fittingSize)
         panel.center()
+    }
+
+    /// The list, its add and remove buttons, and a line on what it is for.
+    private func folderBox() -> NSView {
+        let column = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("folder"))
+        column.resizingMask = .autoresizingMask
+        folderList.addTableColumn(column)
+        folderList.headerView = nil
+        folderList.style = .plain
+        folderList.usesAlternatingRowBackgroundColors = true
+        folderList.allowsMultipleSelection = true
+        folderList.dataSource = self
+        folderList.delegate = self
+        folderList.setAccessibilityLabel("Folders searched inside")
+        let scroll = NSScrollView()
+        scroll.documentView = folderList
+        scroll.hasVerticalScroller = true
+        scroll.autohidesScrollers = true
+        scroll.borderType = .bezelBorder
+        folderButtons.segmentStyle = .smallSquare
+        folderButtons.target = self
+        folderButtons.action = #selector(changeFolders(_:))
+        folderButtons.setToolTip("Add Folder", forSegment: 0)
+        folderButtons.setToolTip("Remove Folder", forSegment: 1)
+        folderButtons.setEnabled(false, forSegment: 1)
+        let hint = NSTextField(wrappingLabelWithString: "Typing also finds words inside the files in these folders.")
+        hint.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
+        hint.textColor = .secondaryLabelColor
+        hint.preferredMaxLayoutWidth = 260
+        let box = NSStackView(views: [scroll, folderButtons, hint])
+        box.orientation = .vertical
+        box.alignment = .leading
+        box.spacing = 0
+        box.setCustomSpacing(6, after: folderButtons)
+        NSLayoutConstraint.activate([
+            scroll.widthAnchor.constraint(equalToConstant: 260),
+            scroll.heightAnchor.constraint(equalToConstant: 88),
+        ])
+        return box
+    }
+
+    @objc func changeFolders(_ sender: Any?) {
+        folderButtons.selectedSegment == 0 ? addFolders() : removeFolders()
+    }
+
+    func addFolders() {
+        choosing = true
+        stage.chooseFolders { [weak self] urls in
+            guard let self else { return }
+            choosing = false
+            folders.add(urls.map(\.path))
+            folderList.reloadData()
+            if shown { stage.makeKey(panel) }
+        }
+    }
+
+    func removeFolders() {
+        folders.remove(at: folderList.selectedRowIndexes)
+        folderList.reloadData()
+        folderList.deselectAll(nil)
+        folderButtons.setEnabled(false, forSegment: 1)
+    }
+
+    func numberOfRows(in tableView: NSTableView) -> Int {
+        folders.paths.count
+    }
+
+    func tableView(_ tableView: NSTableView, viewFor column: NSTableColumn?, row: Int) -> NSView? {
+        let label = NSTextField(labelWithString: (folders.paths[row] as NSString).abbreviatingWithTildeInPath)
+        label.lineBreakMode = .byTruncatingMiddle
+        label.toolTip = folders.paths[row]
+        return label
+    }
+
+    func tableViewSelectionDidChange(_ note: Notification) {
+        folderButtons.setEnabled(!folderList.selectedRowIndexes.isEmpty, forSegment: 1)
     }
 
     func show() {
@@ -231,6 +322,7 @@ final class HealthWindow: NSObject, NSWindowDelegate {
 
     /// Like the search window, it goes once you click in another app.
     func windowDidResignKey(_ note: Notification) {
+        guard !choosing else { return }
         hide()
     }
 }

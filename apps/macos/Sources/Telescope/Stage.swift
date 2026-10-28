@@ -21,6 +21,8 @@ protocol Stage: AnyObject {
     /// In its own app, or launched when it is an app.
     func open(_ url: URL)
     func showInFinder(_ url: URL)
+    /// Asks for folders with the open panel; `done` gets none when cancelled.
+    func chooseFolders(_ done: @escaping @MainActor ([URL]) -> Void)
 }
 
 @MainActor
@@ -72,5 +74,19 @@ final class Screen: Stage {
 
     func showInFinder(_ url: URL) {
         NSWorkspace.shared.activateFileViewerSelecting([url])
+    }
+
+    func chooseFolders(_ done: @escaping @MainActor ([URL]) -> Void) {
+        let choose = NSOpenPanel()
+        choose.canChooseFiles = false
+        choose.canChooseDirectories = true
+        choose.allowsMultipleSelection = true
+        choose.prompt = "Add"
+        choose.message = "Telescope will also search the text inside the files in these folders."
+        // The open panel takes no typing while another app is active.
+        NSApp.activate(ignoringOtherApps: true)
+        choose.begin { response in
+            MainActor.assumeIsolated { done(response == .OK ? choose.urls : []) }
+        }
     }
 }

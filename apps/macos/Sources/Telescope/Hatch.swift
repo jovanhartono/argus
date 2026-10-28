@@ -22,6 +22,31 @@ struct Row: Equatable {
     var real: URL { isApp ? url.resolvingSymlinksInPath() : url }
 }
 
+/// A line a text search found inside a file.
+struct TextHit: Equatable {
+    let path: String
+    /// Trimmed, and cut to about 200 bytes around the match when long.
+    let text: String
+    /// Where the match sits in `text`, counted as AppKit counts.
+    let match: NSRange
+    let line: UInt64
+
+    /// The file, as a result row, so opening, Quick Look and the details pane treat it as one.
+    var file: Row {
+        let url = URL(fileURLWithPath: path)
+        return Row(name: url.lastPathComponent, folder: url.deletingLastPathComponent().path, isFolder: false)
+    }
+}
+
+/// The lines a text search found since the last take; once `done`, nothing more comes for it.
+struct TextBatch: Equatable {
+    var hits: [TextHit] = []
+    var done = false
+    /// A bug in the engine ended the search early.
+    var failed = false
+    var filesSearched: UInt64 = 0
+}
+
 /// The only file that touches Rust's pointers. Rows are copied into Swift strings and Rust's
 /// copy is freed at once, so nothing outside this file can point back into Rust.
 @MainActor
@@ -37,6 +62,8 @@ final class Hatch {
         case rebuilt(count: UInt64, ms: UInt64)
         /// An open was counted or the apps changed, so the same search may answer in another order.
         case reranked
+        /// Lines found inside files, or the end of that search, wait for `takeText`.
+        case lines(ticket: UInt64)
     }
 
     /// One core per app, so the C callback can find its listener without a context pointer.
@@ -161,6 +188,48 @@ final class Hatch {
         return copy(out)
     }
 
+    /// Searches the text inside the files in `folders`, on threads of its own, so a search by
+    /// name never waits for it. Every older text search stops. Returns 0 when it can't start.
+    func searchText(_ query: String, in folders: [String]) -> UInt64 {
+        var query = query
+        var bytes: [UInt8] = []
+        for folder in folders {
+            bytes += folder.utf8
+            bytes.append(0)
+        }
+        return query.withUTF8 { tl_grep_submit(core, bytes, bytes.count, $0.baseAddress, $0.count) }
+    }
+
+    /// The lines `ticket` found since the last take, or nil when nothing waits or a newer text
+    /// search took over.
+    func takeText(_ ticket: UInt64) -> TextBatch? {
+        var out = TlLines()
+        let status = tl_grep_take(core, ticket, &out)
+        if status == TL_PANICKED { Hatch.listener?(.failed(code: 0)) }
+        guard status == TL_OK else { return nil }
+        defer { tl_lines_free(out) }
+        let bytes = { (start: UInt32, length: UInt32) in
+            UnsafeBufferPointer(start: out.text + Int(start), count: Int(length))
+        }
+        let hits = UnsafeBufferPointer(start: out.lines, count: out.count).map { found in
+            let line = bytes(found.text_start, found.text_len)
+            let start = min(Int(found.match_start), line.count)
+            let end = min(start + Int(found.match_len), line.count)
+            let utf16 = { (part: Slice<UnsafeBufferPointer<UInt8>>) in String(decoding: part, as: UTF8.self).utf16.count }
+            return TextHit(
+                path: String(decoding: bytes(found.path_start, found.path_len), as: UTF8.self),
+                text: String(decoding: line, as: UTF8.self),
+                match: NSRange(location: utf16(line[..<start]), length: utf16(line[start..<end])),
+                line: found.line)
+        }
+        return TextBatch(hits: hits, done: out.done, failed: out.failed, filesSearched: out.report.files_searched)
+    }
+
+    /// Stops the text search under way; no more lines come for it.
+    func cancelText() {
+        tl_grep_cancel(core)
+    }
+
     /// Reads the apps in `folders` before the next search, so one installed since shows too.
     func readApps(in folders: [String]) {
         var bytes: [UInt8] = []
@@ -281,6 +350,7 @@ final class Hatch {
         case TL_EVENT_FAILED: listener?(.failed(code: Int32(truncatingIfNeeded: value)))
         case TL_EVENT_REBUILT: listener?(.rebuilt(count: value & 0xFFFF_FFFF, ms: value >> 32))
         case TL_EVENT_RERANKED: listener?(.reranked)
+        case TL_EVENT_LINES: listener?(.lines(ticket: value))
         default: break
         }
     }

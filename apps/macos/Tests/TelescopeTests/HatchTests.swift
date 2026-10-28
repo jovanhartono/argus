@@ -17,7 +17,7 @@ final class HatchTests: XCTestCase {
                     answered = ticket
                     ready.fulfill()
                 case .failed: XCTFail("the core stopped")
-                case .rebuilt, .opened, .reranked: XCTFail("nothing changed, saved or opened")
+                case .rebuilt, .opened, .reranked, .lines: XCTFail("nothing changed, saved, opened or read")
                 }
             })
         await fulfillment(of: [indexed], timeout: 5)
@@ -43,7 +43,7 @@ final class HatchTests: XCTestCase {
                     XCTAssertEqual(count, 10_000)
                     rebuilt.fulfill()
                 case .failed: XCTFail("the core stopped")
-                case .ready, .opened, .reranked: XCTFail("nothing searched, saved or opened")
+                case .ready, .opened, .reranked, .lines: XCTFail("nothing searched, saved, opened or read")
                 }
             })
         let started = Date(timeIntervalSince1970: Date().timeIntervalSince1970.rounded(.down))
@@ -96,7 +96,7 @@ final class HatchTests: XCTestCase {
                 case .indexed: indexed.fulfill()
                 case .ready(let ticket): ready[ticket]?.fulfill()
                 case .failed: XCTFail("the core stopped")
-                case .rebuilt, .opened, .reranked: XCTFail("nothing changed, saved or opened")
+                case .rebuilt, .opened, .reranked, .lines: XCTFail("nothing changed, saved, opened or read")
                 }
             })
         await fulfillment(of: [indexed], timeout: 5)
@@ -141,7 +141,7 @@ final class HatchTests: XCTestCase {
                 case .failed: XCTFail("the scan failed")
                 case .rebuilt: break
                 case .opened: XCTFail("nothing was saved")
-                case .reranked: XCTFail("nothing was opened")
+                case .reranked, .lines: XCTFail("nothing was opened or read")
                 }
             })
         await fulfillment(of: [indexed], timeout: 5)
@@ -208,7 +208,7 @@ final class HatchTests: XCTestCase {
                 case .ready: break
                 case .failed: XCTFail("the scan failed")
                 case .opened: XCTFail("nothing was saved")
-                case .reranked: XCTFail("nothing was opened")
+                case .reranked, .lines: XCTFail("nothing was opened or read")
                 }
             })
         // The scan may or may not have read them yet; either way the list ends up with them.
@@ -393,7 +393,7 @@ final class HatchTests: XCTestCase {
                 case .rebuilt(let count, _): counts.add(count)
                 case .ready: break
                 case .failed: XCTFail("the scan failed")
-                case .reranked: XCTFail("nothing was opened")
+                case .reranked, .lines: XCTFail("nothing was opened or read")
                 }
             })
         await fulfillment(of: [first], timeout: 5)

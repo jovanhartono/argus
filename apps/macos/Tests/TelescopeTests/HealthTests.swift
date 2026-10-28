@@ -75,10 +75,12 @@ final class HealthWindowTests: XCTestCase {
     private var rebuilds = 0
     private var fullDisk = true
     private var health = Health(entries: 48_127, scannedAt: Date(), scanMs: 90)
+    private var folders: TextFolders!
 
     override func setUp() async throws {
         _ = NSApplication.shared
         stage = OffStage()
+        folders = TextFolders()
     }
 
     override func tearDown() async throws {
@@ -101,7 +103,7 @@ final class HealthWindowTests: XCTestCase {
                 rebuilds += 1
                 health.busy = true
             },
-            stage: stage, format: HealthFormat(locale: Locale(identifier: "en_US")), tick: tick)
+            stage: stage, folders: folders, format: HealthFormat(locale: Locale(identifier: "en_US")), tick: tick)
     }
 
     func testShowingReadsTheCoreAndTakesTheKeysOffStage() {
@@ -233,5 +235,120 @@ final class HealthWindowTests: XCTestCase {
         window.refresh()
         XCTAssertEqual(window.panel.frame.minX, frame.minX + 40, "a window moved by hand stays")
         XCTAssertEqual(window.panel.frame.size, frame.size)
+    }
+
+    func testNoFolderIsSearchedInsideUntilYouAddOne() {
+        let window = window()
+        window.show()
+        defer { window.hide() }
+        XCTAssertEqual(window.folderList.numberOfRows, 0)
+        XCTAssertTrue(window.folderButtons.isEnabled(forSegment: 0))
+        XCTAssertFalse(window.folderButtons.isEnabled(forSegment: 1), "nothing to remove")
+    }
+
+    func testAddingFoldersListsEachOnceAndKeepsTheWindowUp() {
+        let home = NSHomeDirectory()
+        let window = window()
+        window.show()
+        defer { window.hide() }
+        stage.chosen = [URL(fileURLWithPath: home + "/notes"), URL(fileURLWithPath: "/Volumes/Work")]
+        window.addFolders()
+        XCTAssertEqual(stage.choosing, 1)
+        XCTAssertEqual(folders.paths, [home + "/notes", "/Volumes/Work"])
+        XCTAssertEqual(window.folderList.numberOfRows, 2)
+        let first = window.folderList.view(atColumn: 0, row: 0, makeIfNecessary: true) as? NSTextField
+        XCTAssertEqual(first?.stringValue, "~/notes")
+        XCTAssertEqual(first?.toolTip, home + "/notes")
+        XCTAssertTrue(stage.key === window.panel, "the keys come back once the open panel goes")
+        XCTAssertTrue(window.shown)
+
+        stage.chosen = [URL(fileURLWithPath: "/Volumes/Work")]
+        window.addFolders()
+        XCTAssertEqual(folders.paths.count, 2, "a folder chosen again is listed once")
+        stage.chosen = []
+        window.addFolders()
+        XCTAssertEqual(folders.paths.count, 2, "Cancel adds nothing")
+    }
+
+    func testTheOpenPanelTakingTheKeysLeavesTheWindowUp() {
+        let held = HeldStage()
+        let holding = HealthWindow(
+            read: { Health() }, hasAccess: { true }, rebuild: {}, stage: held, folders: folders)
+        holding.show()
+        defer { holding.hide() }
+        holding.addFolders()
+        XCTAssertTrue(holding.choosing)
+        holding.windowDidResignKey(Notification(name: NSWindow.didResignKeyNotification))
+        XCTAssertTrue(holding.shown, "the open panel took the keys")
+        held.answer([URL(fileURLWithPath: "/tmp/notes")])
+        XCTAssertFalse(holding.choosing)
+        XCTAssertEqual(folders.paths, ["/tmp/notes"])
+    }
+
+    func testRemoveTakesTheSelectedFolders() {
+        folders.add(["/a", "/b", "/c"])
+        let window = window()
+        window.show()
+        defer { window.hide() }
+        XCTAssertEqual(window.folderList.numberOfRows, 3)
+        window.folderList.selectRowIndexes([0, 2], byExtendingSelection: false)
+        XCTAssertTrue(window.folderButtons.isEnabled(forSegment: 1))
+        window.removeFolders()
+        XCTAssertEqual(folders.paths, ["/b"])
+        XCTAssertEqual(window.folderList.numberOfRows, 1)
+        XCTAssertFalse(window.folderButtons.isEnabled(forSegment: 1))
+    }
+}
+
+/// Holds the open panel's answer until the test gives it.
+@MainActor
+private final class HeldStage: Stage {
+    private var done: (@MainActor ([URL]) -> Void)?
+    var isActive = false
+    var previewShows = false
+    var previewIsKey = false
+    func isKey(_ window: NSWindow) -> Bool { false }
+    func bringForward(_ window: NSWindow) {}
+    func putAway(_ window: NSWindow) {}
+    func makeKey(_ window: NSWindow) {}
+    func openPreview() {}
+    func closePreview() {}
+    func reloadPreview() {}
+    func open(_ url: URL) {}
+    func showInFinder(_ url: URL) {}
+    func chooseFolders(_ done: @escaping @MainActor ([URL]) -> Void) { self.done = done }
+    func answer(_ urls: [URL]) { done?(urls) }
+}
+
+@MainActor
+final class TextFoldersTests: XCTestCase {
+    func testFoldersAreKeptOnceInOrderAndAcrossLaunches() throws {
+        let name = "telescope-tests-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: name))
+        defer { defaults.removePersistentDomain(forName: name) }
+        let folders = TextFolders(defaults: defaults)
+        XCTAssertEqual(folders.paths, [], "none at first")
+        folders.add(["/b", "/a", "/b"])
+        folders.add(["/a", "/c"])
+        XCTAssertEqual(folders.paths, ["/b", "/a", "/c"])
+        XCTAssertEqual(TextFolders(defaults: defaults).paths, ["/b", "/a", "/c"])
+        folders.remove(at: [0, 2, 7])
+        XCTAssertEqual(folders.paths, ["/a"])
+        XCTAssertEqual(TextFolders(defaults: defaults).paths, ["/a"])
+        XCTAssertEqual(TextFolders().paths, [], "without defaults nothing is read")
+    }
+
+    func testASearchInsideAFolderReachesOnlyTheChosenFoldersThere() {
+        let folders = TextFolders()
+        folders.add(["/Users/me/notes", "/Users/me/code/app", "/Volumes/Work/"])
+        XCTAssertEqual(folders.reached(within: nil), folders.paths)
+        XCTAssertEqual(folders.reached(within: "/Users/me/notes/2026"), ["/Users/me/notes/2026"])
+        XCTAssertEqual(folders.reached(within: "/Users/me/notes"), ["/Users/me/notes"])
+        XCTAssertEqual(folders.reached(within: "/Users/me"), ["/Users/me/notes", "/Users/me/code/app"])
+        XCTAssertEqual(folders.reached(within: "/Users/me/code"), ["/Users/me/code/app"])
+        XCTAssertEqual(folders.reached(within: "/Users/me/notes2"), [], "a name that only starts the same")
+        XCTAssertEqual(folders.reached(within: "/Users/me/downloads"), [])
+        XCTAssertEqual(folders.reached(within: "/Volumes/Work/plans"), ["/Volumes/Work/plans"])
+        XCTAssertEqual(folders.reached(within: "/"), folders.paths)
     }
 }

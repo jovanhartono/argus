@@ -1,11 +1,16 @@
 import AppKit
 
+/// Shows a file found by name, a line found inside a file, or the title above those lines. A
+/// row on screen changes from one to another in place as you type.
 final class ResultCell: NSTableCellView {
     static let id = NSUserInterfaceItemIdentifier("result")
 
     let icon = NSImageView(frame: NSRect(x: 6, y: 8, width: 32, height: 32))
     let name = NSTextField(labelWithString: "")
     let folder = NSTextField(labelWithString: "")
+    /// The line shown, so its colours follow the selection.
+    private(set) var hit: TextHit?
+    private(set) var isHeader = false
 
     init() {
         super.init(frame: NSRect(x: 0, y: 0, width: Metric.width, height: Metric.row))
@@ -27,18 +32,71 @@ final class ResultCell: NSTableCellView {
 
     /// Only what differs is set: each label set again lays itself out again.
     func show(_ row: Row, icon image: NSImage) {
+        if hit != nil || isHeader { reset() }
         if name.stringValue != row.name { name.stringValue = row.name }
         if folder.stringValue != row.folder { folder.stringValue = row.folder }
         if icon.image !== image { icon.image = image }
     }
 
+    /// "budget.md, line 12 · ~/notes" under the line, the match in bold.
+    func show(_ found: TextHit, icon image: NSImage) {
+        if isHeader { reset() }
+        guard found != hit else { return }
+        hit = found
+        name.lineBreakMode = .byTruncatingTail
+        paint()
+        let file = found.file
+        folder.stringValue = "\(file.name), line \(found.line) · \((file.folder as NSString).abbreviatingWithTildeInPath)"
+        if icon.image !== image { icon.image = image }
+    }
+
+    /// The title above the lines found inside files, in a shorter row.
+    func showHeader(_ title: String) {
+        guard !isHeader else { return }
+        hit = nil
+        isHeader = true
+        icon.isHidden = true
+        folder.isHidden = true
+        name.frame.origin = NSPoint(x: 18, y: 4)
+        name.font = .systemFont(ofSize: NSFont.smallSystemFontSize, weight: .semibold)
+        name.textColor = .secondaryLabelColor
+        name.stringValue = title
+    }
+
+    private func reset() {
+        hit = nil
+        isHeader = false
+        icon.isHidden = false
+        folder.isHidden = false
+        name.frame.origin = NSPoint(x: 48, y: 24)
+        name.font = .systemFont(ofSize: NSFont.systemFontSize)
+        name.lineBreakMode = .byTruncatingMiddle
+        name.stringValue = ""
+        folder.stringValue = ""
+        backgroundStyle = backgroundStyle
+    }
+
+    /// An attributed line keeps the colour it was made with, so it is made again on selection.
+    private func paint() {
+        guard let hit else { return }
+        let color = name.textColor ?? .labelColor
+        let line = NSMutableAttributedString(
+            string: hit.text, attributes: [.font: NSFont.systemFont(ofSize: NSFont.systemFontSize), .foregroundColor: color])
+        if NSMaxRange(hit.match) <= line.length {
+            line.addAttribute(.font, value: NSFont.boldSystemFont(ofSize: NSFont.systemFontSize), range: hit.match)
+        }
+        name.attributedStringValue = line
+    }
+
     override var backgroundStyle: NSView.BackgroundStyle {
         didSet {
+            guard !isHeader else { return }
             let selected = backgroundStyle == .emphasized
             name.textColor = selected ? .alternateSelectedControlTextColor : .labelColor
             folder.textColor =
                 selected
                 ? .alternateSelectedControlTextColor.withAlphaComponent(0.8) : .secondaryLabelColor
+            paint()
         }
     }
 }
