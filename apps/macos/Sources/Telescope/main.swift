@@ -3,6 +3,9 @@ import KeyboardShortcuts
 
 extension KeyboardShortcuts.Name {
     static let toggleWindow = Self("toggleWindow", initial: .init(.space, modifiers: [.command, .shift]))
+    /// The window's own hotkey plus ⌥; ⌥⌘Space is Finder's own search window.
+    static let searchFinderFolder = Self(
+        "searchFinderFolder", initial: .init(.space, modifiers: [.command, .shift, .option]))
 }
 
 @MainActor
@@ -13,6 +16,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let window = SearchPanel(saved: Hatch.savedList, opens: Hatch.openedList, apps: Hatch.appFolders)
         window.warmUp()
         KeyboardShortcuts.onKeyDown(for: .toggleWindow) { window.toggle() }
+        KeyboardShortcuts.onKeyDown(for: .searchFinderFolder) { window.toggleInFinderFolder() }
         self.window = window
     }
 }
@@ -34,7 +38,9 @@ private func keyMenu() -> NSMenu {
     edit.addItem(withTitle: "Copy", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
     edit.addItem(withTitle: "Paste", action: #selector(NSText.paste(_:)), keyEquivalent: "v")
     edit.addItem(withTitle: "Select All", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
+    file.addItem(withTitle: "Close", action: #selector(NSWindow.performClose(_:)), keyEquivalent: "w")
     let app = NSMenu(title: "Telescope")
+    app.addItem(withTitle: "Index Health…", action: #selector(SearchPanel.showHealth(_:)), keyEquivalent: ",")
     app.addItem(withTitle: "Quit Telescope", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
     let bar = NSMenu()
     for menu in [app, file, edit] {

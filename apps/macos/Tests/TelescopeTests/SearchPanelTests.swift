@@ -922,6 +922,158 @@ final class SearchPanelTests: XCTestCase {
         XCTAssertFalse(window.chip.isHidden)
     }
 
+    func testTheFinderHotkeyOpensTheWindowInsideFindersFolder() async throws {
+        for path in ["notes/budget a.txt", "budget top.txt"] {
+            let file = root.appendingPathComponent(path)
+            try FileManager.default.createDirectory(
+                at: file.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try Data().write(to: file)
+        }
+        let notes = realRoot.appendingPathComponent("notes").path
+        let window = try await opened(access: true, finder: { .folder(notes) })
+        try await type("budget", in: window)
+        try await until { window.rows.count == 2 }
+
+        window.toggleInFinderFolder()
+        XCTAssertFalse(window.shown, "waits for Finder's answer")
+        try await until { window.shown }
+        XCTAssertEqual(window.scopes.map(\.path), [notes])
+        XCTAssertEqual(window.chipText.stringValue, "notes")
+        XCTAssertEqual(window.field.stringValue, "", "a new folder starts a new search")
+        XCTAssertTrue(stage.key === window.panel)
+        try await type("budget", in: window)
+        try await until { window.rows.map(\.name) == ["budget a.txt"] }
+
+        window.toggleInFinderFolder()
+        XCTAssertFalse(window.shown, "pressed again, it hides")
+    }
+
+    func testWithoutAFolderInFinderTheHotkeyOpensTheWindowAsYouLeftIt() async throws {
+        try FileManager.default.createDirectory(
+            at: root.appendingPathComponent("notes"), withIntermediateDirectories: false)
+        for answer in [FinderFolder.none, .failed(Int(errAETimeout))] {
+            let window = try await opened(access: true, finder: { answer })
+            try await type("notes", in: window)
+            try await until { window.rows.first?.name == "notes" }
+            XCTAssertTrue(tab(window))
+            window.toggleInFinderFolder()
+            try await until { window.shown }
+            defer { window.hide() }
+            XCTAssertEqual(window.scopes.map(\.name), ["notes"], "\(answer)")
+            XCTAssertNil(window.notice)
+        }
+    }
+
+    func testFinderSwitchedOffShowsTheLineToItsOwnSettingsPage() async throws {
+        for access in [true, false] {
+            let stage = OffStage()
+            let window = try await opened(access: access, on: stage, finder: { .denied })
+            let before = window.panel.frame.height
+            window.toggleInFinderFolder()
+            try await until { window.shown }
+            XCTAssertEqual(window.notice, .needsFinder)
+            XCTAssertFalse(window.settings.isHidden)
+            XCTAssertEqual(window.panel.frame.height, Metric.field + 1 + Metric.message)
+            assertFits(window)
+            XCTAssertTrue(window.scopes.isEmpty)
+
+            window.settings.performClick(nil)
+            XCTAssertEqual(stage.opened, [Notice.needsFinder.settings])
+            XCTAssertFalse(window.shown)
+            // Gone with the window; the access line, if any, comes back.
+            try await until { window.notice == (access ? nil : .needsAccess) }
+            XCTAssertEqual(window.panel.frame.height, before)
+            window.show()
+            defer { window.hide() }
+            XCTAssertEqual(window.notice, access ? nil : .needsAccess)
+        }
+    }
+
+    func testFullDiskAccessGrantedWhileTheFinderLineShowsStillCounts() async throws {
+        let window = try await opened(access: false, finder: { .denied })
+        window.toggleInFinderFolder()
+        try await until { window.shown }
+        access = true
+        window.recheckAccess()
+        XCTAssertFalse(window.lacksAccess)
+        XCTAssertEqual(window.notice, .needsFinder, "the Finder line stays while the window does")
+        window.hide()
+        try await until { window.notice == nil }
+    }
+
+    func testOnlyTheNewestFinderAnswerOpensTheWindow() async throws {
+        for name in ["first", "second"] {
+            try FileManager.default.createDirectory(
+                at: root.appendingPathComponent(name), withIntermediateDirectories: false)
+        }
+        let (first, second) = (realRoot.appendingPathComponent("first").path, realRoot.appendingPathComponent("second").path)
+        let asked = Asked()
+        let window = try await opened(access: true) {
+            if asked.next() == 1 {
+                Thread.sleep(forTimeInterval: 0.3)
+                return .folder(first)
+            }
+            return .folder(second)
+        }
+        window.toggleInFinderFolder()
+        window.toggleInFinderFolder()
+        try await until { window.shown }
+        defer { window.hide() }
+        XCTAssertEqual(window.scopes.map(\.path), [second])
+        try await Task.sleep(for: .milliseconds(500))
+        XCTAssertEqual(window.scopes.map(\.path), [second], "the late answer is dropped")
+    }
+
+    func testAFinderAnswerAfterTheWindowOpenedAnotherWayIsDropped() async throws {
+        let window = try await opened(access: true) {
+            Thread.sleep(forTimeInterval: 0.2)
+            return .folder("/")
+        }
+        window.toggleInFinderFolder()
+        window.show()
+        defer { window.hide() }
+        try await Task.sleep(for: .milliseconds(400))
+        XCTAssertTrue(window.scopes.isEmpty)
+    }
+
+    func testCommandCommaSwapsTheSearchWindowForTheHealthView() async throws {
+        try Data().write(to: root.appendingPathComponent("budget.txt"))
+        let window = try await opened(access: false)
+        window.show()
+        window.showHealth(nil)
+        let health = try XCTUnwrap(window.health)
+        defer { health.hide() }
+        XCTAssertFalse(window.shown)
+        XCTAssertTrue(health.shown)
+        XCTAssertTrue(stage.key === health.panel)
+        XCTAssertEqual(health.entries.stringValue, "2", "the folder and the budget")
+        XCTAssertTrue(health.access.stringValue.hasPrefix("Off"))
+        XCTAssertFalse(health.grid.row(at: 5).isHidden)
+        XCTAssertNotEqual(health.scanned.stringValue, "Under way")
+
+        // Switched on while the view shows: the next tick brings in the guarded folders.
+        access = true
+        try await until { health.access.stringValue == "On" }
+        XCTAssertFalse(window.lacksAccess)
+        XCTAssertNil(window.notice)
+        try await until { health.health.changedAt != nil && !health.health.busy }
+        XCTAssertEqual(health.state.stringValue, "Up to date")
+    }
+
+    func testTheHealthViewsRebuildBuildsTheListAgain() async throws {
+        let window = try await opened(access: true)
+        window.showHealth(nil)
+        let health = try XCTUnwrap(window.health)
+        defer { health.hide() }
+        XCTAssertNil(health.health.changedAt)
+        health.rebuild.performClick(nil)
+        try await until { health.health.changedAt != nil && !health.health.busy }
+        XCTAssertTrue(health.rebuild.isEnabled)
+        XCTAssertNotNil(health.health.scannedAt)
+        window.showHealth(nil)
+        XCTAssertTrue(window.health === health, "one view, shown again")
+    }
+
     func testARowsURLIsItsPathAndKnowsAFolder() {
         let file = Row(name: "budget.txt", folder: "/Users/me/notes", isFolder: false)
         XCTAssertEqual(file.url, URL(fileURLWithPath: "/Users/me/notes/budget.txt"))
@@ -2058,8 +2210,10 @@ final class SearchPanelTests: XCTestCase {
     }
 
     /// Waits for the scan, so its event can't reach the next test's core.
+    /// Never the real Finder, which would ask whether the test runner may control it.
     private func opened(
-        access: Bool, on stage: (any Stage)? = nil, saved: String? = nil, opens: String? = nil, apps: [String] = []
+        access: Bool, on stage: (any Stage)? = nil, saved: String? = nil, opens: String? = nil, apps: [String] = [],
+        finder: @escaping @Sendable () -> FinderFolder = { .none }
     ) async throws -> SearchPanel {
         self.access = access
         let hasAccess = { [unowned self] in
@@ -2067,7 +2221,8 @@ final class SearchPanelTests: XCTestCase {
             return self.access
         }
         let window = SearchPanel(
-            root: root.path, saved: saved, opens: opens, apps: apps, hasAccess: hasAccess, stage: stage ?? self.stage)
+            root: root.path, saved: saved, opens: opens, apps: apps, hasAccess: hasAccess, stage: stage ?? self.stage,
+            finder: finder)
         for _ in 0..<500 where !window.indexed { try await Task.sleep(for: .milliseconds(10)) }
         XCTAssertTrue(window.indexed)
         return window
@@ -2076,5 +2231,18 @@ final class SearchPanelTests: XCTestCase {
     private func assertFits(_ window: SearchPanel, file: StaticString = #filePath, line: UInt = #line) {
         let needed = window.barText.cell?.cellSize.width ?? .infinity
         XCTAssertLessThanOrEqual(needed, window.barText.frame.width, window.barText.stringValue, file: file, line: line)
+    }
+}
+
+/// Counts calls to a stand-in Finder, which come from background threads.
+private final class Asked: @unchecked Sendable {
+    private let lock = NSLock()
+    private var count = 0
+
+    func next() -> Int {
+        lock.withLock {
+            count += 1
+            return count
+        }
     }
 }
