@@ -3693,9 +3693,17 @@ mod tests {
         let events = Events::default();
         let core = saving_core(&home, &file, b"5F2A", 9, &events);
         events.wait_for(TL_EVENT_INDEXED, 3);
-        let notes = events.wait_for_note("the list could not be saved");
-        assert_eq!(notes.len(), 2, "{notes:?}");
-        assert!(notes[0].starts_with("the saved list could not be opened"));
+        let mut notes = events.wait_for_note("the list could not be saved");
+        // Windows reads a path under a file as missing, so only Unix notes the failed open.
+        if cfg!(unix) {
+            assert!(
+                notes
+                    .remove(0)
+                    .starts_with("the saved list could not be opened")
+            );
+        }
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert!(notes[0].starts_with("the list could not be saved"));
         assert_eq!(found(&core, &events, "budget"), ["budget.txt"]);
     }
 
