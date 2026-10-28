@@ -17,8 +17,9 @@
 //! |       | path's length as u16, the path in UTF-8                    |
 
 use crate::apps::{AppId, Apps};
-use crate::index::{EntryId, Index, NO_PARENT, NameId, name_fingerprints};
+use crate::index::{EntryId, Index, NO_PARENT, NameId, name_fingerprint};
 use crate::search::Item;
+use crate::siblings::NO_FOLDER;
 use hashbrown::{HashMap, HashSet};
 use rayon::prelude::*;
 use std::f64::consts::LN_2;
@@ -358,10 +359,8 @@ impl Frecency {
         }
 
         // The letter fingerprint rules out most names before any is hashed.
-        let fingerprints: HashSet<u64> = wanted
-            .keys()
-            .map(|name| name_fingerprints(name).0)
-            .collect();
+        let fingerprints: HashSet<u64> =
+            wanted.keys().map(|name| name_fingerprint(name).0).collect();
         let named: HashMap<NameId, &[(Vec<&str>, u32)]> = (0..index.distinct_names() as NameId)
             .into_par_iter()
             .filter(|&name| fingerprints.contains(&index.name_letters[name as usize]))
@@ -379,19 +378,24 @@ impl Frecency {
         let found: Vec<(EntryId, u32)> = index
             .entry_name
             .par_chunks(CHUNK)
-            .zip(index.entry_parent.par_chunks(CHUNK))
             .enumerate()
-            .flat_map_iter(|(chunk, (names, parents))| {
+            .flat_map_iter(|(chunk, names)| {
                 let (is_named, named) = (&is_named, &named);
-                let entries = names.iter().zip(parents).enumerate();
-                entries.filter_map(move |(i, (&name, &parent))| {
-                    if is_named[name as usize / 64] >> (name % 64) & 1 == 0 || parent == NO_PARENT {
-                        return None;
-                    }
-                    let (_, boost) = named[&name]
-                        .iter()
-                        .find(|(folders, _)| reached_through(index, parent, folders))?;
-                    Some(((chunk * CHUNK + i) as EntryId, *boost))
+                let first = chunk * CHUNK;
+                let runs = index.runs_in(first..first + names.len());
+                let runs = runs.filter(|&(_, folder)| folder != NO_FOLDER);
+                runs.flat_map(move |(entries, folder)| {
+                    let parent = index.folders[folder as usize];
+                    entries.filter_map(move |entry| {
+                        let name = index.entry_name[entry];
+                        if is_named[name as usize / 64] >> (name % 64) & 1 == 0 {
+                            return None;
+                        }
+                        let (_, boost) = named[&name]
+                            .iter()
+                            .find(|(folders, _)| reached_through(index, parent, folders))?;
+                        Some((entry as EntryId, *boost))
+                    })
                 })
             })
             .collect();
@@ -406,7 +410,7 @@ fn reached_through(index: &Index, mut folder: EntryId, names: &[&str]) -> bool {
         if folder == 0 || folder == NO_PARENT || index.name(folder) != name {
             return false;
         }
-        folder = index.entry_parent[folder as usize];
+        folder = index.parent(folder);
     }
     folder == 0
 }
@@ -1029,7 +1033,9 @@ mod tests {
         let readme = entry(&index, "/home/docs/README.md");
         let list = opened(&[("/home/docs/README.md", &[NOW])]);
         assert_eq!(boosts_of(&list, &index, NOW).len(), 1);
-        index.entry_parent[readme as usize] = NO_PARENT;
+        let mut parents = index.parents();
+        parents[readme as usize] = NO_PARENT;
+        index.siblings = crate::siblings::Siblings::from_parents(&parents, &index.folders);
         assert!(boosts_of(&list, &index, NOW).is_empty());
     }
 

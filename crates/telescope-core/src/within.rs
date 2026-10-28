@@ -1,6 +1,7 @@
 //! A search inside one folder: which entries sit below it.
 
 use crate::index::{EntryId, Index, NO_PARENT, NameId};
+use crate::siblings::NO_FOLDER;
 use std::ops::Range;
 use std::path::{Component, Path};
 
@@ -34,27 +35,25 @@ impl Within {
         };
         within.set(folder);
         // A folder is numbered after the folder holding it, so one pass in order finds them all.
-        let after = index.folders.partition_point(|&entry| entry <= folder);
-        for &entry in &index.folders[after..] {
-            if within.holds(index.entry_parent[entry as usize]) {
-                within.set(entry);
+        let mut span: Option<Range<usize>> = None;
+        for (entries, slot) in index.runs_in(folder as usize + 1..index.len()) {
+            if slot == NO_FOLDER || !within.holds(index.folders[slot as usize]) {
+                continue;
             }
-        }
-        let below = folder as usize + 1;
-        let parents = &index.entry_parent[below..];
-        if let Some(first) = parents.iter().position(|&parent| within.holds(parent)) {
-            let last = parents.iter().rposition(|&parent| within.holds(parent));
-            within.entries = below + first..below + last.unwrap_or(first) + 1;
-        }
-        for entry in within.entries.clone() {
-            if within.holds(index.entry_parent[entry]) {
+            for &inside in index.folders_in(entries.clone()) {
+                within.set(inside);
+            }
+            for entry in entries.clone() {
                 within.add_name(index.entry_name[entry]);
             }
+            let start = span.as_ref().map_or(entries.start, |span| span.start);
+            span = Some(start..entries.end);
         }
+        within.entries = span.unwrap_or(0..0);
         let mut above = folder;
         while above != NO_PARENT {
             within.add_name(index.entry_name[above as usize]);
-            above = index.entry_parent[above as usize];
+            above = index.parent(above);
         }
         within
     }
@@ -111,16 +110,16 @@ mod tests {
         let within = Within::new(index, folder);
         index
             .ids()
-            .filter(|&entry| within.holds(index.entry_parent[entry as usize]))
+            .filter(|&entry| within.holds(index.parent(entry)))
             .collect()
     }
 
     /// What lies inside `folder`, found by climbing from every entry.
     fn climbed(index: &Index, folder: EntryId) -> Vec<EntryId> {
         let climbs = |entry: EntryId| {
-            let mut at = index.entry_parent[entry as usize];
+            let mut at = index.parent(entry);
             while at != NO_PARENT && at != folder {
-                at = index.entry_parent[at as usize];
+                at = index.parent(at);
             }
             at == folder
         };
@@ -263,7 +262,7 @@ mod tests {
                 .collect();
             let held: Vec<EntryId> = index
                 .ids()
-                .filter(|&entry| within.holds(index.entry_parent[entry as usize]))
+                .filter(|&entry| within.holds(index.parent(entry)))
                 .collect();
             assert_eq!(held, expected, "{folder}");
             let apps = Apps::default();

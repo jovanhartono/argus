@@ -1,8 +1,10 @@
 //! Keeping the index current: each changed folder is read again and the lists are patched in
 //! place, so a change costs a few folder reads instead of a rescan.
 
-use crate::index::{EntryId, Index, IndexBuilder, NO_PARENT, NameId, name_fingerprints};
+use crate::index::{EntryId, Index, IndexBuilder, NO_PARENT, NameId, name_fingerprint};
+use crate::siblings::{NO_FOLDER, Siblings};
 use crate::walk::{Kind, Listing, Rules, walk};
+use hashbrown::HashSet;
 use rayon::prelude::*;
 use std::cmp::Ordering;
 use std::ffi::OsStr;
@@ -29,36 +31,58 @@ pub struct Update {
     pub compacted: bool,
 }
 
-/// Where each folder's children sit. A scan pushes a folder's children in one go, so a folder
-/// has one run of them, plus one more for each update that added to it. A run may also hold
-/// removed entries, so each child found is checked against its parent.
-#[cfg_attr(test, derive(Debug, PartialEq))]
-#[derive(Clone, Default)]
-pub(crate) struct Runs {
-    /// Each folder's first run, by the folder's place in `folders`.
-    first: Vec<(EntryId, EntryId)>,
-    /// Later runs as (folder, start, end), by folder.
-    more: Vec<(EntryId, EntryId, EntryId)>,
+/// What an update changes while it runs, folded into the runs of siblings when it ends, so it
+/// costs a step per run and per change rather than a list as long as the index.
+struct Edit {
+    /// Each folder's runs of children. After an update a folder's children may sit in several
+    /// runs, and finding them in the runs alone would read every run after the folder.
+    runs: Runs,
+    /// Entries this update removed.
+    removed: HashSet<EntryId>,
+    /// The folder of each entry this update added, in order.
+    added_parents: Vec<EntryId>,
 }
 
+/// Each folder's runs, by the folder's place in `folders`.
+struct Runs {
+    first: Vec<u32>,
+    /// Further runs as (folder place, run), by folder place.
+    more: Vec<(u32, u32)>,
+}
+
+const NO_RUN: u32 = u32::MAX;
+
 impl Runs {
-    pub(crate) fn heap_bytes(&self) -> usize {
-        self.first.capacity() * size_of::<(EntryId, EntryId)>()
-            + self.more.capacity() * size_of::<(EntryId, EntryId, EntryId)>()
+    fn new(siblings: &Siblings, folders: usize) -> Self {
+        let mut runs = Self {
+            first: vec![NO_RUN; folders],
+            more: Vec::new(),
+        };
+        for (run, &slot) in siblings.folders.iter().enumerate() {
+            if slot == NO_FOLDER {
+                continue;
+            }
+            let first = &mut runs.first[slot as usize];
+            if *first == NO_RUN {
+                *first = run as u32;
+            } else {
+                runs.more.push((slot, run as u32));
+            }
+        }
+        runs.more.sort_unstable();
+        runs
     }
 
-    fn add(&mut self, folders: &[EntryId], (folder, start, end): (EntryId, EntryId, EntryId)) {
-        let Ok(slot) = folders.binary_search(&folder) else {
-            return;
-        };
-        let first = &mut self.first[slot];
-        if first.0 == first.1 {
-            *first = (start, end);
-        } else if first.1 == start {
-            first.1 = end;
-        } else {
-            self.more.push((folder, start, end));
-        }
+    fn of(&self, slot: usize) -> impl Iterator<Item = usize> + '_ {
+        let from = self.more.partition_point(|&(s, _)| (s as usize) < slot);
+        let more = self.more[from..]
+            .iter()
+            .take_while(move |&&(s, _)| s as usize == slot)
+            .map(|&(_, run)| run);
+        std::iter::once(self.first[slot])
+            .filter(|&run| run != NO_RUN)
+            .chain(more)
+            .map(|run| run as usize)
     }
 }
 
@@ -70,10 +94,6 @@ impl Index {
     /// a new folder's or a deleted one's all work. A path under no root changes nothing.
     pub(crate) fn update<P: AsRef<Path>>(&mut self, rules: &Rules, changed: &[P]) -> Update {
         let mut update = Update::default();
-        if self.roots.is_empty() {
-            return update;
-        }
-        self.find_runs();
         // Copied, as the lists change below while these paths are still read.
         let roots: Vec<(EntryId, PathBuf)> = self
             .roots
@@ -81,7 +101,13 @@ impl Index {
             .map(|&root| (root, PathBuf::from(self.name(root))))
             .collect();
         let changed: Vec<&Path> = changed.iter().map(AsRef::as_ref).collect();
-        let mut targets = self.changed_folders(&roots, &changed);
+        let under_a_root = |path: &&Path| roots.iter().any(|(_, root)| path.starts_with(root));
+        if !changed.iter().any(under_a_root) {
+            return update;
+        }
+        let first_new = self.len();
+        let mut edit = self.edit();
+        let mut targets = self.changed_folders(&edit, &roots, &changed);
         // Parents first, so a folder its parent replaced is not read into the old one.
         targets.sort_unstable_by_key(|&(folder, ..)| folder);
         targets.dedup_by_key(|&mut (folder, ..)| folder);
@@ -104,21 +130,36 @@ impl Index {
                 })
                 .collect();
             for (&(folder, ..), (listing, partial)) in chunk.iter().zip(listings) {
-                if self.is_removed(folder) {
+                if edit.removed.contains(&folder) {
                     continue;
                 }
                 update.folders_read += 1;
                 update.unreadable_folders += usize::from(partial);
-                update.removed += self.apply(folder, listing, partial, &mut added);
+                update.removed += self.apply(&mut edit, folder, listing, partial, &mut added);
             }
         }
         if !added.anchors.is_empty() {
             let walked = walk(added.builder, rules, NO_PARENT, added.walks, &|| false);
             update.unreadable_folders += walked.unreadable_folders;
-            update.added = self.splice(&walked.builder.lists(), &added.anchors);
+            let new = walked.builder.lists();
+            update.added = self.splice(&mut edit.added_parents, &new, &added.anchors);
         }
+        self.fold_in(edit, first_new);
         update.compacted = self.compact_if_due();
         update
+    }
+
+    /// Folds what `edit` changed into the runs of siblings; entries from `first_new` on are new.
+    fn fold_in(&mut self, edit: Edit, first_new: usize) {
+        if edit.removed.is_empty() && edit.added_parents.is_empty() {
+            return;
+        }
+        let mut removed: Vec<EntryId> = edit.removed.into_iter().collect();
+        removed.sort_unstable();
+        let added = &edit.added_parents;
+        self.siblings = self
+            .siblings
+            .edited(&removed, first_new, added, &self.folders);
     }
 
     /// Rebuilds the lists once the entries removed, and the names added entries store again,
@@ -126,7 +167,9 @@ impl Index {
     fn compact_if_due(&mut self) -> bool {
         let due = (self.removed + self.added) * COMPACT_SHARE > self.len();
         if due {
-            self.compact();
+            let mut parents = self.parents();
+            self.compact(&mut parents);
+            self.siblings = Siblings::from_parents(&parents, &self.folders);
         }
         due
     }
@@ -170,8 +213,14 @@ impl Index {
         // Appended whole, each folder's children side by side as a scan leaves them, so
         // nothing needs compacting and searches stay as fast as on a fresh scan.
         let (added, apart) = (self.added, self.children_apart);
+        let first_new = self.len();
         let root = self.push_root(&name);
-        let entries = self.splice(&new, &[root]);
+        let mut parents = Vec::with_capacity(new.len());
+        parents.push(NO_PARENT);
+        let entries = self.splice(&mut parents, &new, &[root]);
+        self.siblings = self
+            .siblings
+            .edited(&[], first_new, &parents, &self.folders);
         (self.added, self.children_apart) = (added, apart);
         Ok(Update {
             folders_read: 1,
@@ -189,10 +238,9 @@ impl Index {
         self.names.reserve_exact(name_bytes + new.names.len());
         self.name_starts.reserve_exact(names);
         self.name_letters.reserve_exact(names);
-        self.name_word_starts.reserve_exact(names);
+        self.name_digit_starts.reserve_exact(names);
+        self.name_symbols.reserve_exact(names);
         self.entry_name.reserve_exact(entries);
-        self.entry_parent.reserve_exact(entries);
-        self.entry_depth.reserve_exact(entries);
         self.folders.reserve_exact(folders);
         self.folder_inodes.reserve_exact(folders);
         self.passages.reserve_exact(new.passages.len());
@@ -203,8 +251,10 @@ impl Index {
     /// volume this index holds.
     pub(crate) fn remove_volume(&mut self, volume: &Path) -> Option<Update> {
         let root = self.root_at(volume).filter(|&root| root != 0)?;
-        self.find_runs();
-        let removed = self.remove_root(root);
+        let mut edit = self.edit();
+        self.roots.retain(|&kept| kept != root);
+        let removed = self.remove(&mut edit, root);
+        self.fold_in(edit, self.len());
         Some(Update {
             removed,
             compacted: self.compact_if_due(),
@@ -212,48 +262,26 @@ impl Index {
         })
     }
 
-    fn remove_root(&mut self, root: EntryId) -> usize {
-        self.roots.retain(|&kept| kept != root);
-        self.remove(root)
-    }
-
-    /// Appends a root, its name stored like any name an update adds.
+    /// Appends a root, its name stored like any name an update adds, in room `reserve_exact`
+    /// made. Its run is left for `Siblings::edited`.
     fn push_root(&mut self, name: &str) -> EntryId {
         let root = self.len() as EntryId;
         let name_id = self.distinct_names() as NameId;
-        if self.names.capacity() - self.names.len() < name.len() {
-            self.names
-                .reserve_exact(name.len().max(self.names.len() / GROW_BY));
-        }
         self.names.push_str(name);
-        grow(&mut self.name_starts, 1);
-        self.name_starts.push(self.names.len() as u32);
-        let (letters, starts) = name_fingerprints(name);
-        grow(&mut self.name_letters, 1);
-        grow(&mut self.name_word_starts, 1);
+        // A path is at most 1,024 bytes, so it fits a group beside 15 file names.
+        assert!(
+            self.name_starts.push(self.names.len() as u32),
+            "a volume's path fits a group"
+        );
+        let (letters, starts, symbols) = name_fingerprint(name);
         self.name_letters.push(letters);
-        self.name_word_starts.push(starts);
-        for list in [&mut self.entry_name, &mut self.entry_parent] {
-            grow(list, 1);
-        }
+        self.name_digit_starts.push(starts);
+        self.name_symbols.push(symbols);
         self.entry_name.push(name_id);
-        self.entry_parent.push(NO_PARENT);
-        grow(&mut self.entry_depth, 1);
-        self.entry_depth.push(0);
-        grow(&mut self.folders, 1);
-        grow(&mut self.folder_inodes, 1);
         self.folders.push(root);
         self.folder_inodes.push(0);
         self.roots.push(root);
-        self.added += 1;
         root
-    }
-
-    fn find_runs(&mut self) {
-        if self.runs.is_none() {
-            self.runs = Some(Runs::default());
-            self.add_runs(0);
-        }
     }
 
     /// For each changed folder, the deepest indexed folder on its path that is still a folder
@@ -262,6 +290,7 @@ impl Index {
     /// catch-up after a restart may bring many thousands.
     fn changed_folders<'p>(
         &self,
+        edit: &Edit,
         roots: &[(EntryId, PathBuf)],
         changed: &[&'p Path],
     ) -> Vec<(EntryId, usize, usize, &'p Path)> {
@@ -277,7 +306,7 @@ impl Index {
             // `Path` sorts name by name, so paths into one folder sit together and its children
             // are looked up once for them all.
             paths.sort_unstable_by_key(|&(below, _)| below);
-            self.descend(*root, 0, top, &mut paths, &mut found);
+            self.descend(edit, *root, 0, top, &mut paths, &mut found);
         }
         found
             .into_par_iter()
@@ -287,7 +316,7 @@ impl Index {
                 while !self.is_root(folder)
                     && !fs::symlink_metadata(&at).is_ok_and(|meta| meta.is_dir())
                 {
-                    folder = self.entry_parent[folder as usize];
+                    folder = self.parent(folder);
                     at.pop();
                     depth -= 1;
                 }
@@ -301,6 +330,7 @@ impl Index {
     /// lead to it.
     fn descend<'p>(
         &self,
+        edit: &Edit,
         folder: EntryId,
         depth: usize,
         top: usize,
@@ -312,7 +342,7 @@ impl Index {
         let paths = &mut paths[ends..];
         if !paths.is_empty() {
             let mut children: Vec<(&str, EntryId)> = self
-                .run_children(folder)
+                .run_children(edit, folder)
                 .filter(|&child| self.is_dir(child))
                 .map(|child| (self.name(child), child))
                 .collect();
@@ -326,7 +356,7 @@ impl Index {
                             parts.next();
                             *rest = parts.as_path();
                         }
-                        self.descend(children[at].1, depth + 1, top, group, found);
+                        self.descend(edit, children[at].1, depth + 1, top, group, found);
                     }
                     Err(_) => here = here.or(Some(group[0].0)),
                 }
@@ -337,24 +367,18 @@ impl Index {
         }
     }
 
-    fn run_children(&self, folder: EntryId) -> impl Iterator<Item = EntryId> + '_ {
-        let runs = self
-            .runs
-            .as_ref()
-            .expect("runs are found before any update");
-        let first = self
-            .folders
-            .binary_search(&folder)
-            .map_or((0, 0), |slot| runs.first[slot]);
-        let from = runs.more.partition_point(|&(f, ..)| f < folder);
-        let more = runs.more[from..]
-            .iter()
-            .take_while(move |&&(f, ..)| f == folder)
-            .map(|&(_, start, end)| (start, end));
-        std::iter::once(first)
-            .chain(more)
-            .flat_map(|(start, end)| start..end)
-            .filter(move |&child| self.entry_parent[child as usize] == folder)
+    fn run_children<'a>(
+        &'a self,
+        edit: &'a Edit,
+        folder: EntryId,
+    ) -> impl Iterator<Item = EntryId> + 'a {
+        let len = self.len();
+        let slot = self.folders.binary_search(&folder).ok();
+        slot.into_iter()
+            .flat_map(|slot| edit.runs.of(slot))
+            .flat_map(move |run| self.siblings.entries(run, len))
+            .map(|child| child as EntryId)
+            .filter(|child| !edit.removed.contains(child))
     }
 
     /// What the entry is, and its inode when it is a folder.
@@ -374,6 +398,7 @@ impl Index {
     /// were removed; new ones go to `added`.
     fn apply(
         &mut self,
+        edit: &mut Edit,
         folder: EntryId,
         mut listing: Listing,
         partial: bool,
@@ -382,7 +407,7 @@ impl Index {
         let mut paths = std::mem::take(&mut listing.folders);
         // (name, kind, inode, entry) and (name, kind, inode, place among the folders).
         let mut old: Vec<(&str, Kind, u32, EntryId)> = self
-            .run_children(folder)
+            .run_children(edit, folder)
             .map(|child| {
                 let (kind, inode) = self.kind(child);
                 (self.name(child), kind, inode, child)
@@ -435,29 +460,33 @@ impl Index {
                 }
             }
         }
-        gone.into_iter().map(|entry| self.remove(entry)).sum()
+        gone.into_iter().map(|entry| self.remove(edit, entry)).sum()
     }
 
     /// Removes `entry` and everything inside it from search. Returns how many entries that was.
-    fn remove(&mut self, entry: EntryId) -> usize {
+    fn remove(&mut self, edit: &mut Edit, entry: EntryId) -> usize {
         let mut removed = 0;
         let mut stack = vec![entry];
         while let Some(entry) = stack.pop() {
             if self.is_dir(entry) {
-                stack.extend(self.run_children(entry));
+                stack.extend(self.run_children(edit, entry));
                 self.removed_folders += 1;
             }
-            self.entry_parent[entry as usize] = NO_PARENT;
+            edit.removed.insert(entry);
             removed += 1;
         }
         self.removed += removed;
         removed
     }
 
-    /// Appends what an update found, each anchor's children going to its folder in `anchors`.
-    /// Returns how many entries were added.
-    fn splice(&mut self, new: &Index, anchors: &[EntryId]) -> usize {
-        let first_new = self.len();
+    /// Appends what an update found, each anchor's children going to its folder in `anchors`,
+    /// and each added entry's folder to `added_parents`. Returns how many entries were added.
+    fn splice(
+        &mut self,
+        added_parents: &mut Vec<EntryId>,
+        new: &Index,
+        anchors: &[EntryId],
+    ) -> usize {
         // An anchor came first, so name 0 is the anchors' empty name, which is left out.
         debug_assert_eq!(new.name_text(0), "");
         let name_base = self.distinct_names() as NameId - 1;
@@ -468,21 +497,27 @@ impl Index {
         }
         self.names.push_str(&new.names);
         let names = new.distinct_names() - 1;
-        grow(&mut self.name_starts, names);
+        let groups = self.name_starts.more_groups(names);
+        grow(&mut self.name_starts.groups, groups);
+        grow(&mut self.name_starts.offsets, names);
         grow(&mut self.name_letters, names);
-        grow(&mut self.name_word_starts, names);
+        grow(&mut self.name_digit_starts, names);
+        grow(&mut self.name_symbols, names);
         for name in 1..=names {
-            self.name_starts
-                .push(bytes_base + new.name_starts[name + 1]);
-            let (letters, starts) = name_fingerprints(new.name_text(name as NameId));
+            let end = bytes_base + new.name_starts.get(name + 1) as u32;
+            assert!(
+                self.name_starts.push(end),
+                "a file name is at most 765 bytes"
+            );
+            let (letters, starts, symbols) = name_fingerprint(new.name_text(name as NameId));
             self.name_letters.push(letters);
-            self.name_word_starts.push(starts);
+            self.name_digit_starts.push(starts);
+            self.name_symbols.push(symbols);
         }
 
         let entries = new.len() - anchors.len();
         grow(&mut self.entry_name, entries);
-        grow(&mut self.entry_parent, entries);
-        grow(&mut self.entry_depth, entries);
+        added_parents.reserve_exact(entries);
         let folders = new.folders.len() - anchors.len();
         grow(&mut self.folders, folders);
         grow(&mut self.folder_inodes, folders);
@@ -490,7 +525,7 @@ impl Index {
         let mut anchors = anchors.iter();
         let mut folders = new.folders.iter().zip(&new.folder_inodes).peekable();
         let mut passages = new.passages.iter().peekable();
-        for (entry, (&name, &parent)) in new.entry_name.iter().zip(&new.entry_parent).enumerate() {
+        for (entry, (&name, parent)) in new.entry_name.iter().zip(new.parents()).enumerate() {
             let entry = entry as EntryId;
             let folder = folders.next_if(|&(&folder, _)| folder == entry);
             if parent == NO_PARENT {
@@ -499,11 +534,8 @@ impl Index {
             }
             let id = self.len() as EntryId;
             in_index.push(id);
-            let parent = in_index[parent as usize];
             self.entry_name.push(name_base + name);
-            self.entry_parent.push(parent);
-            let depth = self.entry_depth[parent as usize].saturating_add(1);
-            self.entry_depth.push(depth);
+            added_parents.push(in_index[parent as usize]);
             if let Some((_, &inode)) = folder {
                 self.folders.push(id);
                 self.folder_inodes.push(inode);
@@ -512,61 +544,27 @@ impl Index {
                 self.passages.push(id);
             }
         }
-        // Without runs yet, the first update finds them all, these included.
-        if self.runs.is_some() {
-            self.add_runs(first_new);
-        }
         self.added += entries;
         self.children_apart |= entries > 0;
         entries
     }
 
-    /// Records the runs of children among the entries from `from` on.
-    fn add_runs(&mut self, from: usize) {
-        let Self {
-            runs,
-            folders,
-            entry_parent,
-            ..
-        } = self;
-        let runs = runs
-            .as_mut()
-            .expect("runs are made before they are added to");
-        runs.first.resize(folders.len(), (0, 0));
-        let sorted = runs.more.len();
-        let mut current: Option<(EntryId, EntryId, EntryId)> = None;
-        for (entry, &parent) in entry_parent.iter().enumerate().skip(from) {
-            // Removed entries may sit inside a run without ending it.
-            if parent == NO_PARENT {
-                continue;
-            }
-            let entry = entry as EntryId;
-            match &mut current {
-                Some((folder, _, end)) if *folder == parent => *end = entry + 1,
-                _ => {
-                    if let Some(run) = current.replace((parent, entry, entry + 1)) {
-                        runs.add(folders, run);
-                    }
-                }
-            }
-        }
-        if let Some(run) = current {
-            runs.add(folders, run);
-        }
-        if runs.more.len() > sorted {
-            // A stable sort merges the new runs into the sorted ones in about one pass.
-            runs.more.sort();
+    fn edit(&self) -> Edit {
+        Edit {
+            runs: Runs::new(&self.siblings, self.folders.len()),
+            removed: HashSet::new(),
+            added_parents: Vec::new(),
         }
     }
 
     /// Drops the removed entries and stores each name once, keeping the order, so searches are
     /// as fast as on a fresh scan. The entry lists are rewritten where they are, so the
     /// rebuild never holds two copies of them.
-    fn compact(&mut self) {
+    fn compact(&mut self, parents: &mut Vec<EntryId>) {
         self.name_letters = Vec::new();
-        self.name_word_starts = Vec::new();
-        self.entry_depth = Vec::new();
-        self.runs = None;
+        self.name_digit_starts = Vec::new();
+        self.name_symbols = Vec::new();
+        self.siblings = Siblings::default();
         let mut names = IndexBuilder::new();
         names.reserve_names(self.names.len(), self.distinct_names());
         let mut renamed = vec![NameId::MAX; self.distinct_names()];
@@ -581,7 +579,7 @@ impl Index {
             let is_folder = self.folders.get(slot) == Some(&(entry as EntryId));
             slot += usize::from(is_folder);
             let is_passage = passage.next_if_eq(&&(entry as EntryId)).is_some();
-            let parent = match self.entry_parent[entry] {
+            let parent = match parents[entry] {
                 NO_PARENT if self.is_root(entry as EntryId) => {
                     roots.push(kept as EntryId);
                     NO_PARENT
@@ -598,7 +596,7 @@ impl Index {
                 renamed[name] = names.intern(self.name_text(name as NameId));
             }
             self.entry_name[kept] = renamed[name];
-            self.entry_parent[kept] = parent;
+            parents[kept] = parent;
             if is_folder {
                 placed[slot - 1] = id;
                 folders.push(id);
@@ -610,7 +608,7 @@ impl Index {
             kept += 1;
         }
         drop((renamed, placed));
-        for list in [&mut self.entry_name, &mut self.entry_parent] {
+        for list in [&mut self.entry_name, parents] {
             list.truncate(kept);
             list.shrink_to_fit();
         }
@@ -625,7 +623,7 @@ impl Index {
         self.passages = passages;
         self.roots = roots;
         (self.removed, self.removed_folders, self.added) = (0, 0, 0);
-        self.add_depths_and_letters();
+        self.add_letters();
     }
 }
 
@@ -685,12 +683,12 @@ mod tests {
     /// its whole path on a volume.
     fn findable(index: &Index, root: &Path) -> BTreeSet<(PathBuf, (Kind, u32))> {
         (0..index.len() as EntryId)
-            .filter(|&entry| index.entry_parent[entry as usize] != NO_PARENT)
+            .filter(|&entry| index.parent(entry) != NO_PARENT)
             .map(|entry| {
                 let path = index.path(entry);
                 let below = path.strip_prefix(top_of(index, &path).0).unwrap();
                 assert_eq!(
-                    usize::from(index.entry_depth[entry as usize]),
+                    usize::from(index.depth(entry)),
                     below.components().count().min(255),
                     "{below:?}"
                 );
@@ -702,29 +700,33 @@ mod tests {
 
     /// The lists hold together as a saved index must, and every name has its fingerprint.
     fn assert_sound(index: &Index) {
+        let starts: Vec<u32> = index.name_starts.iter().collect();
         assert!(is_sound(
             &index.names,
-            &index.name_starts,
+            &starts,
             &index.entry_name,
-            &index.entry_parent,
+            (&index.siblings.starts, &index.siblings.folders),
             &index.folders,
             &index.passages,
             &index.roots
         ));
         assert_eq!(index.folder_inodes.len(), index.folders.len());
-        assert_eq!(index.entry_depth.len(), index.len());
-        let (letters, starts): (Vec<u64>, Vec<u64>) = (0..index.distinct_names())
-            .map(|name| name_fingerprints(index.name_text(name as NameId)))
-            .unzip();
-        assert_eq!(index.name_letters, letters);
-        assert_eq!(index.name_word_starts, starts);
+        let runs = Siblings::from_parents(&index.parents(), &index.folders);
+        assert_eq!(index.siblings, runs);
+        let fingerprints: Vec<(u64, u8, u8)> = (0..index.distinct_names())
+            .map(|name| name_fingerprint(index.name_text(name as NameId)))
+            .collect();
+        let kept = (index.name_letters.iter().zip(&index.name_digit_starts))
+            .zip(&index.name_symbols)
+            .map(|((&letters, &starts), &symbols)| (letters, starts, symbols));
+        assert_eq!(kept.collect::<Vec<_>>(), fingerprints);
     }
 
     /// What deciding whether a change needs a new list reads: each folder's children, and
     /// each folder found by its names from its root.
     fn assert_children_found(index: &Index, context: &str) {
         let mut every = vec![Vec::new(); index.len()];
-        for (entry, &parent) in index.entry_parent.iter().enumerate() {
+        for (entry, &parent) in index.parents().iter().enumerate() {
             if parent != NO_PARENT {
                 every[parent as usize].push(entry as EntryId);
             }
@@ -771,6 +773,27 @@ mod tests {
             (fresh.entry_count(), fresh.folder_count()),
             "{context}"
         );
+        // Words under four letters, as a longer one may take a typo only when no name holds
+        // it, and the names of removed entries are kept until the lists are rebuilt.
+        for query in ["a", "md re", "a !b", "c kee", "b !old", "doc lib"] {
+            assert_eq!(
+                hits(index, query),
+                hits(&fresh, query),
+                "{context}: {query:?}"
+            );
+        }
+    }
+
+    /// Every hit for `query`, by path and score.
+    fn hits(index: &Index, query: &str) -> Vec<(PathBuf, u32)> {
+        let searcher = Searcher::with_threads(1);
+        let apps = crate::Apps::default();
+        let hits = searcher.search(index, &apps, query, searcher.ticket(), index.len());
+        let mut found: Vec<(PathBuf, u32)> = (hits.unwrap().iter())
+            .map(|hit| (index.path(hit.entry().unwrap()), hit.score))
+            .collect();
+        found.sort();
+        found
     }
 
     fn write(root: &Path, files: &[&str]) {
@@ -1215,9 +1238,8 @@ mod tests {
         let (_dir, root) = temp_root();
         write(&root, &["a/b/c.txt", "a/d.txt", "a-b/g.txt", "e/f.txt"]);
         let settings = keep_all(&root);
-        let mut index = settings.scan().unwrap().index;
-        let none: [&Path; 0] = [];
-        settings.update(&mut index, &none);
+        let index = settings.scan().unwrap().index;
+        let edit = index.edit();
         let mut changed: Vec<PathBuf> = (0..50)
             .flat_map(|i| [format!("a/b/new{i}.txt"), format!("a/gone{i}/x")])
             .map(|path| root.join(path))
@@ -1229,7 +1251,7 @@ mod tests {
         changed.push(PathBuf::from(dotted));
         let changed: Vec<&Path> = changed.iter().map(PathBuf::as_path).collect();
         let mut found: Vec<(&str, usize)> = index
-            .changed_folders(&[(0, root.clone())], &changed)
+            .changed_folders(&edit, &[(0, root.clone())], &changed)
             .into_iter()
             .map(|(folder, depth, ..)| (index.name(folder), depth))
             .collect();
@@ -1245,15 +1267,37 @@ mod tests {
         let mut index = settings.scan().unwrap().index;
         write(&root, &["inside/b.txt"]);
 
+        let (siblings, bytes) = (index.siblings.clone(), index.heap_bytes());
         let changed = [root.clone(), root.join("insider"), PathBuf::from("inside")];
         assert_eq!(settings.update(&mut index, &changed), Update::default());
         let none: [&Path; 0] = [];
         assert_eq!(settings.update(&mut index, &none), Update::default());
+        assert_eq!((&index.siblings, index.heap_bytes()), (&siblings, bytes));
         let mut empty = IndexBuilder::new().finish();
         assert_eq!(
             settings.update(&mut empty, &[root.join("inside")]),
             Update::default()
         );
+    }
+
+    #[test]
+    fn a_folder_read_again_with_nothing_new_leaves_the_lists_as_they_are() {
+        let (_dir, root) = temp_root();
+        pad(&root);
+        write(&root, &["a/x.txt", "b/y.txt"]);
+        let settings = keep_all(&root);
+        let mut index = settings.scan().unwrap().index;
+        write(&root, &["a/z.txt"]);
+        settings.update(&mut index, &[root.join("a")]);
+        let (siblings, bytes) = (index.siblings.clone(), index.heap_bytes());
+
+        let update = settings.update(&mut index, &[root.join("a"), root.join("b")]);
+        assert_eq!(update.folders_read, 2);
+        assert_eq!(
+            (update.added, update.removed, update.compacted),
+            (0, 0, false)
+        );
+        assert_eq!((&index.siblings, index.heap_bytes()), (&siblings, bytes));
     }
 
     #[test]
@@ -1434,7 +1478,6 @@ mod tests {
         let fresh = fresh();
         assert_eq!(index.len(), fresh.len());
         assert_eq!(index.distinct_names(), fresh.distinct_names());
-        assert!(index.runs.is_none());
         assert_current(&settings, &index, &root, "after compacting");
     }
 
@@ -1488,19 +1531,26 @@ mod tests {
         );
     }
 
-    /// Each list's length and room.
-    fn lists(index: &Index) -> [(usize, usize); 9] {
+    /// Each list's length and room, but the runs of siblings, which every update builds anew.
+    fn lists(index: &Index) -> [(usize, usize); 10] {
         [
             (index.names.len(), index.names.capacity()),
-            (index.name_starts.len(), index.name_starts.capacity()),
+            (
+                index.name_starts.groups.len(),
+                index.name_starts.groups.capacity(),
+            ),
+            (
+                index.name_starts.offsets.len(),
+                index.name_starts.offsets.capacity(),
+            ),
+            (index.passages.len(), index.passages.capacity()),
             (index.name_letters.len(), index.name_letters.capacity()),
             (
-                index.name_word_starts.len(),
-                index.name_word_starts.capacity(),
+                index.name_digit_starts.len(),
+                index.name_digit_starts.capacity(),
             ),
+            (index.name_symbols.len(), index.name_symbols.capacity()),
             (index.entry_name.len(), index.entry_name.capacity()),
-            (index.entry_parent.len(), index.entry_parent.capacity()),
-            (index.entry_depth.len(), index.entry_depth.capacity()),
             (index.folders.len(), index.folders.capacity()),
             (index.folder_inodes.len(), index.folder_inodes.capacity()),
         ]
@@ -1527,7 +1577,7 @@ mod tests {
         }
         write(&root, &["d1/newer.txt"]);
         assert_eq!(settings.update(&mut index, &[root.join("d1")]).added, 1);
-        let capacities = |lists: [(usize, usize); 9]| lists.map(|(_, capacity)| capacity);
+        let capacities = |lists: [(usize, usize); 10]| lists.map(|(_, capacity)| capacity);
         assert_eq!(capacities(lists(&index)), capacities(grown));
     }
 
@@ -1754,13 +1804,14 @@ mod tests {
         let (_h, home, _v, volume) = home_and_volume();
         let settings = skip_clutter(&home);
         let mut index = settings.scan().unwrap().index;
-        let home_bytes = index.heap_bytes();
+        let (home_bytes, home_runs) = (index.heap_bytes(), index.siblings.len());
         let alone = skip_clutter(&volume).scan().unwrap().index;
         let added = settings.add_volume(&mut index, &volume).unwrap();
         assert!(!added.compacted);
-        // No room kept for updates, no runs, and nothing counted toward a compaction.
+        // No room kept for updates, the runs a scan of it makes, and nothing counted toward
+        // a compaction.
         assert!(index.heap_bytes() <= home_bytes + alone.heap_bytes());
-        assert!(index.runs.is_none());
+        assert_eq!(index.siblings.len(), home_runs + alone.siblings.len());
         assert_eq!((index.added, index.removed), (0, 0));
         assert!(!index.children_apart);
         assert_current(&settings, &index, &home, "with the volume");
@@ -1865,6 +1916,36 @@ mod tests {
     }
 
     #[test]
+    fn added_names_as_long_as_a_disk_allows_keep_their_starts() {
+        let mut builder = IndexBuilder::new();
+        let root = builder.push("/r", NO_PARENT, true);
+        builder.push("a", root, false);
+        let mut index = builder.finish();
+        for round in 0..3 {
+            let mut edit = index.edit();
+            let mut new = IndexBuilder::new();
+            let anchor = new.push("", NO_PARENT, true);
+            // 37 names a round, so groups of name starts are split across updates.
+            let names: Vec<String> = (0..37)
+                .map(|i| char::from_u32(0x65E5 + 37 * round + i).unwrap())
+                .map(|letter| std::iter::repeat_n(letter, 255).collect())
+                .collect();
+            for name in &names {
+                new.push(name, anchor, false);
+            }
+            let first_new = index.len();
+            let added = &mut edit.added_parents;
+            assert_eq!(index.splice(added, &new.lists(), &[root]), 37);
+            for (entry, name) in (first_new as EntryId..).zip(&names) {
+                assert_eq!(index.name(entry), name);
+            }
+            let added = &edit.added_parents;
+            index.siblings = (index.siblings).edited(&[], first_new, added, &index.folders);
+        }
+        assert_sound(&index);
+    }
+
+    #[test]
     fn finds_every_child_however_the_runs_fall() {
         for seed in 1..=200u64 {
             let rng = &mut Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15));
@@ -1878,38 +1959,78 @@ mod tests {
                 }
             }
             let mut index = builder.finish();
-            index.runs = Some(Runs::default());
-            index.add_runs(0);
             for step in 0..6 {
+                let context = format!("seed {seed}, step {step}");
+                let mut parents = index.parents();
+                let mut edit = index.edit();
+                let assert_children = |index: &Index, edit: &Edit, parents: &[EntryId]| {
+                    for &folder in &index.folders {
+                        let mut children: Vec<EntryId> = index.run_children(edit, folder).collect();
+                        children.sort_unstable();
+                        let expected: Vec<EntryId> = (0..index.len() as EntryId)
+                            .filter(|&entry| parents[entry as usize] == folder)
+                            .filter(|entry| !edit.removed.contains(entry))
+                            .collect();
+                        assert_eq!(children, expected, "{context}");
+                    }
+                };
+                assert_children(&index, &edit, &parents);
+                // Removals, each with everything inside it, sometimes inside one already gone.
                 for _ in 0..rng.below(4) {
                     let entry = 1 + rng.below(index.len());
-                    if entry < index.len() {
-                        index.entry_parent[entry] = NO_PARENT;
+                    if entry < index.len() && parents[entry] != NO_PARENT {
+                        index.remove(&mut edit, entry as EntryId);
                     }
+                }
+                assert_children(&index, &edit, &parents);
+                for &entry in &edit.removed {
+                    parents[entry as usize] = NO_PARENT;
                 }
                 // Appended children, often several to one folder in a row, and new folders.
                 let first_new = index.len();
-                let mut parent = *rng.pick(&index.folders);
+                let mut live: Vec<EntryId> = (index.folders.iter().copied())
+                    .filter(|&folder| folder == 0 || parents[folder as usize] != NO_PARENT)
+                    .collect();
+                let mut parent = *rng.pick(&live);
                 for _ in 0..rng.below(12) {
                     if rng.below(2) == 0 {
-                        parent = *rng.pick(&index.folders);
+                        parent = *rng.pick(&live);
                     }
                     let id = index.len() as EntryId;
                     index.entry_name.push(0);
-                    index.entry_parent.push(parent);
+                    edit.added_parents.push(parent);
+                    parents.push(parent);
                     if rng.below(3) == 0 {
                         index.folders.push(id);
                         index.folder_inodes.push(0);
+                        live.push(id);
                     }
                 }
-                index.add_runs(first_new);
+                let mut removed: Vec<EntryId> = edit.removed.iter().copied().collect();
+                removed.sort_unstable();
+                let edited = (index.siblings).edited(
+                    &removed,
+                    first_new,
+                    &edit.added_parents,
+                    &index.folders,
+                );
+                assert_eq!(
+                    edited,
+                    Siblings::from_parents(&parents, &index.folders),
+                    "{context}"
+                );
+                index.siblings = edited;
+                index.children_apart = true;
+                assert_eq!(index.parents(), parents, "{context}");
                 for &folder in &index.folders {
-                    let mut children: Vec<EntryId> = index.run_children(folder).collect();
-                    children.sort_unstable();
+                    if folder != 0 && parents[folder as usize] == NO_PARENT {
+                        continue;
+                    }
                     let expected: Vec<EntryId> = (0..index.len() as EntryId)
-                        .filter(|&entry| index.entry_parent[entry as usize] == folder)
+                        .filter(|&entry| parents[entry as usize] == folder)
                         .collect();
-                    assert_eq!(children, expected, "seed {seed}, step {step}");
+                    let children: Vec<EntryId> = index.children(folder).collect();
+                    assert_eq!(children, expected, "{context}");
                 }
             }
         }

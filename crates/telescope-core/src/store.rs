@@ -1,6 +1,6 @@
 //! The saved index: one file that opens in milliseconds, so a restart needs no rescan.
 //!
-//! Version 3, every number little-endian:
+//! Version 4, every number little-endian:
 //!
 //! | bytes | what                                                       |
 //! |-------|------------------------------------------------------------|
@@ -12,30 +12,33 @@
 //! | 28    | entries added since the lists were last built, low 31 bits |
 //! |       | of a u32; the top bit is set once an update added any      |
 //! | 32    | sizes, u32 each: settings bytes, name bytes, distinct      |
-//! |       | names, entries, folders, passages, roots                   |
-//! | 60    | settings, names, name starts, entry names, entry parents,  |
-//! |       | folders, folder inodes, passages, roots; the last seven as |
-//! |       | u32 lists, folder inodes as long as folders                |
+//! |       | names, entries, runs, folders, passages, roots             |
+//! | 64    | settings, names, name starts, entry names, run starts, run |
+//! |       | folders, folders, folder inodes, passages, roots; the last |
+//! |       | eight as u32 lists, run folders as long as run starts and  |
+//! |       | folder inodes as long as folders                           |
 //!
-//! An entry an update removed keeps its place with `NO_PARENT` as its parent, as a root does.
-//! Version 1 had no removed or added entries, folder inodes or passages; version 2 had one
-//! root, entry 0, and no volumes.
+//! A run is entries side by side in one folder, given by its place among the folders; the
+//! runs of roots, and of entries an update removed, have `NO_FOLDER`. Version 3 kept a parent
+//! for every entry; version 2 also had one root, entry 0, and no volumes; version 1 also had
+//! no removed or added entries, folder inodes or passages.
 
 use crate::Ignore;
-use crate::index::{EntryId, Index, NO_PARENT, NameId};
+use crate::index::{EntryId, Index, NameId};
+use crate::name_starts::NameStarts;
 use crate::scope::Scope;
+use crate::siblings::NO_FOLDER;
 use crate::update::Update;
 use crate::walk::{Access, Clutter, Rules, Scan, scan_with};
 use crc32fast::Hasher;
-use rayon::prelude::*;
 use std::fmt;
 use std::fs::{self, File};
 use std::io::{self, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 const MAGIC: [u8; 8] = *b"TL-INDEX";
-const VERSION: u32 = 3;
-const HEADER: usize = 60;
+const VERSION: u32 = 4;
+const HEADER: usize = 64;
 const CRC: std::ops::Range<usize> = 12..16;
 const SIZES: usize = 32;
 /// The added count's bits at byte 28; the top bit says an update added children apart.
@@ -264,6 +267,7 @@ fn write(
         index.names.len(),
         index.distinct_names(),
         index.len(),
+        index.siblings.len(),
         index.folders.len(),
         index.passages.len(),
         index.roots.len(),
@@ -291,21 +295,24 @@ fn write(
     };
     emit(&settings.key)?;
     emit(index.names.as_bytes())?;
-    let mut buffer = Vec::with_capacity(CHUNK);
-    for list in [
-        &index.name_starts,
+    let lists = [
         &index.entry_name,
-        &index.entry_parent,
+        &index.siblings.starts,
+        &index.siblings.folders,
         &index.folders,
         &index.folder_inodes,
         &index.passages,
         &index.roots,
-    ] {
-        for chunk in list.chunks(CHUNK / 4) {
-            buffer.clear();
-            buffer.extend(chunk.iter().flat_map(|number| number.to_le_bytes()));
-            emit(&buffer)?;
+    ];
+    let mut numbers = (index.name_starts.iter()).chain(lists.into_iter().flatten().copied());
+    let mut buffer = Vec::with_capacity(CHUNK);
+    loop {
+        buffer.clear();
+        buffer.extend(numbers.by_ref().take(CHUNK / 4).flat_map(u32::to_le_bytes));
+        if buffer.is_empty() {
+            break;
         }
+        emit(&buffer)?;
     }
     head[CRC].copy_from_slice(&crc.finalize().to_le_bytes());
     out.seek(SeekFrom::Start(0))?;
@@ -340,14 +347,14 @@ fn read(mut file: impl Read, length: u64, settings: &Settings) -> Result<Saved, 
         names_len,
         distinct,
         entries,
+        runs,
         folders,
         passages,
         roots,
-    ] = [0, 4, 8, 12, 16, 20, 24].map(|at| u64::from(number(SIZES + at)));
+    ] = [0, 4, 8, 12, 16, 20, 24, 28].map(|at| u64::from(number(SIZES + at)));
     // Checked before anything is allocated, so a damaged size never asks for gigabytes.
-    let lists = distinct + 1 + 2 * entries + 2 * folders + passages + roots;
-    let body = settings_len + names_len + 4 * lists;
-    if length != HEADER as u64 + body {
+    let numbers = distinct + 1 + entries + 2 * runs + 2 * folders + passages + roots;
+    if length != HEADER as u64 + settings_len + names_len + 4 * numbers {
         return Err(OpenError::WrongLength);
     }
 
@@ -364,7 +371,8 @@ fn read(mut file: impl Read, length: u64, settings: &Settings) -> Result<Saved, 
     let names = reader.bytes(names_len)?;
     let name_starts = reader.numbers(distinct + 1)?;
     let entry_name = reader.numbers(entries)?;
-    let entry_parent = reader.numbers(entries)?;
+    let run_starts = reader.numbers(runs)?;
+    let run_folders = reader.numbers(runs)?;
     let folder_count = folders;
     let folders = reader.numbers(folder_count)?;
     let folder_inodes = reader.numbers(folder_count)?;
@@ -374,23 +382,26 @@ fn read(mut file: impl Read, length: u64, settings: &Settings) -> Result<Saved, 
         return Err(OpenError::Damaged);
     }
     let names = String::from_utf8(names).map_err(|_| OpenError::Damaged)?;
+    let runs = (run_starts, run_folders);
     let sound = is_sound(
         &names,
         &name_starts,
         &entry_name,
-        &entry_parent,
+        (&runs.0, &runs.1),
         &folders,
         &passages,
         &roots,
     );
-    if !sound {
+    let kept_starts = NameStarts::from_starts(&name_starts);
+    drop(name_starts);
+    let (true, Some(name_starts)) = (sound, kept_starts) else {
         return Err(OpenError::Damaged);
-    }
+    };
     let mut index = Index::from_lists(
         names,
         name_starts,
         entry_name,
-        entry_parent,
+        runs,
         folders,
         folder_inodes,
         passages,
@@ -441,12 +452,14 @@ pub(crate) fn is_sound(
     names: &str,
     name_starts: &[u32],
     entry_name: &[NameId],
-    entry_parent: &[EntryId],
+    runs: (&[EntryId], &[u32]),
     folders: &[EntryId],
     passages: &[EntryId],
     roots: &[EntryId],
 ) -> bool {
     let distinct = name_starts.len() - 1;
+    let entries = entry_name.len();
+    let (starts, run_folders) = runs;
     let ascending = |list: &[EntryId]| list.windows(2).all(|pair| pair[0] < pair[1]);
     name_starts.first() == Some(&0)
         && name_starts.last().map(|&end| end as usize) == Some(names.len())
@@ -455,52 +468,57 @@ pub(crate) fn is_sound(
             .iter()
             .all(|&start| names.is_char_boundary(start as usize))
         && entry_name.iter().all(|&name| (name as usize) < distinct)
+        && starts.len() == run_folders.len()
+        && (entries == 0) == starts.is_empty()
+        && starts.first().is_none_or(|&first| first == 0)
+        && run_folders.first().is_none_or(|&root| root == NO_FOLDER)
+        && ascending(starts)
+        && starts.last().is_none_or(|&last| (last as usize) < entries)
         && ascending(folders)
-        && folders
-            .last()
-            .is_none_or(|&last| (last as usize) < entry_parent.len())
+        && folders.last().is_none_or(|&last| (last as usize) < entries)
         && ascending(passages)
         && passages
             .iter()
             .all(|passage| folders.binary_search(passage).is_ok())
-        && (roots.first() == Some(&0) || (entry_parent.is_empty() && roots.is_empty()))
+        && (roots.first() == Some(&0) || (entries == 0 && roots.is_empty()))
         && ascending(roots)
         && roots.iter().all(|&root| {
-            entry_parent.get(root as usize) == Some(&NO_PARENT)
+            (root as usize) < entries
+                && has_no_folder(starts, run_folders, root)
                 && folders.binary_search(&root).is_ok()
         })
-        && parents_are_folders_in_the_index(entry_parent, folders, roots)
+        && parents_are_folders_in_the_index(starts, run_folders, folders, roots)
 }
 
-/// Each entry's parent is an earlier folder that an update has not removed, so every path
+/// Whether `entry`, inside the runs `starts` begin, is in a run of `NO_FOLDER`.
+fn has_no_folder(starts: &[EntryId], run_folders: &[u32], entry: EntryId) -> bool {
+    run_folders[starts.partition_point(|&s| s <= entry) - 1] == NO_FOLDER
+}
+
+/// Each run's folder is an earlier folder that an update has not removed, so every path
 /// walks up to a root and removing a folder reaches everything inside it.
 fn parents_are_folders_in_the_index(
-    entry_parent: &[EntryId],
+    starts: &[EntryId],
+    run_folders: &[u32],
     folders: &[EntryId],
     roots: &[EntryId],
 ) -> bool {
-    let mut is_folder = vec![0_u64; entry_parent.len().div_ceil(64)];
-    for &folder in folders {
-        is_folder[folder as usize / 64] |= 1 << (folder % 64);
-    }
-    entry_parent
-        .par_iter()
-        .enumerate()
-        .skip(1)
-        .all(|(entry, &parent)| {
-            let at = parent as usize;
-            parent == NO_PARENT
-                || (at < entry
-                    && is_folder[at / 64] >> (at % 64) & 1 == 1
-                    && (entry_parent[at] != NO_PARENT || roots.binary_search(&parent).is_ok()))
-        })
+    starts.iter().zip(run_folders).all(|(&start, &slot)| {
+        slot == NO_FOLDER
+            || folders.get(slot as usize).is_some_and(|&parent| {
+                parent < start
+                    && (!has_no_folder(starts, run_folders, parent)
+                        || roots.binary_search(&parent).is_ok())
+            })
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::Searcher;
-    use crate::index::IndexBuilder;
+    use crate::index::{IndexBuilder, NO_PARENT};
+    use crate::siblings::Siblings;
     use crate::walk::Kind;
 
     const HOME: &str = "/nowhere";
@@ -563,25 +581,43 @@ mod tests {
         (dir, settings, bytes)
     }
 
-    /// Lists as given, with no depths or fingerprints, which saving does not read.
-    fn raw(names: &str, starts: &[u32], name: &[u32], parent: &[u32], folders: &[u32]) -> Index {
+    /// The root's run, then one run in the root.
+    const RUNS: &[(u32, u32)] = &[(0, NO_FOLDER), (1, 0)];
+
+    /// Lists as given, `runs` as each run's start and folder place, with no depths or
+    /// fingerprints, which saving does not read. Name starts out of order are saved wrapped
+    /// around.
+    fn raw(
+        names: &str,
+        starts: &[u32],
+        name: &[u32],
+        runs: &[(u32, u32)],
+        folders: &[u32],
+    ) -> Index {
+        let mut name_starts = NameStarts::default();
+        for (at, &start) in starts.iter().enumerate() {
+            if at.div_ceil(16) == name_starts.groups.len() {
+                name_starts.groups.push(start);
+            }
+            let group = name_starts.groups.last().unwrap();
+            name_starts.offsets.push(start.wrapping_sub(*group) as u16);
+        }
         Index {
             names: names.to_owned(),
-            name_starts: starts.to_vec(),
+            name_starts,
             name_letters: Vec::new(),
-            name_word_starts: Vec::new(),
+            name_digit_starts: Vec::new(),
+            name_symbols: Vec::new(),
             entry_name: name.to_vec(),
-            entry_parent: parent.to_vec(),
-            entry_depth: Vec::new(),
-            roots: if parent.is_empty() {
-                Vec::new()
-            } else {
-                vec![0]
+            siblings: Siblings {
+                starts: runs.iter().map(|&(start, _)| start).collect(),
+                folders: runs.iter().map(|&(_, folder)| folder).collect(),
+                ..Siblings::default()
             },
+            roots: if name.is_empty() { Vec::new() } else { vec![0] },
             folders: folders.to_vec(),
             folder_inodes: vec![0; folders.len()],
             passages: Vec::new(),
-            runs: None,
             removed: 0,
             removed_folders: 0,
             added: 0,
@@ -639,34 +675,50 @@ mod tests {
                 }
             }
             let mut built = builder.finish();
+            let mut parents = built.parents();
             // Entries an update removed, each with everything inside it, and volumes ejected.
+            // Entry 1 joins the root's run when it goes.
             for _ in 0..next(20) {
                 let entry = 1 + next(built.len());
                 if entry < built.len() {
-                    built.entry_parent[entry] = NO_PARENT;
+                    parents[entry] = NO_PARENT;
                 }
+            }
+            if pass % 4 == 0 && built.len() > 1 {
+                parents[1] = NO_PARENT;
             }
             if built.roots.len() > 1 && next(2) == 0 {
                 built.roots.remove(1 + next(built.roots.len() - 1));
             }
             for entry in 1..built.len() {
-                let parent = built.entry_parent[entry];
+                let parent = parents[entry];
                 if parent != NO_PARENT
                     && !built.roots.contains(&parent)
-                    && built.entry_parent[parent as usize] == NO_PARENT
+                    && parents[parent as usize] == NO_PARENT
                 {
-                    built.entry_parent[entry] = NO_PARENT;
+                    parents[entry] = NO_PARENT;
                 }
             }
+            let runs = Siblings::from_parents(&parents, &built.folders);
+            let roots = &built.roots;
+            let gone =
+                |entry: &EntryId| parents[*entry as usize] == NO_PARENT && !roots.contains(entry);
+            let removed = (0..built.len() as EntryId).filter(gone).count();
+            let removed_folders = built.folders.iter().filter(|folder| gone(folder)).count();
             let mut index = Index::from_lists(
                 built.names,
                 built.name_starts,
                 built.entry_name,
-                built.entry_parent,
+                (runs.starts, runs.folders),
                 built.folders,
                 built.folder_inodes,
                 built.passages,
                 built.roots,
+            );
+            assert_eq!(
+                (index.removed, index.removed_folders),
+                (removed, removed_folders),
+                "pass {pass}"
             );
             index.added = next(1000);
             let scan = Scan {
@@ -715,7 +767,7 @@ mod tests {
 
     #[test]
     fn numbers_are_little_endian_at_fixed_places() {
-        let mut index = raw("/ab", &[0, 1, 3], &[0, 1], &[NO_PARENT, 0], &[0, 1]);
+        let mut index = raw("/ab", &[0, 1, 3], &[0, 1], RUNS, &[0, 1]);
         index.folder_inodes = vec![0x0102_0304, 5];
         index.passages = vec![1];
         index.added = 0x0E0F_1011;
@@ -728,26 +780,27 @@ mod tests {
         let bytes = encode(&scan, &settings, 0x0102_0304_0506_0708);
 
         assert_eq!(bytes[..8], *b"TL-INDEX");
-        assert_eq!(bytes[8..12], [3, 0, 0, 0]);
+        assert_eq!(bytes[8..12], [4, 0, 0, 0]);
         let mut zeroed = bytes.clone();
         zeroed[12..16].fill(0);
         assert_eq!(bytes[12..16], crc32fast::hash(&zeroed).to_le_bytes());
         assert_eq!(bytes[16..24], [8, 7, 6, 5, 4, 3, 2, 1]);
         assert_eq!(bytes[24..28], [0x0D, 0x0C, 0x0B, 0x0A]);
         assert_eq!(bytes[28..32], [0x11, 0x10, 0x0F, 0x8E]);
-        let sizes = [settings.key.len() as u32, 3, 2, 2, 2, 1, 1];
+        let sizes = [settings.key.len() as u32, 3, 2, 2, 2, 2, 1, 1];
         let expected: Vec<u8> = sizes.iter().flat_map(|size| size.to_le_bytes()).collect();
-        assert_eq!(bytes[32..60], expected);
-        assert_eq!(bytes[60..60 + settings.key.len()], settings.key);
-        let lists = &bytes[60 + settings.key.len()..];
+        assert_eq!(bytes[32..64], expected);
+        assert_eq!(bytes[64..64 + settings.key.len()], settings.key);
+        let lists = &bytes[64 + settings.key.len()..];
         assert_eq!(lists[..3], *b"/ab");
         assert_eq!(lists[3..15], [0, 0, 0, 0, 1, 0, 0, 0, 3, 0, 0, 0]);
         assert_eq!(lists[15..23], [0, 0, 0, 0, 1, 0, 0, 0]);
-        assert_eq!(lists[23..31], [0xFF, 0xFF, 0xFF, 0xFF, 0, 0, 0, 0]);
-        assert_eq!(lists[31..39], [0, 0, 0, 0, 1, 0, 0, 0]);
-        assert_eq!(lists[39..47], [4, 3, 2, 1, 5, 0, 0, 0]);
-        assert_eq!(lists[47..51], [1, 0, 0, 0]);
-        assert_eq!(lists[51..], [0, 0, 0, 0]);
+        assert_eq!(lists[23..31], [0, 0, 0, 0, 1, 0, 0, 0]);
+        assert_eq!(lists[31..39], [0xFF, 0xFF, 0xFF, 0xFF, 0, 0, 0, 0]);
+        assert_eq!(lists[39..47], [0, 0, 0, 0, 1, 0, 0, 0]);
+        assert_eq!(lists[47..55], [4, 3, 2, 1, 5, 0, 0, 0]);
+        assert_eq!(lists[55..59], [1, 0, 0, 0]);
+        assert_eq!(lists[59..], [0, 0, 0, 0]);
     }
 
     #[test]
@@ -793,7 +846,7 @@ mod tests {
     #[test]
     fn refuses_huge_sizes_before_reading_them() {
         let (_dir, settings, bytes) = saved_tree();
-        for at in [SIZES + 12, SIZES + 4, SIZES] {
+        for at in (SIZES..HEADER).step_by(4) {
             let mut huge = bytes.clone();
             huge[at..at + 4].copy_from_slice(&u32::MAX.to_le_bytes());
             fix_crc(&mut huge);
@@ -817,7 +870,8 @@ mod tests {
             0,
             1,
             2,
-            4,
+            3,
+            5,
             u32::MAX,
             u32::from_be_bytes(VERSION.to_le_bytes()),
         ] {
@@ -933,25 +987,32 @@ mod tests {
     fn refuses_lists_that_point_outside_themselves() {
         let settings = keep(Path::new(HOME));
         let with_passages = |passages: &[u32]| {
-            let mut index = raw("/aé", &[0, 1, 4], &[0, 1], &[NO_PARENT, 0], &[0, 1]);
+            let mut index = raw("/aé", &[0, 1, 4], &[0, 1], RUNS, &[0, 1]);
             index.passages = passages.to_vec();
             index
         };
         // The root, a volume and a file on it.
-        let with_roots = |parents: &[u32], folders: &[u32], roots: &[u32]| {
-            let mut index = raw("/abc", &[0, 1, 2, 4], &[0, 1, 2], parents, folders);
+        let with_roots = |runs: &[(u32, u32)], folders: &[u32], roots: &[u32]| {
+            let mut index = raw("/abc", &[0, 1, 2, 4], &[0, 1, 2], runs, folders);
             index.roots = roots.to_vec();
             index
         };
-        let volume = [NO_PARENT, NO_PARENT, 1];
+        let volume = [(0, NO_FOLDER), (2, 1)];
         let sound = [
-            raw("/aé", &[0, 1, 4], &[0, 1], &[NO_PARENT, 0], &[0]),
-            // Removed by an update.
-            raw("/aé", &[0, 1, 4], &[0, 1], &[NO_PARENT, NO_PARENT], &[0]),
+            raw("/aé", &[0, 1, 4], &[0, 1], RUNS, &[0]),
+            // Removed by an update, in a run of its own or the root's.
+            raw(
+                "/aé",
+                &[0, 1, 4],
+                &[0, 1],
+                &[(0, NO_FOLDER), (1, NO_FOLDER)],
+                &[0],
+            ),
+            raw("/aé", &[0, 1, 4], &[0, 1], &[(0, NO_FOLDER)], &[0]),
             with_passages(&[1]),
             with_roots(&volume, &[0, 1], &[0, 1]),
             // An ejected volume, everything on it removed.
-            with_roots(&[NO_PARENT; 3], &[0, 1], &[0]),
+            with_roots(&[(0, NO_FOLDER)], &[0, 1], &[0]),
             // Two roots of one name, which no update makes: odd, yet nothing points outside
             // a list, and a path finds the first.
             {
@@ -966,9 +1027,9 @@ mod tests {
             with_roots(&volume, &[0, 1], &[]),
             with_roots(&volume, &[0, 1], &[0, 1, 1]),
             with_roots(&volume, &[0, 1], &[0, 3]),
-            with_roots(&volume, &[0, 1], &[0, NO_PARENT]),
+            with_roots(&volume, &[0, 1], &[0, EntryId::MAX]),
             with_roots(&volume, &[0], &[0, 1]),
-            with_roots(&[NO_PARENT, 0, 1], &[0, 1], &[0, 1]),
+            with_roots(&[(0, NO_FOLDER), (1, 0), (2, 1)], &[0, 1], &[0, 1]),
             // A file left on an ejected volume.
             with_roots(&volume, &[0, 1], &[0]),
             {
@@ -978,26 +1039,50 @@ mod tests {
             },
         ];
         let unsound = [
-            raw("/aé", &[0, 1, 3], &[0, 1], &[NO_PARENT, 0], &[0]),
-            raw("/aé", &[1, 1, 4], &[0, 1], &[NO_PARENT, 0], &[0]),
-            raw("/aé", &[0, 2, 1, 4], &[0, 1], &[NO_PARENT, 0], &[0]),
-            raw("/aé", &[0, 3, 4], &[0, 1], &[NO_PARENT, 0], &[0]),
-            raw("/aé", &[0, 1, 4], &[0, 2], &[NO_PARENT, 0], &[0]),
-            raw("/aé", &[0, 1, 4], &[0, 1], &[0, 0], &[0]),
-            raw("/aé", &[0, 1, 4], &[0, 1], &[NO_PARENT, 1], &[0]),
-            raw("/aé", &[0, 1, 4], &[0, 1], &[NO_PARENT, 0], &[0, 0]),
-            raw("/aé", &[0, 1, 4], &[0, 1], &[NO_PARENT, 0], &[2]),
+            raw("/aé", &[0, 1, 3], &[0, 1], RUNS, &[0]),
+            raw("/aé", &[1, 1, 4], &[0, 1], RUNS, &[0]),
+            raw("/aé", &[0, 2, 1, 4], &[0, 1], RUNS, &[0]),
+            raw("/aé", &[0, 3, 4], &[0, 1], RUNS, &[0]),
+            raw("/aé", &[0, 1, 4], &[0, 2], RUNS, &[0]),
+            // The root inside a folder, and an entry inside itself.
+            raw("/aé", &[0, 1, 4], &[0, 1], &[(0, 0), (1, 0)], &[0]),
+            raw(
+                "/aé",
+                &[0, 1, 4],
+                &[0, 1],
+                &[(0, NO_FOLDER), (1, 1)],
+                &[0, 1],
+            ),
+            raw("/aé", &[0, 1, 4], &[0, 1], RUNS, &[0, 0]),
+            raw("/aé", &[0, 1, 4], &[0, 1], RUNS, &[2]),
             raw("", &[0], &[], &[], &[0]),
+            // Runs that miss entries, overlap or run past the end.
+            raw("/aé", &[0, 1, 4], &[0, 1], &[], &[0]),
+            raw("/aé", &[0, 1, 4], &[0, 1], &[(1, NO_FOLDER)], &[0]),
+            raw(
+                "/aé",
+                &[0, 1, 4],
+                &[0, 1],
+                &[(0, NO_FOLDER), (1, 0), (1, 0)],
+                &[0],
+            ),
+            raw("/aé", &[0, 1, 4], &[0, 1], &[(0, NO_FOLDER), (2, 0)], &[0]),
             with_passages(&[1, 1]),
             with_passages(&[2]),
             with_passages(&[NO_PARENT]),
-            // A file as a parent, and an entry left inside a removed folder.
-            raw("/abc", &[0, 1, 2, 4], &[0, 1, 2], &[NO_PARENT, 0, 1], &[0]),
+            // A folder that is not there, and an entry left inside a removed folder.
             raw(
                 "/abc",
                 &[0, 1, 2, 4],
                 &[0, 1, 2],
-                &[NO_PARENT, NO_PARENT, 1],
+                &[(0, NO_FOLDER), (1, 0), (2, 1)],
+                &[0],
+            ),
+            raw(
+                "/abc",
+                &[0, 1, 2, 4],
+                &[0, 1, 2],
+                &[(0, NO_FOLDER), (2, 1)],
                 &[0, 1],
             ),
         ];
@@ -1011,9 +1096,62 @@ mod tests {
     }
 
     #[test]
+    fn refuses_a_name_too_far_from_its_group_s_start() {
+        let settings = keep(Path::new(HOME));
+        // After the root's name, a group's names span at most 65,535 bytes.
+        let names = |long: u32| format!("/{}b", "a".repeat(long as usize));
+        let index = |long: u32| {
+            let starts = [0, 1, long + 1, long + 2];
+            let index = raw(&names(long), &starts, &[0, 1, 2], RUNS, &[0]);
+            encode(&whole(index), &settings, 0)
+        };
+        let fits = u32::from(u16::MAX) - 1;
+        assert!(decode(&index(fits), &settings).is_ok());
+        // Saving the start too far wraps it around, so it is written as it was meant.
+        let mut bytes = index(fits + 1);
+        let end = HEADER + settings.key.len() + names(fits + 1).len() + 4 * 3;
+        bytes[end..end + 4].copy_from_slice(&(fits + 3).to_le_bytes());
+        fix_crc(&mut bytes);
+        assert!(matches!(decode(&bytes, &settings), Err(OpenError::Damaged)));
+    }
+
+    #[test]
+    fn opens_the_longest_names_a_disk_allows_and_folders_deeper_than_depths_count() {
+        let settings = keep(Path::new(HOME));
+        let mut builder = IndexBuilder::new();
+        let mut folder = builder.push("/", NO_PARENT, true);
+        // 255 characters of 3 bytes each, as macOS allows, fill whole groups of name starts.
+        for i in 0..40 {
+            let long: String =
+                std::iter::repeat_n(char::from_u32(0x65E5 + i).unwrap(), 255).collect();
+            builder.push(&long, folder, false);
+        }
+        for _ in 0..260 {
+            folder = builder.push("d", folder, true);
+        }
+        let built = whole(builder.finish());
+        let saved = decode(&encode(&built, &settings, 0), &settings).unwrap();
+        let index = saved.scan.index;
+        assert_eq!(index, built.index);
+        assert_eq!(index.name(40).len(), 765);
+        assert_eq!(index.depth(40), 1);
+        assert_eq!(index.depth(index.len() as EntryId - 1), u8::MAX);
+    }
+
+    #[test]
+    #[should_panic(expected = "longer than 765 bytes")]
+    fn a_name_far_longer_than_a_disk_allows_is_refused_while_building() {
+        let mut builder = IndexBuilder::new();
+        let root = builder.push("/", NO_PARENT, true);
+        for i in 0..16 {
+            builder.push(&format!("{i}{}", "a".repeat(5000)), root, false);
+        }
+    }
+
+    #[test]
     fn refuses_names_that_are_not_utf_8() {
         let settings = keep(Path::new(HOME));
-        let index = raw("/ab", &[0, 1, 3], &[0, 1], &[NO_PARENT, 0], &[0]);
+        let index = raw("/ab", &[0, 1, 3], &[0, 1], RUNS, &[0]);
         let mut bytes = encode(&whole(index), &settings, 0);
         bytes[HEADER + settings.key.len() + 1] = 0xFF;
         fix_crc(&mut bytes);
@@ -1128,7 +1266,7 @@ mod tests {
     fn replaces_the_old_file_and_leaves_no_temporary_one() {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("index");
-        let scan = whole(raw("/", &[0, 1], &[0], &[NO_PARENT], &[0]));
+        let scan = whole(raw("/", &[0, 1], &[0], &[(0, NO_FOLDER)], &[0]));
         let settings = keep(dir.path());
         save_index(&file, &scan, &settings, 1).unwrap();
         save_index(&file, &scan, &settings, 2).unwrap();
@@ -1147,7 +1285,7 @@ mod tests {
         let file = dir.path().join("index");
         fs::create_dir(&file).unwrap();
         fs::write(file.join("inside"), "mine").unwrap();
-        let scan = whole(raw("/", &[0, 1], &[0], &[NO_PARENT], &[0]));
+        let scan = whole(raw("/", &[0, 1], &[0], &[(0, NO_FOLDER)], &[0]));
 
         assert!(save_index(&file, &scan, &keep(dir.path()), 1).is_err());
         let left: Vec<_> = fs::read_dir(dir.path()).unwrap().collect();
@@ -1161,7 +1299,7 @@ mod tests {
         let file = dir.path().join("index");
         let temp = file.with_added_extension(format!("{}.tmp", std::process::id()));
         fs::write(&temp, "mine").unwrap();
-        let scan = whole(raw("/", &[0, 1], &[0], &[NO_PARENT], &[0]));
+        let scan = whole(raw("/", &[0, 1], &[0], &[(0, NO_FOLDER)], &[0]));
 
         let saved = save_index(&file, &scan, &keep(dir.path()), 1);
         assert_eq!(saved.unwrap_err().kind(), io::ErrorKind::AlreadyExists);
