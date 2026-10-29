@@ -48,7 +48,7 @@ To start Argus when you log in, open System Settings → General → Login Items
 2. Open the new `Argus.dmg`, drag Argus to Applications and click Replace.
 3. Open Argus. macOS blocks it once more, so repeat Open Anyway from the install steps.
 
-Open Anyway comes back with every update, because macOS approves each build on its own. Full Disk Access carries over, because every release is signed with the same certificate (checked going from 0.1.0 to 0.2.0, [#13](https://github.com/jovanhartono/argus/issues/13)). If the window ever says it needs Full Disk Access again, remove Argus from the Full Disk Access list with −, add it back with +, and quit and reopen it.
+Open Anyway comes back with every update, because macOS approves each build on its own. Full Disk Access carries over, because every release from 0.2.1 on is signed with the same certificate (checked going from 0.1.0 to 0.2.0, [#13](https://github.com/jovanhartono/argus/issues/13)). If the window ever says it needs Full Disk Access again, remove Argus from the Full Disk Access list with −, add it back with +, and quit and reopen it.
 
 ## Licence
 
