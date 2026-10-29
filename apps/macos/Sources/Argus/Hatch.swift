@@ -154,17 +154,23 @@ final class Hatch {
         return CFUUIDCreateString(nil, log) as String?
     }
 
-    /// macOS's own list of permissions opens only with Full Disk Access, and trying never shows
-    /// a pop-up. Any failure counts as no access, so a doubt never brings up pop-ups.
-    nonisolated static func hasFullDiskAccess(probing list: String = permissionList) -> Bool {
-        let file = open(list, O_RDONLY)
-        guard file >= 0 else { return false }
-        close(file)
-        return true
+    /// Each of `guarded` opens only with Full Disk Access, and trying never shows a pop-up. Any
+    /// one opening means access, as macOS 27 no longer keeps the first; a doubt counts as none.
+    nonisolated static func hasFullDiskAccess(probing places: [String] = guarded) -> Bool {
+        places.contains { place in
+            let file = open(place, O_RDONLY)
+            guard file >= 0 else { return false }
+            close(file)
+            return true
+        }
     }
 
-    nonisolated static let permissionList =
-        NSHomeDirectory() + "/Library/Application Support/com.apple.TCC/TCC.db"
+    /// macOS's own lists of permissions, the user's and the system's, then Safari's data.
+    nonisolated static let guarded = [
+        NSHomeDirectory() + "/Library/Application Support/com.apple.TCC/TCC.db",
+        "/Library/Application Support/com.apple.TCC/TCC.db",
+        NSHomeDirectory() + "/Library/Safari",
+    ]
 
     deinit {
         if let stream { end(stream) }
