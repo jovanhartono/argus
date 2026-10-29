@@ -407,6 +407,24 @@ final class HealthWindowTests: XCTestCase {
         XCTAssertEqual(stage.handedBack, 1, "only when it was showing")
     }
 
+    func testAnEmptyListSaysNoFoldersYetUntilOneIsAdded() {
+        let held = HeldStage()
+        let empty = HealthWindow(
+            read: { Health() }, hasAccess: { true }, rebuild: {}, stage: held, folders: folders)
+        empty.show()
+        defer { empty.hide() }
+        XCTAssertFalse(empty.noFolders.isHidden)
+        XCTAssertEqual(empty.noFolders.stringValue, "No folders yet")
+        empty.addFolders()
+        held.answer([URL(fileURLWithPath: "/tmp/notes")])
+        XCTAssertTrue(empty.noFolders.isHidden, "a folder is listed")
+        empty.folderList.selectRowIndexes([0], byExtendingSelection: false)
+        empty.removeFolders()
+        XCTAssertFalse(empty.noFolders.isHidden, "the last folder is gone")
+        folders.add(["/a"])
+        XCTAssertTrue(window().noFolders.isHidden, "a window opened over a kept list")
+    }
+
     func testRemoveTakesTheSelectedFolders() {
         folders.add(["/a", "/b", "/c"])
         let window = window()

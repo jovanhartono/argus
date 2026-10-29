@@ -108,6 +108,7 @@ final class HealthWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, NST
     let everythingHint = NSTextField(wrappingLabelWithString: "")
     let grid = NSGridView()
     let folderList = NSTableView()
+    let noFolders = NSTextField(labelWithString: "No folders yet")
     let folderButtons = NSSegmentedControl(
         images: [NSImage(named: NSImage.addTemplateName)!, NSImage(named: NSImage.removeTemplateName)!],
         trackingMode: .momentary, target: nil, action: nil)
@@ -241,6 +242,10 @@ final class HealthWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, NST
         scroll.hasVerticalScroller = true
         scroll.autohidesScrollers = true
         scroll.borderType = .bezelBorder
+        noFolders.textColor = .secondaryLabelColor
+        noFolders.translatesAutoresizingMaskIntoConstraints = false
+        noFolders.isHidden = !folders.paths.isEmpty
+        scroll.addSubview(noFolders)
         folderButtons.segmentStyle = .smallSquare
         folderButtons.target = self
         folderButtons.action = #selector(changeFolders(_:))
@@ -259,6 +264,8 @@ final class HealthWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, NST
         NSLayoutConstraint.activate([
             scroll.widthAnchor.constraint(equalToConstant: 260),
             scroll.heightAnchor.constraint(equalToConstant: 88),
+            noFolders.centerXAnchor.constraint(equalTo: scroll.centerXAnchor),
+            noFolders.centerYAnchor.constraint(equalTo: scroll.centerYAnchor),
         ])
         return box
     }
@@ -273,16 +280,21 @@ final class HealthWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, NST
             guard let self else { return }
             choosing = false
             folders.add(urls.map(\.path))
-            folderList.reloadData()
+            reloadFolders()
             if shown { stage.makeKey(panel) }
         }
     }
 
     func removeFolders() {
         folders.remove(at: folderList.selectedRowIndexes)
-        folderList.reloadData()
+        reloadFolders()
         folderList.deselectAll(nil)
         folderButtons.setEnabled(false, forSegment: 1)
+    }
+
+    private func reloadFolders() {
+        folderList.reloadData()
+        noFolders.isHidden = !folders.paths.isEmpty
     }
 
     func numberOfRows(in tableView: NSTableView) -> Int {
