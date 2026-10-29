@@ -21,21 +21,37 @@ final class NoticeTests: XCTestCase {
         XCTAssertTrue(Notice.needsFinder.text.contains("control Finder"), Notice.needsFinder.text)
     }
 
-    func testTheProbedListIsMacOSOwnInTheHomeFolder() {
-        let folder = (Hatch.permissionList as NSString).deletingLastPathComponent
-        XCTAssertEqual(folder, NSHomeDirectory() + "/Library/Application Support/com.apple.TCC")
-        XCTAssertTrue(FileManager.default.fileExists(atPath: folder), folder)
+    /// Run from a terminal with Full Disk Access, as on the dev Mac, the real places say so.
+    func testWithAccessTheRealPlacesSaySo() throws {
+        try XCTSkipUnless(
+            FileManager.default.isReadableFile(atPath: Hatch.guarded[1]), "this test runner lacks Full Disk Access")
+        XCTAssertTrue(Hatch.hasFullDiskAccess())
+        for place in Hatch.guarded where FileManager.default.fileExists(atPath: place) {
+            XCTAssertTrue(Hatch.hasFullDiskAccess(probing: [place]), place)
+        }
+    }
+
+    func testAFolderThatOpensMeansAccess() {
+        XCTAssertTrue(Hatch.hasFullDiskAccess(probing: [FileManager.default.temporaryDirectory.path]))
     }
 
     func testAReadableListMeansAccess() throws {
         let list = try temporaryFile()
         defer { try? FileManager.default.removeItem(atPath: list) }
-        XCTAssertTrue(Hatch.hasFullDiskAccess(probing: list))
+        XCTAssertTrue(Hatch.hasFullDiskAccess(probing: [list]))
     }
 
     func testAMissingListMeansNoAccess() {
-        XCTAssertFalse(Hatch.hasFullDiskAccess(probing: "/nonexistent/\(UUID().uuidString)/TCC.db"))
-        XCTAssertFalse(Hatch.hasFullDiskAccess(probing: ""))
+        XCTAssertFalse(Hatch.hasFullDiskAccess(probing: ["/nonexistent/\(UUID().uuidString)/TCC.db"]))
+        XCTAssertFalse(Hatch.hasFullDiskAccess(probing: [""]))
+        XCTAssertFalse(Hatch.hasFullDiskAccess(probing: []))
+    }
+
+    /// As on macOS 27, where the user's own list is gone but the system's opens with access.
+    func testAPlaceThatOpensAfterAMissingOneMeansAccess() throws {
+        let list = try temporaryFile()
+        defer { try? FileManager.default.removeItem(atPath: list) }
+        XCTAssertTrue(Hatch.hasFullDiskAccess(probing: ["/nonexistent/\(UUID().uuidString)/TCC.db", list]))
     }
 
     func testALockedListMeansNoAccess() throws {
@@ -43,14 +59,14 @@ final class NoticeTests: XCTestCase {
         let list = try temporaryFile()
         defer { try? FileManager.default.removeItem(atPath: list) }
         try FileManager.default.setAttributes([.posixPermissions: 0], ofItemAtPath: list)
-        XCTAssertFalse(Hatch.hasFullDiskAccess(probing: list))
+        XCTAssertFalse(Hatch.hasFullDiskAccess(probing: [list, list + "-missing"]))
     }
 
     func testProbingLeavesNoFileOpen() throws {
         let list = try temporaryFile()
         defer { try? FileManager.default.removeItem(atPath: list) }
         let before = try openFiles()
-        for _ in 0..<1_000 { _ = Hatch.hasFullDiskAccess(probing: list) }
+        for _ in 0..<1_000 { _ = Hatch.hasFullDiskAccess(probing: [list]) }
         // Other tests' scan threads may open a file or two meanwhile; a leak would show 1,000.
         XCTAssertLessThan(try openFiles() - before, 10)
     }
