@@ -449,6 +449,13 @@ fn read(mut file: impl Read, length: u64, settings: &Settings) -> Result<Saved, 
         passages,
         roots,
     );
+    // A root naming a folder above the one scanned would have the next update read all of it.
+    let root = settings.root();
+    let elsewhere = index.len() > 0 && index.path(0) != root
+        || index.volumes().any(|volume| root.starts_with(volume));
+    if elsewhere {
+        return Err(OpenError::Damaged);
+    }
     index.added = added;
     index.children_apart = children_apart;
     Ok(Saved {
@@ -563,11 +570,17 @@ mod tests {
     use crate::siblings::Siblings;
     use crate::walk::Kind;
 
-    const HOME: &str = "/nowhere";
+    /// The root of the made-up indexes below, as a saved list must name the folder scanned.
+    const HOME: &str = "/";
 
     fn settings(root: &Path, clutter: Clutter) -> Settings {
         let home = Path::new(HOME);
-        Settings::new(root, home, clutter, Ignore::default(), Access::Full)
+        let mut settings = Settings::new(root, home, clutter, Ignore::default(), Access::Full);
+        // Spelled as the made-up indexes spell it; Windows would make it a drive's root.
+        if root == home {
+            settings.root = home.to_path_buf();
+        }
+        settings
     }
 
     fn keep(root: &Path) -> Settings {
@@ -1062,16 +1075,14 @@ mod tests {
             with_roots(&volume, &[0, 1], &[0, 1]),
             // An ejected volume, everything on it removed.
             with_roots(&[(0, NO_FOLDER)], &[0, 1], &[0]),
-            // Two roots of one name, which no update makes: odd, yet nothing points outside
-            // a list, and a path finds the first.
+        ];
+        let unsound_roots = [
+            // A volume named as the root, or above it, would have an update read the root again.
             {
                 let mut twins = with_roots(&volume, &[0, 1], &[0, 1]);
                 twins.entry_name[1] = twins.entry_name[0];
-                assert_eq!(twins.root_at(Path::new(twins.name(1))), Some(0));
                 twins
             },
-        ];
-        let unsound_roots = [
             with_roots(&volume, &[0, 1], &[1]),
             with_roots(&volume, &[0, 1], &[]),
             with_roots(&volume, &[0, 1], &[0, 1, 1]),
@@ -1195,6 +1206,32 @@ mod tests {
         for i in 0..16 {
             builder.push(&format!("{i}{}", "a".repeat(5000)), root, false);
         }
+    }
+
+    /// Damaged with the CRC intact, as a bug in saving would leave it: the next update would read
+    /// the whole folder the root names.
+    #[test]
+    fn refuses_a_root_that_names_another_folder() {
+        let (dir, settings, bytes) = saved_tree();
+        assert!(decode(&bytes, &settings).is_ok());
+        let root = fs::canonicalize(dir.path()).unwrap();
+        let name = root.to_str().unwrap().as_bytes();
+        let names_at = HEADER + settings.key.len();
+        assert_eq!(&bytes[names_at..names_at + name.len()], name);
+        let mut elsewhere = bytes.clone();
+        // The same length, so only the folder it names differs.
+        elsewhere[names_at + name.len() - 1] ^= 1;
+        fix_crc(&mut elsewhere);
+        assert!(matches!(
+            decode(&elsewhere, &settings),
+            Err(OpenError::Damaged)
+        ));
+        let other = raw("/x", &[0, 2], &[0], &[(0, NO_FOLDER)], &[0]);
+        let other = encode(&whole(other), &keep(Path::new(HOME)), 0);
+        assert!(matches!(
+            decode(&other, &keep(Path::new(HOME))),
+            Err(OpenError::Damaged)
+        ));
     }
 
     #[test]
@@ -1337,7 +1374,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("index");
         let index = raw("/", &[0, 1], &[0], &[(0, NO_FOLDER)], &[0]);
-        let settings = keep(dir.path());
+        let settings = keep(Path::new(HOME));
         save_index(&file, &index, 0, &settings, 1).unwrap();
         save_index(&file, &index, 0, &settings, 2).unwrap();
         assert_eq!(open_index(&file, &settings).unwrap().event_id, 2);
