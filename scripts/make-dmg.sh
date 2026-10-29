@@ -4,9 +4,10 @@
 set -euo pipefail
 cd "${0:A:h}/.."
 
-# The certificate v0.1.0 shipped with. macOS ties Full Disk Access to it, so a release signed
-# by any other, even a new one with the same name, makes everyone grant it again.
-leaf=8099307fd8f0fe98d0b0fb7774435ccdf98043ec
+# The certificate releases have been signed with since the rename to Argus. macOS ties Full Disk
+# Access to it, so a release signed by any other, even a new one with the same name, makes
+# everyone grant it again.
+leaf=bcb35d10da67ed5f62e373a13a2208e5c2362f8c
 if [[ ${(L)$(security find-identity -p codesigning)} != *$leaf* ]]; then
   echo "The release certificate $leaf isn't in your keychains; restore it from its .p12 backup" >&2
   exit 1
