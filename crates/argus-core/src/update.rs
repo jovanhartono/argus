@@ -669,7 +669,7 @@ struct Added {
 mod tests {
     use super::*;
     use crate::store::{is_sound, open_index, save_index};
-    use crate::{Access, Clutter, Ignore, Scan, Searcher, Settings};
+    use crate::{Access, Boosts, Clutter, Frecency, Ignore, Scan, Searcher, Settings, Within};
     use std::collections::BTreeSet;
 
     /// The root `path` is under, and its entry.
@@ -1698,6 +1698,151 @@ mod tests {
         fs::remove_file(file).unwrap();
         assert!(opened == scan.index);
         assert_current(&settings, &opened, &home, "after opening");
+    }
+
+    /// When the boosts below count from, so a seed always ranks the same.
+    const NOW: u64 = 1_800_000_000;
+
+    /// The hits inside every folder, by path and score with frecency's boosts added, are
+    /// a fresh scan's, as are the best five's scores in their order. Returns how many of
+    /// those searches had a boosted hit.
+    fn assert_same_inside_every_folder(
+        settings: &Settings,
+        index: &Index,
+        frecency: &Frecency,
+        context: &str,
+    ) -> usize {
+        assert_sound(index);
+        let volumes: Vec<PathBuf> = index.volumes().map(Path::to_path_buf).collect();
+        let fresh = fresh(settings, &volumes);
+        let folders = |index: &Index| -> BTreeSet<PathBuf> {
+            (index.folders.iter())
+                .filter(|&&folder| !index.is_removed(folder))
+                .map(|&folder| index.path(folder))
+                .collect()
+        };
+        let folders_held = folders(index);
+        assert_eq!(folders_held, folders(&fresh), "{context}");
+        let searcher = Searcher::with_threads(1);
+        let apps = crate::Apps::default();
+        let boosts = searcher.boosts(frecency, index, &apps, NOW);
+        let fresh_boosts = searcher.boosts(frecency, &fresh, &apps, NOW);
+        assert_eq!(boosts.len(), fresh_boosts.len(), "{context}");
+        let found = |index: &Index, boosts: &Boosts, folder: &Path, query: &str, limit: usize| {
+            let within = Within::folder(index, folder);
+            let within = within.unwrap_or_else(|| panic!("{context}: {folder:?}"));
+            let ticket = searcher.ticket();
+            let hits =
+                searcher.search_with(index, &apps, Some(&within), query, ticket, limit, boosts);
+            let hits = hits.unwrap();
+            let boosted = hits.iter().any(|hit| boosts.get(hit.item) > 0);
+            let hits: Vec<(PathBuf, u32)> = (hits.iter())
+                .map(|hit| (index.path(hit.entry().unwrap()), hit.score))
+                .collect();
+            (hits, boosted)
+        };
+        let scores = |(hits, _): (Vec<(PathBuf, u32)>, bool)| -> Vec<u32> {
+            hits.into_iter().map(|(_, score)| score).collect()
+        };
+        let mut with_boosted_hits = 0;
+        for folder in &folders_held {
+            for query in ["a", "md re", "b !old"] {
+                let (mut all, boosted) = found(index, &boosts, folder, query, index.len());
+                let (mut expected, _) = found(&fresh, &fresh_boosts, folder, query, index.len());
+                all.sort();
+                expected.sort();
+                assert_eq!(all, expected, "{context}: {query:?} in {folder:?}");
+                with_boosted_hits += usize::from(boosted);
+                // Ties among the best may fall either way, as entries are numbered apart.
+                let best = scores(found(index, &boosts, folder, query, 5));
+                let fresh_best = scores(found(&fresh, &fresh_boosts, folder, query, 5));
+                assert_eq!(best, fresh_best, "{context}: {query:?} in {folder:?}");
+            }
+        }
+        with_boosted_hits
+    }
+
+    /// A saved home and volume, searched inside every folder, then the volume ejected while
+    /// files change, plugged in again with more changes, saved and opened, a few rounds over.
+    #[test]
+    fn searches_inside_every_folder_match_a_fresh_scan_through_ejecting_and_reopening() {
+        let (mut boosted, mut with_removed, mut in_place) = (0, 0, 0);
+        for seed in 1..=6 {
+            let (_h, home, _v, volume) = home_and_volume();
+            let rng = &mut Rng(0x2545_F491_4F6C_DD1D ^ seed << 8);
+            for _ in 0..20 {
+                change(rng, &home, &BTreeSet::new());
+                change(rng, &volume, &BTreeSet::new());
+            }
+            let settings = skip_clutter(&home);
+            let file = index_file(&home);
+            let mut frecency = Frecency::default();
+            // A few more files opened before each look, some since gone. Those on the volume
+            // never get a boost, as frecency only reaches files under home.
+            let mut check = |index: &Index, rng: &mut Rng, stage: &str| {
+                // By path, home first, as a scan numbers entries in whatever order its threads
+                // finish and the two temporary folders' names sort either way.
+                let mut live: Vec<PathBuf> = (index.ids())
+                    .filter(|&entry| !index.is_removed(entry))
+                    .map(|entry| index.path(entry))
+                    .filter(|path| !path.starts_with(home.join(PADDING)))
+                    .collect();
+                live.sort_by_key(|path| (!path.starts_with(&home), path.clone()));
+                for _ in 0..4 {
+                    let opened = NOW - rng.below(30 * 86_400) as u64;
+                    frecency.record(rng.pick(&live), opened);
+                }
+                with_removed += usize::from(index.removed > 0);
+                let context = format!("seed {seed}, {stage}");
+                boosted += assert_same_inside_every_folder(&settings, index, &frecency, &context);
+            };
+            let reopen = |index: Index, stage: &str| {
+                save_index(&file, &index, 0, &settings, 0).unwrap();
+                let opened = open_index(&file, &settings).unwrap().scan.index;
+                fs::remove_file(&file).unwrap();
+                assert!(opened == index, "seed {seed}, {stage}");
+                opened
+            };
+            // Folders already on disk are never made again, which only an inode tells apart.
+            let changes = |rng: &mut Rng, top: &Path| {
+                let taken: BTreeSet<PathBuf> = (on_disk(top).into_iter())
+                    .filter_map(|(path, is_dir)| is_dir.then_some(path))
+                    .collect();
+                let mut changed = Vec::new();
+                for _ in 0..=rng.below(6) {
+                    changed.extend(change(rng, top, &taken));
+                }
+                changed
+            };
+            let mut update = |index: &mut Index, changed: &[PathBuf]| {
+                let update = settings.update(index, changed);
+                in_place += usize::from(!update.compacted && update.added + update.removed > 0);
+            };
+
+            let mut index = reopen(fresh(&settings, std::slice::from_ref(&volume)), "saved");
+            check(&index, rng, "opened");
+            for round in 0..3 {
+                settings.remove_volume(&mut index, &volume).unwrap();
+                check(&index, rng, &format!("round {round}, ejected"));
+                // The volume changes too while out, and is read anew once plugged in.
+                let changed = changes(rng, &home);
+                changes(rng, &volume);
+                update(&mut index, &changed);
+                check(&index, rng, &format!("round {round}, updated"));
+                settings.add_volume(&mut index, &volume).unwrap();
+                check(&index, rng, &format!("round {round}, plugged in"));
+                let changed = [changes(rng, &home), changes(rng, &volume)].concat();
+                update(&mut index, &changed);
+                check(&index, rng, &format!("round {round}, updated with it"));
+                index = reopen(index, &format!("round {round}"));
+                check(&index, rng, &format!("round {round}, reopened"));
+            }
+        }
+        assert!(
+            boosted > 300 && with_removed > 50 && in_place > 20,
+            "{boosted} searches with a boosted hit, {with_removed} checks with removed entries, \
+             {in_place} in place"
+        );
     }
 
     #[test]
