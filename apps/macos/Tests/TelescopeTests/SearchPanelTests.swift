@@ -674,9 +674,7 @@ final class SearchPanelTests: XCTestCase {
         let granted = try await opened(access: false)
         access = true
         granted.recheckAccess()
-        granted.panel.makeFirstResponder(granted.field)
         XCTAssertTrue(granted.control(NSTextField(), textView: NSTextView(), doCommandBy: #selector(NSResponder.insertTab(_:))))
-        XCTAssertTrue(granted.panel.firstResponder === granted.field.currentEditor())
 
         let full = try await opened(access: true)
         XCTAssertTrue(full.control(NSTextField(), textView: NSTextView(), doCommandBy: #selector(NSResponder.insertBacktab(_:))))

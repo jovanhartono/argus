@@ -1035,8 +1035,8 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
     /// Quick Look takes the keys as it comes up, even while you're in another app, and macOS
     /// then doesn't count it as key, so the window would hide. Only a click on it keeps them.
     func windowDidBecomeKey(_ note: Notification) {
-        guard note.object as? NSWindow !== panel, !stage.isActive,
-              NSApp.currentEvent?.type != .leftMouseDown else { return }
+        let clicked = NSApp.currentEvent.map { $0.type == .leftMouseDown && $0.window === note.object as? NSWindow }
+        guard note.object as? NSWindow !== panel, !stage.isActive, clicked != true else { return }
         stage.makeKey(panel)
     }
 
