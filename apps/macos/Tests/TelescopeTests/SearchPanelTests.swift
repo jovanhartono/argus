@@ -501,7 +501,7 @@ final class SearchPanelTests: XCTestCase {
         try await until { window.rows.map(\.name) == ["Budget", "Budget Planner"] }
         XCTAssertTrue(window.rows.allSatisfy(\.isApp), "\(window.rows)")
         down(window)
-        XCTAssertFalse(tab(window), "an app is not a folder to search in")
+        XCTAssertTrue(tab(window), "an app is not a folder to search in")
         XCTAssertTrue(window.scopes.isEmpty)
         XCTAssertTrue(window.control(NSTextField(), textView: NSTextView(), doCommandBy: #selector(NSResponder.insertNewline(_:))))
         XCTAssertEqual(stage.opened.map(\.path), [apps.appendingPathComponent("Budget Planner.app").path])
@@ -670,14 +670,16 @@ final class SearchPanelTests: XCTestCase {
         }
     }
 
-    func testTabIsLeftAloneWithoutAButton() async throws {
+    func testTabWithoutAButtonKeepsTheKeysInTheBox() async throws {
         let granted = try await opened(access: false)
         access = true
         granted.recheckAccess()
-        XCTAssertFalse(granted.control(NSTextField(), textView: NSTextView(), doCommandBy: #selector(NSResponder.insertTab(_:))))
+        granted.panel.makeFirstResponder(granted.field)
+        XCTAssertTrue(granted.control(NSTextField(), textView: NSTextView(), doCommandBy: #selector(NSResponder.insertTab(_:))))
+        XCTAssertTrue(granted.panel.firstResponder === granted.field.currentEditor())
 
         let full = try await opened(access: true)
-        XCTAssertFalse(full.control(NSTextField(), textView: NSTextView(), doCommandBy: #selector(NSResponder.insertTab(_:))))
+        XCTAssertTrue(full.control(NSTextField(), textView: NSTextView(), doCommandBy: #selector(NSResponder.insertBacktab(_:))))
     }
 
     func testTabOnAFolderSearchesInsideItAndBackspaceStepsBackOut() async throws {
@@ -703,6 +705,7 @@ final class SearchPanelTests: XCTestCase {
         XCTAssertEqual(window.field.placeholderString, "Search in notes")
         XCTAssertGreaterThan(window.field.frame.minX, window.chip.frame.maxX)
         XCTAssertEqual(window.field.frame.maxX, wide.maxX)
+        XCTAssertGreaterThanOrEqual(window.chipText.frame.width, window.chipText.cell!.cellSize.width, "not cut short")
         // An empty box shows no list, once the window has shrunk back.
         try await until { window.panel.frame.height == Metric.field }
 
@@ -734,16 +737,17 @@ final class SearchPanelTests: XCTestCase {
         try await until { window.rows.count == 3 }
     }
 
-    func testTabOnAFileOrNoResultsIsLeftAlone() async throws {
+    func testTabOnAFileOrNoResultsKeepsTheKeysInTheBox() async throws {
         try Data().write(to: root.appendingPathComponent("budget.txt"))
         let window = try await opened(access: true)
-        XCTAssertFalse(tab(window), "an empty box")
+        XCTAssertTrue(tab(window), "an empty box")
         try await type("budget", in: window)
         try await until { window.rows.count == 1 }
-        XCTAssertFalse(tab(window))
+        XCTAssertTrue(tab(window))
+        XCTAssertEqual(window.field.stringValue, "budget")
         try await type("zzzzqqq", in: window)
         try await until { window.rows.isEmpty && window.panel.frame.height > Metric.field }
-        XCTAssertFalse(tab(window))
+        XCTAssertTrue(tab(window))
         XCTAssertTrue(window.scopes.isEmpty)
     }
 
@@ -842,7 +846,8 @@ final class SearchPanelTests: XCTestCase {
             }
         }
         move(try XCTUnwrap(window.rows.lastIndex { !$0.isFolder }))
-        XCTAssertFalse(tab(window), "a file")
+        XCTAssertTrue(tab(window), "a file")
+        XCTAssertTrue(window.scopes.isEmpty)
         let folder = try XCTUnwrap(window.rows.lastIndex { $0.isFolder })
         XCTAssertGreaterThan(folder, 0)
         move(folder)
@@ -1537,6 +1542,46 @@ final class SearchPanelTests: XCTestCase {
         XCTAssertTrue(window.shown, "the preview has the keys by the time it decides")
         XCTAssertTrue(window.previewing)
         XCTAssertNil(stage.key)
+    }
+
+    func testAPreviewOpeningWhileAnotherAppIsActiveHandsTheKeysBackToTheBox() async throws {
+        try Data("budget\n".utf8).write(to: root.appendingPathComponent("budget.txt"))
+        let window = try await opened(access: true)
+        window.show()
+        defer { window.hide() }
+        try await type("budget", in: window)
+        try await until { window.rows.count == 1 }
+        window.quickLook(nil)
+        try await until { window.previewing }
+
+        // Quick Look takes the keys as it comes up, with Telescope still not the active app.
+        stage.key = nil
+        window.windowDidResignKey(Notification(name: NSWindow.didResignKeyNotification, object: window.panel))
+        window.windowDidBecomeKey(Notification(name: NSWindow.didBecomeKeyNotification, object: QLPreviewPanel.shared()))
+        await nextTurn()
+        XCTAssertTrue(window.shown)
+        XCTAssertTrue(window.previewing)
+        XCTAssertTrue(stage.isKey(window.panel))
+        XCTAssertTrue(window.panel.firstResponder === window.field.currentEditor())
+    }
+
+    func testOnScreenAPreviewOpeningKeepsTheWindow() async throws {
+        try onScreenOnly()
+        try Data("budget\n".utf8).write(to: root.appendingPathComponent("budget.txt"))
+        let window = try await opened(access: true, on: Screen())
+        window.show()
+        defer { window.hide() }
+        let unlocked = await soon { window.panel.isKeyWindow }
+        try XCTSkipUnless(unlocked, "needs an unlocked screen")
+        try await type("budget", in: window)
+        try await until { window.rows.count == 1 }
+        window.quickLook(nil)
+        try await until { window.previewing }
+
+        // Quick Look comes up over about 0.3 s and settles the keys at the end.
+        try await Task.sleep(for: .seconds(1))
+        XCTAssertTrue(window.shown)
+        XCTAssertTrue(window.previewing)
     }
 
     func testFocusLeavingTheWindowWithoutAPreviewHidesItAtOnce() async throws {

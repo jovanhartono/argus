@@ -715,7 +715,8 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
         chipText.setAccessibilityLabel(scopes.last.map { "Searching in \($0.name)" })
         field.placeholderString = scopes.last.map { "Search in \($0.name)" } ?? "Search"
         let padding: CGFloat = 8
-        let size = chipText.intrinsicContentSize
+        // The label's own size is a few points short of what it draws, which cut "pdf" to "…f".
+        let size = chipText.cell!.cellSize
         let text = min(size.width, Metric.chip - 2 * padding)
         let height = size.height
         chipText.frame = NSRect(x: padding, y: (Metric.chipHeight - height) / 2, width: text, height: height)
@@ -1023,11 +1024,20 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
         case #selector(NSResponder.deleteBackward(_:)):
             return leaveFolder()
         case #selector(NSResponder.insertTab(_:)), #selector(NSResponder.insertBacktab(_:)):
-            return reachSettings()
+            // With nowhere to go, Tab would move the keys from the box to the list.
+            return reachSettings() || !composing
         default:
             return false
         }
         return true
+    }
+
+    /// Quick Look takes the keys as it comes up, even while you're in another app, and macOS
+    /// then doesn't count it as key, so the window would hide. Only a click on it keeps them.
+    func windowDidBecomeKey(_ note: Notification) {
+        guard note.object as? NSWindow !== panel, !stage.isActive,
+              NSApp.currentEvent?.type != .leftMouseDown else { return }
+        stage.makeKey(panel)
     }
 
     /// Also hears the preview, whose delegate this is while it shows.
