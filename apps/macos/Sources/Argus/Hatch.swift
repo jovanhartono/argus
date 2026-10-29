@@ -318,15 +318,23 @@ final class Hatch {
         return path.withUTF8 { tl_volume_added(core, $0.baseAddress, $0.count, FSEventsGetCurrentEventId()) } == 1
     }
 
-    /// True when the core had the drive. Its watch ends at once, before macOS checks whether
-    /// anything holds it, so Finder ejects it on the first try.
+    /// True when the core had the drive, or let go of it as macOS asked to unmount it. Its watch
+    /// ends at once, before macOS checks whether anything holds it, so Finder ejects it on the
+    /// first try.
     @discardableResult
     func volumeRemoved(_ path: String) -> Bool {
-        var path = path
-        let held = path.withUTF8 { tl_volume_removed(core, $0.baseAddress, $0.count, FSEventsGetCurrentEventId()) } == 1
+        let before = watching
+        let held = letGo(path)
         // From where the old watch stopped, so a change at home during the swap still counts.
-        if held { watch(replaying: heardUpTo) }
-        return held
+        if held || watching.contains(where: { $0.isInside(path) }) { watch(replaying: heardUpTo) }
+        return held || watching != before
+    }
+
+    /// True when the core had the drive; returns once no scan of it is under way. Safe from any
+    /// thread, as macOS asks before an unmount on a queue of its own.
+    nonisolated func letGo(_ path: String) -> Bool {
+        var path = path
+        return path.withUTF8 { tl_volume_removed(core, $0.baseAddress, $0.count, FSEventsGetCurrentEventId()) } == 1
     }
 
     var heardUpTo: FSEventStreamEventId {

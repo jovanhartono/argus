@@ -334,6 +334,12 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
         drivesTold[path] = told
     }
 
+    /// For macOS's question before an unmount, which comes off the main thread.
+    var letGoOfDrive: (@Sendable (String) -> Void)? {
+        guard let hatch else { return nil }
+        return { path in _ = hatch.letGo(path) }
+    }
+
     func driveUnmounting(_ path: String) {
         let told = ProcessInfo.processInfo.systemUptime
         guard hatch?.volumeRemoved(path) == true else { return }

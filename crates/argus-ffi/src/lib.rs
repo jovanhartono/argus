@@ -507,6 +507,9 @@ struct Live {
     saves: Mutex<()>,
     /// Counts volumes taken out, so a scan of one stops at once and never holds up its eject.
     ejected: AtomicU64,
+    /// Held while volumes are read, so a drive taken out is approved for unmounting only once
+    /// its stopped scan has closed every folder on it.
+    reading: Mutex<()>,
     save_after: Duration,
     save_within: Duration,
     resave: Duration,
@@ -527,6 +530,7 @@ impl Default for Live {
             opens: Mutex::default(),
             saves: Mutex::default(),
             ejected: AtomicU64::default(),
+            reading: Mutex::default(),
             save_after: SAVE_AFTER,
             save_within: SAVE_WITHIN,
             resave: RESAVE,
@@ -700,10 +704,18 @@ impl Live {
         volumes: &[PathBuf],
         notify: &Notify,
     ) -> bool {
-        let ejected = self.ejected.load(Ordering::Relaxed);
-        let stop = || self.ejected.load(Ordering::Relaxed) != ejected;
         let mut joined = false;
         for volume in volumes {
+            let _reading = self.reading.lock().unwrap();
+            // Ejected while the home folder was read, before this pass reached the drive.
+            let ejected = {
+                let plan = self.plan.lock().unwrap();
+                if !plan.volumes.contains(volume) {
+                    continue;
+                }
+                self.ejected.load(Ordering::Relaxed)
+            };
+            let stop = || self.ejected.load(Ordering::Relaxed) != ejected;
             match settings.add_volume_until(index, volume, &stop) {
                 Ok(_) => joined = true,
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
@@ -1823,9 +1835,10 @@ pub unsafe extern "C" fn tl_volume_added(
 /// newest list drops it and everything on it without the home folder being read again;
 /// `TL_EVENT_REBUILT` follows. Call it once macOS says the volume will unmount, or has
 /// unmounted without warning: `tl_watched` stops naming it at once, even for a list read
-/// before, and a scan of it under way stops at once, so it never keeps the volume busy. Returns 1 when that work was queued, else 0, as for a volume the
-/// core was never told of. `mark` is as for `tl_changed`. Safe to call from any thread, and
-/// never touches the volume.
+/// before, and a scan of it under way stops and has closed every folder on it by the time this
+/// returns, while a scan not started yet never starts. Returns 1 when that work was queued, else 0, as
+/// for a volume the core was never told of. `mark` is as for `tl_changed`. Safe to call from
+/// any thread, and never touches the volume.
 ///
 /// # Safety
 /// `core` came from `tl_core_new` or `tl_core_new_stand_in`, and `path` points to `len` bytes.
@@ -1855,6 +1868,7 @@ pub unsafe extern "C" fn tl_volume_removed(
         plan.patch(mark);
         drop(plan);
         core.live.wake.notify_all();
+        drop(core.live.reading.lock().unwrap());
         1
     })
 }
@@ -3892,6 +3906,53 @@ mod tests {
         assert_eq!(events.wait_for_rebuilt(5), 8);
         assert_eq!(found(&core, &events, "unseen"), ["unseen.txt"]);
         assert_eq!(found(&core, &events, "dunes"), ["dunes.jpg"]);
+    }
+
+    #[test]
+    fn a_volume_taken_out_mid_scan_is_let_go_of_before_the_call_returns() {
+        let events = Events::default();
+        let (core, _dirs, [_, _]) = home_and_volume(1, &events);
+        let folders: Vec<String> = (0..20_000).map(|n| format!("f{}/g{n}/", n % 100)).collect();
+        let folders: Vec<&str> = folders.iter().map(String::as_str).collect();
+        let (_big_dir, big) = home_with(&folders);
+        let live = unsafe { &(*core.0).live };
+        assert_eq!(mounted(&core, &big, 5), 1);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while live.reading.try_lock().is_ok() {
+            assert!(
+                Instant::now() < deadline,
+                "never caught the volume being read"
+            );
+        }
+        assert_eq!(unmounted(&core, &big, 6), 1);
+        assert!(
+            live.reading.try_lock().is_ok(),
+            "the scan still reads the volume"
+        );
+        let big_text = big.to_string_lossy().into_owned();
+        assert!(!watched_inside(&core).contains(&big_text));
+    }
+
+    #[test]
+    fn a_pass_planned_before_an_eject_never_reads_the_drive() {
+        let (_h, home) = home_with(&["notes/a.txt"]);
+        let (_v, volume) = home_with(&["photos/beach.jpg"]);
+        let live = live(Duration::ZERO);
+        live.plan(|plan| plan.volumes.push(volume.clone()));
+        // The pass copies the drive, then reads the home folder while the drive is ejected.
+        let volumes = live.plan.lock().unwrap().volumes.clone();
+        live.plan(|plan| assert!(plan.forget(&volume)));
+        live.ejected.fetch_add(1, Ordering::Relaxed);
+
+        let events = Events::default();
+        let notify = Notify {
+            ctx: &events as *const Events as *mut c_void,
+            on_event: record,
+        };
+        let settings = Settings::new(&home, &home, Clutter::Skip, Ignore::default(), Access::Full);
+        let mut index = settings.scan().unwrap().index;
+        assert!(!live.add_volumes(&settings, &mut index, &volumes, &notify));
+        assert_eq!(index.volumes().count(), 0);
     }
 
     #[test]
