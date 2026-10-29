@@ -9,6 +9,49 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "683d7910e743518b0e34f1186f92494becacb047c7b6bf616c96772180fef923"
 
 [[package]]
+name = "argus-cli"
+version = "0.2.0"
+dependencies = [
+ "argus-core",
+ "argus-grep",
+ "libc",
+ "tempfile",
+]
+
+[[package]]
+name = "argus-core"
+version = "0.2.0"
+dependencies = [
+ "crc32fast",
+ "frizbee",
+ "hashbrown",
+ "libc",
+ "rayon",
+ "tempfile",
+]
+
+[[package]]
+name = "argus-ffi"
+version = "0.2.0"
+dependencies = [
+ "argus-core",
+ "argus-grep",
+ "tempfile",
+]
+
+[[package]]
+name = "argus-grep"
+version = "0.2.0"
+dependencies = [
+ "argus-core",
+ "grep-matcher",
+ "grep-searcher",
+ "memchr",
+ "rayon",
+ "tempfile",
+]
+
+[[package]]
 name = "bitflags"
 version = "2.13.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -341,49 +384,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "unicode-ident",
-]
-
-[[package]]
-name = "telescope-cli"
-version = "0.2.0"
-dependencies = [
- "libc",
- "telescope-core",
- "telescope-grep",
- "tempfile",
-]
-
-[[package]]
-name = "telescope-core"
-version = "0.2.0"
-dependencies = [
- "crc32fast",
- "frizbee",
- "hashbrown",
- "libc",
- "rayon",
- "tempfile",
-]
-
-[[package]]
-name = "telescope-ffi"
-version = "0.2.0"
-dependencies = [
- "telescope-core",
- "telescope-grep",
- "tempfile",
-]
-
-[[package]]
-name = "telescope-grep"
-version = "0.2.0"
-dependencies = [
- "grep-matcher",
- "grep-searcher",
- "memchr",
- "rayon",
- "telescope-core",
- "tempfile",
 ]
 
 [[package]]

@@ -1,8 +1,8 @@
 #!/bin/zsh
 # Makes the 10-year certificate build-mac.sh signs with. macOS ties the permissions you grant
-# Telescope to this certificate, so they survive rebuilds. Run once per Mac.
+# Argus to this certificate, so they survive rebuilds. Run once per Mac.
 set -euo pipefail
-name="Telescope Self-Signed"
+name="Argus Self-Signed"
 keychain=${1:-login.keychain-db}
 
 # The same search build-mac.sh signs with, so the two scripts never disagree.

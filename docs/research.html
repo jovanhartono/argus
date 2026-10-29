@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<title>Telescope Plan</title>
+<title>Argus Plan</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,600;12..96,700&family=IBM+Plex+Sans:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap">
@@ -146,7 +146,7 @@ footer { border-top: 1px solid var(--line); margin-top: 32px; padding-top: 20px;
 
 <header>
   <span class="eyebrow">Plan &middot; updated 27 Oct 2026 &middot; measured on your Mac: Apple M1, 8 GB, macOS 26.6</span>
-  <h1>Telescope plan</h1>
+  <h1>Argus plan</h1>
   <p class="lede">A fast, light launcher that finds any file, folder or app on macOS and Windows as you type.</p>
   <div class="chips">
     <span class="chip keep">Research complete</span>
@@ -175,11 +175,11 @@ footer { border-top: 1px solid var(--line); margin-top: 32px; padding-top: 20px;
 <section id="verdict">
   <h2>Bottom line</h2>
   <ul class="prose">
-    <li>Worth building as your daily driver and as open source. Raycast 2 and Wox 2.4 already keep their own file lists on both systems, so Telescope's edge is weight: no hidden web browser inside, a target of under 60 MB of memory while idle, and a goal of running well on a 4 GB PC (not yet tested beyond your Mac).</li>
+    <li>Worth building as your daily driver and as open source. Raycast 2 and Wox 2.4 already keep their own file lists on both systems, so Argus's edge is weight: no hidden web browser inside, a target of under 60 MB of memory while idle, and a goal of running well on a 4 GB PC (not yet tested beyond your Mac).</li>
     <li>Speed is mostly solved. <span class="term" tabindex="0" data-tip="Finding a name from letters typed in order with gaps allowed, so 'tlpl' finds 'telescope-plan'.">Fuzzy matching</span> every name in your home folder took 6-12 ms per keystroke on your Mac.</li>
     <li>The hard parts are putting the right file first, keeping up with file changes, making the window feel like Spotlight, and Windows.</li>
     <li>Rust does all the searching. A thin <span class="term" tabindex="0" data-tip="Apple's own programming language for Mac and iPhone apps.">Swift</span> window shows the results on macOS. Windows gets its own thin window at milestone 5 (M5).</li>
-    <li>No database. The list of file names is Telescope's own file, read straight from disk.</li>
+    <li>No database. The list of file names is Argus's own file, read straight from disk.</li>
     <li>Shipping is free: a .dmg on GitHub. Because we never pay Apple's $99 a year, each user approves the app once in System Settings (still to confirm on macOS 15.1).</li>
     <li>Spotlight is not a reliable backup. On your Mac it found 16 of the 141 files named "telescope".</li>
     <li>The biggest risk is the project stalling. Three Rust launchers, Loungy, Gauntlet and Kunkun, went quiet. Every milestone has a time limit.</li>
@@ -255,17 +255,17 @@ footer { border-top: 1px solid var(--line); margin-top: 32px; padding-top: 20px;
     <h3><span class="num">2</span>A phone book of file names</h3>
     <p>Asking the disk "which files match tel?" means opening every one of the 266,968 folders in your home folder. That took 10.7 s on your Mac.</p>
     <p class="analogy">A phone book solves this: write every name down once, then look names up in the book instead of knocking on every door.</p>
-    <p>The book is called the index. By default it skips clutter like ~/Library (but keeps iCloud Drive and other cloud drives), hidden folders, tool downloads and caches like node_modules, and the thousands of pieces inside packages like Photos Library, which Finder shows as one file. On your Mac on 27 Oct 2026 that left 47,933 entries, indexed in 0.15 s. An "index everything" switch covers all 2.44 million that day; the whole home folder's count changes from day to day (see <a href="#measured">Measured on your Mac</a>). Your own list in ~/.config/telescope/ignore can skip more folders, or bring back one Telescope skips, like ~/.config.</p>
+    <p>The book is called the index. By default it skips clutter like ~/Library (but keeps iCloud Drive and other cloud drives), hidden folders, tool downloads and caches like node_modules, and the thousands of pieces inside packages like Photos Library, which Finder shows as one file. On your Mac on 27 Oct 2026 that left 47,933 entries, indexed in 0.15 s. An "index everything" switch covers all 2.44 million that day; the whole home folder's count changes from day to day (see <a href="#measured">Measured on your Mac</a>). Your own list in ~/.config/argus/ignore can skip more folders, or bring back one Argus skips, like ~/.config.</p>
   </div>
 
   <div class="idea">
     <h3><span class="num">3</span>Writing each folder once</h3>
     <p>Storing every file's full path repeats "/Users/you/Documents/" for every file inside that folder. For your Mac that adds up to 491 MB.</p>
     <p class="analogy">An address book can say "same street as #3" instead of writing the street out again.</p>
-    <p>Telescope stores each entry's own name plus the number of the folder it sits in. The names alone take 66 MB for your whole home folder and about 14 MB (estimate) for the 353k default-folder entries of 25 Oct 2026. With the stricter rules of 27 Oct 2026, the whole index for 47,933 entries measured about 1.2 MB. Full paths are rebuilt only for the 50 rows on screen.</p>
+    <p>Argus stores each entry's own name plus the number of the folder it sits in. The names alone take 66 MB for your whole home folder and about 14 MB (estimate) for the 353k default-folder entries of 25 Oct 2026. With the stricter rules of 27 Oct 2026, the whole index for 47,933 entries measured about 1.2 MB. Full paths are rebuilt only for the 50 rows on screen.</p>
     <figure>
       <div class="fig-wrap">
-        <svg viewBox="0 0 960 280" role="img" aria-label="Comparison: full paths repeat the folder part for every file, 491 MB; Telescope stores each name once with the number of its folder, 66 MB.">
+        <svg viewBox="0 0 960 280" role="img" aria-label="Comparison: full paths repeat the folder part for every file, 491 MB; Argus stores each name once with the number of its folder, 66 MB.">
           <text class="s-title" x="16" y="24">Full paths: 491 MB on your Mac</text>
           <rect class="s-box" x="16" y="38" width="440" height="200" rx="8"/>
           <text class="s-val" x="36" y="80">/Users/you/Documents/plan.pdf</text>
@@ -274,7 +274,7 @@ footer { border-top: 1px solid var(--line); margin-top: 32px; padding-top: 20px;
           <text class="s-small" x="36" y="176">and 2.36 million more</text>
           <text class="s-small" x="16" y="266">The folder part is written again for every file inside it</text>
 
-          <text class="s-title" x="504" y="24">Telescope: 66 MB</text>
+          <text class="s-title" x="504" y="24">Argus: 66 MB</text>
           <rect class="s-box-hi" x="504" y="38" width="440" height="200" rx="8"/>
           <text class="s-val" x="524" y="66">#1</text><text class="s-val" x="564" y="66">Users</text><text class="s-small" x="720" y="66">top level</text>
           <text class="s-val" x="524" y="90">#2</text><text class="s-val" x="564" y="90">you</text><text class="s-small" x="720" y="90">inside #1</text>
@@ -295,7 +295,7 @@ footer { border-top: 1px solid var(--line); margin-top: 32px; padding-top: 20px;
     <p>Loading the whole index file into memory at every launch is slow, and the app keeps holding that memory while the window is hidden.</p>
     <p class="analogy">Compare photocopying a whole reference book with reading it on the library shelf. On the shelf you touch only the pages you need, and the librarian can put pages away when space runs short.</p>
     <p>Programmers call this memory-mapping. macOS loads pages of the index file only when a search touches them, and can drop them while you are not searching.</p>
-    <p>Measured later, on 28 Oct 2026: every search reads every list in the index, so after the first search the whole file is in memory anyway. Reading all of it at launch took about 20 ms for your whole home folder, so Telescope reads it in one go. See "Saving the index" below.</p>
+    <p>Measured later, on 28 Oct 2026: every search reads every list in the index, so after the first search the whole file is in memory anyway. Reading all of it at launch took about 20 ms for your whole home folder, so Argus reads it in one go. See "Saving the index" below.</p>
   </div>
 
   <div class="idea">
@@ -356,15 +356,15 @@ footer { border-top: 1px solid var(--line); margin-top: 32px; padding-top: 20px;
   <div class="idea">
     <h3><span class="num">7</span>Keeping up with new files</h3>
     <p>Files change all day, and rescanning everything at each launch takes seconds.</p>
-    <p class="analogy">macOS keeps a numbered logbook noting which folders changed. Telescope bookmarks the last entry it read; after a restart it reads only the new entries and re-checks just those folders.</p>
+    <p class="analogy">macOS keeps a numbered logbook noting which folders changed. Argus bookmarks the last entry it read; after a restart it reads only the new entries and re-checks just those folders.</p>
     <p>The logbook is called FSEvents. On your Mac, catching up on a short gap after a restart took 8 ms, and macOS reported new files 4-12 ms after they were created.</p>
   </div>
 
   <div class="idea">
-    <h3><span class="num">8</span>Why macOS keeps Telescope's permissions</h3>
-    <p>Telescope needs <span class="term" tabindex="0" data-tip="A macOS privacy permission the user grants in System Settings. Without it, some folders are invisible to the app.">Full Disk Access</span> to see some folders. If macOS forgot that after every update, you would grant it again each time.</p>
+    <h3><span class="num">8</span>Why macOS keeps Argus's permissions</h3>
+    <p>Argus needs <span class="term" tabindex="0" data-tip="A macOS privacy permission the user grants in System Settings. Without it, some folders are invisible to the app.">Full Disk Access</span> to see some folders. If macOS forgot that after every update, you would grant it again each time.</p>
     <p class="analogy">macOS recognises apps the way a building guard recognises ID cards. By default every build gets a throwaway card that changes each time, so the guard forgets you. One homemade card that never changes keeps you recognised.</p>
-    <p>The card is a code-signing certificate; the throwaway kind is called an ad-hoc signature. The certificate comes with a secret key used to stamp each build, and whoever holds the key can stamp builds that look like yours. Telescope uses one self-signed certificate, valid for 10 years, with the key kept on your Mac. Rebuilds on the same Mac keep their permissions; a downloaded update is tested on your Mac at M2, and another Mac needs a tester.</p>
+    <p>The card is a code-signing certificate; the throwaway kind is called an ad-hoc signature. The certificate comes with a secret key used to stamp each build, and whoever holds the key can stamp builds that look like yours. Argus uses one self-signed certificate, valid for 10 years, with the key kept on your Mac. Rebuilds on the same Mac keep their permissions; a downloaded update is tested on your Mac at M2, and another Mac needs a tester.</p>
   </div>
 </section>
 
@@ -430,10 +430,10 @@ footer { border-top: 1px solid var(--line); margin-top: 32px; padding-top: 20px;
 
 <section id="pains">
   <h2>What users hate about Spotlight and Windows Search</h2>
-  <p class="prose">About 90 complaints from Apple and Microsoft forums, Hacker News and specialist blogs boil down to 32 distinct pains. These ten matter most, and Telescope can fix all of them. Reddit was unreachable, so Reddit opinion is second-hand only.</p>
+  <p class="prose">About 90 complaints from Apple and Microsoft forums, Hacker News and specialist blogs boil down to 32 distinct pains. These ten matter most, and Argus can fix all of them. Reddit was unreachable, so Reddit opinion is second-hand only.</p>
   <div class="table-wrap">
     <table>
-      <thead><tr><th>Pain</th><th>Evidence</th><th>Telescope's answer</th></tr></thead>
+      <thead><tr><th>Pain</th><th>Evidence</th><th>Argus's answer</th></tr></thead>
       <tbody>
         <tr><td>The system's search breaks, often after an update, and returns no local files</td><td><a href="https://discussions.apple.com/thread/256138998">Tahoe (macOS 26) thread</a>, 227 "me too"; Windows rebuilds take <a href="https://learn.microsoft.com/en-us/answers/a/5951232">4-5 days</a></td><td>Its own index; never depends on Spotlight or Windows Search</td></tr>
         <tr><td>Installed apps missing from search</td><td><a href="https://discussions.apple.com/thread/255834181">Sequoia (macOS 15) thread</a>, 270 "me too"</td><td>Reads the app folders and the Start Menu directly; apps match on the first keystroke</td></tr>
@@ -480,11 +480,11 @@ footer { border-top: 1px solid var(--line); margin-top: 32px; padding-top: 20px;
   <p class="prose">Raycast 2 and Wox 2.4 are the real competitors. Spotlight and Windows Search are what users are leaving.</p>
   <div class="table-wrap">
     <table>
-      <thead><tr><th>Tool</th><th>Runs on</th><th>Licence</th><th>How it finds files</th><th>Memory</th><th>What Telescope adds</th></tr></thead>
+      <thead><tr><th>Tool</th><th>Runs on</th><th>Licence</th><th>How it finds files</th><th>Memory</th><th>What Argus adds</th></tr></thead>
       <tbody>
         <tr><td class="name">Raycast 2</td><td>macOS, Windows</td><td>Closed, freemium, needs an account</td><td>Own Rust index; asks the system's search for file contents</td><td class="n">350-450 MB<span class="sub">published before v2.6</span></td><td>Open source, no account, several times lighter</td></tr>
         <tr><td class="name">Wox 2.4</td><td>macOS, Windows, Linux</td><td><span class="term" tabindex="0" data-tip="A licence requiring anything built with the code to be released under the same terms, so it can't be mixed into an MIT or Apache app.">GPL-3</span>, free</td><td>Own index; needs an admin service on Windows; optional content index</td><td class="n">~150 MB daily<span class="sub">about 440-525 MB while indexing</span></td><td>Lighter; a more permissive licence; no admin service</td></tr>
-        <tr><td class="name">Cardinal</td><td>macOS</td><td><span class="term" tabindex="0" data-tip="A permissive licence: anyone may use and change the code, even in closed-source apps. Telescope uses MIT or Apache-2.0.">MIT</span>, free</td><td>Own index built the same way we plan</td><td class="n">Hidden browser</td><td>Fuzzy matching, apps, Windows, no browser inside</td></tr>
+        <tr><td class="name">Cardinal</td><td>macOS</td><td><span class="term" tabindex="0" data-tip="A permissive licence: anyone may use and change the code, even in closed-source apps. Argus uses MIT or Apache-2.0.">MIT</span>, free</td><td>Own index built the same way we plan</td><td class="n">Hidden browser</td><td>Fuzzy matching, apps, Windows, no browser inside</td></tr>
         <tr><td class="name">Everything</td><td>Windows</td><td>Freeware</td><td>Reads the drive's master file list; needs admin or its service</td><td class="n">~100 MB per 1M files</td><td>macOS, fuzzy matching, apps, less memory</td></tr>
         <tr><td class="name">Spotlight</td><td>macOS</td><td>Built in</td><td>System index; hides hidden folders and ~/Library</td><td class="n">System processes</td><td>Reliability, fuzzy matching, hidden folders</td></tr>
         <tr><td class="name">Flow, Command Palette</td><td>Windows</td><td>MIT</td><td>None of its own; uses Everything or Windows Search</td><td class="n">Flow 135 MB to 1.4 GB</td><td>Its own index, macOS</td></tr>
@@ -512,7 +512,7 @@ footer { border-top: 1px solid var(--line); margin-top: 32px; padding-top: 20px;
         <tr><td class="name">Fuzzy matching</td><td>frizbee 0.13 crate, version pinned; nucleo-matcher as a fallback</td><td>nucleo, skim</td><td>2-5 times faster than nucleo on your names; nucleo's last release was Feb 2024</td></tr>
         <tr><td class="name">Ranking</td><td>Match quality, a bonus when a word stands alone in the name and a bigger one when it is the whole name bar the extension, words found in a folder above, depth, the shorter name on ties; later frecency (an open 30 days ago counts half as much as one today) and an app boost</td><td>Match score alone</td><td>"tele" fuzzy-matches 69,000 names, so order decides usefulness</td></tr>
         <tr><td class="name">Search inside files</td><td>v1: live search of text and code in the folder you pick</td><td>A text index of the whole home folder</td><td>Whole-disk indexes are how Spotlight breaks; Apple's PDF reader took 1.2-12.6 s per text-heavy PDF</td></tr>
-        <tr><td class="name">PDF and Office text</td><td>v2: pdf_oxide and calamine, in a separate helper with a memory cap</td><td>pdf-extract, Tika</td><td>Broken files crash readers, so a helper keeps the main app safe; MuPDF is AGPL, a stricter GPL that would force Telescope's licence to change</td></tr>
+        <tr><td class="name">PDF and Office text</td><td>v2: pdf_oxide and calamine, in a separate helper with a memory cap</td><td>pdf-extract, Tika</td><td>Broken files crash readers, so a helper keeps the main app safe; MuPDF is AGPL, a stricter GPL that would force Argus's licence to change</td></tr>
         <tr><td class="name">Hotkey</td><td>KeyboardShortcuts 3.1.0, a Swift library</td><td>global-hotkey crate</td><td>No permission needed; comes with a "record new shortcut" box. Creating a window takes 150-275 ms, so the window is built once and then shown in about 0.4 ms</td></tr>
         <tr><td class="name">Shipping</td><td>One .dmg for both Mac chip types on GitHub, self-signed</td><td>Default ad-hoc signing, which changes every build</td><td>Ad-hoc signatures make macOS drop permissions; one fixed certificate keeps them across rebuilds (downloaded updates tested at M2); no Apple fee</td></tr>
       </tbody>
@@ -520,7 +520,7 @@ footer { border-top: 1px solid var(--line); margin-top: 32px; padding-top: 20px;
   </div>
   <figure>
     <div class="fig-wrap">
-      <svg class="chart" viewBox="0 0 930 402" role="img" aria-label="Bar chart of idle memory of an empty window by toolkit: plain macOS window 14 MB, Telescope test app 16 to 18, Slint CPU 24, gpui 29 to 34, iced 41 to 46, Slint GPU 44, egui 49 to 50, Tauri browser layer 60, Tauri plus React 159, Raycast 2 350 to 450.">
+      <svg class="chart" viewBox="0 0 930 402" role="img" aria-label="Bar chart of idle memory of an empty window by toolkit: plain macOS window 14 MB, Argus test app 16 to 18, Slint CPU 24, gpui 29 to 34, iced 41 to 46, Slint GPU 44, egui 49 to 50, Tauri browser layer 60, Tauri plus React 159, Raycast 2 350 to 450.">
         <line class="s-grid" x1="250" y1="26" x2="250" y2="372"/>
         <line class="s-grid" x1="383.3" y1="26" x2="383.3" y2="372"/>
         <line class="s-grid" x1="516.7" y1="26" x2="516.7" y2="372"/>
@@ -536,7 +536,7 @@ footer { border-top: 1px solid var(--line); margin-top: 32px; padding-top: 20px;
         <rect class="s-bar" x="250" y="36" width="18.7" height="20" rx="2"/>
         <text class="s-val" x="276" y="50">14</text>
 
-        <text class="s-text" x="240" y="84" text-anchor="end">Telescope test app</text>
+        <text class="s-text" x="240" y="84" text-anchor="end">Argus test app</text>
         <rect class="s-bar" x="250" y="70" width="21.3" height="20" rx="2"/>
         <rect class="s-bar-light" x="271.3" y="70" width="2.7" height="20"/>
         <text class="s-val" x="282" y="84">16-18</text>
@@ -578,7 +578,7 @@ footer { border-top: 1px solid var(--line); margin-top: 32px; padding-top: 20px;
         <text class="s-val" x="858" y="356">350-450</text>
       </svg>
     </div>
-    <figcaption>Memory of an empty window per UI toolkit, in MB of <span class="term" tabindex="0" data-tip="Memory that belongs to the app alone, the number in Activity Monitor's Memory column.">footprint</span>. Slint, gpui, iced and egui are Rust toolkits that draw windows without a browser. Blue bars were measured on your Mac; grey bars are published figures. The Telescope test app ran with a stand-in core, and two ways of measuring it differ by about 6 MB. Raycast published 350-450 MB before v2.6, which roughly halved one of its processes. No Windows numbers exist yet.</figcaption>
+    <figcaption>Memory of an empty window per UI toolkit, in MB of <span class="term" tabindex="0" data-tip="Memory that belongs to the app alone, the number in Activity Monitor's Memory column.">footprint</span>. Slint, gpui, iced and egui are Rust toolkits that draw windows without a browser. Blue bars were measured on your Mac; grey bars are published figures. The Argus test app ran with a stand-in core, and two ways of measuring it differ by about 6 MB. Raycast published 350-450 MB before v2.6, which roughly halved one of its processes. No Windows numbers exist yet.</figcaption>
   </figure>
 </section>
 
@@ -657,7 +657,7 @@ footer { border-top: 1px solid var(--line); margin-top: 32px; padding-top: 20px;
       <h3>The window</h3>
       <ul>
         <li>Built once at launch, then only shown and hidden.</li>
-        <li>Telescope never takes over as the active app, so the app you came from gets focus back when the window closes.</li>
+        <li>Argus never takes over as the active app, so the app you came from gets focus back when the window closes.</li>
         <li>Opens on the current <span class="term" tabindex="0" data-tip="A macOS virtual desktop. Swiping with three fingers moves between Spaces.">Space</span> and over full-screen apps.</li>
         <li>Japanese and Chinese typing work: no search runs while the <span class="term" tabindex="0" data-tip="Input method editor: the system that turns keystrokes into characters for languages like Chinese or Japanese.">IME</span> is still composing a word.</li>
         <li>Settings and the index health view use SwiftUI, which is fine for windows opened rarely.</li>
@@ -730,7 +730,7 @@ footer { border-top: 1px solid var(--line); margin-top: 32px; padding-top: 20px;
         <tr><td class="name">M0 engine</td><td>A command-line search over your real file list</td><td>On the full 2.36M-entry list (25 Oct 2026): under 100 MB normally and 150 MB at peak; 95% of searches under 15 ms on your Mac (8 threads) and 45 ms on 4 slow cores (was 40 ms, relaxed on 27 Oct 2026); 8 fast searches with all searchers running deliver 2 results or fewer; the expected file is in the top 3 for 16 of your 20 <span class="term" tabindex="0" data-tip="Your list of 20 real searches, each with the file you expect on top. Rerun after every ranking change.">golden set</span> searches</td><td>Rust basics: <span class="term" tabindex="0" data-tip="Rust's build tool and package downloader, like npm.">Cargo</span>, <span class="term" tabindex="0" data-tip="Rust's way to group fields into one type, like a TypeScript interface that holds data.">structs</span>, <span class="term" tabindex="0" data-tip="Rust's growable list, like a JavaScript array.">vectors</span>, <span class="term" tabindex="0" data-tip="Rust's rule for who may use a piece of data and when. The compiler checks it before the program runs; it is what new Rust users struggle with most.">borrowing</span>, threads</td><td class="n">4-8 evenings</td></tr>
         <tr><td class="name">M1 window</td><td>The Spotlight feel: the Swift window over a stand-in core with 1M made-up names</td><td>95% of the time: window drawn within 10 ms of the hotkey (timed inside the app; was 4 ms, relaxed on 27 Oct 2026) and results within 25 ms of a keystroke; 8 fast keystrokes with all searchers running show 2 results or fewer, and the last search always wins; focus returns to your previous app 20 of 20 times; works over full-screen apps; hidden with the stand-in core: under 22 MB and 0% CPU; builds in <span class="term" tabindex="0" data-tip="Swift's strictest setting, which catches threading mistakes before the app runs.">Swift 6 mode</span>; permissions survive 5 rebuilds; a downloaded .dmg opens through Open Anyway in 4 steps or fewer</td><td>Swift, AppKit, Xcode, calling Rust from Swift, code signing</td><td class="n">2-4 weekends<span class="sub">estimate</span></td></tr>
         <tr><td class="name">M2 daily driver</td><td>It replaces opening folders one by one</td><td>You use it 7 days straight; 95% of searches under 30 ms; new files appear within 1 s; Full Disk Access survives an update installed from a downloaded .dmg</td><td>FSEvents, macOS permissions</td><td class="n">3-6 weekends</td></tr>
-        <tr><td class="name">M3 beats Spotlight</td><td>Quality that compounds</td><td>Frecency, Tab into a folder, apps, saved index with a restart under 300 ms, index health view, current-Finder-folder hotkey, Cmd+I details pane; an "index everything" switch, external drives and per-folder updates (<a href="https://github.com/jovanhartono/telescope/issues/21">#21</a>, <a href="https://github.com/jovanhartono/telescope/issues/22">#22</a>, <a href="https://github.com/jovanhartono/telescope/issues/23">#23</a>, added 27 Oct 2026); 18 of 20 golden searches. Steps: <a href="m3-beats-spotlight.html">m3-beats-spotlight.html</a></td><td>Ranking, saving and loading the index file</td><td class="n">4-8 weekends</td></tr>
+        <tr><td class="name">M3 beats Spotlight</td><td>Quality that compounds</td><td>Frecency, Tab into a folder, apps, saved index with a restart under 300 ms, index health view, current-Finder-folder hotkey, Cmd+I details pane; an "index everything" switch, external drives and per-folder updates (<a href="https://github.com/jovanhartono/argus/issues/21">#21</a>, <a href="https://github.com/jovanhartono/argus/issues/22">#22</a>, <a href="https://github.com/jovanhartono/argus/issues/23">#23</a>, added 27 Oct 2026); 18 of 20 golden searches. Steps: <a href="m3-beats-spotlight.html">m3-beats-spotlight.html</a></td><td>Ranking, saving and loading the index file</td><td class="n">4-8 weekends</td></tr>
         <tr><td class="name">M4 text search</td><td>Search inside text and code files</td><td>Live search in folders you choose; name results never wait for it; never downloads iCloud files. Steps: <a href="m4-text-search.html">m4-text-search.html</a></td><td>Fast file reading</td><td class="n">2-4 weekends</td></tr>
         <tr><td class="name">M5 Windows</td><td>The low-end PC promise</td><td>A Windows window picked by a test build (default Win32), a scanner without admin rights, change notices, Everything support, Start Menu and Store apps, an MSIX package (Windows' modern app package format). On a low-end PC: hotkey under 100 ms, idle under 60 MB, searches under 50 ms</td><td>Windows system calls from Rust</td><td class="n">6-12 weekends<span class="sub">least certain</span></td></tr>
         <tr><td class="name">v2</td><td>Search inside PDF and Office files</td><td>Text reading in a separate helper with a memory cap; optional per-folder index</td><td>PDF and Office file formats</td><td class="n">open-ended</td></tr>
@@ -754,7 +754,7 @@ footer { border-top: 1px solid var(--line); margin-top: 32px; padding-top: 20px;
         <tr><td>macOS forgets Full Disk Access after a rebuild or update</td><td>High if ad-hoc signed (the default)</td><td>Medium-high</td><td>The same self-signed certificate on every build; permission status in the health view</td><td>M1: 5 rebuilds. M2: update from a downloaded .dmg</td></tr>
         <tr><td>A bug at the hatch closes the app: a Rust panic, or Swift reading freed memory</td><td>Medium</td><td>High</td><td>Catch panics at the hatch; copy rows across; risky code in one file</td><td>M1</td></tr>
         <tr><td>The first keystroke stalls on a 4 GB Mac with a hard disk after a long idle</td><td>Medium-high</td><td>High</td><td>Warm up the index when the hotkey fires; keep the letter fingerprints (about 10 MB) in memory if needed</td><td>M1: first keystroke after clearing memory</td></tr>
-        <tr><td>The signing key leaks, so anyone could sign a fake Telescope that keeps users' Full Disk Access</td><td>Low</td><td>High</td><td>Sign only on your Mac, never on CI machines; keep the key offline</td><td>None until it happens</td></tr>
+        <tr><td>The signing key leaks, so anyone could sign a fake Argus that keeps users' Full Disk Access</td><td>Low</td><td>High</td><td>Sign only on your Mac, never on CI machines; keep the key offline</td><td>None until it happens</td></tr>
         <tr><td>Text search downloads iCloud or OneDrive files</td><td>Medium</td><td>High</td><td>Check whether a file is cloud-only before opening it; skip cloud folders</td><td>M4</td></tr>
         <tr><td>Intel Macs fade: macOS 26 is the last version for Intel</td><td>Certain</td><td>Medium</td><td>Test the Intel build on GitHub's Intel machines</td><td>GitHub retiring its Intel machines</td></tr>
       </tbody>
@@ -791,7 +791,7 @@ footer { border-top: 1px solid var(--line); margin-top: 32px; padding-top: 20px;
     <div><dt>Quick Look key</dt><dd>Cmd+Y only (Space dropped on 27 Oct 2026)</dd></div>
     <div><dt>Look</dt><dd>Solid background; blur and Liquid Glass (macOS 26's see-through style) are opt-in settings</dd></div>
     <div><dt>Intel Mac testing</dt><dd>GitHub's Intel machines plus testers, like Windows</dd></div>
-    <div><dt>Name</dt><dd>Telescope is a codename; rename before the first public release</dd></div>
+    <div><dt>Name</dt><dd>Argus is a codename; rename before the first public release</dd></div>
   </dl>
   <h3>Defaults, taken unless you object</h3>
   <p class="prose note">Each is a reviewer's recommendation you haven't picked yourself.</p>
@@ -828,7 +828,7 @@ footer { border-top: 1px solid var(--line); margin-top: 32px; padding-top: 20px;
 <section id="next">
   <h2>Next steps</h2>
   <ol class="prose">
-    <li>The golden set, M0 and M1 are done. M1 closed on 27 Oct 2026 with <a href="https://github.com/jovanhartono/telescope/releases/tag/v0.1.0">v0.1.0</a>.</li>
+    <li>The golden set, M0 and M1 are done. M1 closed on 27 Oct 2026 with <a href="https://github.com/jovanhartono/argus/releases/tag/v0.1.0">v0.1.0</a>.</li>
     <li>M2, the daily driver: its steps are in <a href="m2-daily-driver.html">m2-daily-driver.html</a>.</li>
     <li>M3 and M4, built early while M2's week runs: <a href="m3-beats-spotlight.html">m3-beats-spotlight.html</a> and <a href="m4-text-search.html">m4-text-search.html</a>.</li>
   </ol>
