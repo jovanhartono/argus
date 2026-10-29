@@ -565,10 +565,10 @@ fn parents_are_folders_in_the_index(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Searcher;
     use crate::index::{IndexBuilder, NO_PARENT};
     use crate::siblings::Siblings;
     use crate::walk::Kind;
+    use crate::{Searcher, Within};
 
     /// The root of the made-up indexes below, as a saved list must name the folder scanned.
     const HOME: &str = "/";
@@ -1245,12 +1245,16 @@ mod tests {
     }
 
     /// Lists damaged so the CRC still holds, as a bug in saving would leave them: either
-    /// refused, or safe to show, search and update.
-    #[test]
-    fn damaged_lists_with_a_good_crc_never_panic() {
-        let (dir, settings, bytes) = saved_tree();
-        let root = fs::canonicalize(dir.path()).unwrap();
-        let changed = [root.clone(), root.join("src"), root.join("docs/README.md")];
+    /// refused, or safe to show, search, search inside a folder, update and eject from.
+    fn assert_damage_never_panics(source: &str, settings: &Settings, bytes: &[u8], least: usize) {
+        let root = settings.root().to_path_buf();
+        let volumes: Vec<PathBuf> = (decode(bytes, settings).unwrap().scan.index.volumes())
+            .map(Path::to_path_buf)
+            .collect();
+        let mut changed = vec![root.clone(), root.join("src"), root.join("docs/README.md")];
+        for volume in &volumes {
+            changed.extend([volume.clone(), volume.join("src")]);
+        }
         let names_at = HEADER + settings.key.len();
         let names_len = u32::from_le_bytes(bytes[SIZES + 4..SIZES + 8].try_into().unwrap());
         let lists_at = names_at + names_len as usize;
@@ -1265,7 +1269,7 @@ mod tests {
         };
         let mut opened = 0;
         for pass in 0..3000 {
-            let mut damaged = bytes.clone();
+            let mut damaged = bytes.to_vec();
             for _ in 0..=next(3) {
                 if next(4) == 0 {
                     damaged[names_at + next(names_len as usize)] ^= 1 << next(8);
@@ -1279,24 +1283,85 @@ mod tests {
                 }
             }
             fix_crc(&mut damaged);
-            let Ok(saved) = decode(&damaged, &settings) else {
+            let Ok(saved) = decode(&damaged, settings) else {
                 continue;
             };
             opened += 1;
             let mut index = saved.scan.index;
-            for entry in 0..index.len() as EntryId {
-                let _ = (index.path(entry), index.name(entry), index.is_dir(entry));
-            }
             let apps = crate::Apps::default();
+            let search = |index: &Index, within: Option<&Within>, query: &str| {
+                let hits = searcher.search_in(index, &apps, within, query, searcher.ticket(), 10);
+                assert!(hits.is_some(), "{source}, pass {pass}");
+            };
+            for entry in index.ids() {
+                let _ = (index.path(entry), index.name(entry), index.is_dir(entry));
+                let _ = index.is_removed(entry);
+            }
             for query in ["a", "re", "md src", "é"] {
-                let hits = searcher.search(&index, &apps, query, searcher.ticket(), 10);
-                assert!(hits.is_some(), "pass {pass}");
+                search(&index, None, query);
+            }
+            let mut folders = [std::slice::from_ref(&root), &volumes].concat();
+            // Picked without the seed, so each source damages its lists as before.
+            if index.len() > 0 {
+                folders.extend((1..4).map(|at| index.path((pass * at % index.len()) as EntryId)));
+            }
+            for folder in &folders {
+                if let Some(within) = Within::folder(&index, folder) {
+                    search(&index, Some(&within), "re");
+                }
             }
             settings.update(&mut index, &changed);
-            let hits = searcher.search(&index, &apps, "md src", searcher.ticket(), 10);
-            assert!(hits.is_some(), "pass {pass}");
+            search(&index, None, "md src");
+            for volume in &volumes {
+                settings.remove_volume(&mut index, volume);
+            }
+            search(&index, None, "md src");
         }
-        assert!(opened > 100, "only {opened} damaged indexes opened");
+        assert!(
+            opened > least,
+            "{source}: only {opened} damaged indexes opened"
+        );
+    }
+
+    #[test]
+    fn damaged_lists_with_a_good_crc_never_panic() {
+        let (_dir, settings, bytes) = saved_tree();
+        assert_damage_never_panics("a plain scan", &settings, &bytes, 500);
+    }
+
+    #[test]
+    fn damaged_lists_holding_a_volume_never_panic() {
+        let (home, volume) = (tree(), tree());
+        let settings = keep(home.path());
+        let mut index = settings.scan().unwrap().index;
+        settings.add_volume(&mut index, volume.path()).unwrap();
+        let bytes = encode(&whole(index), &settings, 7);
+        assert_damage_never_panics("a volume", &settings, &bytes, 500);
+    }
+
+    /// A volume ejected and a folder and a file deleted, their entries left in place as too
+    /// few to rebuild the lists for, beside a volume still plugged in.
+    #[test]
+    fn damaged_lists_holding_removed_entries_never_panic() {
+        let (home, volume, ejected) = (tree(), tree(), tempfile::tempdir().unwrap());
+        let root = fs::canonicalize(home.path()).unwrap();
+        fs::create_dir(root.join("pad")).unwrap();
+        for i in 0..150 {
+            fs::write(root.join("pad").join(i.to_string()), "").unwrap();
+        }
+        fs::write(ejected.path().join("a.txt"), "").unwrap();
+        let settings = keep(&root);
+        let mut index = settings.scan().unwrap().index;
+        settings.add_volume(&mut index, ejected.path()).unwrap();
+        settings.add_volume(&mut index, volume.path()).unwrap();
+        let ejected = fs::canonicalize(ejected.path()).unwrap();
+        settings.remove_volume(&mut index, &ejected).unwrap();
+        fs::remove_dir(root.join("empty")).unwrap();
+        fs::remove_file(root.join("docs/README.md")).unwrap();
+        settings.update(&mut index, &[root.clone(), root.join("docs")]);
+        assert_eq!((index.removed, index.volumes().count()), (4, 1));
+        let bytes = encode(&whole(index), &settings, 7);
+        assert_damage_never_panics("removed entries", &settings, &bytes, 500);
     }
 
     #[test]
