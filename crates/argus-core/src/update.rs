@@ -1704,8 +1704,8 @@ mod tests {
     const NOW: u64 = 1_800_000_000;
 
     /// The hits inside every folder, by path and score with frecency's boosts added, are
-    /// a fresh scan's, as are the best five's scores in their order. Returns the entries
-    /// boosted.
+    /// a fresh scan's, as are the best five's scores in their order. Returns how many of
+    /// those searches had a boosted hit.
     fn assert_same_inside_every_folder(
         settings: &Settings,
         index: &Index,
@@ -1734,25 +1734,32 @@ mod tests {
             let ticket = searcher.ticket();
             let hits =
                 searcher.search_with(index, &apps, Some(&within), query, ticket, limit, boosts);
-            (hits.unwrap().iter())
+            let hits = hits.unwrap();
+            let boosted = hits.iter().any(|hit| boosts.get(hit.item) > 0);
+            let hits: Vec<(PathBuf, u32)> = (hits.iter())
                 .map(|hit| (index.path(hit.entry().unwrap()), hit.score))
-                .collect::<Vec<_>>()
+                .collect();
+            (hits, boosted)
         };
-        let scores = |hits: Vec<(PathBuf, u32)>| hits.into_iter().map(|(_, score)| score).collect();
+        let scores = |(hits, _): (Vec<(PathBuf, u32)>, bool)| -> Vec<u32> {
+            hits.into_iter().map(|(_, score)| score).collect()
+        };
+        let mut with_boosted_hits = 0;
         for folder in &folders_held {
             for query in ["a", "md re", "b !old"] {
-                let mut all = found(index, &boosts, folder, query, index.len());
-                let mut expected = found(&fresh, &fresh_boosts, folder, query, index.len());
+                let (mut all, boosted) = found(index, &boosts, folder, query, index.len());
+                let (mut expected, _) = found(&fresh, &fresh_boosts, folder, query, index.len());
                 all.sort();
                 expected.sort();
                 assert_eq!(all, expected, "{context}: {query:?} in {folder:?}");
+                with_boosted_hits += usize::from(boosted);
                 // Ties among the best may fall either way, as entries are numbered apart.
-                let best: Vec<u32> = scores(found(index, &boosts, folder, query, 5));
-                let fresh_best: Vec<u32> = scores(found(&fresh, &fresh_boosts, folder, query, 5));
+                let best = scores(found(index, &boosts, folder, query, 5));
+                let fresh_best = scores(found(&fresh, &fresh_boosts, folder, query, 5));
                 assert_eq!(best, fresh_best, "{context}: {query:?} in {folder:?}");
             }
         }
-        boosts.len()
+        with_boosted_hits
     }
 
     /// A saved home and volume, searched inside every folder, then the volume ejected while
@@ -1770,12 +1777,20 @@ mod tests {
             let settings = skip_clutter(&home);
             let file = index_file(&home);
             let mut frecency = Frecency::default();
-            // A few more files opened before each look, some since gone or on the volume.
+            // A few more files opened before each look, some since gone. Those on the volume
+            // never get a boost, as frecency only reaches files under home.
             let mut check = |index: &Index, rng: &mut Rng, stage: &str| {
-                let live: Vec<EntryId> = index.ids().filter(|&e| !index.is_removed(e)).collect();
+                // By path, home first, as a scan numbers entries in whatever order its threads
+                // finish and the two temporary folders' names sort either way.
+                let mut live: Vec<PathBuf> = (index.ids())
+                    .filter(|&entry| !index.is_removed(entry))
+                    .map(|entry| index.path(entry))
+                    .filter(|path| !path.starts_with(home.join(PADDING)))
+                    .collect();
+                live.sort_by_key(|path| (!path.starts_with(&home), path.clone()));
                 for _ in 0..4 {
                     let opened = NOW - rng.below(30 * 86_400) as u64;
-                    frecency.record(&index.path(*rng.pick(&live)), opened);
+                    frecency.record(rng.pick(&live), opened);
                 }
                 with_removed += usize::from(index.removed > 0);
                 let context = format!("seed {seed}, {stage}");
@@ -1824,8 +1839,9 @@ mod tests {
             }
         }
         assert!(
-            boosted > 2000 && with_removed > 50 && in_place > 20,
-            "{boosted} boosted, {with_removed} checks with removed entries, {in_place} in place"
+            boosted > 300 && with_removed > 50 && in_place > 20,
+            "{boosted} searches with a boosted hit, {with_removed} checks with removed entries, \
+             {in_place} in place"
         );
     }
 
