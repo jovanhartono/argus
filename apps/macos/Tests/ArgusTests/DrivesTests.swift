@@ -1,5 +1,6 @@
 import AppKit
 import XCTest
+import os
 
 @testable import Argus
 
@@ -80,6 +81,57 @@ final class DrivesTests: XCTestCase {
         try await settled()
         XCTAssertEqual(heard, ["-/Volumes/Photos", "+/Volumes/Photos"])
         _ = drives
+    }
+
+    func testMacOSAskingToUnmountLetsGoWhileTheMainThreadIsBusy() async throws {
+        let gone = OSAllocatedUnfairLock<[String]>(initialState: [])
+        let drives = Drives(
+            center: center, mounted: [], isMounted: { _ in false }, settle: .milliseconds(50),
+            letGo: { path in gone.withLock { $0.append(path) } },
+            added: { [unowned self] in heard.append("+" + $0) },
+            removing: { [unowned self] in heard.append("-" + $0) })
+        // The main thread waits here throughout, as on a slow search.
+        DispatchQueue.global().sync { drives.unmountAsked("/Volumes/Photos") }
+        XCTAssertEqual(gone.withLock { $0 }, ["/Volumes/Photos"])
+        XCTAssertEqual(heard, [], "the window hears once the main thread is free")
+        post(NSWorkspace.willUnmountNotification, "/Volumes/Photos")
+        XCTAssertEqual(heard, ["-/Volumes/Photos"])
+        try await Task.sleep(for: .milliseconds(10))
+        post(NSWorkspace.didUnmountNotification, "/Volumes/Photos")
+        try await settled()
+        XCTAssertEqual(heard, ["-/Volumes/Photos"], "let go of once")
+        XCTAssertEqual(drives.leaving, [])
+    }
+
+    func testASlowUnmountIsNeverListedAgain() async throws {
+        var asked = 0
+        let drives = Drives(
+            center: center, mounted: [],
+            isMounted: { _ in
+                asked += 1
+                // Answered only once the unmount, still under way at the check, is done.
+                try? await Task.sleep(for: .milliseconds(300))
+                return false
+            },
+            settle: .milliseconds(50), added: { [unowned self] in heard.append("+" + $0) },
+            removing: { [unowned self] in heard.append("-" + $0) })
+        post(NSWorkspace.willUnmountNotification, "/Volumes/Photos")
+        try await Task.sleep(for: .milliseconds(600))
+        XCTAssertEqual(asked, 1)
+        XCTAssertEqual(heard, ["-/Volumes/Photos"])
+        XCTAssertEqual(drives.leaving, [])
+    }
+
+    func testOnlyAMountPointCountsAsStillMounted() async throws {
+        let folder = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let isMounted = await Drives.stillMounted("/")
+        XCTAssertTrue(isMounted)
+        let folderIsMounted = await Drives.stillMounted(folder.path)
+        XCTAssertFalse(folderIsMounted, "a folder on the startup disk")
+        let goneIsMounted = await Drives.stillMounted("/Volumes/No Such Drive")
+        XCTAssertFalse(goneIsMounted)
     }
 
     func testARenamedDriveMovesToItsNewName() {
@@ -214,8 +266,9 @@ final class DriveImageTests: XCTestCase {
         hatch.watch()
         let home = lists[0]
         var volume = ""
+        // As the app does: macOS's question lets go first, then the window re-watches.
         let drives = Drives(
-            mounted: [],
+            mounted: [], letGo: { _ = hatch.letGo($0) },
             added: { path in
                 told = ProcessInfo.processInfo.systemUptime
                 guard hatch.volumeAdded(path) else { return }
@@ -248,6 +301,41 @@ final class DriveImageTests: XCTestCase {
         let after = hatch.submit("zanzibar sunset")
         try await until { ready == after }
         XCTAssertEqual(hatch.take(after), [])
+        _ = drives
+    }
+
+    /// Wants an image with tens of thousands of folders, so its scan is still under way.
+    func testAnEjectWhileTheMainThreadIsBusySucceedsFirstTime() async throws {
+        guard let image = ProcessInfo.processInfo.environment["ARGUS_DRIVE_IMAGE"] else {
+            throw XCTSkip("mounts a disk image; set ARGUS_DRIVE_IMAGE to run it")
+        }
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        var lists = 0
+        let hatch = try XCTUnwrap(Hatch(root: root.path, fullDisk: true) { _ in lists += 1 })
+        try await until { lists == 1 }
+        var volume = ""
+        let drives = Drives(
+            mounted: [], letGo: { _ = hatch.letGo($0) },
+            added: { path in if hatch.volumeAdded(path) { volume = path } },
+            removing: { hatch.volumeRemoved($0) })
+        try await hdiutil("attach", image)
+        try await until { !volume.isEmpty && hatch.health().busy }
+        // Into the read itself: on 40,000 folders, about 0.35 s of waiting between lists, then 0.7 s.
+        try await Task.sleep(for: .milliseconds(600))
+        XCTAssertEqual(lists, 1, "still reading the drive")
+        // The main thread waits here throughout, so only macOS's own question reaches the core.
+        let status = DispatchQueue.global().sync {
+            let detach = Process()
+            detach.executableURL = URL(fileURLWithPath: "/usr/bin/hdiutil")
+            detach.arguments = ["detach", volume]
+            try? detach.run()
+            detach.waitUntilExit()
+            return detach.terminationStatus
+        }
+        if status != 0 { try await hdiutil("detach", "-force", volume) }
+        XCTAssertEqual(status, 0, "the drive was in use")
         _ = drives
     }
 
