@@ -1,0 +1,17 @@
+[package]
+name = "argus-ffi"
+description = "The hatch: the C-style functions an Argus window calls to reach the engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+crate-type = ["staticlib"]
+
+[dependencies]
+argus-core = { path = "../argus-core" }
+argus-grep = { path = "../argus-grep" }
+
+[dev-dependencies]
+tempfile = "3.27.0"

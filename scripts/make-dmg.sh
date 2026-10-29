@@ -1,5 +1,5 @@
 #!/bin/zsh
-# Builds build/Telescope.dmg: the app for Apple and Intel chips, next to a shortcut to
+# Builds build/Argus.dmg: the app for Apple and Intel chips, next to a shortcut to
 # Applications so installing is one drag.
 set -euo pipefail
 cd "${0:A:h}/.."
@@ -13,15 +13,15 @@ if [[ ${(L)$(security find-identity -p codesigning)} != *$leaf* ]]; then
 fi
 
 ./scripts/build-mac.sh --universal
-if [[ $(codesign -d -r- build/Telescope.app 2>&1) != *"certificate leaf = H\"$leaf\""* ]]; then
-  echo "build/Telescope.app isn't signed with $leaf; remove other Telescope Self-Signed certificates" >&2
+if [[ $(codesign -d -r- build/Argus.app 2>&1) != *"certificate leaf = H\"$leaf\""* ]]; then
+  echo "build/Argus.app isn't signed with $leaf; remove other Argus Self-Signed certificates" >&2
   exit 1
 fi
 stage=build/dmg
 trap 'rm -rf $stage' EXIT
 rm -rf $stage
 mkdir -p $stage
-cp -R build/Telescope.app $stage/
+cp -R build/Argus.app $stage/
 ln -s /Applications $stage/Applications
-hdiutil create -volname Telescope -srcfolder $stage -format UDZO -ov build/Telescope.dmg >/dev/null
-echo build/Telescope.dmg
+hdiutil create -volname Argus -srcfolder $stage -format UDZO -ov build/Argus.dmg >/dev/null
+echo build/Argus.dmg

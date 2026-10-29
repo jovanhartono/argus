@@ -18,7 +18,7 @@ esac
 
 # Read in full first, so a bad date stops here instead of reading as a day with no searches.
 drawn=$(/usr/bin/log show $window --style compact --predicate \
-  'process == "Telescope" AND category == "timing" AND eventMessage BEGINSWITH "results drawn"')
+  'process == "Argus" AND category == "timing" AND eventMessage BEGINSWITH "results drawn"')
 print -r -- $drawn |
   awk '/results drawn/ { for (i = 1; i < NF; i++) if ($i == "drawn") { print $1, $(i + 1); print "~all", $(i + 1) } }' |
   LC_ALL=C sort -k1,1 -k2,2n |

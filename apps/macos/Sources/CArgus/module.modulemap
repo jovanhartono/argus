@@ -1,0 +1,5 @@
+module CArgus [system] {
+    header "../../../../crates/argus-ffi/include/argus.h"
+    link "argus_ffi"
+    export *
+}

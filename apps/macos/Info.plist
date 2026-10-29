@@ -3,13 +3,13 @@
 <plist version="1.0">
 <dict>
 	<key>CFBundleIdentifier</key>
-	<string>io.github.jovanhartono.telescope</string>
+	<string>io.github.jovanhartono.argus</string>
 	<key>CFBundleName</key>
-	<string>Telescope</string>
+	<string>Argus</string>
 	<key>CFBundleDisplayName</key>
-	<string>Telescope</string>
+	<string>Argus</string>
 	<key>CFBundleExecutable</key>
-	<string>Telescope</string>
+	<string>Argus</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>

@@ -2,7 +2,7 @@
 import Foundation
 import PackageDescription
 
-/// The Rust core as a static library; `cargo build --release -p telescope-ffi` makes it, and
+/// The Rust core as a static library; `cargo build --release -p argus-ffi` makes it, and
 /// scripts/build-mac.sh runs that first.
 let rustLibrary = URL(fileURLWithPath: #filePath)
     .deletingLastPathComponent()
@@ -10,21 +10,21 @@ let rustLibrary = URL(fileURLWithPath: #filePath)
     .standardized.path
 
 let package = Package(
-    name: "Telescope",
+    name: "Argus",
     platforms: [.macOS(.v13)],
     dependencies: [
         .package(url: "https://github.com/sindresorhus/KeyboardShortcuts", exact: "3.1.0"),
     ],
     targets: [
-        .systemLibrary(name: "CTelescope"),
+        .systemLibrary(name: "CArgus"),
         .executableTarget(
-            name: "Telescope",
-            dependencies: ["CTelescope", "KeyboardShortcuts"],
+            name: "Argus",
+            dependencies: ["CArgus", "KeyboardShortcuts"],
             linkerSettings: [.unsafeFlags(["-L", rustLibrary])]
         ),
         .testTarget(
-            name: "TelescopeTests",
-            dependencies: ["Telescope"],
+            name: "ArgusTests",
+            dependencies: ["Argus"],
             linkerSettings: [.unsafeFlags(["-L", rustLibrary])]
         ),
     ]
