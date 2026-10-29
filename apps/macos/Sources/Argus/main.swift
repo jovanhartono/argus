@@ -18,7 +18,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             saved: Hatch.savedList, opens: Hatch.openedList, apps: Hatch.appFolders,
             textFolders: TextFolders(defaults: .standard), everything: IndexEverything(defaults: .standard))
         window.warmUp()
-        drives = Drives(added: window.driveMounted, removing: window.driveUnmounting)
+        drives = Drives(letGo: window.letGoOfDrive, added: window.driveMounted, removing: window.driveUnmounting)
         KeyboardShortcuts.onKeyDown(for: .toggleWindow) { window.toggle() }
         KeyboardShortcuts.onKeyDown(for: .searchFinderFolder) { window.toggleInFinderFolder() }
         self.window = window
