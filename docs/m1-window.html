@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<title>Telescope Window</title>
+<title>Argus Window</title>
 <style>
 :root {
   --bg: #f5f5f7; --surface: #ffffff; --ink: #1d1d1f; --muted: #6e6e73; --line: #d2d2d7;
@@ -104,7 +104,7 @@ footer { border-top: 0.5px solid var(--line); margin-top: 36px; padding-top: 20p
 
 <header>
   <span class="eyebrow">Milestone M1 · steps and design · updated 27 Oct 2026</span>
-  <h1>Telescope window</h1>
+  <h1>Argus window</h1>
   <p class="lede">The steps of milestone M1, and what the Mac window looks like and how it behaves when M1 is done. Every picture here is a real screenshot of the preview app, built only from Apple's own parts.</p>
   <div class="chips">
     <span class="chip keep">6 of 6 steps merged</span>
@@ -134,12 +134,12 @@ footer { border-top: 0.5px solid var(--line); margin-top: 36px; padding-top: 20p
     <table>
       <thead><tr><th>#</th><th>Step</th><th>What you get</th><th>Status</th></tr></thead>
       <tbody>
-        <tr><td class="n">1</td><td class="name">Hatch</td><td>Swift can call the Rust core: six C-style functions, and a made-up list of 1M names to test with</td><td class="n"><span class="chip keep">Done</span> <a href="https://github.com/jovanhartono/telescope/pull/3">#3</a></td></tr>
-        <tr><td class="n">2</td><td class="name">The window</td><td>An app you can launch: the Swift package and build script, <kbd>⌘</kbd> <kbd>⇧</kbd> <kbd>Space</kbd>, the search box, results, and the states and animations on this page</td><td class="n"><span class="chip keep">Done</span> <a href="https://github.com/jovanhartono/telescope/pull/5">#5</a></td></tr>
-        <tr><td class="n">3</td><td class="name">Keys and feel</td><td><kbd>Return</kbd> opens, <kbd>⌘</kbd> <kbd>Return</kbd> shows in Finder, <kbd>⌥</kbd> <kbd>⌘</kbd> <kbd>C</kbd> copies the path; focus goes back to your app; works over full-screen apps; waits while a Japanese or Chinese word is half-typed</td><td class="n"><span class="chip keep">Done</span> <a href="https://github.com/jovanhartono/telescope/pull/6">#6</a></td></tr>
-        <tr><td class="n">4</td><td class="name">Signing</td><td>One 10-year certificate of your own, so macOS keeps Telescope's permissions across 5 rebuilds</td><td class="n"><span class="chip keep">Done</span> <a href="https://github.com/jovanhartono/telescope/pull/7">#7</a></td></tr>
-        <tr><td class="n">5</td><td class="name">Measuring</td><td>Every target below timed on your Mac: window shown, results, idle memory and CPU</td><td class="n"><span class="chip keep">Done</span> <a href="https://github.com/jovanhartono/telescope/pull/8">#8</a></td></tr>
-        <tr><td class="n">6</td><td class="name">Download</td><td>The .dmg on GitHub, opened through Open Anyway in 4 steps or fewer</td><td class="n"><span class="chip keep">Done</span> <a href="https://github.com/jovanhartono/telescope/pull/9">#9</a> builds the .dmg; <a href="https://github.com/jovanhartono/telescope/releases/tag/v0.1.0">v0.1.0</a> publishes it</td></tr>
+        <tr><td class="n">1</td><td class="name">Hatch</td><td>Swift can call the Rust core: six C-style functions, and a made-up list of 1M names to test with</td><td class="n"><span class="chip keep">Done</span> <a href="https://github.com/jovanhartono/argus/pull/3">#3</a></td></tr>
+        <tr><td class="n">2</td><td class="name">The window</td><td>An app you can launch: the Swift package and build script, <kbd>⌘</kbd> <kbd>⇧</kbd> <kbd>Space</kbd>, the search box, results, and the states and animations on this page</td><td class="n"><span class="chip keep">Done</span> <a href="https://github.com/jovanhartono/argus/pull/5">#5</a></td></tr>
+        <tr><td class="n">3</td><td class="name">Keys and feel</td><td><kbd>Return</kbd> opens, <kbd>⌘</kbd> <kbd>Return</kbd> shows in Finder, <kbd>⌥</kbd> <kbd>⌘</kbd> <kbd>C</kbd> copies the path; focus goes back to your app; works over full-screen apps; waits while a Japanese or Chinese word is half-typed</td><td class="n"><span class="chip keep">Done</span> <a href="https://github.com/jovanhartono/argus/pull/6">#6</a></td></tr>
+        <tr><td class="n">4</td><td class="name">Signing</td><td>One 10-year certificate of your own, so macOS keeps Argus's permissions across 5 rebuilds</td><td class="n"><span class="chip keep">Done</span> <a href="https://github.com/jovanhartono/argus/pull/7">#7</a></td></tr>
+        <tr><td class="n">5</td><td class="name">Measuring</td><td>Every target below timed on your Mac: window shown, results, idle memory and CPU</td><td class="n"><span class="chip keep">Done</span> <a href="https://github.com/jovanhartono/argus/pull/8">#8</a></td></tr>
+        <tr><td class="n">6</td><td class="name">Download</td><td>The .dmg on GitHub, opened through Open Anyway in 4 steps or fewer</td><td class="n"><span class="chip keep">Done</span> <a href="https://github.com/jovanhartono/argus/pull/9">#9</a> builds the .dmg; <a href="https://github.com/jovanhartono/argus/releases/tag/v0.1.0">v0.1.0</a> publishes it</td></tr>
       </tbody>
     </table>
   </div>
@@ -156,7 +156,7 @@ footer { border-top: 0.5px solid var(--line); margin-top: 36px; padding-top: 20p
     <div class="desk">
       <picture class="shot">
         <source srcset="m1-window/empty-dark.png" media="(prefers-color-scheme: dark)">
-        <img src="m1-window/empty-light.png" alt="Empty Telescope window: a magnifying glass and the word Search" width="1360" height="112">
+        <img src="m1-window/empty-light.png" alt="Empty Argus window: a magnifying glass and the word Search" width="1360" height="112">
       </picture>
     </div>
     <figcaption>Empty. The box alone: 680 by 56 points.</figcaption>
@@ -165,7 +165,7 @@ footer { border-top: 0.5px solid var(--line); margin-top: 36px; padding-top: 20p
     <div class="desk">
       <picture class="shot">
         <source srcset="m1-window/results-dark.png" media="(prefers-color-scheme: dark)">
-        <img src="m1-window/results-light.png" alt="Telescope window with the search telescope plan and eight results, the first selected in blue" width="1360" height="914">
+        <img src="m1-window/results-light.png" alt="Argus window with the search telescope plan and eight results, the first selected in blue" width="1360" height="914">
       </picture>
     </div>
     <figcaption>Results for "telescope plan" over 1,000,000 made-up names; the odd folder names come from the made-up list. 8 rows show and the rest of the top 50 scroll. The page switches to the dark screenshots when your Mac is in dark mode.</figcaption>
@@ -219,7 +219,7 @@ footer { border-top: 0.5px solid var(--line); margin-top: 36px; padding-top: 20p
     <figure>
       <div class="desk"><picture class="shot">
         <source srcset="m1-window/error-dark.png" media="(prefers-color-scheme: dark)">
-        <img src="m1-window/error-light.png" alt="Search budget with the message Search stopped working. Quit and reopen Telescope." width="1360" height="210">
+        <img src="m1-window/error-light.png" alt="Search budget with the message Search stopped working. Quit and reopen Argus." width="1360" height="210">
       </picture></div>
       <figcaption>A bug in the Rust core. The app stays open and says so instead of crashing.</figcaption>
     </figure>
@@ -249,8 +249,8 @@ footer { border-top: 0.5px solid var(--line); margin-top: 36px; padding-top: 20p
 <section id="behaviour">
   <h2>Behaviour</h2>
   <ul class="prose">
-    <li>The window is built once when Telescope starts, then only shown and hidden. Showing a ready window took about 0.4 ms in the research tests; building one takes 150-275 ms.</li>
-    <li>Telescope never becomes the active app, just like Spotlight. When the window hides, the app you were in still has the keyboard.</li>
+    <li>The window is built once when Argus starts, then only shown and hidden. Showing a ready window took about 0.4 ms in the research tests; building one takes 150-275 ms.</li>
+    <li>Argus never becomes the active app, just like Spotlight. When the window hides, the app you were in still has the keyboard.</li>
     <li>It opens on the desktop you're looking at, over full-screen apps too, and on the screen with your mouse.</li>
     <li>Clicking anywhere outside the window hides it.</li>
     <li>No Dock icon and no menu bar; only the hotkey. A menu bar icon can come with settings later.</li>
@@ -309,16 +309,16 @@ footer { border-top: 0.5px solid var(--line); margin-top: 36px; padding-top: 20p
     <table>
       <thead><tr><th>Check</th><th>Target</th><th>Measured on your Mac, 27 Oct, while busy (load average 2.5-4.5)</th></tr></thead>
       <tbody>
-        <tr><td class="name">Hotkey to window drawn</td><td class="n">10 ms, 95% of the time<span class="sub">was 4 ms; relaxed on 27 Oct</span></td><td><span class="chip keep">Pass</span> 95% within 8.3 ms over 40 opens, half within 7.3 ms. Timed from the key press to the window drawn with the keyboard in it; the fade then takes 0.12 s to reach full strength. About 3 ms is macOS handing the keyboard to the window, which Telescope can't speed up</td></tr>
+        <tr><td class="name">Hotkey to window drawn</td><td class="n">10 ms, 95% of the time<span class="sub">was 4 ms; relaxed on 27 Oct</span></td><td><span class="chip keep">Pass</span> 95% within 8.3 ms over 40 opens, half within 7.3 ms. Timed from the key press to the window drawn with the keyboard in it; the fade then takes 0.12 s to reach full strength. About 3 ms is macOS handing the keyboard to the window, which Argus can't speed up</td></tr>
         <tr><td class="name">Keystroke to results</td><td class="n">25 ms, 95% of the time</td><td><span class="chip keep">Pass</span> 38 of 40 within 23.9 ms, from the key press to the first frame with rows, for a one-letter search (the heaviest kind); the slowest took 48 ms. 12-15 ms of that is searching the 1M names. The window then grows to show all the rows over 0.15 s</td></tr>
         <tr><td class="name">8 fast keystrokes</td><td>2 results shown or fewer; the last always wins</td><td><span class="chip keep">Pass</span> 1 shown in 9 of 10 bursts, 2 in one; the box always ended on the last word typed. The test sends all 8 keys at once, so the last one waits behind the others: its results were drawn 23-71 ms after it</td></tr>
         <tr><td class="name">Focus goes back</td><td>20 of 20 times</td><td><span class="chip keep">Pass</span> 20 of 20, twice: TextEdit kept the keyboard and got every keystroke</td></tr>
         <tr><td class="name">Over full-screen apps</td><td>Works</td><td><span class="chip keep">Pass</span> Shows and searches over full-screen TextEdit, which gets the keyboard back</td></tr>
         <tr><td class="name">Japanese and Chinese typing</td><td>Never opens a result mid-word<span class="sub">dropped on 27 Oct; too hard to test by hand</span></td><td><span class="chip">Dropped</span> Searching and opening both wait while a word is half-typed, and a half-typed accent (<kbd>⌥</kbd> <kbd>E</kbd>) left behind when the window hides is kept as typed, so the next search isn't blocked. Not tried with real Japanese or Chinese input</td></tr>
-        <tr><td class="name">Hidden</td><td class="n">Under 22 MB, 0% CPU</td><td><span class="chip keep">Pass</span> The window alone (started with <code>TELESCOPE_STAND_IN=0</code>): 21 MB, no CPU time in 60 s. With the 1M made-up names: 66 MB, so the list alone is about 45 MB (decision 6)</td></tr>
+        <tr><td class="name">Hidden</td><td class="n">Under 22 MB, 0% CPU</td><td><span class="chip keep">Pass</span> The window alone (started with <code>ARGUS_STAND_IN=0</code>): 21 MB, no CPU time in 60 s. With the 1M made-up names: 66 MB, so the list alone is about 45 MB (decision 6)</td></tr>
         <tr><td class="name"><span class="term" tabindex="0" data-tip="Swift's strictest setting, which catches threading mistakes before the app runs.">Swift 6 mode</span></td><td>Builds and runs</td><td><span class="chip keep">Pass</span> Every file compiles with Swift 6's checks and the app runs</td></tr>
         <tr><td class="name">Permissions after rebuilds</td><td>Survive 5 rebuilds</td><td><span class="chip keep">Pass</span> 5 different builds all meet the first build's signing rule, which macOS checks before keeping a permission; ad-hoc builds fail it</td></tr>
-        <tr><td class="name">Downloaded .dmg</td><td>Opens through Open Anyway in 4 steps or fewer</td><td><span class="chip keep">Pass</span> 4 steps on 27 Oct: downloaded <a href="https://github.com/jovanhartono/telescope/releases/tag/v0.1.0">v0.1.0</a> in Safari, dragged it to Applications, opened it and got “Not Opened”, then Open Anyway in Privacy &amp; Security. It started and <kbd>⌘</kbd> <kbd>⇧</kbd> <kbd>Space</kbd> showed the window. One app for Apple and Intel chips; a 2.0 MB download</td></tr>
+        <tr><td class="name">Downloaded .dmg</td><td>Opens through Open Anyway in 4 steps or fewer</td><td><span class="chip keep">Pass</span> 4 steps on 27 Oct: downloaded <a href="https://github.com/jovanhartono/argus/releases/tag/v0.1.0">v0.1.0</a> in Safari, dragged it to Applications, opened it and got “Not Opened”, then Open Anyway in Privacy &amp; Security. It started and <kbd>⌘</kbd> <kbd>⇧</kbd> <kbd>Space</kbd> showed the window. One app for Apple and Intel chips; a 2.0 MB download</td></tr>
         <tr><td class="name">App size</td><td class="n">Under 6 MB for both chips<span class="sub">was 3 MB; relaxed on 27 Oct</span></td><td><span class="chip keep">Pass</span> The app is 4.1 MB on disk: its program holds a 1.9 MB copy for Apple chips and a 2.3 MB copy for Intel. The Rust core is 1.27 MB of the Apple copy, mostly frizbee's matching code; <span class="term" tabindex="0" data-tip="Link-time optimisation: the compiler looks at the whole program at once and drops code nothing calls.">LTO</span> cuts about 0.2 MB per chip</td></tr>
       </tbody>
     </table>
@@ -338,7 +338,7 @@ footer { border-top: 0.5px solid var(--line); margin-top: 36px; padding-top: 20p
         <tr><td class="n">4</td><td>Opening it again</td><td>Shows your last search, selected, so typing replaces it (Spotlight does this)</td><td>Always starts empty</td></tr>
         <tr><td class="n">5</td><td>Position</td><td>Always the same spot, a fifth of the way down the screen</td><td>Remembers where you dragged it</td></tr>
         <tr><td class="n">6</td><td>Idle memory</td><td>Judge the window alone against 22 MB, and report the made-up list on its own line: 1M names take about 45 MB by themselves (measured in step 5; the first estimate was 25-30 MB)</td><td>Keep 22 MB for everything and cut the made-up list to about 100,000 names</td></tr>
-        <tr><td class="n">7</td><td>Animations</td><td>A quick fade when the window shows and hides, and a smooth height change as results grow or shrink. macOS moves the finished window image itself, so they cost Telescope about 0 MB (an estimate; hidden after showing, the window measured 21 MB). Both stop when Reduce Motion is on.</td><td>The selection gliding between rows, or rows animating in while you type: a few MB each, and rows that move while you type make Return open the wrong file</td></tr>
+        <tr><td class="n">7</td><td>Animations</td><td>A quick fade when the window shows and hides, and a smooth height change as results grow or shrink. macOS moves the finished window image itself, so they cost Argus about 0 MB (an estimate; hidden after showing, the window measured 21 MB). Both stop when Reduce Motion is on.</td><td>The selection gliding between rows, or rows animating in while you type: a few MB each, and rows that move while you type make Return open the wrong file</td></tr>
       </tbody>
     </table>
   </div>
@@ -348,7 +348,7 @@ footer { border-top: 0.5px solid var(--line); margin-top: 36px; padding-top: 20p
 <section id="next">
   <h2>Next steps</h2>
   <ol class="prose">
-    <li>M1 closed on 27 Oct 2026: every check above passes or was dropped, and <a href="https://github.com/jovanhartono/telescope/releases/tag/v0.1.0">v0.1.0</a> is on GitHub.</li>
+    <li>M1 closed on 27 Oct 2026: every check above passes or was dropped, and <a href="https://github.com/jovanhartono/argus/releases/tag/v0.1.0">v0.1.0</a> is on GitHub.</li>
     <li>M2, the daily driver: this window searches your real files and keeps up as they change. Its steps are in <a href="m2-daily-driver.html">m2-daily-driver.html</a>.</li>
   </ol>
 </section>
