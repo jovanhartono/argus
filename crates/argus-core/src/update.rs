@@ -159,6 +159,17 @@ impl Index {
     /// The first half of `update`: reads the changed folders, and walks the new ones, without
     /// changing the index.
     pub(crate) fn read_update<P: AsRef<Path>>(&self, rules: &Rules, changed: &[P]) -> Changes {
+        self.read_update_until(rules, changed, &|| false)
+            .expect("never asked to stop")
+    }
+
+    /// As `read_update`, but `None` once `stop` says so, with no folder read after that.
+    pub(crate) fn read_update_until<P: AsRef<Path>>(
+        &self,
+        rules: &Rules,
+        changed: &[P],
+        stop: &(dyn Fn() -> bool + Sync),
+    ) -> Option<Changes> {
         let mut update = Update::default();
         let roots: Vec<(EntryId, PathBuf)> = self
             .roots
@@ -168,7 +179,7 @@ impl Index {
         let changed: Vec<&Path> = changed.iter().map(AsRef::as_ref).collect();
         let under_a_root = |path: &&Path| roots.iter().any(|(_, root)| path.starts_with(root));
         if !changed.iter().any(under_a_root) {
-            return self.changes(None, update);
+            return Some(self.changes(None, update));
         }
         let mut edit = self.edit();
         let mut targets = self.changed_folders(&edit, &roots, &changed);
@@ -184,15 +195,18 @@ impl Index {
             let listings: Vec<(Listing, bool)> = chunk
                 .par_iter()
                 .map_init(PathBuf::new, |at, &(folder, depth, top, below)| {
+                    if stop() {
+                        return None;
+                    }
                     folder_path(at, &roots[top].1, below, depth);
                     let passage = self.passages.binary_search(&folder).is_ok();
                     let listing = rules.list(at, self.is_root(folder), passage);
                     // A folder deleted since it was found lost everything in it.
                     let partial = listing.unreadable
                         && fs::symlink_metadata(&at).is_ok_and(|meta| meta.is_dir());
-                    (listing, partial)
+                    Some((listing, partial))
                 })
-                .collect();
+                .collect::<Option<_>>()?;
             for (&(folder, ..), (listing, partial)) in chunk.iter().zip(listings) {
                 if edit.removed.contains(&folder) {
                     continue;
@@ -204,11 +218,14 @@ impl Index {
         }
         let mut changes = self.changes(Some(edit), update);
         if !added.anchors.is_empty() {
-            let walked = walk(added.builder, rules, NO_PARENT, added.walks, &|| false);
+            let walked = walk(added.builder, rules, NO_PARENT, added.walks, stop);
+            if stop() {
+                return None;
+            }
             changes.update.unreadable_folders += walked.unreadable_folders;
             changes.added = Some((walked.builder.lists(), added.anchors));
         }
-        changes
+        Some(changes)
     }
 
     /// Changes taking out what `edit` removed, or nothing without one.
@@ -2127,6 +2144,31 @@ mod tests {
         assert!(index == before);
         // The top folder, one ask for each of Photos and Projects, then one at the end.
         assert_eq!(asked.load(Ordering::Relaxed), 4);
+    }
+
+    #[test]
+    fn a_folder_copied_onto_a_drive_ejected_midway_is_left_unread() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let (_h, home, _v, volume) = home_and_volume();
+        let settings = skip_clutter(&home);
+        let mut index = settings.scan().unwrap().index;
+        settings.add_volume(&mut index, &volume).unwrap();
+        write(
+            &volume,
+            &["Photos/copied/a/b/c.jpg", "Photos/copied/d/e.jpg"],
+        );
+        let changed = [volume.join("Photos")];
+        // Ejected once Photos is read, so the new folder inside is never opened.
+        let asked = AtomicUsize::new(0);
+        let eject = || asked.fetch_add(1, Ordering::Relaxed) >= 1;
+        let stopped = settings.read_update_until(&index, &changed, &eject);
+        assert_eq!(stopped.err().unwrap().kind(), io::ErrorKind::Interrupted);
+        // Photos, then copied, then one at the end.
+        assert_eq!(asked.load(Ordering::Relaxed), 3);
+
+        let changes = settings.read_update_until(&index, &changed, &|| false);
+        changes.unwrap().apply(&mut index);
+        assert_current(&settings, &index, &home, "read again in full");
     }
 
     #[test]
