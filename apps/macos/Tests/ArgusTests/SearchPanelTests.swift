@@ -652,9 +652,7 @@ final class SearchPanelTests: XCTestCase {
     }
 
     func testTheMadeUpNamesNeverShowTheLine() async throws {
-        setenv("ARGUS_STAND_IN", "0", 1)
-        defer { unsetenv("ARGUS_STAND_IN") }
-        let window = try await opened(access: false)
+        let window = try await opened(access: false, standIn: 0)
         window.recheckAccess()
         XCTAssertNil(window.notice)
         XCTAssertEqual(checks, 0)
@@ -1855,9 +1853,7 @@ final class SearchPanelTests: XCTestCase {
     }
 
     func testAMadeUpNameSaysItCantBeFoundInsteadOfPreviewing() async throws {
-        setenv("ARGUS_STAND_IN", "1000", 1)
-        defer { unsetenv("ARGUS_STAND_IN") }
-        let window = try await opened(access: true)
+        let window = try await opened(access: true, standIn: 1000)
         window.show()
         defer { window.hide() }
         try await type("budget", in: window)
@@ -2115,9 +2111,7 @@ final class SearchPanelTests: XCTestCase {
     }
 
     func testAMadeUpNameShowsItCantBeFoundWithoutAThumbnail() async throws {
-        setenv("ARGUS_STAND_IN", "1000", 1)
-        defer { unsetenv("ARGUS_STAND_IN") }
-        let window = try await opened(access: true)
+        let window = try await opened(access: true, standIn: 1000)
         window.show()
         defer { window.hide() }
         try await type("budget", in: window)
@@ -2469,19 +2463,15 @@ final class SearchPanelTests: XCTestCase {
         XCTAssertEqual(window.status, "No Results")
     }
 
-    func testWithoutATextEngineNamesStillShowAndNoLineIsAwaited() async throws {
-        setenv("ARGUS_STAND_IN", "1000", 1)
-        defer { unsetenv("ARGUS_STAND_IN") }
-        let window = try await opened(access: true, textFolders: [root.path])
+    func testTheMadeUpNamesStillReadTheChosenFoldersAndEndOnNoResults() async throws {
+        let window = try await opened(access: true, standIn: 1000, textFolders: [root.path])
         window.show()
         defer { window.hide() }
         try await type("zzqx", in: window)
-        try await until { window.answered != 0 }
-        XCTAssertEqual(window.textTicket, 0)
+        try await until { window.answered != 0 && window.textTicket == 0 }
+        XCTAssertTrue(window.rows.isEmpty)
+        XCTAssertTrue(window.hits.isEmpty)
         XCTAssertEqual(window.status, "No Results", "never stuck on Searching inside files…")
-        try await type("zzq", in: window)
-        try await until { window.answered != 0 }
-        XCTAssertEqual(window.textTicket, 0)
     }
 
     func testFoldersAddedInTheHealthViewAreSearchedFromTheWindow() async throws {
@@ -2792,8 +2782,8 @@ final class SearchPanelTests: XCTestCase {
     /// Waits for the scan, so its event can't reach the next test's core.
     /// Never the real Finder, which would ask whether the test runner may control it.
     private func opened(
-        access: Bool, on stage: (any Stage)? = nil, saved: String? = nil, opens: String? = nil, apps: [String] = [],
-        textFolders: [String] = [], everything: IndexEverything = IndexEverything(),
+        access: Bool, on stage: (any Stage)? = nil, standIn: UInt64? = nil, saved: String? = nil, opens: String? = nil,
+        apps: [String] = [], textFolders: [String] = [], everything: IndexEverything = IndexEverything(),
         finder: @escaping @Sendable () -> FinderFolder = { .none }
     ) async throws -> SearchPanel {
         self.access = access
@@ -2804,7 +2794,7 @@ final class SearchPanelTests: XCTestCase {
         let folders = TextFolders()
         folders.add(textFolders)
         let window = SearchPanel(
-            root: root.path, saved: saved, opens: opens, apps: apps, textFolders: folders, everything: everything,
+            root: root.path, standIn: standIn, saved: saved, opens: opens, apps: apps, textFolders: folders, everything: everything,
             hasAccess: hasAccess, stage: stage ?? self.stage, finder: finder)
         for _ in 0..<500 where !window.indexed { try await Task.sleep(for: .milliseconds(10)) }
         XCTAssertTrue(window.indexed)
