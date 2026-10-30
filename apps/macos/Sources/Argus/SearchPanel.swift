@@ -141,6 +141,10 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
     /// A search run again for the same words leaves the old lines up until its own come, so the
     /// window doesn't shrink and grow back.
     private var replacing = false
+    /// The line picked when that search started, until a later batch of its lines brings it back;
+    /// row is where the pick waits. Any arrow or click on a row meanwhile drops it, so the user's
+    /// choice wins even when it lands back on that row.
+    var repick: (hit: TextHit, row: Int)?
     private var filesChangedAt: TimeInterval = 0
     /// When macOS told of each drive plugged in, until a list holding it is in use.
     var drivesTold: [String: TimeInterval] = [:]
@@ -799,6 +803,7 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
         }
         guard let ask, needsText(ask) else { return fit() }
         replacing = !hits.isEmpty
+        repick = nil
         textAsked = ask
         textTypedAt = typed
         textStartedAt = ProcessInfo.processInfo.systemUptime
@@ -815,6 +820,7 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
         textAsked = nil
         textWhole = false
         replacing = false
+        repick = nil
     }
 
     private func stopText() {
@@ -826,8 +832,8 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
     private func takeText(_ ticket: UInt64) {
         guard let batch = hatch?.takeText(ticket) else { return }
         let replaced = replacing && (!batch.hits.isEmpty || batch.done)
-        let picked = replaced ? hit(at: table.selectedRow) : nil
         if replaced {
+            repick = hit(at: table.selectedRow).map { ($0, table.selectedRow) }
             replacing = false
             hits = []
         }
@@ -835,17 +841,22 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
         if replaced || !batch.hits.isEmpty {
             hits += batch.hits
             refill()
-            if let picked, let at = hits.firstIndex(where: { $0.path == picked.path && $0.line == picked.line }) {
+            if let picked = repick, replaced || table.selectedRow == picked.row,
+                let at = hits.firstIndex(where: { $0.path == picked.hit.path && $0.line == picked.hit.line })
+            {
+                repick = nil
                 select(rows.count + 1 + at)
             } else if table.selectedRow < 0, let top {
                 select(top)
             }
             if replaced {
+                repick?.row = table.selectedRow
                 showDetails()
                 follow()
             }
         }
         if batch.done {
+            repick = nil
             textTicket = 0
             textWhole = !batch.failed && filesChangedAt < textStartedAt
             if batch.failed { failures.error("a text search stopped early") }
@@ -874,6 +885,7 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
 
     /// The first arrow after "can't be found" brings the list back, on the same row.
     private func move(by step: Int) {
+        repick = nil
         if missing != nil {
             missing = nil
             return fit()
@@ -1069,6 +1081,7 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
     func tableView(_ tableView: NSTableView, selectionIndexesForProposedSelection proposed: IndexSet) -> IndexSet {
         var proposed = proposed
         if let header { proposed.remove(header) }
+        if !proposed.isEmpty { repick = nil }
         return proposed.isEmpty ? tableView.selectedRowIndexes : proposed
     }
 
