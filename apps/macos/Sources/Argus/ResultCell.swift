@@ -37,7 +37,7 @@ final class ResultCell: NSTableCellView, NSViewToolTipOwner {
         _ view: NSView, stringForToolTip tag: NSView.ToolTipTag, point: NSPoint, userData data: UnsafeMutableRawPointer?
     ) -> String {
         let label = point.y >= name.frame.minY ? name : folder
-        guard !label.isHidden, label.attributedStringValue.size().width > label.frame.width else { return "" }
+        guard !label.isHidden, label.cell!.cellSize.width > label.frame.width else { return "" }
         return label.stringValue
     }
 

@@ -146,6 +146,8 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
     private(set) var rows: [Row] = []
     /// Every name found for the box; `rows` lists only the first few while lines show.
     private var names: [Row] = []
+    /// How many names stay above the lines: three, or down to the one picked when they came.
+    private var kept = 3
     let textFolders: TextFolders
     let everything: IndexEverything
     let cloud: CloudDrives
@@ -572,7 +574,7 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
         switch textState {
         case .searching: return "Searching inside files…"
         case .stopped: return "Searching inside files stopped early."
-        case .unreached(let why): return why
+        case .unreached(let why): return scopes.isEmpty ? why : "\(why) Press ⌫ to search everywhere."
         case .done, nil:
             return scopes.last.map { "No results in \($0.name). Press ⌫ to search everywhere." } ?? "No Results"
         }
@@ -941,6 +943,7 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
         textAsked = nil
         textWhole = false
         textStopped = false
+        kept = 3
         replacing = false
         repick = nil
     }
@@ -960,7 +963,9 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
             hits = []
         }
         let first = hits.isEmpty && !batch.hits.isEmpty
-        let pickedName = table.selectedRow >= 0 && table.selectedRow < rows.count
+        // Someone who arrowed down to the fifth name while the files were read, then pressed
+        // Return, opens that name, not the top one.
+        if first, table.selectedRow < rows.count { kept = max(3, table.selectedRow + 1) }
         if replaced || !batch.hits.isEmpty {
             hits += batch.hits
             refill()
@@ -969,8 +974,7 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
             {
                 repick = nil
                 select(rows.count + 1 + at)
-            } else if table.selectedRow < 0 || pickedName && table.selectedRow >= rows.count, let top {
-                // A name picked below the first few went when the lines came.
+            } else if table.selectedRow < 0, let top {
                 select(top)
             }
             if replaced {
@@ -1261,7 +1265,7 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
     /// reloadData throws every row away and builds it again, most of the wait after a keystroke.
     private func refill() {
         // Once ⌘T finds lines, a dozen names would push them all below the window's edge.
-        rows = hits.isEmpty ? names : Array(names.prefix(3))
+        rows = hits.isEmpty ? names : Array(names.prefix(kept))
         textState = readTextState()
         table.noteNumberOfRowsChanged()
         // The table keeps the old heights through noteNumberOfRowsChanged, so the title's old

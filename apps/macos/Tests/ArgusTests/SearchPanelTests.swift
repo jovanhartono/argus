@@ -2484,6 +2484,11 @@ final class SearchPanelTests: XCTestCase {
         try await until { window.rows.map(\.name) == ["budget.txt"] && window.header == 1 }
         XCTAssertEqual(window.textTitle, "None of your chosen folders are inside work.")
         XCTAssertEqual(window.textTicket, 0)
+
+        try await type("zzzz", in: window)
+        try await until {
+            window.status == "None of your chosen folders are inside work. Press ⌫ to search everywhere."
+        }
     }
 
     func testTheTitleShowsFromTheStartAndSaysWhenNoLineIsFound() async throws {
@@ -2523,16 +2528,26 @@ final class SearchPanelTests: XCTestCase {
 
         window.toggleText(nil)
         try await until { window.hits.count == 1 && window.textTicket == 0 }
-        XCTAssertEqual(window.rows.count, 3)
-        XCTAssertEqual(window.header, 3)
-        XCTAssertEqual(window.textTitle, "Inside Files")
-        XCTAssertEqual(window.table.numberOfRows, 5)
-        XCTAssertEqual(window.table.selectedRow, 0, "the picked name went, so the top one is picked")
-        try await until { window.panel.frame.height == Metric.field + 1 + 4 * Metric.row + Metric.header + 2 * Metric.inset }
+        XCTAssertEqual(window.rows.count, 5, "names down to the picked one stay")
+        XCTAssertEqual(window.header, 5)
+        XCTAssertEqual(window.table.selectedRow, 4, "Return still opens the name picked before the lines came")
 
         window.toggleText(nil)
         XCTAssertEqual(window.rows.count, 6, "every name comes back")
         XCTAssertEqual(window.table.numberOfRows, 6)
+
+        for _ in 0..<3 {
+            _ = window.control(NSTextField(), textView: NSTextView(), doCommandBy: #selector(NSResponder.moveUp(_:)))
+        }
+        XCTAssertEqual(window.table.selectedRow, 1)
+        window.toggleText(nil)
+        try await until { window.hits.count == 1 && window.textTicket == 0 }
+        XCTAssertEqual(window.rows.count, 3)
+        XCTAssertEqual(window.header, 3)
+        XCTAssertEqual(window.textTitle, "Inside Files")
+        XCTAssertEqual(window.table.numberOfRows, 5)
+        XCTAssertEqual(window.table.selectedRow, 1)
+        try await until { window.panel.frame.height == Metric.field + 1 + 4 * Metric.row + Metric.header + 2 * Metric.inset }
     }
 
     func testLinesInsideFilesListUnderTheNamesAndAfterThem() async throws {
@@ -2948,6 +2963,10 @@ final class SearchPanelTests: XCTestCase {
         let tip = { (y: CGFloat) in cell.view(cell, stringForToolTip: 0, point: NSPoint(x: 100, y: y), userData: nil) }
         XCTAssertEqual(tip(12), long, "a folder cut short shows whole on hover")
         XCTAssertEqual(tip(30), "", "a name that fits needs no tip")
+        let width = cell.name.frame.width
+        cell.name.frame.size.width = cell.name.attributedStringValue.size().width + 1
+        XCTAssertEqual(tip(30), "budget.txt", "the label's own margins cut a name a point short of its text")
+        cell.name.frame.size.width = width
         let line = TextHit(path: "/notes/plan.txt", text: "q3 budget", match: NSRange(location: 3, length: 6), line: 9)
         cell.show(line, icon: icon)
         XCTAssertEqual(cell.folder.stringValue, "plan.txt, line 9 · /notes")
