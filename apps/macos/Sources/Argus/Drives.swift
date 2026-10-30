@@ -13,16 +13,21 @@ final class Drives {
     private let settle: Duration
     /// Told they will unmount, and not unmounted yet.
     private(set) var leaving: Set<String> = []
+    /// How many ejects of each drive in `leaving` were heard, so only the latest one's check
+    /// counts.
+    private var ejects: [String: Int] = [:]
     private nonisolated let asker: Asker
     nonisolated(unsafe) private var session: DASession?
     private nonisolated static let questions = DispatchQueue(label: "io.github.jovanhartono.argus.unmounts")
 
     /// With `letGo`, macOS asks before each unmount and the drive is let go of on a queue of its
     /// own, so Finder's eject never waits on a busy main thread and never finds the drive in use.
+    /// macOS waits about 10.7 s for each app's answer before it unmounts anyway (measured on
+    /// macOS 26), so a drive still mounted `settle` after its latest eject stayed for good.
     init(
         center: NotificationCenter = NSWorkspace.shared.notificationCenter, mounted: [String] = Drives.mounted(),
         isMounted: @escaping @MainActor (String) async -> Bool = Drives.stillMounted,
-        settle: Duration = .seconds(10), letGo: (@Sendable (String) -> Void)? = nil,
+        settle: Duration = .seconds(15), letGo: (@Sendable (String) -> Void)? = nil,
         added: @escaping @MainActor (String) -> Void, removing: @escaping @MainActor (String) -> Void
     ) {
         self.center = center
@@ -37,11 +42,13 @@ final class Drives {
         observers = [
             hear(NSWorkspace.didMountNotification) { drives, path, _ in
                 drives.leaving.remove(path)
+                drives.ejects[path] = nil
                 drives.added(path)
             },
             hear(NSWorkspace.willUnmountNotification) { drives, path, _ in drives.unmounting(path) },
             // Pulled out without an eject, so no warning came first.
             hear(NSWorkspace.didUnmountNotification) { drives, path, _ in
+                drives.ejects[path] = nil
                 if drives.leaving.remove(path) == nil { drives.removing(path) }
             },
             hear(NSWorkspace.didRenameVolumeNotification) { drives, path, old in
@@ -83,17 +90,20 @@ final class Drives {
         asker.ask(path)
     }
 
-    /// An eject refused because a file on the drive is open leaves it mounted with no further
-    /// note, so it is listed again once that has had time to show.
+    /// An eject refused because a file on the drive is open, or an app said no, leaves it
+    /// mounted with no further note, so it is listed again once that has had time to show. An
+    /// eject tried again, as after a refused one, starts that time over.
     fileprivate func unmounting(_ path: String) {
-        guard leaving.insert(path).inserted else { return }
-        removing(path)
+        if leaving.insert(path).inserted { removing(path) }
+        let eject = ejects[path, default: 0] + 1
+        ejects[path] = eject
         Task { [weak self, settle] in
             try? await Task.sleep(for: settle)
-            guard let self, leaving.contains(path) else { return }
+            guard let self, ejects[path] == eject else { return }
             let mounted = await isMounted(path)
-            guard leaving.remove(path) != nil, mounted else { return }
-            added(path)
+            guard ejects[path] == eject, leaving.remove(path) != nil else { return }
+            ejects[path] = nil
+            if mounted { added(path) }
         }
     }
 

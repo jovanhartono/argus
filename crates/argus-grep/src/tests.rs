@@ -402,6 +402,33 @@ fn a_replaced_search_opens_no_more_files() {
 }
 
 #[test]
+fn a_search_stopped_midway_opens_no_more_files_and_counts_what_it_read() {
+    static OPENED: AtomicUsize = AtomicUsize::new(0);
+    let folder = many(2000, |i| format!("d{}/{i}.txt", i % 20), b"milk\n");
+    let index = index(&folder);
+    let mut grep = Grep::with_threads(4);
+    grep.cloud_only = |_, _| {
+        OPENED.fetch_add(1, Ordering::Relaxed);
+        false
+    };
+    let (ejected, at_eject) = (AtomicBool::new(false), AtomicUsize::new(0));
+    let stop = || ejected.load(Ordering::Relaxed);
+    let report = grep.search_until(&index, "milk", grep.ticket(), usize::MAX, &stop, |_| {
+        if !ejected.swap(true, Ordering::Relaxed) {
+            at_eject.store(OPENED.load(Ordering::Relaxed), Ordering::Relaxed);
+        }
+    });
+    // Still wanted, so it tells what it found before the stop.
+    let report = report.unwrap();
+    assert!(
+        report.files_searched >= 1 && report.files_searched < 2000,
+        "{report:?}"
+    );
+    let opened = OPENED.load(Ordering::Relaxed);
+    assert!(opened <= at_eject.into_inner() + grep.threads(), "{opened}");
+}
+
+#[test]
 fn a_file_stops_at_the_next_read_once_the_search_is_over() {
     let folder = folder(&[("a.txt", b"milk\n")]);
     let matcher = Literal::new("milk").unwrap();

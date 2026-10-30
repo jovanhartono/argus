@@ -338,6 +338,12 @@ struct Plan {
     /// Full Disk Access is on, so lists read `volumes`. Kept here rather than read beside
     /// the plan, so a volume added just as access is granted is never left out.
     granted: bool,
+    /// Drives taken out of `volumes` by an eject, which nothing reads until mounted again:
+    /// macOS may take a while to unmount one, and a folder opened meanwhile would stop it.
+    leaving: Vec<PathBuf>,
+    /// The drive of each read of `volumes` under way, from a scan to a text search, so an
+    /// eject waits for those reading its drive.
+    reading: Vec<PathBuf>,
     /// `volumes` changed, or folders the newest list holds did, since the newest list, or
     /// the one being built, was started.
     patching: bool,
@@ -487,13 +493,18 @@ enum Missed {
     More,
 }
 
-fn missed<P: AsRef<Path>>(scope: &Scope, list: &RwLock<Listed>, paths: &[P]) -> Missed {
+fn missed<P: AsRef<Path>>(
+    live: &Live,
+    scope: &Scope,
+    list: &RwLock<Listed>,
+    paths: &[P],
+) -> Missed {
     let mut folders = Vec::new();
     for path in paths.iter().map(AsRef::as_ref) {
         if scope.changes_rules(path) {
             return Missed::More;
         }
-        if !holds(scope, list, path) {
+        if !holds_unless_leaving(live, scope, list, path) {
             folders.push(path.to_path_buf());
         }
     }
@@ -508,6 +519,13 @@ fn missed<P: AsRef<Path>>(scope: &Scope, list: &RwLock<Listed>, paths: &[P]) -> 
 /// at a time, so a catch-up of thousands at launch never holds a patch, and searches, back.
 fn holds(scope: &Scope, list: &RwLock<Listed>, path: &Path) -> bool {
     read(list).is_some_and(|listed| scope.holds(path, &listed.index))
+}
+
+/// As `holds`, but a folder on a drive being ejected is left unread and counts as held: the
+/// list lets go of the drive anyway.
+fn holds_unless_leaving(live: &Live, scope: &Scope, list: &RwLock<Listed>, path: &Path) -> bool {
+    live.drive_read(|drive| path.starts_with(drive))
+        .is_none_or(|_read| holds(scope, list, path))
 }
 
 /// A list searches read, patched in place as files change. Each patch moves `version` on, since
@@ -552,11 +570,11 @@ struct Live {
     /// Taken around each read or save of the opens' file, so it never goes back to an older
     /// list, while searches never wait for the disk.
     saves: Mutex<()>,
-    /// Counts volumes taken out, so a scan of one stops at once and never holds up its eject.
+    /// Counts volumes taken out, so a read of one stops at once and never holds up its eject.
     ejected: AtomicU64,
-    /// Held while volumes are read, so a drive taken out is approved for unmounting only once
-    /// its stopped scan has closed every folder on it.
-    reading: Mutex<()>,
+    /// Woken as each read of a drive ends, so a drive taken out is approved for unmounting only
+    /// once its stopped reads have closed every folder and file on it.
+    freed: Condvar,
     save_after: Duration,
     save_within: Duration,
     resave: Duration,
@@ -580,7 +598,7 @@ impl Default for Live {
             opens: Mutex::default(),
             saves: Mutex::default(),
             ejected: AtomicU64::default(),
-            reading: Mutex::default(),
+            freed: Condvar::new(),
             save_after: SAVE_AFTER,
             save_within: SAVE_WITHIN,
             resave: RESAVE,
@@ -743,7 +761,29 @@ impl Live {
     fn misses(&self, paths: &[PathBuf]) -> Missed {
         let newest = self.newest.lock().unwrap().clone();
         newest.map_or(Missed::Nothing, |(scope, list)| {
-            missed(&scope, &list, paths)
+            missed(self, &scope, &list, paths)
+        })
+    }
+
+    /// Notes a read of each drive in `volumes` that `touches` picks, until the read is
+    /// dropped. `None` when it picks a drive being ejected, which must not be read.
+    fn drive_read(&self, touches: impl Fn(&Path) -> bool) -> Option<DriveRead<'_>> {
+        let mut plan = lock(&self.plan);
+        if plan.leaving.iter().any(|drive| touches(drive)) {
+            return None;
+        }
+        let drives: Vec<PathBuf> = plan
+            .volumes
+            .iter()
+            .filter(|drive| touches(drive))
+            .cloned()
+            .collect();
+        plan.reading.extend_from_slice(&drives);
+        let seen = AtomicU64::new(self.ejected.load(Ordering::Relaxed));
+        Some(DriveRead {
+            live: self,
+            drives,
+            seen,
         })
     }
 
@@ -759,17 +799,14 @@ impl Live {
     ) -> bool {
         let mut joined = false;
         for volume in volumes {
-            let _reading = self.reading.lock().unwrap();
             // Ejected while the home folder was read, before this pass reached the drive.
-            let ejected = {
-                let plan = self.plan.lock().unwrap();
-                if !plan.volumes.contains(volume) {
-                    continue;
-                }
-                self.ejected.load(Ordering::Relaxed)
+            let Some(read) = self.drive_read(|drive| drive == volume) else {
+                continue;
             };
-            let stop = || self.ejected.load(Ordering::Relaxed) != ejected;
-            match settings.add_volume_until(index, volume, &stop) {
+            if read.drives.is_empty() {
+                continue;
+            }
+            match settings.add_volume_until(index, volume, &|| read.ejected()) {
                 Ok(_) => joined = true,
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
                 Err(error) => {
@@ -780,6 +817,50 @@ impl Live {
             }
         }
         joined
+    }
+}
+
+/// A read of drives the window told of, noted in the plan while it lasts. It takes the plan
+/// while a patch reads the list, so nothing may wait for the list while holding the plan.
+struct DriveRead<'a> {
+    live: &'a Live,
+    drives: Vec<PathBuf>,
+    /// Ejects counted while none of `drives` was leaving.
+    seen: AtomicU64,
+}
+
+impl DriveRead<'_> {
+    /// Whether one of the drives is being ejected, so the read should stop. Asked for each
+    /// folder or file, so it looks at the plan only after an eject.
+    fn ejected(&self) -> bool {
+        if self.drives.is_empty()
+            || self.live.ejected.load(Ordering::Relaxed) == self.seen.load(Ordering::Relaxed)
+        {
+            return false;
+        }
+        let plan = lock(&self.live.plan);
+        let leaving = self.drives.iter().any(|drive| plan.leaving.contains(drive));
+        if !leaving {
+            let ejected = self.live.ejected.load(Ordering::Relaxed);
+            self.seen.store(ejected, Ordering::Relaxed);
+        }
+        leaving
+    }
+}
+
+impl Drop for DriveRead<'_> {
+    fn drop(&mut self) {
+        if self.drives.is_empty() {
+            return;
+        }
+        let mut plan = lock(&self.live.plan);
+        for drive in &self.drives {
+            if let Some(at) = plan.reading.iter().position(|held| held == drive) {
+                plan.reading.swap_remove(at);
+            }
+        }
+        drop(plan);
+        self.live.freed.notify_all();
     }
 }
 
@@ -962,12 +1043,16 @@ impl Source {
             let mut waited = Duration::ZERO;
             for volume in &gone {
                 waited += patch_in_place(live, &list, |index| {
-                    settings.read_volume_removal(index, volume)
+                    Ok(settings.read_volume_removal(index, volume))
                 })?;
             }
             if !changes.is_empty() {
+                let read = changes_read(live, volumes, changes)?;
                 waited += patch_in_place(live, &list, |index| {
-                    Some(settings.read_update(index, changes))
+                    let changes = settings.read_update_until(index, changes, &|| read.ejected());
+                    // Before the patch waits for a save, which says nothing of the drive.
+                    drop(read);
+                    changes.map(Some)
                 })?;
             }
             let scope = settings.scope(&read(&list).ok_or_else(broken)?.index);
@@ -979,7 +1064,11 @@ impl Source {
             settings.remove_volume(&mut index, volume);
         }
         // Before the new volumes join, which are read whole.
-        settings.update(&mut index, changes);
+        let read = changes_read(live, volumes, changes)?;
+        settings
+            .read_update_until(&index, changes, &|| read.ejected())?
+            .apply(&mut index);
+        drop(read);
         let joined = live.add_volumes(settings, &mut index, &new, notify);
         // A change read again is promised a new list, even one that lists the same.
         let changed = joined || !gone.is_empty() || !changes.is_empty();
@@ -990,14 +1079,29 @@ impl Source {
     }
 }
 
+/// Notes a read of the changed folders on the drives the list holds, `volumes`, or fails with
+/// `Interrupted` when one of those drives is being ejected.
+fn changes_read<'a>(
+    live: &'a Live,
+    volumes: &[PathBuf],
+    changes: &[PathBuf],
+) -> io::Result<DriveRead<'a>> {
+    let touches = |drive: &Path| {
+        volumes.iter().any(|volume| volume == drive)
+            && changes.iter().any(|path| path.starts_with(drive))
+    };
+    live.drive_read(touches)
+        .ok_or_else(|| io::ErrorKind::Interrupted.into())
+}
+
 /// Applies to `list` what `read_changes` finds in it, reading while searches go on, as a new
 /// folder unzipped may take seconds to walk. Returns how long it waited for a save under way.
 fn patch_in_place(
     live: &Live,
     list: &RwLock<Listed>,
-    read_changes: impl FnOnce(&Index) -> Option<Changes>,
+    read_changes: impl FnOnce(&Index) -> io::Result<Option<Changes>>,
 ) -> io::Result<Duration> {
-    let Some(changes) = read_changes(&read(list).ok_or_else(broken)?.index) else {
+    let Some(changes) = read_changes(&read(list).ok_or_else(broken)?.index)? else {
         return Ok(Duration::ZERO);
     };
     let asked = Instant::now();
@@ -1630,6 +1734,11 @@ fn rebuild(source: &mut Source, pass: Pass, live: &Live, swaps: &Sender<Job>, no
             });
         }
         Ok(None) => {}
+        // A drive was ejected while its changed folders were read: they are read again once
+        // the list has let go of it, which this eject brings next.
+        Err(error) if error.kind() == io::ErrorKind::Interrupted && !whole => {
+            live.plan(|plan| plan.reread(pass.changes, pass.mark));
+        }
         Err(error) => {
             let newest = live.newest.lock().unwrap().clone();
             let broken = newest.is_some_and(|(_, list)| list.is_poisoned());
@@ -1881,7 +1990,10 @@ pub unsafe extern "C" fn tl_changed(
                 let changed: Vec<PathBuf> = paths
                     .into_iter()
                     .filter(|path| {
-                        everything || scope.in_scope(path) || !holds(&scope, &list, path)
+                        live.drive_read(|drive| path.starts_with(drive))
+                            .is_some_and(|_read| {
+                                everything || scope.in_scope(path) || !holds(&scope, &list, path)
+                            })
                     })
                     .map(Path::to_path_buf)
                     .collect();
@@ -1909,7 +2021,7 @@ pub unsafe extern "C" fn tl_changed(
                 live.wake.notify_all();
                 return 1;
             }
-            (Some(paths), Some((scope, list))) => match missed(&scope, &list, &paths) {
+            (Some(paths), Some((scope, list))) => match missed(live, &scope, &list, &paths) {
                 Missed::Nothing => false,
                 Missed::More => true,
                 // Read again in place, without the rest of the home folder.
@@ -2049,6 +2161,8 @@ pub unsafe extern "C" fn tl_volume_added(
             return 0;
         };
         let mut plan = core.live.plan.lock().unwrap();
+        // Mounted again, as after an eject refused.
+        plan.leaving.retain(|drive| *drive != volume);
         if plan.stopped || plan.volumes.contains(&volume) {
             return 0;
         }
@@ -2067,8 +2181,9 @@ pub unsafe extern "C" fn tl_volume_added(
 /// newest list drops it and everything on it without the home folder being read again;
 /// `TL_EVENT_REBUILT` follows. Call it once macOS says the volume will unmount, or has
 /// unmounted without warning: `tl_watched` stops naming it at once, even for a list read
-/// before, and a scan of it under way stops and has closed every folder on it by the time this
-/// returns, while a scan not started yet never starts. Returns 1 when that work was queued, else 0, as
+/// before, and a scan of it, a read of folders changed on it or a text search inside it under
+/// way stops and has closed every folder and file on it by the time this returns, while none
+/// starts until `tl_volume_added` tells of it again. Returns 1 when that work was queued, else 0, as
 /// for a volume the core was never told of. `mark` is as for `tl_changed`. Safe to call from
 /// any thread, and never touches the volume.
 ///
@@ -2086,22 +2201,26 @@ pub unsafe extern "C" fn tl_volume_removed(
         let Some(path) = (unsafe { path_from(path, len) }) else {
             return 0;
         };
-        let mut plan = core.live.plan.lock().unwrap();
+        let live = &core.live;
+        let mut plan = live.plan.lock().unwrap();
         if !plan.forget(path) {
             return 0;
         }
-        core.live.ejected.fetch_add(1, Ordering::Relaxed);
-        let mut watched = core.live.watched.lock().unwrap();
+        if !plan.leaving.iter().any(|drive| drive == path) {
+            plan.leaving.push(path.to_path_buf());
+        }
+        live.ejected.fetch_add(1, Ordering::Relaxed);
+        let mut watched = live.watched.lock().unwrap();
         watched.0.retain(|(held, _)| Path::new(held) != path);
         drop(watched);
-        if plan.stopped || !plan.granted {
-            return 0;
+        let queued = !plan.stopped && plan.granted;
+        if queued {
+            plan.patch(mark);
+            live.wake.notify_all();
         }
-        plan.patch(mark);
-        drop(plan);
-        core.live.wake.notify_all();
-        drop(core.live.reading.lock().unwrap());
-        1
+        let reading = |plan: &mut Plan| plan.reading.iter().any(|drive| drive == path);
+        drop(live.freed.wait_while(plan, reading).unwrap());
+        u32::from(queued)
     })
 }
 
@@ -2352,19 +2471,20 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 impl Text {
-    fn search(&self) -> &TextSearch {
+    fn search(&self, live: &Arc<Live>) -> &TextSearch {
         self.started.get_or_init(|| {
             let grep = Arc::new(Grep::default());
             let waiting = Arc::default();
             let (jobs, inbox) = mpsc::channel();
             let worker = {
-                let (grep, waiting) = (Arc::clone(&grep), Arc::clone(&waiting));
+                let (grep, waiting, live) =
+                    (Arc::clone(&grep), Arc::clone(&waiting), Arc::clone(live));
                 let (home, notify) = (self.home.clone(), self.notify);
                 thread::Builder::new()
                     .name("text".into())
                     .spawn(move || {
                         find_loop(&grep, &inbox, &waiting, notify, |find| {
-                            find_in(&grep, find, &waiting, &home, notify)
+                            find_in(&grep, find, &waiting, &home, &live, notify)
                         });
                     })
                     .expect("start the text search worker")
@@ -2425,12 +2545,14 @@ fn find_loop(
 }
 
 /// Lists each folder as the name list would, at the time of the search, then searches it, until
-/// `LINES` lines in all. `None` once a newer search or a cancel took over.
+/// `LINES` lines in all. A folder on a drive being ejected counts as unreadable, and one ejected
+/// midway is searched no further. `None` once a newer search or a cancel took over.
 fn find_in(
     grep: &Grep,
     find: &Find,
     waiting: &Mutex<Waiting>,
     home: &Path,
+    live: &Live,
     notify: Notify,
 ) -> Option<Report> {
     if !argus_grep::can_search(&find.query) {
@@ -2447,20 +2569,29 @@ fn find_in(
         if limit == 0 || stale() {
             break;
         }
+        let touches = |drive: &Path| folder.starts_with(drive) || drive.starts_with(&folder);
+        let Some(drive) = live.drive_read(touches) else {
+            report.unreadable += 1;
+            continue;
+        };
+        let ejected = || drive.ejected();
         // Listing a home folder takes all cores for about 0.1 s: on the text search threads, it
         // leaves name searches alone, and a newer keystroke stops it.
         let scan = grep.install(|| {
-            argus_core::scan_until(&folder, &home, Clutter::Skip, &ignore, find.access, &stale)
+            let stop = || stale() || ejected();
+            argus_core::scan_until(&folder, &home, Clutter::Skip, &ignore, find.access, &stop)
         });
         if stale() {
             return None;
         }
-        let Ok(scan) = scan else {
+        let Some(scan) = scan.ok().filter(|_| !ejected()) else {
             report.unreadable += 1;
             continue;
         };
         let add = |found: Found<'_>| add(waiting, grep, number, &found, notify);
-        report = report + grep.search(&scan.index, &find.query, find.ticket, limit, add)?;
+        let query = &find.query;
+        report =
+            report + grep.search_until(&scan.index, query, find.ticket, limit, &ejected, add)?;
     }
     (!stale()).then_some(report)
 }
@@ -2562,7 +2693,7 @@ pub unsafe extern "C" fn tl_grep_submit(
         } else {
             Access::Limited
         };
-        let search = text.search();
+        let search = text.search(&core.live);
         let ticket = search.grep.ticket();
         let find = Find {
             ticket,
@@ -4363,6 +4494,69 @@ mod tests {
         assert_eq!(found(&core, &events, "dunes"), ["dunes.jpg"]);
     }
 
+    fn reading(core: &Core, drive: &Path) -> bool {
+        let live = unsafe { &(*core.0).live };
+        live.plan
+            .lock()
+            .unwrap()
+            .reading
+            .iter()
+            .any(|held| held == drive)
+    }
+
+    /// Without sleeping, so a moment that passes quickly is still caught.
+    fn until_caught(what: &str, done: impl Fn() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !done() {
+            assert!(Instant::now() < deadline, "never caught {what}");
+        }
+    }
+
+    /// The files and folders this process holds open inside `folder`, as the unmount macOS
+    /// starts once an eject is approved would find them.
+    #[cfg(target_os = "macos")]
+    fn open_inside(folder: &Path) -> Vec<PathBuf> {
+        unsafe extern "C" {
+            fn fcntl(fd: i32, cmd: i32, ...) -> i32;
+        }
+        const F_GETPATH: i32 = 50;
+        let open: Vec<i32> = std::fs::read_dir("/dev/fd")
+            .unwrap()
+            .flatten()
+            .filter_map(|entry| entry.file_name().to_str()?.parse().ok())
+            .collect();
+        open.into_iter()
+            .filter_map(|fd| {
+                let mut path = [0u8; 1024];
+                if unsafe { fcntl(fd, F_GETPATH, path.as_mut_ptr()) } != 0 {
+                    return None;
+                }
+                let path = std::ffi::CStr::from_bytes_until_nul(&path).ok()?;
+                Some(PathBuf::from(path.to_str().ok()?))
+            })
+            .filter(|path| path.starts_with(folder))
+            .collect()
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn open_inside(_: &Path) -> Vec<PathBuf> {
+        Vec::new()
+    }
+
+    /// A home folder and a drive in one folder, the drive first, so a text search of both
+    /// reads the drive first. The core knows of the drive and has read it.
+    fn home_beside_drive(events: &Events) -> (Core, tempfile::TempDir, [PathBuf; 2]) {
+        let (dir, root) = home_with(&["drive/photos/beach.jpg", "home/notes/a.txt"]);
+        let (drive, home) = (root.join("drive"), root.join("home"));
+        let core = scan(home.to_str().unwrap(), 1, events);
+        events.wait_for_event(TL_EVENT_INDEXED);
+        unsafe { (*core.0).judge = Some(any_folder) };
+        assert_eq!(mounted(&core, &drive, 2), 1);
+        // Home, notes and a.txt, then the drive, photos and the beach.
+        assert_eq!(events.wait_for_rebuilt(1), 6);
+        (core, dir, [drive, home])
+    }
+
     #[test]
     fn a_volume_taken_out_mid_scan_is_let_go_of_before_the_call_returns() {
         let events = Events::default();
@@ -4370,22 +4564,80 @@ mod tests {
         let folders: Vec<String> = (0..20_000).map(|n| format!("f{}/g{n}/", n % 100)).collect();
         let folders: Vec<&str> = folders.iter().map(String::as_str).collect();
         let (_big_dir, big) = home_with(&folders);
-        let live = unsafe { &(*core.0).live };
         assert_eq!(mounted(&core, &big, 5), 1);
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while live.reading.try_lock().is_ok() {
-            assert!(
-                Instant::now() < deadline,
-                "never caught the volume being read"
-            );
-        }
+        until_caught("the volume being read", || reading(&core, &big));
         assert_eq!(unmounted(&core, &big, 6), 1);
-        assert!(
-            live.reading.try_lock().is_ok(),
-            "the scan still reads the volume"
-        );
+        assert!(!reading(&core, &big), "the scan still reads the volume");
+        assert_eq!(open_inside(&big), Vec::<PathBuf>::new());
         let big_text = big.to_string_lossy().into_owned();
         assert!(!watched_inside(&core).contains(&big_text));
+    }
+
+    #[test]
+    fn a_folder_copied_onto_a_drive_ejected_mid_read_is_let_go_of_before_the_call_returns() {
+        let events = Events::default();
+        let (core, _dir, [drive, _]) = home_beside_drive(&events);
+        for n in 0..20_000 {
+            std::fs::create_dir_all(drive.join(format!("copied/f{}/g{n}", n % 100))).unwrap();
+        }
+        assert_eq!(changed_at(&core, &[&drive], 0, 3), 1);
+        // Into the walk of the new folder, not just the look at the drive's top folder.
+        let copied = drive.join("copied");
+        let walking = || !cfg!(target_os = "macos") || !open_inside(&copied).is_empty();
+        until_caught("the copied folder being walked", || {
+            reading(&core, &drive) && walking()
+        });
+        let started = Instant::now();
+        assert_eq!(unmounted(&core, &drive, 4), 1);
+        let took = started.elapsed();
+        assert!(!reading(&core, &drive), "the update still reads the drive");
+        assert_eq!(open_inside(&drive), Vec::<PathBuf>::new());
+        eprintln!("MEASURE let go of mid-update in {took:?}");
+        // The changes are read again with the drive gone, so the next list holds only home.
+        assert_eq!(events.wait_for_rebuilt(2), 3);
+        assert!(found(&core, &events, "beach").is_empty());
+        assert!(!reading(&core, &drive));
+    }
+
+    #[test]
+    fn a_text_search_inside_a_drive_ejected_midway_lets_go_of_it_before_the_call_returns() {
+        let events = Events::default();
+        let (core, _dir, [drive, home]) = home_beside_drive(&events);
+        for n in 0..20_000 {
+            let text = if n % 400 == 0 {
+                "budget\n".to_owned()
+            } else {
+                "nothing to see here\n".repeat(40)
+            };
+            write(&drive.join(format!("text/{}/{n}.txt", n % 100)), text);
+        }
+        write(&home.join("notes/plan.md"), "budget at home\n");
+        let ticket = grep(&core, &[&home, &drive], "budget");
+        // Lines from the drive, so its files are being read.
+        events.wait_for(TL_EVENT_LINES, ticket);
+        assert!(reading(&core, &drive));
+        let started = Instant::now();
+        assert_eq!(unmounted(&core, &drive, 3), 1);
+        let took = started.elapsed();
+        assert!(!reading(&core, &drive), "the search still reads the drive");
+        assert_eq!(open_inside(&drive), Vec::<PathBuf>::new());
+        let (lines, report) = grep_all(&core, &events, ticket);
+        eprintln!(
+            "MEASURE let go of mid-search in {took:?}, {} of 20,001 files searched",
+            report.files_searched
+        );
+        assert!(report.files_searched < 20_001, "{report:?}");
+        // The search goes on in the folders on other drives.
+        let at_home = home.join("notes/plan.md").to_string_lossy().into_owned();
+        assert!(lines.iter().any(|(path, ..)| *path == at_home), "{lines:?}");
+
+        // Nothing reads the drive again until it is mounted again.
+        let again = grep(&core, &[&drive], "budget");
+        let (lines, report) = grep_all(&core, &events, again);
+        assert_eq!((lines.len(), report.unreadable), (0, 1));
+        assert_eq!(mounted(&core, &drive, 4), 1);
+        let again = grep(&core, &[&drive], "budget");
+        assert_eq!(grep_all(&core, &events, again).0.len(), 50);
     }
 
     #[test]
