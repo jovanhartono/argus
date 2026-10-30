@@ -213,7 +213,7 @@ footer { border-top: 0.5px solid var(--line); margin-top: 36px; padding-top: 20p
     <table>
       <thead><tr><th>#</th><th>Question</th><th>Decided</th><th>Not chosen</th></tr></thead>
       <tbody>
-        <tr><td class="n">1</td><td>Index the text, or read it live</td><td>Read the files live on every search, in folders you choose</td><td>A text index: disk and memory for every word of every file, and kept in step with every save. An optional per-folder index stays in v2</td></tr>
+        <tr><td class="n">1</td><td>Index the text, or read it live</td><td>Read the files live on each <kbd>⌘</kbd> <kbd>T</kbd> search (decision 9), in folders you choose</td><td>A text index: disk and memory for every word of every file, and kept in step with every save. An optional per-folder index stays in v2</td></tr>
         <tr><td class="n">2</td><td>Which folders by default</td><td>None until you add one in Index Health</td><td>The whole home folder: 3.4-5.3 s to read it once, on every search</td></tr>
         <tr><td class="n">3</td><td>Matching library</td><td>ripgrep's file reader with a small plain-text matcher: 1.79 MB for <span class="mono">tl</span> per chip, at the same speed</td><td>ripgrep's full pattern library: 3.36 MB per chip, for patterns nobody types into a launcher</td></tr>
         <tr><td class="n">4</td><td>Thread priority</td><td>macOS's lowest, background: names stay at 2.5 ms for 95% while text runs</td><td>One level up, utility: names slow to 10.8 ms. Utility with 2 threads: 6.5 ms. The cost: text search is about twice as slow over many tiny files, and a lower priority stops a replaced search later: 8-24 ms at utility on a busy Mac instead of 0.3 ms, not yet measured at background</td></tr>

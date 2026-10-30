@@ -2459,6 +2459,7 @@ final class SearchPanelTests: XCTestCase {
         defer { window.hide() }
         try await type("budget", in: window)
         window.toggleText(nil)
+        XCTAssertEqual(window.textTicket, 0, "waits until the names are drawn")
         try await until { window.answered != 0 && window.hits.count == 1 && window.textTicket == 0 }
     }
 
