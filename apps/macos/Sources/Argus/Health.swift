@@ -1,4 +1,5 @@
 import AppKit
+import KeyboardShortcuts
 
 /// How the list in use is doing, as `tl_health` tells it.
 struct Health: Equatable {
@@ -29,7 +30,7 @@ struct HealthFormat {
     func scan(_ health: Health, now: Date) -> String {
         guard let at = health.scannedAt else {
             if health.entries == 0 && health.stopped { return "Didn’t finish" }
-            return health.busy && health.entries == 0 ? "Under way" : "Not since launch; the saved list opened instead"
+            return health.busy && health.entries == 0 ? "Under way" : "Before Argus last started"
         }
         return "\(ago(at, now: now)), took \(duration(ms: health.scanMs))"
     }
@@ -40,18 +41,20 @@ struct HealthFormat {
 
     func state(_ health: Health) -> String {
         if health.stopped { return "Stopped: quit and reopen Argus" }
-        if health.busy { return "Updating…" }
+        // With Index everything on, ~/Library changes every few seconds; those small patches
+        // aren't worth a word.
+        if health.building { return "Building the index…" }
         return health.behind ? "Missing a change: rebuild the index" : "Up to date"
     }
 
     func access(_ fullDisk: Bool) -> String {
-        fullDisk ? "On" : "Off: Desktop, Documents, Downloads and cloud drives are left out"
+        fullDisk ? "On" : "Off: Desktop, Documents, Downloads and external drives are left out"
     }
 
     /// A whole home folder held 2,478,045 entries on the Mac this was measured on.
     func everything(_ fullDisk: Bool) -> String {
         let count = 2_500_000.formatted(.number.notation(.compactName).locale(locale))
-        let what = "Includes Library and clutter, about \(count) items."
+        let what = "Includes Library, clutter and your skipped folders, about \(count) items."
         return fullDisk ? what : what + " Needs Full Disk Access."
     }
 
@@ -92,12 +95,40 @@ final class HealthPanel: NSPanel {
     }
 }
 
-/// ⌘,'s window: how many entries the list holds, when it was last read in full and last
-/// changed, whether Argus may read every folder, a button to build the list again, the
-/// switches to list everything and cloud drives, and the folders whose files' text a search
-/// looks inside.
+/// Delete removes the chosen folders, as in any macOS list with + and − under it.
+final class FolderList: NSTableView {
+    var onDelete: () -> Void = {}
+
+    override func keyDown(with event: NSEvent) {
+        let delete = event.specialKey == .delete || event.specialKey == .deleteForward
+        guard delete, !selectedRowIndexes.isEmpty else { return super.keyDown(with: event) }
+        onDelete()
+    }
+}
+
+/// ⌘,'s Settings window: how many entries the list holds, when it was last read in full and
+/// last changed, whether Argus may read every folder, a button to build the list again, the
+/// switches to list everything and cloud drives, the folders whose files' text a search looks
+/// inside, the ignore list, both hotkeys, Login Items and Quit.
 @MainActor
 final class HealthWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, NSTableViewDelegate {
+    static let loginItems = URL(string: "x-apple.systempreferences:com.apple.LoginItems-Settings.extension")!
+    /// The core reads it from this place in your home folder (argus-core's ignore.rs).
+    static let ignoreList = URL(fileURLWithPath: NSHomeDirectory() + "/.config/argus/ignore")
+    static let ignoreExample = """
+        # Folders Argus leaves out of search, one per line. Lines starting with # are notes.
+        #
+        # A name leaves out every folder with that name:
+        # build
+        #
+        # A path leaves out that one folder:
+        # ~/Downloads/old
+        #
+        # ! brings back a folder Argus leaves out:
+        # !~/.config
+
+        """
+
     let panel = HealthPanel(
         contentRect: NSRect(x: 0, y: 0, width: 460, height: 200),
         styleMask: [.titled, .closable, .nonactivatingPanel], backing: .buffered, defer: true)
@@ -106,17 +137,22 @@ final class HealthWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, NST
     let changed = NSTextField(labelWithString: "")
     let access = NSTextField(wrappingLabelWithString: "")
     let state = NSTextField(labelWithString: "")
-    let settings = KeyButton(title: "Open Settings", target: nil, action: nil)
+    let settings = KeyButton(title: "Open System Settings", target: nil, action: nil)
     let rebuild = KeyButton(title: "Rebuild Index", target: nil, action: nil)
     let everything = NSButton(checkboxWithTitle: "Index everything", target: nil, action: nil)
-    /// Spins while a whole new list is built, as after flipping the switch: 10 to 20 s.
+    /// Spins beside Status while a whole new list is built, as after flipping a switch: 10 to 20 s.
     let progress = NSProgressIndicator()
     let everythingHint = NSTextField(wrappingLabelWithString: "")
     let cloud = NSButton(checkboxWithTitle: "Include iCloud Drive and cloud storage", target: nil, action: nil)
     let cloudHint = NSTextField(wrappingLabelWithString: "")
     let grid = NSGridView()
-    let folderList = NSTableView()
+    let folderList = FolderList()
     let noFolders = NSTextField(labelWithString: "No folders yet")
+    let editIgnore = KeyButton(title: "Edit…", target: nil, action: nil)
+    let windowKeys = KeyboardShortcuts.RecorderCocoa(for: .toggleWindow)
+    let finderKeys = KeyboardShortcuts.RecorderCocoa(for: .searchFinderFolder)
+    let openLoginItems = KeyButton(title: "Open Login Items…", target: nil, action: nil)
+    let quit = KeyButton(title: "Quit Argus", target: nil, action: nil)
     let folderButtons = NSSegmentedControl(
         images: [NSImage(named: NSImage.addTemplateName)!, NSImage(named: NSImage.removeTemplateName)!],
         trackingMode: .momentary, target: nil, action: nil)
@@ -131,10 +167,13 @@ final class HealthWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, NST
     private let isCloud: () -> Bool
     private let onCloud: (Bool) -> Void
     private let stage: any Stage
+    private let ignoreList: URL
+    private let onQuit: () -> Void
     private let format: HealthFormat
     private let tick: TimeInterval
     private let dates = DetailsFormat()
     private var ticking: Timer?
+    private var fitted = false
     private(set) var shown = false
     private(set) var health = Health()
 
@@ -142,7 +181,8 @@ final class HealthWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, NST
         read: @escaping () -> Health, hasAccess: @escaping () -> Bool, rebuild: @escaping () -> Void,
         stage: any Stage, folders: TextFolders = TextFolders(), everything: @escaping () -> Bool = { false },
         indexEverything: @escaping (Bool) -> Void = { _ in }, cloud: @escaping () -> Bool = { false },
-        indexCloud: @escaping (Bool) -> Void = { _ in }, format: HealthFormat = HealthFormat(),
+        indexCloud: @escaping (Bool) -> Void = { _ in }, ignoreList: URL = HealthWindow.ignoreList,
+        quit: @escaping () -> Void = { NSApp.terminate(nil) }, format: HealthFormat = HealthFormat(),
         tick: TimeInterval = 1
     ) {
         self.folders = folders
@@ -154,6 +194,8 @@ final class HealthWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, NST
         isCloud = cloud
         onCloud = indexCloud
         self.stage = stage
+        self.ignoreList = ignoreList
+        onQuit = quit
         self.format = format
         self.tick = tick
         super.init()
@@ -162,34 +204,47 @@ final class HealthWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, NST
 
     private func build() {
         let label = { (text: String) -> NSView in NSTextField(labelWithString: text) }
+        let status = NSStackView(views: [state, progress])
+        status.spacing = 6
+        let ignorePath = NSTextField(labelWithString: (ignoreList.path as NSString).abbreviatingWithTildeInPath)
+        ignorePath.lineBreakMode = .byTruncatingMiddle
+        let ignoreLine = NSStackView(views: [ignorePath, editIgnore])
+        ignoreLine.spacing = 8
         let rows: [[NSView]] = [
             [label("Entries:"), entries],
             [label("Last full scan:"), scanned],
             [label("Last change applied:"), changed],
-            [label("Status:"), state],
+            [label("Status:"), status],
             [label("Full Disk Access:"), access],
             [NSGridCell.emptyContentView, settings],
             [NSGridCell.emptyContentView, rebuild],
             [NSGridCell.emptyContentView, everythingBox()],
             [NSGridCell.emptyContentView, cloudBox()],
             [label("Search inside files in:"), folderBox()],
+            [label("Skipped folders:"), ignoreLine],
+            [label("Open Argus:"), windowKeys],
+            [label("Search Finder’s folder:"), finderKeys],
+            [label("Start at login:"), openLoginItems],
+            [NSGridCell.emptyContentView, quit],
         ]
         for row in rows { grid.addRow(with: row) }
-        grid.row(at: 7).topPadding = 12
-        grid.row(at: 9).topPadding = 12
-        panel.title = "Index Health"
+        for row in [7, 9, 10, 11, 13, 14] { grid.row(at: row).topPadding = 12 }
+        panel.title = "Settings"
         panel.level = .floating
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         panel.hidesOnDeactivate = false
         panel.isReleasedWhenClosed = false
         panel.delegate = self
         access.preferredMaxLayoutWidth = 260
-        for button in [settings, rebuild] {
+        for button in [settings, rebuild, editIgnore, openLoginItems, quit] {
             button.target = self
             button.bezelStyle = .push
         }
         settings.action = #selector(openSettings(_:))
         rebuild.action = #selector(rebuildIndex(_:))
+        editIgnore.action = #selector(editIgnoreList(_:))
+        openLoginItems.action = #selector(openLoginItems(_:))
+        quit.action = #selector(quitArgus(_:))
         grid.column(at: 0).xPlacement = .trailing
         grid.rowAlignment = .firstBaseline
         grid.rowSpacing = 8
@@ -206,13 +261,14 @@ final class HealthWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, NST
             content.widthAnchor.constraint(equalToConstant: 460),
         ])
         panel.contentView = content
-        panel.initialFirstResponder = rebuild
-        rebuild.nextKeyView = settings
-        settings.nextKeyView = everything
-        everything.nextKeyView = cloud
-        cloud.nextKeyView = folderList
-        folderList.nextKeyView = folderButtons
-        folderButtons.nextKeyView = rebuild
+        // Focus starts on the folder list, where Space does nothing; on Rebuild Index it started a
+        // 10 to 20 s rebuild.
+        panel.initialFirstResponder = folderList
+        let order: [NSView] = [
+            settings, rebuild, everything, cloud, folderList, folderButtons, editIgnore, windowKeys, finderKeys,
+            openLoginItems, quit,
+        ]
+        for (at, view) in order.enumerated() { view.nextKeyView = order[(at + 1) % order.count] }
         panel.setContentSize(content.fittingSize)
         panel.center()
     }
@@ -227,9 +283,7 @@ final class HealthWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, NST
         everythingHint.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
         everythingHint.textColor = .secondaryLabelColor
         everythingHint.preferredMaxLayoutWidth = 260
-        let line = NSStackView(views: [everything, progress])
-        line.spacing = 6
-        let box = NSStackView(views: [line, everythingHint])
+        let box = NSStackView(views: [everything, everythingHint])
         box.orientation = .vertical
         box.alignment = .leading
         box.spacing = 2
@@ -265,20 +319,24 @@ final class HealthWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, NST
         folderList.addTableColumn(column)
         folderList.headerView = nil
         folderList.style = .plain
-        folderList.usesAlternatingRowBackgroundColors = true
         folderList.allowsMultipleSelection = true
         folderList.dataSource = self
         folderList.delegate = self
+        folderList.onDelete = { [weak self] in self?.removeFolders() }
         folderList.setAccessibilityLabel("Folders searched inside")
         let scroll = NSScrollView()
         scroll.documentView = folderList
         scroll.hasVerticalScroller = true
         scroll.autohidesScrollers = true
         scroll.borderType = .bezelBorder
+        scroll.translatesAutoresizingMaskIntoConstraints = false
         noFolders.textColor = .secondaryLabelColor
         noFolders.translatesAutoresizingMaskIntoConstraints = false
-        noFolders.isHidden = !folders.paths.isEmpty
-        scroll.addSubview(noFolders)
+        showEmpty()
+        // A scroll view places its own subviews, so the note sits over it in a plain view instead.
+        let list = NSView()
+        list.addSubview(scroll)
+        list.addSubview(noFolders)
         folderButtons.segmentStyle = .smallSquare
         folderButtons.target = self
         folderButtons.action = #selector(changeFolders(_:))
@@ -289,18 +347,28 @@ final class HealthWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, NST
         hint.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
         hint.textColor = .secondaryLabelColor
         hint.preferredMaxLayoutWidth = 260
-        let box = NSStackView(views: [scroll, folderButtons, hint])
+        let box = NSStackView(views: [list, folderButtons, hint])
         box.orientation = .vertical
         box.alignment = .leading
         box.spacing = 0
         box.setCustomSpacing(6, after: folderButtons)
         NSLayoutConstraint.activate([
-            scroll.widthAnchor.constraint(equalToConstant: 260),
-            scroll.heightAnchor.constraint(equalToConstant: 88),
-            noFolders.centerXAnchor.constraint(equalTo: scroll.centerXAnchor),
-            noFolders.centerYAnchor.constraint(equalTo: scroll.centerYAnchor),
+            list.widthAnchor.constraint(equalToConstant: 260),
+            list.heightAnchor.constraint(equalToConstant: 88),
+            scroll.topAnchor.constraint(equalTo: list.topAnchor),
+            scroll.bottomAnchor.constraint(equalTo: list.bottomAnchor),
+            scroll.leadingAnchor.constraint(equalTo: list.leadingAnchor),
+            scroll.trailingAnchor.constraint(equalTo: list.trailingAnchor),
+            noFolders.centerXAnchor.constraint(equalTo: list.centerXAnchor),
+            noFolders.centerYAnchor.constraint(equalTo: list.centerYAnchor),
         ])
         return box
+    }
+
+    /// Stripes under "No folders yet" would read as rows.
+    private func showEmpty() {
+        noFolders.isHidden = !folders.paths.isEmpty
+        folderList.usesAlternatingRowBackgroundColors = !folders.paths.isEmpty
     }
 
     @objc func changeFolders(_ sender: Any?) {
@@ -327,7 +395,7 @@ final class HealthWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, NST
 
     private func reloadFolders() {
         folderList.reloadData()
-        noFolders.isHidden = !folders.paths.isEmpty
+        showEmpty()
     }
 
     func numberOfRows(in tableView: NSTableView) -> Int {
@@ -348,9 +416,15 @@ final class HealthWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, NST
     func show() {
         shown = true
         refresh()
+        // Built before any words were set, so the first show fits it to them; later, only the
+        // Open System Settings row changes its height.
+        if !fitted {
+            fitted = true
+            fitKeepingTop()
+        }
         stage.bringForward(panel)
         stage.makeKey(panel)
-        panel.makeFirstResponder(rebuild)
+        panel.makeFirstResponder(folderList)
         // The ages tick on while it shows, and a rebuild with no new list still ends.
         ticking?.invalidate()
         ticking = Timer.scheduledTimer(withTimeInterval: tick, repeats: true) { [weak self] _ in
@@ -405,7 +479,7 @@ final class HealthWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, NST
         fitKeepingTop()
     }
 
-    /// The Open Settings row comes and goes; the title bar stays where it was.
+    /// The Open System Settings row comes and goes; the title bar stays where it was.
     private func fitKeepingTop() {
         guard let content = panel.contentView else { return }
         var frame = panel.frameRect(forContentRect: NSRect(origin: .zero, size: content.fittingSize))
@@ -421,6 +495,28 @@ final class HealthWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, NST
     @objc private func openSettings(_ sender: Any?) {
         hide()
         stage.open(Notice.needsAccess.settings)
+    }
+
+    /// A first-time user has no list yet, so they get one that explains itself.
+    @objc func editIgnoreList(_ sender: Any?) {
+        let files = FileManager.default
+        if !files.fileExists(atPath: ignoreList.path) {
+            try? files.createDirectory(at: ignoreList.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try? Data(Self.ignoreExample.utf8).write(to: ignoreList)
+        }
+        hide()
+        stage.openAsText(ignoreList)
+    }
+
+    /// Adding Argus there stays by hand (M2 decision 8); this only saves finding the page.
+    @objc func openLoginItems(_ sender: Any?) {
+        hide()
+        stage.open(Self.loginItems)
+    }
+
+    /// With no Dock icon or menu bar icon, this and ⌘Q are the only ways to quit.
+    @objc func quitArgus(_ sender: Any?) {
+        onQuit()
     }
 
     func windowShouldClose(_ sender: NSWindow) -> Bool {

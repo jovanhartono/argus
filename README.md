@@ -38,10 +38,12 @@ Argus isn't notarized by Apple, so macOS asks you once before it opens:
 2. Open Argus. macOS says it can't check it for malware; click Done.
 3. Open System Settings → Privacy & Security, scroll down and click Open Anyway.
 4. Click Open Anyway again and enter your Mac password.
-5. Press ⌘⇧Space. Until Argus has Full Disk Access, it leaves out Desktop, Documents, Downloads and external drives, and the window says so. Click Open Settings, switch Argus on under Full Disk Access, and click Quit & Reopen when macOS asks.
-6. iCloud Drive, Dropbox and other cloud drives stay out of search until you press ⌘, and turn on Include iCloud Drive and cloud storage. The switch needs Full Disk Access first.
+5. The search window opens; after that, ⌘⇧Space brings it up. Until Argus has Full Disk Access, it leaves out Desktop, Documents, Downloads and external drives, and the window says so. Click Open System Settings, switch Argus on under Full Disk Access, and click Quit & Reopen when macOS asks.
+6. iCloud Drive, Dropbox and other cloud drives stay out of search until you press ⌘, to open Settings and turn on Include iCloud Drive and cloud storage. The switch needs Full Disk Access first.
 
-To start Argus when you log in, open System Settings → General → Login Items & Extensions, click + under Open at Login, and choose Argus in Applications.
+Opening Argus again from Applications while it runs brings up the search window too. Settings (⌘, in the search window) also changes both hotkeys, opens the list of folders Argus skips (`~/.config/argus/ignore`; Edit… makes one with examples if you have none), and has a Quit Argus button.
+
+To start Argus when you log in, open System Settings → General → Login Items & Extensions (Open Login Items… in Argus's Settings goes straight there), click + under Open at Login, and choose Argus in Applications. Started at login, Argus stays out of sight until you press the hotkey.
 
 ## Update to a new release
 

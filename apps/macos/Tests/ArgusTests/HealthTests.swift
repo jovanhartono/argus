@@ -1,4 +1,5 @@
 import AppKit
+import KeyboardShortcuts
 import XCTest
 
 @testable import Argus
@@ -46,7 +47,7 @@ final class HealthFormatTests: XCTestCase {
         XCTAssertEqual(english.scan(fresh, now: now), "Just now, took 120 ms")
         XCTAssertEqual(english.scan(Health(busy: true), now: now), "Under way")
         let opened = Health(entries: 48_127)
-        XCTAssertEqual(english.scan(opened, now: now), "Not since launch; the saved list opened instead")
+        XCTAssertEqual(english.scan(opened, now: now), "Before Argus last started")
         // Still the saved list while its rebuild runs.
         XCTAssertEqual(english.scan(Health(entries: 48_127, busy: true), now: now), english.scan(opened, now: now))
         XCTAssertEqual(english.scan(Health(stopped: true), now: now), "Didn’t finish", "the first scan failed")
@@ -58,16 +59,21 @@ final class HealthFormatTests: XCTestCase {
         XCTAssertEqual(english.change(Health(), now: now), "None since launch")
         XCTAssertEqual(english.change(Health(changedAt: now.addingTimeInterval(-120)), now: now), "2 minutes ago")
         XCTAssertEqual(english.state(Health()), "Up to date")
-        XCTAssertEqual(english.state(Health(busy: true)), "Updating…")
+        XCTAssertEqual(english.state(Health(busy: true)), "Up to date", "a small patch says nothing")
+        XCTAssertEqual(english.state(Health(busy: true, building: true)), "Building the index…")
         XCTAssertEqual(english.state(Health(behind: true)), "Missing a change: rebuild the index")
-        XCTAssertEqual(english.state(Health(busy: true, behind: true)), "Updating…", "the rebuild reads it")
-        XCTAssertEqual(english.state(Health(stopped: true)), "Stopped: quit and reopen Argus")
-        XCTAssertEqual(english.state(Health(busy: true, behind: true, stopped: true)), english.state(Health(stopped: true)))
-        XCTAssertEqual(english.access(true), "On")
-        XCTAssertEqual(english.access(false), "Off: Desktop, Documents, Downloads and cloud drives are left out")
-        XCTAssertEqual(english.everything(true), "Includes Library and clutter, about 2.5M items.")
+        XCTAssertEqual(english.state(Health(busy: true, behind: true)), "Missing a change: rebuild the index")
         XCTAssertEqual(
-            english.everything(false), "Includes Library and clutter, about 2.5M items. Needs Full Disk Access.")
+            english.state(Health(busy: true, building: true, behind: true)), "Building the index…", "the rebuild reads it")
+        XCTAssertEqual(english.state(Health(stopped: true)), "Stopped: quit and reopen Argus")
+        XCTAssertEqual(
+            english.state(Health(busy: true, building: true, behind: true, stopped: true)),
+            english.state(Health(stopped: true)))
+        XCTAssertEqual(english.access(true), "On")
+        XCTAssertEqual(english.access(false), "Off: Desktop, Documents, Downloads and external drives are left out")
+        let everything = "Includes Library, clutter and your skipped folders, about 2.5M items."
+        XCTAssertEqual(english.everything(true), everything)
+        XCTAssertEqual(english.everything(false), everything + " Needs Full Disk Access.")
         let german = HealthFormat(locale: Locale(identifier: "de_DE"))
         XCTAssertTrue(german.everything(true).contains("about 2,5"), german.everything(true))
         let cloud = "iCloud Drive, Dropbox, Google Drive, OneDrive and others. Finding a file by name never downloads it."
@@ -105,7 +111,9 @@ final class HealthWindowTests: XCTestCase {
     }
 
     /// The switch as the core takes it: switched back before the new list started, none is built.
-    private func window(tick: TimeInterval = 1) -> HealthWindow {
+    private func window(
+        tick: TimeInterval = 1, ignoreList: URL = HealthWindow.ignoreList, quit: @escaping () -> Void = {}
+    ) -> HealthWindow {
         let (listed, cloudListed) = (everything, cloud)
         return HealthWindow(
             read: { [unowned self] in
@@ -130,7 +138,7 @@ final class HealthWindowTests: XCTestCase {
                 cloud = on
                 (health.busy, health.building) = (on != cloudListed, on != cloudListed)
             },
-            format: HealthFormat(locale: Locale(identifier: "en_US")), tick: tick)
+            ignoreList: ignoreList, quit: quit, format: HealthFormat(locale: Locale(identifier: "en_US")), tick: tick)
     }
 
     func testTheCloudSwitchIsOffAtFirstAndSpinsWhileTheNewListIsBuilt() {
@@ -183,7 +191,7 @@ final class HealthWindowTests: XCTestCase {
         window.everything.performClick(nil)
         XCTAssertEqual(switched, [true])
         XCTAssertFalse(window.progress.isHidden)
-        XCTAssertEqual(window.state.stringValue, "Updating…")
+        XCTAssertEqual(window.state.stringValue, "Building the index…")
         XCTAssertFalse(window.rebuild.isEnabled)
         XCTAssertTrue(window.everything.isEnabled, "it can be switched back")
 
@@ -214,7 +222,14 @@ final class HealthWindowTests: XCTestCase {
         defer { window.hide() }
         XCTAssertTrue(window.progress.isHidden)
         XCTAssertTrue(window.rebuild.isEnabled)
-        XCTAssertEqual(window.state.stringValue, "Updating…")
+        XCTAssertEqual(window.state.stringValue, "Up to date")
+    }
+
+    /// Any whole rebuild spins it, not just Index everything, so it sits beside Status.
+    func testTheSpinnerSitsBesideStatus() {
+        let window = window()
+        XCTAssertTrue(window.progress.superview === window.state.superview)
+        XCTAssertFalse(window.everything.superview?.subviews.contains(window.progress) ?? true)
     }
 
     /// Reading all of ~/Library without access stops on a macOS pop-up for each media library.
@@ -229,7 +244,7 @@ final class HealthWindowTests: XCTestCase {
         fullDisk = true
         window.refresh()
         XCTAssertTrue(window.everything.isEnabled)
-        XCTAssertEqual(window.everythingHint.stringValue, "Includes Library and clutter, about 2.5M items.")
+        XCTAssertFalse(window.everythingHint.stringValue.hasSuffix("Needs Full Disk Access."))
     }
 
     /// Kept on from before access was taken away, or from another Mac.
@@ -258,14 +273,19 @@ final class HealthWindowTests: XCTestCase {
         XCTAssertTrue(window.progress.isHidden)
     }
 
-    func testTabReachesTheSwitches() {
+    func testTabGoesTopToBottomAndRoundAgain() {
         let window = window()
-        XCTAssertTrue(window.settings.nextKeyView === window.everything)
-        XCTAssertTrue(window.everything.nextKeyView === window.cloud)
-        XCTAssertTrue(window.cloud.nextKeyView === window.folderList)
+        let order: [NSView] = [
+            window.settings, window.rebuild, window.everything, window.cloud, window.folderList, window.folderButtons,
+            window.editIgnore, window.windowKeys, window.finderKeys, window.openLoginItems, window.quit,
+            window.settings,
+        ]
+        for (view, next) in zip(order, order.dropFirst()) {
+            XCTAssertTrue(view.nextKeyView === next, "\(view) then \(next)")
+        }
     }
 
-    func testShowingReadsTheCoreAndTakesTheKeysOffStage() {
+    func testShowingReadsTheCoreAndTakesTheKeysOffStage() throws {
         let window = window()
         XCTAssertEqual(reads, 0, "nothing is read before it shows")
         window.show()
@@ -273,7 +293,10 @@ final class HealthWindowTests: XCTestCase {
         XCTAssertEqual(reads, 1)
         XCTAssertEqual(stage.forward, 1)
         XCTAssertTrue(stage.key === window.panel)
-        XCTAssertTrue(window.panel.firstResponder === window.rebuild)
+        XCTAssertEqual(window.panel.title, "Settings")
+        let content = try XCTUnwrap(window.panel.contentView)
+        XCTAssertEqual(content.frame.height, content.fittingSize.height, "Quit Argus at the bottom isn't cut off")
+        XCTAssertTrue(window.panel.firstResponder === window.folderList, "Space mustn't start a rebuild")
         XCTAssertEqual(window.entries.stringValue, "48,127")
         XCTAssertEqual(window.scanned.stringValue, "Just now, took 90 ms")
         XCTAssertNotNil(window.scanned.toolTip)
@@ -281,7 +304,7 @@ final class HealthWindowTests: XCTestCase {
         XCTAssertNil(window.changed.toolTip)
         XCTAssertEqual(window.state.stringValue, "Up to date")
         XCTAssertEqual(window.access.stringValue, "On")
-        XCTAssertTrue(window.grid.row(at: 5).isHidden, "no Open Settings with access")
+        XCTAssertTrue(window.grid.row(at: 5).isHidden, "no Open System Settings with access")
         XCTAssertTrue(window.rebuild.isEnabled)
     }
 
@@ -291,7 +314,7 @@ final class HealthWindowTests: XCTestCase {
         defer { window.hide() }
         window.rebuild.performClick(nil)
         XCTAssertEqual(rebuilds, 1)
-        XCTAssertEqual(window.state.stringValue, "Updating…")
+        XCTAssertEqual(window.state.stringValue, "Building the index…")
         XCTAssertFalse(window.rebuild.isEnabled, "one rebuild at a time")
 
         (health.busy, health.building) = (false, false)
@@ -301,11 +324,12 @@ final class HealthWindowTests: XCTestCase {
         XCTAssertEqual(window.changed.stringValue, "Just now")
     }
 
-    func testWithoutAccessOpenSettingsShowsAndOpensFullDiskAccess() {
+    func testWithoutAccessOpenSystemSettingsShowsAndOpensFullDiskAccess() {
         fullDisk = false
         let window = window()
         window.show()
         XCTAssertFalse(window.grid.row(at: 5).isHidden)
+        XCTAssertEqual(window.settings.title, "Open System Settings", "not Argus's own Settings")
         XCTAssertTrue(window.access.stringValue.hasPrefix("Off"))
         let short = window.panel.frame
         window.settings.performClick(nil)
@@ -384,7 +408,7 @@ final class HealthWindowTests: XCTestCase {
         XCTAssertTrue(window.rebuild.isEnabled)
     }
 
-    /// Each tick sets the same words again; only Open Settings coming or going resizes.
+    /// Each tick sets the same words again; only Open System Settings coming or going resizes.
     func testATickWithNothingNewKeepsTheWindowsFrame() {
         let window = window()
         window.show()
@@ -489,6 +513,99 @@ final class HealthWindowTests: XCTestCase {
         XCTAssertEqual(window.folderList.numberOfRows, 1)
         XCTAssertFalse(window.folderButtons.isEnabled(forSegment: 1))
     }
+
+    func testDeleteAndForwardDeleteRemoveTheChosenFolders() {
+        folders.add(["/a", "/b", "/c"])
+        let window = window()
+        window.show()
+        defer { window.hide() }
+        window.folderList.selectRowIndexes([1], byExtendingSelection: false)
+        window.folderList.keyDown(with: key(NSDeleteCharacter))
+        XCTAssertEqual(folders.paths, ["/a", "/c"])
+        window.folderList.selectRowIndexes([0], byExtendingSelection: false)
+        window.folderList.keyDown(with: key(NSDeleteFunctionKey))
+        XCTAssertEqual(folders.paths, ["/c"])
+        XCTAssertFalse(window.folderButtons.isEnabled(forSegment: 1))
+    }
+
+    func testAnEmptyListSaysSoInItsMiddleWithoutStripes() throws {
+        let window = window()
+        window.show()
+        defer { window.hide() }
+        window.panel.contentView?.layoutSubtreeIfNeeded()
+        let list = try XCTUnwrap(window.noFolders.superview)
+        XCTAssertFalse(list is NSScrollView, "a scroll view would place the note itself")
+        XCTAssertEqual(window.noFolders.frame.midX, list.bounds.midX, accuracy: 1)
+        XCTAssertEqual(window.noFolders.frame.midY, list.bounds.midY, accuracy: 1)
+        XCTAssertFalse(window.folderList.usesAlternatingRowBackgroundColors)
+        stage.chosen = [URL(fileURLWithPath: "/tmp/notes")]
+        window.addFolders()
+        XCTAssertTrue(window.folderList.usesAlternatingRowBackgroundColors)
+    }
+
+    func testEditMakesAnIgnoreListThatExplainsItselfOnceAndOpensIt() throws {
+        let home = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: home) }
+        let list = home.appendingPathComponent(".config/argus/ignore")
+        let window = window(ignoreList: list)
+        window.show()
+        XCTAssertEqual(window.editIgnore.title, "Edit…")
+        window.editIgnore.performClick(nil)
+        XCTAssertEqual(try String(contentsOf: list, encoding: .utf8), HealthWindow.ignoreExample)
+        XCTAssertEqual(stage.openedAsText, [list])
+        XCTAssertFalse(window.shown, "it steps aside for the editor")
+        let rules = HealthWindow.ignoreExample.split(separator: "\n").filter { !$0.hasPrefix("#") }
+        XCTAssertEqual(rules, [], "every example line is a note, so nothing is skipped until you write a rule")
+
+        try Data("work\n".utf8).write(to: list)
+        window.show()
+        defer { window.hide() }
+        window.editIgnore.performClick(nil)
+        XCTAssertEqual(try String(contentsOf: list, encoding: .utf8), "work\n", "your own list is kept")
+        XCTAssertEqual(stage.openedAsText, [list, list])
+    }
+
+    func testTheIgnoreListShowsWhereItLives() {
+        XCTAssertEqual(HealthWindow.ignoreList.path, NSHomeDirectory() + "/.config/argus/ignore")
+    }
+
+    func testOpenLoginItemsOpensThatPageOfSystemSettings() {
+        let window = window()
+        window.show()
+        window.openLoginItems.performClick(nil)
+        XCTAssertFalse(window.shown)
+        XCTAssertEqual(
+            stage.opened.map(\.absoluteString), ["x-apple.systempreferences:com.apple.LoginItems-Settings.extension"])
+    }
+
+    func testQuitArgusQuits() {
+        var quits = 0
+        let window = window(quit: { quits += 1 })
+        window.show()
+        defer { window.hide() }
+        XCTAssertEqual(window.quit.title, "Quit Argus")
+        window.quit.performClick(nil)
+        XCTAssertEqual(quits, 1)
+    }
+
+    /// Changing a hotkey is the way out when another app already uses ⌘⇧Space.
+    func testBothHotkeysCanBeChangedHereButNothingRecordsAtOpen() {
+        let window = window()
+        window.show()
+        defer { window.hide() }
+        XCTAssertEqual(window.windowKeys.shortcutName, .toggleWindow)
+        XCTAssertEqual(window.finderKeys.shortcutName, .searchFinderFolder)
+        XCTAssertTrue(window.panel.firstResponder === window.folderList, "a recorder with the focus would take keys")
+        XCTAssertNil(window.windowKeys.currentEditor())
+        XCTAssertNil(window.finderKeys.currentEditor())
+    }
+
+    private func key(_ code: Int) -> NSEvent {
+        let characters = String(UnicodeScalar(UInt16(code)).map(Character.init)!)
+        return NSEvent.keyEvent(
+            with: .keyDown, location: .zero, modifierFlags: [], timestamp: 0, windowNumber: 0, context: nil,
+            characters: characters, charactersIgnoringModifiers: characters, isARepeat: false, keyCode: 0)!
+    }
 }
 
 /// Holds the open panel's answer until the test gives it.
@@ -506,6 +623,7 @@ private final class HeldStage: Stage {
     func closePreview() {}
     func reloadPreview() {}
     func open(_ url: URL) {}
+    func openAsText(_ url: URL) {}
     func showInFinder(_ url: URL) {}
     func chooseFolders(on window: NSWindow, _ done: @escaping @MainActor ([URL]) -> Void) { self.done = done }
     func handBack() {}

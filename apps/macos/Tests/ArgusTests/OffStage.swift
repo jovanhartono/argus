@@ -65,6 +65,12 @@ final class OffStage: Stage {
         opened.append(url)
     }
 
+    private(set) var openedAsText: [URL] = []
+
+    func openAsText(_ url: URL) {
+        openedAsText.append(url)
+    }
+
     func showInFinder(_ url: URL) {
         shownInFinder.append(url)
     }

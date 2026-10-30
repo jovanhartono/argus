@@ -1198,6 +1198,32 @@ final class SearchPanelTests: XCTestCase {
         let action = #selector(SearchPanel.showHealth(_:))
         XCTAssertFalse(health.responds(to: action))
         XCTAssertTrue(AppDelegate().responds(to: action))
+        let item = keyMenu().items.flatMap { $0.submenu?.items ?? [] }.first { $0.action == action }
+        XCTAssertEqual(item?.title, "Settings…", "⌘, means Settings on a Mac")
+    }
+
+    /// Double-clicking Argus in Applications while it runs used to do nothing at all.
+    func testOpeningArgusAgainShowsTheWindow() async throws {
+        let window = try await opened(access: true)
+        let delegate = AppDelegate()
+        delegate.window = window
+        XCTAssertFalse(delegate.applicationShouldHandleReopen(NSApp, hasVisibleWindows: false))
+        XCTAssertTrue(window.shown)
+        XCTAssertTrue(stage.key === window.panel)
+        window.hide()
+    }
+
+    func testOnlyALoginLaunchStaysHidden() {
+        let open = {
+            NSAppleEventDescriptor(
+                eventClass: AEEventClass(kCoreEventClass), eventID: AEEventID(kAEOpenApplication), targetDescriptor: nil,
+                returnID: AEReturnID(kAutoGenerateReturnID), transactionID: AETransactionID(kAnyTransactionID))
+        }
+        let atLogin = open()
+        atLogin.setParam(NSAppleEventDescriptor(enumCode: OSType(keyAELaunchedAsLogInItem)), forKeyword: keyAEPropData)
+        XCTAssertTrue(AppDelegate.launchedAtLogin(atLogin))
+        XCTAssertFalse(AppDelegate.launchedAtLogin(open()), "opened from Applications or Quit & Reopen")
+        XCTAssertFalse(AppDelegate.launchedAtLogin(nil), "started from a terminal")
     }
 
     func testCommandCommaSwapsTheSearchWindowForTheHealthView() async throws {

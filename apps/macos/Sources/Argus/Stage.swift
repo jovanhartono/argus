@@ -1,5 +1,6 @@
 import AppKit
 import QuickLookUI
+import UniformTypeIdentifiers
 
 /// Everything that reaches the screen or the keyboard: the search window coming forward and
 /// taking the keys, Quick Look, and the file, app or Finder window a result opens. Tests pass a
@@ -20,6 +21,8 @@ protocol Stage: AnyObject {
     func reloadPreview()
     /// In its own app, or launched when it is an app.
     func open(_ url: URL)
+    /// In your text editor, for a file with no extension that macOS has no app for.
+    func openAsText(_ url: URL)
     func showInFinder(_ url: URL)
     /// Asks for folders with the open panel, as a sheet on `window`; `done` gets none when cancelled.
     func chooseFolders(on window: NSWindow, _ done: @escaping @MainActor ([URL]) -> Void)
@@ -72,6 +75,11 @@ final class Screen: Stage {
 
     func open(_ url: URL) {
         NSWorkspace.shared.open(url)
+    }
+
+    func openAsText(_ url: URL) {
+        guard let editor = NSWorkspace.shared.urlForApplication(toOpen: .plainText) else { return open(url) }
+        NSWorkspace.shared.open([url], withApplicationAt: editor, configuration: NSWorkspace.OpenConfiguration())
     }
 
     func showInFinder(_ url: URL) {
