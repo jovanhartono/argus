@@ -356,7 +356,14 @@ struct Plan {
     shown: bool,
     /// A patch left the newest list due to compact, which waits for the window to hide.
     deferred: bool,
+    /// How many times the window hid, so compacting waits `SETTLE_AFTER_HIDE` from the latest.
+    hid: u64,
 }
+
+/// How long the window stays hidden before a compaction left for it starts. You may press the
+/// hotkey twice by mistake, and a search typed into the window shown again would otherwise
+/// wait about 100 ms for a compaction that began between the two presses.
+const SETTLE_AFTER_HIDE: Duration = Duration::from_secs(1);
 
 impl Plan {
     fn new(everything: bool, granted: bool) -> Self {
@@ -1505,6 +1512,8 @@ impl Clock for Wall {
 /// to build and the window hidden, it compacts what patches left while the window showed.
 fn rebuild_loop(live: &Live, clock: &impl Clock, mut last: Instant, mut rebuild: impl FnMut(Pass)) {
     let mut plan = live.plan.lock().unwrap();
+    // The hide a compaction waits to settle after, and when this thread first saw it.
+    let mut settling: Option<(u64, Instant)> = None;
     loop {
         if plan.stopped {
             return;
@@ -1512,6 +1521,17 @@ fn rebuild_loop(live: &Live, clock: &impl Clock, mut last: Instant, mut rebuild:
         let whole = plan.wanted || plan.everything != plan.everything_listed;
         if !whole && !plan.patching {
             if plan.deferred && !plan.shown {
+                let now = clock.now();
+                let since = match settling {
+                    Some((hid, since)) if hid == plan.hid => since,
+                    _ => now,
+                };
+                settling = Some((plan.hid, since));
+                let settled = since + SETTLE_AFTER_HIDE;
+                if now < settled {
+                    plan = clock.sleep(live, plan, Some(settled - now));
+                    continue;
+                }
                 plan.deferred = false;
                 drop(plan);
                 compact_hidden(live);
@@ -1975,8 +1995,8 @@ pub unsafe extern "C" fn tl_index_everything(core: *const TlCore, on: u32, mark:
 
 /// Tells the core the search window is open when `shown` isn't 0, and hidden when it is. While
 /// it is open, changes go into the list without the tidy-up that drops removed entries, which
-/// on a whole home folder makes searches wait about 100 ms; once it hides, the list is tidied
-/// at once if it needs it. Starts hidden. Returns 1 when that changed what the core knew, else
+/// on a whole home folder makes searches wait about 100 ms; once it has stayed hidden for a
+/// second, the list is tidied if it needs it. Starts hidden. Returns 1 when that changed what the core knew, else
 /// 0. Never waits for a scan, a search or the list. Safe to call from any thread.
 ///
 /// # Safety
@@ -1991,6 +2011,9 @@ pub unsafe extern "C" fn tl_window_shown(core: *const TlCore, shown: u32) -> u32
             return 0;
         }
         plan.shown = shown;
+        if !shown {
+            plan.hid += 1;
+        }
         drop(plan);
         core.live.wake.notify_all();
         1
@@ -3665,6 +3688,7 @@ mod tests {
         std::fs::remove_dir_all(scratch).unwrap();
     }
 
+    #[cfg(target_os = "macos")]
     fn index_bytes(core: &Core) -> u64 {
         let live = unsafe { &(*core.0).live };
         let list = live.newest.lock().unwrap().clone().unwrap().1;
@@ -6787,6 +6811,37 @@ mod tests {
     }
 
     const LONG_AGO: Duration = Duration::from_secs(600);
+
+    /// The hotkey pressed twice: the window hides and shows again, and searches typed into
+    /// it must not wait for a compaction begun in between.
+    #[test]
+    fn a_compaction_waits_until_the_window_stays_hidden() {
+        let live = live(Duration::ZERO);
+        let rebuilds = rebuilds(&live, LONG_AGO);
+        let hide = |plan: &mut Plan| {
+            plan.shown = false;
+            plan.hid += 1;
+        };
+        live.plan(|plan| {
+            plan.deferred = true;
+            hide(plan);
+        });
+        assert_eq!(rebuilds.step(), Step::Waits(Some(SETTLE_AFTER_HIDE)));
+        rebuilds.set_ms(300);
+        live.plan(|plan| plan.shown = true);
+        assert_eq!(rebuilds.step(), Step::Waits(None));
+        rebuilds.set_ms(600);
+        live.plan(hide);
+        assert_eq!(rebuilds.step(), Step::Waits(Some(SETTLE_AFTER_HIDE)));
+        rebuilds.set_ms(1_200);
+        let left = Duration::from_millis(400);
+        assert_eq!(rebuilds.step(), Step::Waits(Some(left)));
+        assert!(live.plan.lock().unwrap().deferred);
+        rebuilds.set_ms(1_600);
+        assert_eq!(rebuilds.step(), Step::Waits(None));
+        assert!(!live.plan.lock().unwrap().deferred, "compacted");
+        rebuilds.stop(&live);
+    }
 
     #[test]
     fn a_lone_change_rebuilds_at_once() {
