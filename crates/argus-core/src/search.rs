@@ -728,11 +728,13 @@ fn points(
         held_in(name, word, app)
     };
     match how {
-        how @ (Held::Whole | Held::Alone) => {
-            let exact = if matches!(how, Held::Whole) && !found.exact {
-                scoring.exact_match_bonus
-            } else {
-                0
+        how @ (Held::Whole | Held::First | Held::Alone) => {
+            let exact = match how {
+                Held::Whole if !found.exact => scoring.exact_match_bonus,
+                // One under the whole name, so "xcode" still puts Xcode above Xcode-beta, and
+                // one over a lark folder at home, which loses `DEPTH_PENALTY` for its depth.
+                Held::First => scoring.exact_match_bonus.saturating_sub(1),
+                _ => 0,
             };
             (
                 score.saturating_add(exact).saturating_add(WHOLE_WORD_BONUS),
@@ -913,11 +915,13 @@ enum Held {
     No,
     Inside,
     Alone,
+    /// The first word of an app's name, as "lark" in LarkSuite.
+    First,
     Whole,
 }
 
 /// People start an app by its first word, "lark" for LarkSuite, so in an app's name that word
-/// is held whole, and a capital after a lower-case letter starts a word. Not in file names,
+/// counts almost as much as the whole name, and a capital after a lower-case letter starts a word. Not in file names,
 /// where hashes like "sLaR.js" would gain at random.
 fn held_in(name: &str, word: &str, app: bool) -> Held {
     let (name, word) = (name.as_bytes(), word.as_bytes());
@@ -937,7 +941,7 @@ fn held_in(name: &str, word: &str, app: bool) -> Held {
                 return match &name[end..] {
                     [] if i == 0 => Held::Whole,
                     [b'.', extension @ ..] if i == 0 && !extension.contains(&b'.') => Held::Whole,
-                    _ if i == 0 && app => Held::Whole,
+                    _ if i == 0 && app => Held::First,
                     _ => Held::Alone,
                 };
             }
@@ -2665,6 +2669,23 @@ mod tests {
         for query in ["lark", "Lark", "lar"] {
             let found = ranked(&index, &apps, query);
             assert_eq!(found[0], "/Applications/LarkSuite.app", "{query} {found:?}");
+        }
+    }
+
+    /// Someone who starts Xcode from the Dock and once opened Xcode-beta through Argus still
+    /// wants Xcode for "xcode", so it must lead on points, not only on its shorter name.
+    #[test]
+    fn an_app_named_exactly_what_was_typed_outscores_a_longer_one() {
+        let index = IndexBuilder::new().finish();
+        let apps = applications(&["Xcode-beta", "Xcode", "Notion Calendar", "Notion"]);
+        let searcher = Searcher::with_threads(2);
+        for (query, exact) in [("xcode", "Xcode"), ("notion", "Notion")] {
+            let hits = searcher
+                .search(&index, &apps, query, searcher.ticket(), 10)
+                .unwrap();
+            assert_eq!(hits.len(), 2, "{query}");
+            assert!(matches!(hits[0].item, Item::App(app) if apps.name(app) == exact));
+            assert!(hits[0].score > hits[1].score, "{query}");
         }
     }
 
