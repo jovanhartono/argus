@@ -29,7 +29,7 @@ use crate::name_starts::NameStarts;
 use crate::scope::Scope;
 use crate::siblings::NO_FOLDER;
 use crate::update::{Changes, Update};
-use crate::walk::{Access, Clutter, Rules, Scan, scan_with};
+use crate::walk::{Access, Cloud, Clutter, Rules, Scan, scan_with};
 use crc32fast::Hasher;
 use std::fmt;
 use std::fs::{self, File};
@@ -66,8 +66,8 @@ const fn fnv(mut hash: u64, bytes: &[u8]) -> u64 {
 }
 
 /// What an index is built from: the values `scan` takes. A saved index opens only with the
-/// same ones, so turning on `--all`, editing the ignore list, granting Full Disk Access or
-/// updating Argus costs one rescan.
+/// same ones, so turning on `--all` or cloud drives, editing the ignore list, granting Full
+/// Disk Access or updating Argus costs one rescan.
 #[derive(Clone, Debug)]
 pub struct Settings {
     root: PathBuf,
@@ -76,7 +76,14 @@ pub struct Settings {
 }
 
 impl Settings {
-    pub fn new(root: &Path, home: &Path, clutter: Clutter, ignore: Ignore, access: Access) -> Self {
+    pub fn new(
+        root: &Path,
+        home: &Path,
+        clutter: Clutter,
+        ignore: Ignore,
+        access: Access,
+        cloud: Cloud,
+    ) -> Self {
         let root = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
         let mut key = Vec::new();
         put(&mut key, env!("CARGO_PKG_VERSION").as_bytes());
@@ -87,6 +94,10 @@ impl Settings {
             Access::Full => 0,
             Access::Limited => 1,
         });
+        key.push(match cloud {
+            Cloud::Keep => 0,
+            Cloud::Skip => 1,
+        });
         match clutter {
             Clutter::Keep => key.push(0),
             Clutter::Skip => {
@@ -96,7 +107,7 @@ impl Settings {
         }
         Self {
             root,
-            rules: Rules::new(home, clutter, &ignore, access),
+            rules: Rules::new(home, clutter, &ignore, access, cloud),
             key,
         }
     }
@@ -599,7 +610,8 @@ mod tests {
 
     fn settings(root: &Path, clutter: Clutter) -> Settings {
         let home = Path::new(HOME);
-        let mut settings = Settings::new(root, home, clutter, Ignore::default(), Access::Full);
+        let ignore = Ignore::default();
+        let mut settings = Settings::new(root, home, clutter, ignore, Access::Full, Cloud::Keep);
         // Spelled as the made-up indexes spell it; Windows would make it a drive's root.
         if root == home {
             settings.root = home.to_path_buf();
@@ -983,18 +995,20 @@ mod tests {
         let home = Path::new(HOME);
         let none = Ignore::default;
         let (ignore, _) = Ignore::parse("docs\n", root, Access::Full);
+        let (full, cloud) = (Access::Full, Cloud::Keep);
         let other = [
-            Settings::new(root, home, Clutter::Skip, none(), Access::Full),
-            Settings::new(&root.join("src"), home, Clutter::Keep, none(), Access::Full),
-            Settings::new(root, root, Clutter::Keep, none(), Access::Full),
-            Settings::new(root, home, Clutter::Keep, none(), Access::Limited),
+            Settings::new(root, home, Clutter::Skip, none(), full, cloud),
+            Settings::new(&root.join("src"), home, Clutter::Keep, none(), full, cloud),
+            Settings::new(root, root, Clutter::Keep, none(), full, cloud),
+            Settings::new(root, home, Clutter::Keep, none(), Access::Limited, cloud),
+            Settings::new(root, home, Clutter::Keep, none(), full, Cloud::Skip),
         ];
         for settings in other {
             let opened = decode(&bytes, &settings);
             assert!(matches!(opened, Err(OpenError::OtherSettings)));
         }
         // --all leaves the ignore list out, so editing it changes nothing.
-        let edited = Settings::new(root, home, Clutter::Keep, ignore, Access::Full);
+        let edited = Settings::new(root, home, Clutter::Keep, ignore, full, cloud);
         assert!(decode(&bytes, &edited).is_ok());
         let dotted = root.join("src").join("..");
         assert!(decode(&bytes, &keep(&dotted)).is_ok());
@@ -1038,7 +1052,7 @@ mod tests {
         let rules = |text: &str| {
             let (ignore, problems) = Ignore::parse(text, root, Access::Full);
             assert!(problems.is_empty(), "{text:?}");
-            Settings::new(root, root, Clutter::Skip, ignore, Access::Full)
+            Settings::new(root, root, Clutter::Skip, ignore, Access::Full, Cloud::Keep)
         };
         let differ = [
             ("docs", "!docs"),

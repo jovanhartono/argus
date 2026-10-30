@@ -227,7 +227,7 @@ final class HatchTests: XCTestCase {
         let library = root.appendingPathComponent("Library")
         try FileManager.default.createDirectory(
             at: library.appendingPathComponent("Caches"), withIntermediateDirectories: true)
-        let (hatch, counts) = try await watching(root)
+        let (hatch, counts) = try await watching(root, cloud: true)
         let cloud = library.appendingPathComponent("CloudStorage")
         try FileManager.default.createDirectory(at: cloud, withIntermediateDirectories: false)
         // The folder, notes, a.txt, Library and CloudStorage.
@@ -237,6 +237,33 @@ final class HatchTests: XCTestCase {
         try await counts.reach(6, within: 5)
         try FileManager.default.moveItem(at: cloud, to: library.appendingPathComponent("Old"))
         try await counts.reach(4, within: 5)
+    }
+
+    func testCloudDrivesAreLeftOutUntilSwitchedOnAndChangesThereWakeNothing() async throws {
+        let (root, _) = try folderWithNotes()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let dropbox = root.appendingPathComponent("Library/CloudStorage/Dropbox")
+        try FileManager.default.createDirectory(at: dropbox, withIntermediateDirectories: true)
+        try Data().write(to: dropbox.appendingPathComponent("plan.md"))
+        let (hatch, counts) = try await watching(root)
+        let off = try await names(hatch, "plan")
+        XCTAssertEqual(off, [])
+        try Data().write(to: dropbox.appendingPathComponent("budget.md"))
+        try await Task.sleep(for: .seconds(1.5))
+        XCTAssertEqual(counts.heard, 0, "a change in a cloud drive left out")
+
+        XCTAssertFalse(hatch.indexCloud(false), "already off")
+        XCTAssertTrue(hatch.indexCloud(true))
+        // The folder, notes, a.txt, Library, CloudStorage, Dropbox, plan.md and budget.md.
+        try await counts.reach(8, within: 10)
+        hatch.watch()
+        let on = try await names(hatch, "plan")
+        XCTAssertEqual(on, ["plan.md"])
+        try Data().write(to: dropbox.appendingPathComponent("notes.md"))
+        try await counts.reach(9, within: 5)
+
+        XCTAssertTrue(hatch.indexCloud(false))
+        try await counts.reach(4, within: 10)
     }
 
     func testSavingTheIgnoreListBringsANewList() async throws {
@@ -527,12 +554,13 @@ final class HatchTests: XCTestCase {
     /// A core over `root`, keeping its list in `saved` when given, watched once its first list
     /// is in, scanned or `opened` from the file.
     private func watching(
-        _ root: URL, fullDisk: Bool = true, everything: Bool = false, saved: String? = nil, opened: Bool = false
+        _ root: URL, fullDisk: Bool = true, everything: Bool = false, cloud: Bool = false, saved: String? = nil,
+        opened: Bool = false
     ) async throws -> (Hatch, Counts) {
         let counts = Counts()
         let first = expectation(description: opened ? "opened" : "indexed")
         let hatch = try XCTUnwrap(
-            Hatch(root: root.path, fullDisk: fullDisk, everything: everything, saved: saved) { event in
+            Hatch(root: root.path, fullDisk: fullDisk, everything: everything, cloud: cloud, saved: saved) { event in
                 switch event {
                 case .indexed:
                     XCTAssertFalse(opened, "scanned in place of the saved list")

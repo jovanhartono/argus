@@ -786,6 +786,7 @@ mod tests {
             crate::Clutter::Keep,
             &ignore,
             crate::Access::Full,
+            crate::Cloud::Keep,
         );
         let index = scan.unwrap().index;
 

@@ -1,5 +1,5 @@
 use super::*;
-use argus_core::{Access, Clutter, Ignore};
+use argus_core::{Access, Cloud, Clutter, Ignore};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
@@ -24,9 +24,17 @@ fn folder(files: &[(&str, &[u8])]) -> Folder {
 
 fn index(folder: &Folder) -> Index {
     let root = &folder.root;
-    argus_core::scan(root, root, Clutter::Skip, &Ignore::default(), Access::Full)
-        .unwrap()
-        .index
+    let ignore = Ignore::default();
+    argus_core::scan(
+        root,
+        root,
+        Clutter::Skip,
+        &ignore,
+        Access::Full,
+        Cloud::Skip,
+    )
+    .unwrap()
+    .index
 }
 
 /// Each line found as "path:line:text", sorted, and the report. Every line must show its

@@ -84,26 +84,27 @@ final class Hatch {
     /// Scans `root` as a home folder in the background. Without Full Disk Access, the folders
     /// macOS guards with a pop-up each are left out, so none appears. With `saved`, the list
     /// kept in that file at the last launch opens instead, and each new list is kept there. With
-    /// `everything`, clutter and the ignore list's folders are listed too.
+    /// `everything`, clutter and the ignore list's folders are listed too, and with `cloud`,
+    /// iCloud Drive and the other cloud drives.
     convenience init?(
-        root: String, fullDisk: Bool, everything: Bool = false, saved: String? = nil,
+        root: String, fullDisk: Bool, everything: Bool = false, cloud: Bool = false, saved: String? = nil,
         onEvent: @escaping (Event) -> Void
     ) {
         var root = root
         // A volume FSEvents keeps no log for can't catch up after a relaunch, so nothing is saved.
         let journal = saved == nil ? nil : Hatch.journal(of: root)
-        let (full, all): (UInt32, UInt32) = (fullDisk ? 1 : 0, everything ? 1 : 0)
+        let (full, all, drives): (UInt32, UInt32, UInt32) = (fullDisk ? 1 : 0, everything ? 1 : 0, cloud ? 1 : 0)
         self.init(onEvent: onEvent) { tag, callback, now in
             root.withUTF8 { root in
                 guard var file = saved, var journal else {
-                    return tl_core_new(root.baseAddress, root.count, full, all, nil, tag, callback)
+                    return tl_core_new(root.baseAddress, root.count, full, all, drives, nil, tag, callback)
                 }
                 return file.withUTF8 { file in
                     journal.withUTF8 { journal in
                         var saved = TlSaved(
                             file: file.baseAddress, file_len: file.count, journal: journal.baseAddress,
                             journal_len: journal.count, now: now)
-                        return tl_core_new(root.baseAddress, root.count, full, all, &saved, tag, callback)
+                        return tl_core_new(root.baseAddress, root.count, full, all, drives, &saved, tag, callback)
                     }
                 }
             }
@@ -276,6 +277,13 @@ final class Hatch {
     @discardableResult
     func indexEverything(_ on: Bool) -> Bool {
         tl_index_everything(core, on ? 1 : 0, FSEventsGetCurrentEventId()) == 1
+    }
+
+    /// Lists iCloud Drive and the other cloud drives from the next list on, or leaves them out
+    /// again, text searches included. True when that builds a new list, which `.rebuilt` brings.
+    @discardableResult
+    func indexCloud(_ on: Bool) -> Bool {
+        tl_index_cloud(core, on ? 1 : 0, FSEventsGetCurrentEventId()) == 1
     }
 
     /// Tells the core whether the search window is open, so the list's slow tidy-up waits until
