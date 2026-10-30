@@ -681,7 +681,8 @@ fn match_apps(
             matched |= 1 << w;
             if wanted >> w & 1 == 1 {
                 let name = &apps.names[n];
-                let (score, holds) = points(found, name, &words[w].needle, 0, &config.scoring);
+                let needle = &words[w].needle;
+                let (score, holds) = points(found, name, needle, 0, true, &config.scoring);
                 app_held[n] |= u8::from(holds) << w;
                 app_score[n] = app_score[n].saturating_add(score);
             }
@@ -712,12 +713,19 @@ fn matcher_config() -> Config {
 
 /// A name's points for one word, and whether it holds the word letter for letter. Below
 /// `floor` it cannot, so the name is not read again.
-fn points(found: Match, name: &str, word: &str, floor: u16, scoring: &Scoring) -> (u16, bool) {
+fn points(
+    found: Match,
+    name: &str,
+    word: &str,
+    floor: u16,
+    app: bool,
+    scoring: &Scoring,
+) -> (u16, bool) {
     let score = found.score;
     let how = if score < floor {
         Held::No
     } else {
-        held_in(name, word)
+        held_in(name, word, app)
     };
     match how {
         how @ (Held::Whole | Held::Alone) => {
@@ -886,7 +894,7 @@ fn match_names(
                                 let text = texts[found.index as usize];
                                 let needle = &words[w].needle;
                                 let (score, holds) =
-                                    points(found, text, needle, floors[w], &config.scoring);
+                                    points(found, text, needle, floors[w], false, &config.scoring);
                                 held |= u8::from(holds) << w;
                                 scores[n] = scores[n].saturating_add(score);
                             }
@@ -908,9 +916,13 @@ enum Held {
     Whole,
 }
 
-fn held_in(name: &str, word: &str) -> Held {
+/// People start an app by its first word, "lark" for LarkSuite, so in an app's name that word
+/// is held whole, and a capital after a lower-case letter starts a word. Not in file names,
+/// where hashes like "sLaR.js" would gain at random.
+fn held_in(name: &str, word: &str, app: bool) -> Held {
     let (name, word) = (name.as_bytes(), word.as_bytes());
-    let alphanumeric = |byte: Option<&u8>| byte.is_some_and(u8::is_ascii_alphanumeric);
+    let camel =
+        |at: usize| app && name[at - 1].is_ascii_lowercase() && name[at].is_ascii_uppercase();
     let mut result = Held::No;
     // One letter matches most names; checking each for it is time with nothing to gain.
     if word.len() < 2 || word.len() > name.len() {
@@ -918,10 +930,14 @@ fn held_in(name: &str, word: &str) -> Held {
     }
     for (i, window) in name.windows(word.len()).enumerate() {
         if window.eq_ignore_ascii_case(word) {
-            if !alphanumeric(name[..i].last()) && !alphanumeric(name.get(i + word.len())) {
-                return match &name[i + word.len()..] {
+            let end = i + word.len();
+            let starts = i == 0 || !name[i - 1].is_ascii_alphanumeric() || camel(i);
+            let ends = end == name.len() || !name[end].is_ascii_alphanumeric() || camel(end);
+            if starts && ends {
+                return match &name[end..] {
                     [] if i == 0 => Held::Whole,
                     [b'.', extension @ ..] if i == 0 && !extension.contains(&b'.') => Held::Whole,
+                    _ if i == 0 && app => Held::Whole,
                     _ => Held::Alone,
                 };
             }
@@ -1277,7 +1293,7 @@ mod tests {
             let haystacks: Vec<String> = (0..40).map(|_| rng.name(&names, 30)).collect();
             for found in Matcher::new(word.clone(), &config).match_list(&haystacks) {
                 let name = &haystacks[found.index as usize];
-                if floor > 0 && !matches!(held_in(name, &needle), Held::No) {
+                if floor > 0 && !matches!(held_in(name, &needle, false), Held::No) {
                     checked += 1;
                     assert!(found.score >= floor, "{typed:?} in {name:?}");
                 }
@@ -1421,7 +1437,7 @@ mod tests {
                 let name = &haystacks[found.index as usize];
                 if word_starts(name) & needed == 0 {
                     checked += 1;
-                    let held = held_in(stripped[found.index as usize], &typed);
+                    let held = held_in(stripped[found.index as usize], &typed, false);
                     assert!(found.score <= ceiling, "{typed:?} in {name:?}");
                     assert!(
                         matches!(held, Held::No | Held::Inside),
@@ -2628,6 +2644,27 @@ mod tests {
             let found = ranked(&index, &apps, query);
             assert_eq!(found[0], "/Applications/Notes.app", "{query}");
             assert_eq!(found.len(), count, "{query}");
+        }
+    }
+
+    /// Issue #71: "Lark" showed LarkSuite first only because a capital typed leaves out every
+    /// lower-case name; "lark" let a folder named lark win.
+    #[test]
+    fn the_first_word_of_an_app_finds_it_first_in_any_case() {
+        let mut builder = IndexBuilder::new();
+        let root = builder.push("/home", NO_PARENT, true);
+        builder.push("lark", root, true);
+        builder.push("lark_report.py", root, false);
+        builder.push("schema-lark", root, true);
+        builder.push("iCloud~com~larksuite~lark", root, true);
+        builder.push("LarkReport.pdf", root, false);
+        // Saved editor history is full of names like this; its capitals mark no words.
+        builder.push("sLaR.js", root, false);
+        let index = builder.finish();
+        let apps = applications(&["LarkSuite", "Safari"]);
+        for query in ["lark", "Lark", "lar"] {
+            let found = ranked(&index, &apps, query);
+            assert_eq!(found[0], "/Applications/LarkSuite.app", "{query} {found:?}");
         }
     }
 
