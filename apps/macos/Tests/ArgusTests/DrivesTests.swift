@@ -55,6 +55,19 @@ final class DrivesTests: XCTestCase {
         _ = drives
     }
 
+    func testEachUnmountIsToldOnceDoneWithOrWithoutAnEject() {
+        var gone: [String] = []
+        let drives = Drives(
+            center: center, mounted: [], isMounted: { _ in false }, added: { _ in }, removing: { _ in },
+            gone: { gone.append($0) })
+        post(NSWorkspace.willUnmountNotification, "/Volumes/Photos")
+        XCTAssertEqual(gone, [], "still mounted while macOS asks")
+        post(NSWorkspace.didUnmountNotification, "/Volumes/Photos")
+        post(NSWorkspace.didUnmountNotification, "/Volumes/Music")
+        XCTAssertEqual(gone, ["/Volumes/Photos", "/Volumes/Music"])
+        _ = drives
+    }
+
     func testADriveStillMountedAfterAnEjectIsListedAgain() async throws {
         let drives = drives()
         stillMounted = ["/Volumes/Photos"]

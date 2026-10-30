@@ -350,6 +350,13 @@ final class Hatch {
         return path.withUTF8 { tl_volume_removed(core, $0.baseAddress, $0.count, FSEventsGetCurrentEventId()) } == 1
     }
 
+    /// Once macOS has unmounted the drive, so a text search of the folder it was in, as
+    /// /Volumes, reads that folder again.
+    func volumeGone(_ path: String) {
+        var path = path
+        path.withUTF8 { tl_volume_gone(core, $0.baseAddress, $0.count) }
+    }
+
     var heardUpTo: FSEventStreamEventId {
         stream.map { FSEventStreamGetLatestEventId($0) } ?? started
     }

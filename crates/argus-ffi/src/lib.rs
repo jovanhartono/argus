@@ -39,7 +39,7 @@ use std::time::{Duration, Instant};
 static PAGES: Pages = Pages;
 
 /// Raise this with any change below, so a window built against an older header refuses to start.
-pub const TL_ABI_VERSION: u32 = 13;
+pub const TL_ABI_VERSION: u32 = 14;
 
 pub const TL_OK: u32 = 0;
 /// No rows for that ticket: not ready yet, already taken, or a newer search replaced them.
@@ -516,16 +516,15 @@ fn missed<P: AsRef<Path>>(
 }
 
 /// Whether `list` already matches what a scan by `scope` would keep of `path`. Looks one folder
-/// at a time, so a catch-up of thousands at launch never holds a patch, and searches, back.
-fn holds(scope: &Scope, list: &RwLock<Listed>, path: &Path) -> bool {
-    read(list).is_some_and(|listed| scope.holds(path, &listed.index))
-}
-
-/// As `holds`, but a folder on a drive being ejected is left unread and counts as held: the
-/// list lets go of the drive anyway.
+/// at a time, so a catch-up of thousands at launch never holds a patch, and searches, back. A
+/// folder on a drive being ejected is left unread and counts as held: the list lets go of the
+/// drive anyway.
 fn holds_unless_leaving(live: &Live, scope: &Scope, list: &RwLock<Listed>, path: &Path) -> bool {
+    // The list first: an eject waits for the drive's reads, and must not also wait out a
+    // compaction this read would otherwise sit behind.
+    let listed = read(list);
     live.drive_read(|drive| path.starts_with(drive))
-        .is_none_or(|_read| holds(scope, list, path))
+        .is_none_or(|_read| listed.is_some_and(|listed| scope.holds(path, &listed.index)))
 }
 
 /// A list searches read, patched in place as files change. Each patch moves `version` on, since
@@ -1990,10 +1989,11 @@ pub unsafe extern "C" fn tl_changed(
                 let changed: Vec<PathBuf> = paths
                     .into_iter()
                     .filter(|path| {
-                        live.drive_read(|drive| path.starts_with(drive))
-                            .is_some_and(|_read| {
-                                everything || scope.in_scope(path) || !holds(&scope, &list, path)
-                            })
+                        if everything || scope.in_scope(path) {
+                            live.drive_read(|drive| path.starts_with(drive)).is_some()
+                        } else {
+                            !holds_unless_leaving(live, &scope, &list, path)
+                        }
                     })
                     .map(Path::to_path_buf)
                     .collect();
@@ -2221,6 +2221,22 @@ pub unsafe extern "C" fn tl_volume_removed(
         let reading = |plan: &mut Plan| plan.reading.iter().any(|drive| drive == path);
         drop(live.freed.wait_while(plan, reading).unwrap());
         u32::from(queued)
+    })
+}
+
+/// Tells the core the volume at `path`, by its real path, has unmounted, so text searches of
+/// a folder it was mounted in, as /Volumes, read that folder again. Call it once macOS says
+/// so. Safe to call from any thread, and never touches the volume.
+///
+/// # Safety
+/// `core` came from `tl_core_new` or `tl_core_new_stand_in`, and `path` points to `len` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tl_volume_gone(core: *const TlCore, path: *const u8, len: usize) {
+    guard((), || {
+        let core = unsafe { &*core };
+        if let Some(path) = unsafe { path_from(path, len) } {
+            lock(&core.live.plan).leaving.retain(|drive| drive != path);
+        }
     })
 }
 
@@ -4638,6 +4654,54 @@ mod tests {
         assert_eq!(mounted(&core, &drive, 4), 1);
         let again = grep(&core, &[&drive], "budget");
         assert_eq!(grep_all(&core, &events, again).0.len(), 50);
+    }
+
+    #[test]
+    fn a_folder_that_held_an_ejected_drive_is_searched_again_once_it_unmounted() {
+        let events = Events::default();
+        let (core, _dir, [drive, home]) = home_beside_drive(&events);
+        write(&drive.join("notes.txt"), "budget on the drive\n");
+        write(&home.join("notes/plan.md"), "budget at home\n");
+        let around = drive.parent().unwrap();
+        assert_eq!(unmounted(&core, &drive, 3), 1);
+        // Mounted still, as macOS takes a moment to unmount it once the eject is approved.
+        let ticket = grep(&core, &[around], "budget");
+        assert_eq!(grep_all(&core, &events, ticket).1.unreadable, 1);
+
+        std::fs::remove_dir_all(&drive).unwrap();
+        let path = drive.to_str().unwrap();
+        unsafe { tl_volume_gone(core.0, path.as_ptr(), path.len()) };
+        let ticket = grep(&core, &[around], "budget");
+        let (lines, report) = grep_all(&core, &events, ticket);
+        assert_eq!((lines.len(), report.unreadable), (1, 0), "{lines:?}");
+    }
+
+    #[test]
+    fn an_eject_never_waits_for_a_compaction_a_change_on_the_drive_waits_behind() {
+        let events = Events::default();
+        let (core, _dir, [drive, _]) = home_beside_drive(&events);
+        let live = unsafe { &(*core.0).live };
+        let (scope, list) = live.newest.lock().unwrap().clone().unwrap();
+        let photos = drive.join("photos");
+        // A raw pointer can't cross threads, its address can.
+        let raw = core.0 as usize;
+        let compacting = list.write().unwrap();
+        std::thread::scope(|threads| {
+            threads.spawn(|| holds_unless_leaving(live, &scope, &list, &photos));
+            // Long enough for the check of the change to reach the list and wait there.
+            std::thread::sleep(Duration::from_millis(200));
+            let ejecting = threads.spawn(|| {
+                let started = Instant::now();
+                let path = drive.to_str().unwrap();
+                let core = raw as *const TlCore;
+                unsafe { tl_volume_removed(core, path.as_ptr(), path.len(), 3) };
+                started.elapsed()
+            });
+            std::thread::sleep(Duration::from_secs(2));
+            drop(compacting);
+            let took = ejecting.join().unwrap();
+            assert!(took < Duration::from_secs(1), "the eject waited {took:?}");
+        });
     }
 
     #[test]

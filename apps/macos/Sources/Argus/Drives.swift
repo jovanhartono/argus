@@ -9,6 +9,8 @@ final class Drives {
     nonisolated(unsafe) private var observers: [NSObjectProtocol] = []
     private let added: @MainActor (String) -> Void
     private let removing: @MainActor (String) -> Void
+    /// Told each unmount once it is done.
+    private let gone: @MainActor (String) -> Void
     private let isMounted: @MainActor (String) async -> Bool
     private let settle: Duration
     /// Told they will unmount, and not unmounted yet.
@@ -28,11 +30,13 @@ final class Drives {
         center: NotificationCenter = NSWorkspace.shared.notificationCenter, mounted: [String] = Drives.mounted(),
         isMounted: @escaping @MainActor (String) async -> Bool = Drives.stillMounted,
         settle: Duration = .seconds(15), letGo: (@Sendable (String) -> Void)? = nil,
-        added: @escaping @MainActor (String) -> Void, removing: @escaping @MainActor (String) -> Void
+        added: @escaping @MainActor (String) -> Void, removing: @escaping @MainActor (String) -> Void,
+        gone: @escaping @MainActor (String) -> Void = { _ in }
     ) {
         self.center = center
         self.added = added
         self.removing = removing
+        self.gone = gone
         self.isMounted = isMounted
         self.settle = settle
         asker = Asker(letGo: letGo ?? { _ in })
@@ -50,6 +54,7 @@ final class Drives {
             hear(NSWorkspace.didUnmountNotification) { drives, path, _ in
                 drives.ejects[path] = nil
                 if drives.leaving.remove(path) == nil { drives.removing(path) }
+                drives.gone(path)
             },
             hear(NSWorkspace.didRenameVolumeNotification) { drives, path, old in
                 guard let old else { return }

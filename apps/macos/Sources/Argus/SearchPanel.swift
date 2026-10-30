@@ -349,6 +349,10 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
         timing.notice("let go of a drive \(ms(since: told), format: .fixed(precision: 2)) ms after macOS told")
     }
 
+    func driveGone(_ path: String) {
+        hatch?.volumeGone(path)
+    }
+
     /// A list built for a change at home can land first, so only one holding the drive counts.
     func timeDrives(watching: [String]) {
         for (path, told) in drivesTold where watching.contains(path) {
