@@ -91,6 +91,9 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
     /// The folders Tab went into, outermost first, shown before the box.
     let chip = NSBox()
     let chipText = NSTextField(labelWithString: "")
+    /// Shown while ⌘T has the box read inside files too.
+    let textChip = NSBox()
+    let textChipText = NSTextField(labelWithString: "Inside Files")
     private(set) var scopes: [Row] = []
     private let line = NSBox(frame: NSRect(x: 0, y: Metric.field, width: Metric.width, height: 1))
     private let scroll = NSScrollView()
@@ -132,11 +135,13 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
     private(set) var rows: [Row] = []
     let textFolders: TextFolders
     let everything: IndexEverything
+    /// ⌘T's switch. Off at each show, so a plain search never reads a file's text.
+    private(set) var textOn = false
     private(set) var hits: [TextHit] = []
     private(set) var textTicket: UInt64 = 0
     private var textAsked: TextAsk?
     /// The search for those lines ran to the end while the window showed, and no file changed
-    /// since it started. Editing a file's text brings no new list, so each show reads again.
+    /// since it started. Editing a file's text brings no new list, so each ⌘T reads again.
     private var textWhole = false
     /// A search run again for the same words leaves the old lines up until its own come, so the
     /// window doesn't shrink and grow back.
@@ -232,6 +237,8 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
         // Read again on each show, about 0.3 ms off the main thread, so a new app is found.
         if !appFolders.isEmpty { hatch?.readApps(in: appFolders) }
         if stale { runAgain() }
+        // Shown again before the fade-out ended, the lines and chip of ⌘T are still up.
+        if !textChip.isHidden { namesOnly() }
         // A file saved while the window was hidden shows its new size and date.
         showDetails()
         shown = true
@@ -257,6 +264,7 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
         shown = false
         hatch?.windowShown(false)
         pending = nil
+        textOn = false
         stopText()
         textWhole = false
         closePreview()
@@ -271,6 +279,7 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
             // Shown again while fading out: keep it.
             guard let self, !shown else { return }
             stage.putAway(panel)
+            namesOnly()
             if notice == .needsFinder {
                 post(lacksAccess ? .needsAccess : nil)
                 fit()
@@ -300,7 +309,7 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
         case .folder(let path) where hatch?.holds(folder: path) == true:
             scopes = [Row(folderAt: path)]
             field.stringValue = ""
-            showScopes()
+            showChips()
             search()
         case .folder, .none:
             break
@@ -393,16 +402,20 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
         field.cell?.lineBreakMode = .byTruncatingTail
         field.delegate = self
 
-        chip.boxType = .custom
-        chip.titlePosition = .noTitle
-        chip.borderWidth = 0
-        chip.cornerRadius = 6
-        chip.fillColor = .quaternaryLabelColor
-        chip.contentViewMargins = .zero
-        chip.isHidden = true
-        chipText.font = .systemFont(ofSize: NSFont.systemFontSize, weight: .medium)
+        for (box, label) in [(chip, chipText), (textChip, textChipText)] {
+            box.boxType = .custom
+            box.titlePosition = .noTitle
+            box.borderWidth = 0
+            box.cornerRadius = 6
+            box.fillColor = .quaternaryLabelColor
+            box.contentViewMargins = .zero
+            box.isHidden = true
+            label.font = .systemFont(ofSize: NSFont.systemFontSize, weight: .medium)
+            box.contentView?.addSubview(label)
+        }
         chipText.lineBreakMode = .byTruncatingHead
-        chip.contentView?.addSubview(chipText)
+        textChip.toolTip = "⌘T searches names only again"
+        textChipText.setAccessibilityLabel("Searching inside files")
 
         line.boxType = .separator
         line.autoresizingMask = [.width]
@@ -455,7 +468,7 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
 
         // Starting at the window's size, the views that stretch with it start at the right width.
         let content = TopDown(frame: NSRect(x: 0, y: 0, width: Metric.width, height: Metric.field))
-        for view in [glass, chip, field, line, scroll, message, bar, pane] { content.addSubview(view) }
+        for view in [glass, textChip, chip, field, line, scroll, message, bar, pane] { content.addSubview(view) }
         panel.contentView = content
     }
 
@@ -594,7 +607,12 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
             frame.origin.x = x
         }
         guard shown, !reduceMotion else {
-            panel.setFrame(frame, display: true)
+            // Hidden mid-resize, as when ⌘T's lines go after the fade-out, the old resize would
+            // land after this one; going through the animator stops it.
+            NSAnimationContext.runAnimationGroup { context in
+                context.duration = 0
+                panel.animator().setFrame(frame, display: true)
+            }
             return
         }
         NSAnimationContext.runAnimationGroup { context in
@@ -710,7 +728,7 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
     private func enter(_ folder: Row) {
         scopes.append(folder)
         field.stringValue = ""
-        showScopes()
+        showChips()
         search()
     }
 
@@ -719,27 +737,36 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
         // Holding Backspace to clear the box stops there instead of leaving every folder too.
         if let event = NSApp.currentEvent, event.type == .keyDown, event.isARepeat { return true }
         scopes.removeLast()
-        showScopes()
+        showChips()
         search()
         return true
     }
 
-    private func showScopes() {
+    private func showChips() {
         chip.isHidden = scopes.isEmpty
         chipText.stringValue = scopes.map(\.name).joined(separator: " › ")
         chip.toolTip = scopes.last?.path
         chipText.setAccessibilityLabel(scopes.last.map { "Searching in \($0.name)" })
         field.placeholderString = scopes.last.map { "Search in \($0.name)" } ?? "Search"
+        textChip.isHidden = !textOn
+        var x: CGFloat = 50
+        for (box, label) in [(textChip, textChipText), (chip, chipText)] where !box.isHidden {
+            x = fitChip(box, label, at: x) + 8
+        }
+        field.frame = NSRect(x: x, y: 13, width: Metric.width - 18 - x, height: 30)
+    }
+
+    /// Returns where the chip ends.
+    private func fitChip(_ box: NSBox, _ label: NSTextField, at x: CGFloat) -> CGFloat {
         let padding: CGFloat = 8
         // The label's own size is a few points short of what it draws, which cut "pdf" to "…f".
-        let size = chipText.cell!.cellSize
+        let size = label.cell!.cellSize
         let text = min(size.width, Metric.chip - 2 * padding)
         let height = size.height
-        chipText.frame = NSRect(x: padding, y: (Metric.chipHeight - height) / 2, width: text, height: height)
-        chip.frame = NSRect(
-            x: 50, y: (Metric.field - Metric.chipHeight) / 2, width: text + 2 * padding, height: Metric.chipHeight)
-        let x = scopes.isEmpty ? 50 : chip.frame.maxX + 8
-        field.frame = NSRect(x: x, y: 13, width: Metric.width - 18 - x, height: 30)
+        label.frame = NSRect(x: padding, y: (Metric.chipHeight - height) / 2, width: text, height: height)
+        box.frame = NSRect(
+            x: x, y: (Metric.field - Metric.chipHeight) / 2, width: text + 2 * padding, height: Metric.chipHeight)
+        return box.frame.maxX
     }
 
     private func take(_ ticket: UInt64) {
@@ -783,9 +810,10 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
         ask != nil && (ask != textAsked || !textWhole && textTicket == 0)
     }
 
-    /// What a text search for the box would look for, or nil when no chosen folder is reached.
+    /// What a text search for the box would look for, or nil when ⌘T is off or no chosen folder
+    /// is reached.
     private func textAsk() -> TextAsk? {
-        guard !field.stringValue.isEmpty, !composing else { return nil }
+        guard textOn, !field.stringValue.isEmpty, !composing else { return nil }
         let folders = textFolders.reached(within: scopes.last?.path)
         return folders.isEmpty ? nil : TextAsk(query: field.stringValue, folders: folders)
     }
@@ -811,6 +839,34 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
         if textTicket == 0 {
             textAsked = nil
             replacing = false
+        }
+        fit()
+    }
+
+    /// ⌘T: the same words searched inside the chosen folders' files too, or by name alone again.
+    @objc func toggleText(_ sender: Any?) {
+        textOn.toggle()
+        guard textOn else {
+            stopText()
+            return namesOnly()
+        }
+        showChips()
+        // Names still on their way start it once drawn, as after a keystroke.
+        if answered == newest { startText(textAsk(), typedAt: pressedAt()) }
+    }
+
+    /// A picked line hands the pick to the top name.
+    private func namesOnly() {
+        showChips()
+        guard textAsked != nil || !hits.isEmpty else { return fit() }
+        let pickedLine = hit(at: table.selectedRow) != nil
+        dropLines()
+        refill()
+        if pickedLine, let top {
+            select(top)
+        } else if pickedLine {
+            showDetails()
+            follow()
         }
         fit()
     }

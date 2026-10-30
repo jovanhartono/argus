@@ -92,11 +92,11 @@ footer { border-top: 0.5px solid var(--line); margin-top: 36px; padding-top: 20p
 <div class="wrap">
 
 <header>
-  <span class="eyebrow">Milestone M4 · steps and plan · updated 28 Oct 2026</span>
+  <span class="eyebrow">Milestone M4 · steps and plan · updated 30 Oct 2026</span>
   <h1>Argus text search</h1>
-  <p class="lede">The steps of milestone M4. Below the files found by name, the window lists lines found inside the files of folders you choose, without ever slowing the names or downloading a cloud file.</p>
+  <p class="lede">The steps of milestone M4. The window searches names. Press <kbd>⌘</kbd> <kbd>T</kbd> and, below the files found by name, it also lists lines found inside the files of folders you choose, without ever slowing the names or downloading a cloud file.</p>
   <div class="chips">
-    <span class="chip keep">4 of 4 steps merged</span>
+    <span class="chip keep">4 of 5 steps merged</span>
     <span class="chip keep">Names never wait</span>
     <span class="chip open">Whole-home name speed and hand checks to go</span>
     <span class="chip">Built early, while M2's week runs</span>
@@ -125,6 +125,7 @@ footer { border-top: 0.5px solid var(--line); margin-top: 36px; padding-top: 20p
         <tr><td class="n">Core</td><td class="name">Background priority and a bench</td><td>Text search threads run at macOS's lowest <span class="term" tabindex="0" data-tip="macOS's way of ranking threads. Low-priority work runs on the power-saving cores and waits for anything more urgent.">priority</span>, so name search keeps its speed while one runs: 2.5 ms for 95% of name searches alone and 2.5 ms with a text search running, against 10.8 ms at the next level up. <span class="mono">tl grep-bench</span> times text searches from Terminal</td><td class="n"><span class="chip keep">Done</span> <a href="https://github.com/jovanhartono/argus/pull/33">#33</a></td></tr>
         <tr><td class="n">Hatch</td><td class="name">Text search through the C calls</td><td>Four new calls let the app start a text search, take the lines found so far, and stop it. Text search gets its own threads, started on first use, so a Mac that never searches text pays nothing; at most 100 lines per search. Freeing the core 20 ms into a search now takes 0.28 ms instead of 39 ms</td><td class="n"><span class="chip keep">Done</span> <a href="https://github.com/jovanhartono/argus/pull/38">#38</a></td></tr>
         <tr><td class="n">Window</td><td class="name">Text search in the window</td><td>An “Inside Files” section under the names lists lines with the match in bold, the file's name and line number under it. Folders are chosen in the Index Health window (<kbd>⌘</kbd> <kbd>,</kbd>) with + and − and kept between launches. <kbd>Return</kbd>, Quick Look, the details pane, Show in Finder and Copy Path all work on a line's file</td><td class="n"><span class="chip keep">Done</span> <a href="https://github.com/jovanhartono/argus/pull/60">#60</a></td></tr>
+        <tr><td class="n">Window</td><td class="name">Text search on a key</td><td>A plain search lists names only; no file is read and no text search thread starts. <kbd>⌘</kbd> <kbd>T</kbd> searches the same words inside files too, and an “Inside Files” chip in the box says so. <kbd>⌘</kbd> <kbd>T</kbd> again, or hiding the window, goes back to names</td><td class="n"><span class="chip open">In review</span> <a href="https://github.com/jovanhartono/argus/issues/70">#70</a></td></tr>
       </tbody>
     </table>
   </div>
@@ -133,11 +134,12 @@ footer { border-top: 0.5px solid var(--line); margin-top: 36px; padding-top: 20p
 <section id="how">
   <h2>Names first, then text</h2>
   <p class="prose">Finding a file by name means comparing what you typed with a list already in memory: a few milliseconds. Finding a line inside files means opening and reading every one of them: hundreds of milliseconds for a big folder. Done on the same threads at the same time, the slow job would make every keystroke feel slow.</p>
-  <p class="prose">Think of a librarian with two jobs. Asked for a book, she first reads the titles off the catalogue cards and hands you that list at once. Only then does she send an assistant to the shelves you pointed at, to leaf through the books for your words. If you ask something new, she calls the assistant back straight away.</p>
+  <p class="prose">Think of a librarian with two jobs. Asked for a book, she first reads the titles off the catalogue cards and hands you that list at once. Only if you ask her to look inside the books too does she send an assistant to the shelves you pointed at, to leaf through them for your words. If you ask something new, she calls the assistant back straight away.</p>
   <ul class="prose">
+    <li><strong>Asking for the books.</strong> Text search runs only after <kbd>⌘</kbd> <kbd>T</kbd>, shown by an “Inside Files” chip in the box. Without it, lines would crowd the names out of every search. <kbd>⌘</kbd> <kbd>T</kbd> again, or hiding the window, goes back to names.</li>
     <li><strong>The catalogue.</strong> Each keystroke runs the name search as in M3. Only once those names are on screen does the text search start.</li>
     <li><strong>The assistant.</strong> Text search runs on threads of its own, at macOS's lowest priority, so it uses the power-saving cores and gives way to anything more urgent. Lines arrive in small batches and are added under the names, up to 100.</li>
-    <li><strong>Calling back.</strong> A new keystroke stops the text search at once, and any line found for the older search is thrown away rather than shown. Hiding the window stops it too.</li>
+    <li><strong>Calling back.</strong> A new keystroke stops the text search at once, and any line found for the older search is thrown away rather than shown. Hiding the window stops it too, and drops its lines.</li>
     <li><strong>The shelves you pointed at.</strong> Only folders you add in Index Health are read; none are by default. Inside a folder you tabbed into, only the part of those folders inside it is read.</li>
   </ul>
   <figure>
@@ -146,7 +148,7 @@ footer { border-top: 0.5px solid var(--line); margin-top: 36px; padding-top: 20p
         <defs><marker id="h" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="s-head" d="M0,0 L10,5 L0,10 z"/></marker></defs>
         <text class="s-small" x="20" y="22">Name search, every keystroke</text>
         <rect class="s-lane" x="10" y="30" width="880" height="80" rx="10"/>
-        <text class="s-small" x="20" y="152">Text search, low-priority threads, chosen folders only</text>
+        <text class="s-small" x="20" y="152">Text search, after ⌘T, low-priority threads, chosen folders only</text>
         <rect class="s-lane" x="10" y="160" width="880" height="80" rx="10"/>
         <rect class="s-box" x="24" y="44" width="150" height="52" rx="9"/>
         <text class="s-title" x="38" y="66">Keystroke</text>
@@ -211,7 +213,7 @@ footer { border-top: 0.5px solid var(--line); margin-top: 36px; padding-top: 20p
     <table>
       <thead><tr><th>#</th><th>Question</th><th>Decided</th><th>Not chosen</th></tr></thead>
       <tbody>
-        <tr><td class="n">1</td><td>Index the text, or read it live</td><td>Read the files live on every search, in folders you choose</td><td>A text index: disk and memory for every word of every file, and kept in step with every save. An optional per-folder index stays in v2</td></tr>
+        <tr><td class="n">1</td><td>Index the text, or read it live</td><td>Read the files live on each <kbd>⌘</kbd> <kbd>T</kbd> search (decision 9), in folders you choose</td><td>A text index: disk and memory for every word of every file, and kept in step with every save. An optional per-folder index stays in v2</td></tr>
         <tr><td class="n">2</td><td>Which folders by default</td><td>None until you add one in Index Health</td><td>The whole home folder: 3.4-5.3 s to read it once, on every search</td></tr>
         <tr><td class="n">3</td><td>Matching library</td><td>ripgrep's file reader with a small plain-text matcher: 1.79 MB for <span class="mono">tl</span> per chip, at the same speed</td><td>ripgrep's full pattern library: 3.36 MB per chip, for patterns nobody types into a launcher</td></tr>
         <tr><td class="n">4</td><td>Thread priority</td><td>macOS's lowest, background: names stay at 2.5 ms for 95% while text runs</td><td>One level up, utility: names slow to 10.8 ms. Utility with 2 threads: 6.5 ms. The cost: text search is about twice as slow over many tiny files, and a lower priority stops a replaced search later: 8-24 ms at utility on a busy Mac instead of 0.3 ms, not yet measured at background</td></tr>
@@ -219,6 +221,7 @@ footer { border-top: 0.5px solid var(--line); margin-top: 36px; padding-top: 20p
         <tr><td class="n">6</td><td>Which files to read</td><td>List the chosen folders afresh for each search, with the name list's skip rules: listing home takes 80-90 ms against 3.4-5.3 s to read its files</td><td>Keeping the listing between searches: about 3% of the time saved, for a list that goes stale. Reusing the live name list: it trails a save by up to a second and leaves out ~/Library and folders outside home</td></tr>
         <tr><td class="n">7</td><td>What to skip</td><td>Files with a zero byte (binary), over 8 MB, or with a line over 1 MB; each line cut to 200 bytes around the match; 100 lines in all</td><td>A 128 KB line cap: peak memory from about 10 MB to 5 MB, but 27 more files skipped in ~/Documents</td></tr>
         <tr><td class="n">8</td><td>What <kbd>Return</kbd> does on a line</td><td>Opens the file</td><td>Opening at the line: every editor takes the line its own way, and there is no one cheap call for all of them</td></tr>
+        <tr><td class="n">9</td><td>When text search runs</td><td>Only after <kbd>⌘</kbd> <kbd>T</kbd>, for the words already in the box, until <kbd>⌘</kbd> <kbd>T</kbd> again or the window hides (<a href="https://github.com/jovanhartono/argus/issues/70">#70</a>)</td><td>On every search: lines crowded the names out. A typed prefix such as <span class="mono">/</span>: a key keeps the words as typed. <kbd>Tab</kbd>: it already goes into a folder</td></tr>
       </tbody>
     </table>
   </div>
@@ -240,7 +243,7 @@ footer { border-top: 0.5px solid var(--line); margin-top: 36px; padding-top: 20p
   <h2>Next steps</h2>
   <ol class="prose">
     <li>Finish M2 first: the v0.2.0 release, the update test and the 7-day run, all on the <a href="m2-daily-driver.html#next">M2 page</a>.</li>
-    <li>Add one folder you search often in Index Health and use text search during the week; the hand checks above, once.</li>
+    <li>Add one folder you search often in Index Health and press <kbd>⌘</kbd> <kbd>T</kbd> to search inside it during the week; the hand checks above, once.</li>
     <li>Add the licence notice before the release that first ships text search.</li>
     <li>Time the listing and the file reads apart on ~/Documents to find where the first 0.7 s goes, and the stop time of a replaced search at background priority. M4 closes when every check in <a href="#targets">What M4 must prove</a> passes and the hand checks are done.</li>
   </ol>
