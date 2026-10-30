@@ -922,9 +922,11 @@ enum Held {
 
 /// People start an app by its first word, "lark" for LarkSuite, so in an app's name that word
 /// counts almost as much as the whole name, and a capital after a lower-case letter starts a word. Not in file names,
-/// where hashes like "sLaR.js" would gain at random.
+/// where hashes like "sLaR.js" would gain at random. Nor for one to three letters, a quick
+/// jump like "go" for ~/go rather than GoLand.
 fn held_in(name: &str, word: &str, app: bool) -> Held {
     let (name, word) = (name.as_bytes(), word.as_bytes());
+    let app = app && word.len() >= 4;
     let camel =
         |at: usize| app && name[at - 1].is_ascii_lowercase() && name[at].is_ascii_uppercase();
     let mut result = Held::No;
@@ -2666,10 +2668,24 @@ mod tests {
         builder.push("sLaR.js", root, false);
         let index = builder.finish();
         let apps = applications(&["LarkSuite", "Safari"]);
-        for query in ["lark", "Lark", "lar"] {
+        for query in ["lark", "Lark"] {
             let found = ranked(&index, &apps, query);
             assert_eq!(found[0], "/Applications/LarkSuite.app", "{query} {found:?}");
         }
+        let found = ranked(&index, &apps, "lar");
+        assert_ne!(found[0], "/home/sLaR.js", "{found:?}");
+    }
+
+    /// A developer typing "go" wants ~/go, their Go workspace, not GoLand.
+    #[test]
+    fn a_short_query_keeps_a_folder_of_that_name_above_an_app_starting_with_it() {
+        let mut builder = IndexBuilder::new();
+        let root = builder.push("/home", NO_PARENT, true);
+        builder.push("go", root, true);
+        let index = builder.finish();
+        let apps = applications(&["GoLand", "WeChat"]);
+        let found = ranked(&index, &apps, "go");
+        assert_eq!(found[0], "/home/go", "{found:?}");
     }
 
     /// Someone who starts Xcode from the Dock and once opened Xcode-beta through Argus still
