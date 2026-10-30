@@ -62,8 +62,9 @@ pub struct Changes {
 }
 
 impl Changes {
-    /// Brings `index` up to date with what was read. Panics when `index` is not the one read,
-    /// or changed since, as the entry numbers read would then be wrong.
+    /// Brings `index` up to date with what was read. Nothing may change `index` in between, as
+    /// the entry numbers read would then be wrong; most such misuse panics, but a change undone
+    /// by a compaction can slip past the check.
     pub fn apply(self, index: &mut Index) -> Update {
         assert!(
             self.read_from == index.state(),
