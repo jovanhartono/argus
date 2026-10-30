@@ -3327,6 +3327,76 @@ mod tests {
     }
 
     /// Where a core saves its list; an empty `journal` may come without a pointer.
+    /// The memory macOS counts against this process, as `footprint` shows it.
+    #[cfg(target_os = "macos")]
+    fn footprint() -> u64 {
+        #[repr(C)]
+        #[derive(Default)]
+        struct RusageInfoV0 {
+            uuid: [u8; 16],
+            times_and_wakeups: [u64; 6],
+            resident_size: u64,
+            phys_footprint: u64,
+            start_and_exit: [u64; 2],
+        }
+        unsafe extern "C" {
+            fn proc_pid_rusage(pid: i32, flavor: i32, buffer: *mut RusageInfoV0) -> i32;
+        }
+        let mut info = RusageInfoV0::default();
+        assert_eq!(
+            unsafe { proc_pid_rusage(std::process::id() as i32, 0, &mut info) },
+            0
+        );
+        info.phys_footprint
+    }
+
+    /// Run alone: `cargo test -p argus-ffi --release update_peak -- --ignored --nocapture`.
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "indexes the whole home folder with everything on, and needs Full Disk Access"]
+    fn update_peak_with_everything_on() {
+        let home = argus_core::home();
+        let scratch = home.join("Library/Caches/argus-measure");
+        std::fs::create_dir_all(&scratch).unwrap();
+        let saves = tempfile::tempdir().unwrap();
+        let file = saves.path().join("index").to_string_lossy().into_owned();
+        let saved = saved_at(file.as_bytes(), b"", 1);
+        let events = Events::default();
+        let core = scan_saving(home.to_str().unwrap(), 1, 1, &saved, &events);
+        events.wait_for_event(TL_EVENT_INDEXED);
+        thread::sleep(Duration::from_secs(3));
+        let mb = |bytes: u64| bytes as f64 / 1_048_576.0;
+        eprintln!("MEASURE idle after the scan {:.1} MB", mb(footprint()));
+        for round in 1..=6_u64 {
+            std::fs::write(scratch.join(format!("{round}.txt")), "").unwrap();
+            let stop = Arc::new(AtomicBool::new(false));
+            let sampler = thread::spawn({
+                let stop = Arc::clone(&stop);
+                move || {
+                    let mut peak = 0;
+                    while !stop.load(Ordering::Relaxed) {
+                        peak = peak.max(footprint());
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                    peak
+                }
+            });
+            let started = Instant::now();
+            assert_eq!(changed_at(&core, &[&scratch], 0, round + 1), 1);
+            let entries = events.wait_for_rebuilt(round as usize);
+            let took = started.elapsed();
+            stop.store(true, Ordering::Relaxed);
+            let peak = sampler.join().unwrap();
+            eprintln!(
+                "MEASURE round {round}: peak {:.1} MB, list in use after {took:?}, {entries} entries",
+                mb(peak)
+            );
+            thread::sleep(Duration::from_secs(2));
+        }
+        eprintln!("MEASURE idle at the end {:.1} MB", mb(footprint()));
+        std::fs::remove_dir_all(scratch).unwrap();
+    }
+
     fn saved_at(file: &[u8], journal: &[u8], now: u64) -> TlSaved {
         TlSaved {
             file: file.as_ptr(),
