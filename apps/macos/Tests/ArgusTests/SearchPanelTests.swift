@@ -1112,6 +1112,36 @@ final class SearchPanelTests: XCTestCase {
         XCTAssertEqual(NSDragOperation(rawValue: mask(window.table, ask, false)), .copy, "never a move")
     }
 
+    func testALineFoundInsideAFileActsAsItsFileAndTheTitleAsNothing() async throws {
+        try write("x", at: "budget a.txt")
+        try write("the budget", at: "notes/plan.txt")
+        let window = try await opened(access: true, textFolders: [root.path])
+        window.show()
+        defer { window.hide() }
+        try await type("budget", in: window)
+        window.toggleText(nil)
+        try await until { window.hits.count == 1 && window.textTicket == 0 }
+        XCTAssertEqual(window.header, 1)
+        let line = (window.tableView(window.table, pasteboardWriterForRow: 2) as? NSURL) as URL?
+        XCTAssertEqual(line?.path, window.hits[0].path)
+        XCTAssertNil(window.tableView(window.table, pasteboardWriterForRow: 1), "the title drags nothing")
+
+        let menu = try XCTUnwrap(window.table.menu)
+        XCTAssertEqual(window.table.selectedRow, 0)
+        try rightClick(row: 1, in: window.table)
+        window.menuNeedsUpdate(menu)
+        XCTAssertEqual(menu.items, [], "the title has nothing to act on")
+        XCTAssertEqual(window.table.selectedRow, 0)
+
+        // As if a file change had the search waiting to put back an older pick: the right-click wins.
+        window.repick = (window.hits[0], 0)
+        try rightClick(row: 2, in: window.table)
+        window.menuNeedsUpdate(menu)
+        XCTAssertNil(window.repick)
+        XCTAssertEqual(window.table.selectedRow, 2)
+        XCTAssertEqual(window.selected?.path, window.hits[0].path)
+    }
+
     func testCopyPathSaysSoForAMomentThenHides() async throws {
         try write("x", at: "budget a.txt")
         let window = try await opened(access: true)
@@ -1119,11 +1149,15 @@ final class SearchPanelTests: XCTestCase {
         try await type("budget", in: window)
         try await until { window.rows.count == 1 }
         let path = window.rows[0].path
+        XCTAssertTrue(stage.isKey(window.panel))
 
         window.copyPath(nil)
         XCTAssertEqual(stage.copied, [path])
         XCTAssertEqual(window.status, "Path copied")
         XCTAssertTrue(window.shown)
+        XCTAssertFalse(stage.isKey(window.panel), "a quick ⌘V pastes into your own app, not the box")
+        window.windowDidResignKey(Notification(name: NSWindow.didResignKeyNotification, object: window.panel))
+        XCTAssertTrue(window.shown, "giving the keys back doesn't cut the message short")
         try await until { !window.shown }
 
         // Hidden and shown again before the moment is up, the window stays.
@@ -1177,7 +1211,7 @@ final class SearchPanelTests: XCTestCase {
             XCTAssertEqual(window.scopes.map(\.name), ["notes"], "\(answer)")
             XCTAssertNil(window.notice)
             let why = answer == .none ? "no folder open in Finder" : "Finder didn’t answer"
-            XCTAssertEqual(window.field.placeholderString, "Search in notes (\(why))")
+            XCTAssertEqual(window.field.placeholderString, "Search (\(why))", "the folder label names notes")
             window.hide()
             window.show()
             defer { window.hide() }
@@ -1295,6 +1329,28 @@ final class SearchPanelTests: XCTestCase {
             try await until { !window.rows.isEmpty }
             XCTAssertTrue(window.rows.contains { $0.path.hasSuffix("notes/budget.txt") }, folder)
         }
+    }
+
+    func testBesideAFolderLabelTheReasonFitsInTheBox() async throws {
+        let folder = "Client Projects Archive 2026"
+        try write("x", at: "\(folder)/budget.txt")
+        let downloads = realRoot.appendingPathComponent("Downloads").path
+        let window = try await opened(access: false, finder: { .folder(downloads) })
+        window.show()
+        try await type(folder, in: window)
+        try await until { window.rows.first?.name == folder }
+        XCTAssertTrue(tab(window))
+        window.hide()
+
+        window.toggleInFinderFolder()
+        try await until { window.shown }
+        defer { window.hide() }
+        XCTAssertEqual(window.scopes.map(\.name), [folder])
+        XCTAssertFalse(window.chip.isHidden)
+        let text = try XCTUnwrap(window.field.placeholderString)
+        XCTAssertEqual(text, "Search (Downloads isn’t in the list)", "the label already names the folder")
+        let width = NSAttributedString(string: text, attributes: [.font: try XCTUnwrap(window.field.font)]).size().width
+        XCTAssertLessThan(width + 8, window.field.frame.width)
     }
 
     /// Hidden and shown again within the fade, by the usual hotkey.

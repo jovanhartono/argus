@@ -255,10 +255,11 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
     }
 
     /// `needsFinder` shows the Finder line, which only the Finder hotkey's window has. `fellBack`
-    /// says in the empty box why the Finder hotkey opened the window as you left it.
+    /// says in the empty box why the Finder hotkey opened the window as you left it; the folder
+    /// label already names the folder, so the reason fits beside it.
     func show(needsFinder: Bool = false, fellBack: String? = nil) {
         let pressed = pressedAt()
-        field.placeholderString = fellBack.map { "\(placeholder) (\($0))" } ?? placeholder
+        field.placeholderString = fellBack.map { "Search (\($0))" } ?? placeholder
         hatch?.windowShown(true)
         finderAsks += 1
         recheckAccess()
@@ -549,7 +550,9 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
         let index = table.clickedRow
         let onRow = index >= 0 && index < listed && index != header
         menu.items = onRow ? rowItems : []
-        if onRow { select(index) }
+        guard onRow else { return }
+        repick = nil
+        select(index)
     }
 
     /// Checked on each show while access is missing, so the line goes once access is switched
@@ -1165,6 +1168,9 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
             stage.copy(row.path)
             copied = true
             fit()
+            // Put away and brought back without the keys, so a quick ⌘V pastes into your own app.
+            stage.putAway(panel)
+            stage.bringForward(panel)
             DispatchQueue.main.asyncAfter(deadline: .now() + Metric.copied) { [weak self] in
                 guard let self, copied else { return }
                 hide()
@@ -1303,7 +1309,7 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
     /// Also hears the preview, whose delegate this is while it shows.
     func windowDidResignKey(_ note: Notification) {
         guard note.object as? NSWindow === panel, !previewing else { return settleKeys() }
-        hide()
+        if !copied { hide() }
     }
 
     /// Arrows, a click on a row, and a new list all land here.
