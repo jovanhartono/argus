@@ -681,7 +681,8 @@ fn match_apps(
             matched |= 1 << w;
             if wanted >> w & 1 == 1 {
                 let name = &apps.names[n];
-                let (score, holds) = points(found, name, &words[w].needle, 0, &config.scoring);
+                let needle = &words[w].needle;
+                let (score, holds) = points(found, name, needle, 0, true, &config.scoring);
                 app_held[n] |= u8::from(holds) << w;
                 app_score[n] = app_score[n].saturating_add(score);
             }
@@ -712,19 +713,28 @@ fn matcher_config() -> Config {
 
 /// A name's points for one word, and whether it holds the word letter for letter. Below
 /// `floor` it cannot, so the name is not read again.
-fn points(found: Match, name: &str, word: &str, floor: u16, scoring: &Scoring) -> (u16, bool) {
+fn points(
+    found: Match,
+    name: &str,
+    word: &str,
+    floor: u16,
+    app: bool,
+    scoring: &Scoring,
+) -> (u16, bool) {
     let score = found.score;
     let how = if score < floor {
         Held::No
     } else {
-        held_in(name, word)
+        held_in(name, word, app)
     };
     match how {
-        how @ (Held::Whole | Held::Alone) => {
-            let exact = if matches!(how, Held::Whole) && !found.exact {
-                scoring.exact_match_bonus
-            } else {
-                0
+        how @ (Held::Whole | Held::First | Held::Alone) => {
+            let exact = match how {
+                Held::Whole if !found.exact => scoring.exact_match_bonus,
+                // One under the whole name, so "xcode" still puts Xcode above Xcode-beta, and
+                // one over a lark folder at home, which loses `DEPTH_PENALTY` for its depth.
+                Held::First => scoring.exact_match_bonus.saturating_sub(1),
+                _ => 0,
             };
             (
                 score.saturating_add(exact).saturating_add(WHOLE_WORD_BONUS),
@@ -886,7 +896,7 @@ fn match_names(
                                 let text = texts[found.index as usize];
                                 let needle = &words[w].needle;
                                 let (score, holds) =
-                                    points(found, text, needle, floors[w], &config.scoring);
+                                    points(found, text, needle, floors[w], false, &config.scoring);
                                 held |= u8::from(holds) << w;
                                 scores[n] = scores[n].saturating_add(score);
                             }
@@ -905,12 +915,20 @@ enum Held {
     No,
     Inside,
     Alone,
+    /// The first word of an app's name, as "lark" in LarkSuite.
+    First,
     Whole,
 }
 
-fn held_in(name: &str, word: &str) -> Held {
+/// People start an app by its first word, "lark" for LarkSuite, so in an app's name that word
+/// counts almost as much as the whole name, and a capital after a lower-case letter starts a word. Not in file names,
+/// where hashes like "sLaR.js" would gain at random. Nor for one to three letters, a quick
+/// jump like "go" for ~/go rather than GoLand.
+fn held_in(name: &str, word: &str, app: bool) -> Held {
     let (name, word) = (name.as_bytes(), word.as_bytes());
-    let alphanumeric = |byte: Option<&u8>| byte.is_some_and(u8::is_ascii_alphanumeric);
+    let app = app && word.len() >= 4;
+    let camel =
+        |at: usize| app && name[at - 1].is_ascii_lowercase() && name[at].is_ascii_uppercase();
     let mut result = Held::No;
     // One letter matches most names; checking each for it is time with nothing to gain.
     if word.len() < 2 || word.len() > name.len() {
@@ -918,10 +936,14 @@ fn held_in(name: &str, word: &str) -> Held {
     }
     for (i, window) in name.windows(word.len()).enumerate() {
         if window.eq_ignore_ascii_case(word) {
-            if !alphanumeric(name[..i].last()) && !alphanumeric(name.get(i + word.len())) {
-                return match &name[i + word.len()..] {
+            let end = i + word.len();
+            let starts = i == 0 || !name[i - 1].is_ascii_alphanumeric() || camel(i);
+            let ends = end == name.len() || !name[end].is_ascii_alphanumeric() || camel(end);
+            if starts && ends {
+                return match &name[end..] {
                     [] if i == 0 => Held::Whole,
                     [b'.', extension @ ..] if i == 0 && !extension.contains(&b'.') => Held::Whole,
+                    _ if i == 0 && app => Held::First,
                     _ => Held::Alone,
                 };
             }
@@ -1277,7 +1299,7 @@ mod tests {
             let haystacks: Vec<String> = (0..40).map(|_| rng.name(&names, 30)).collect();
             for found in Matcher::new(word.clone(), &config).match_list(&haystacks) {
                 let name = &haystacks[found.index as usize];
-                if floor > 0 && !matches!(held_in(name, &needle), Held::No) {
+                if floor > 0 && !matches!(held_in(name, &needle, false), Held::No) {
                     checked += 1;
                     assert!(found.score >= floor, "{typed:?} in {name:?}");
                 }
@@ -1421,7 +1443,7 @@ mod tests {
                 let name = &haystacks[found.index as usize];
                 if word_starts(name) & needed == 0 {
                     checked += 1;
-                    let held = held_in(stripped[found.index as usize], &typed);
+                    let held = held_in(stripped[found.index as usize], &typed, false);
                     assert!(found.score <= ceiling, "{typed:?} in {name:?}");
                     assert!(
                         matches!(held, Held::No | Held::Inside),
@@ -2628,6 +2650,58 @@ mod tests {
             let found = ranked(&index, &apps, query);
             assert_eq!(found[0], "/Applications/Notes.app", "{query}");
             assert_eq!(found.len(), count, "{query}");
+        }
+    }
+
+    /// Issue #71: "Lark" showed LarkSuite first only because a capital typed leaves out every
+    /// lower-case name; "lark" let a folder named lark win.
+    #[test]
+    fn the_first_word_of_an_app_finds_it_first_in_any_case() {
+        let mut builder = IndexBuilder::new();
+        let root = builder.push("/home", NO_PARENT, true);
+        builder.push("lark", root, true);
+        builder.push("lark_report.py", root, false);
+        builder.push("schema-lark", root, true);
+        builder.push("iCloud~com~larksuite~lark", root, true);
+        builder.push("LarkReport.pdf", root, false);
+        // Saved editor history is full of names like this; its capitals mark no words.
+        builder.push("sLaR.js", root, false);
+        let index = builder.finish();
+        let apps = applications(&["LarkSuite", "Safari"]);
+        for query in ["lark", "Lark"] {
+            let found = ranked(&index, &apps, query);
+            assert_eq!(found[0], "/Applications/LarkSuite.app", "{query} {found:?}");
+        }
+        let found = ranked(&index, &apps, "lar");
+        assert_ne!(found[0], "/home/sLaR.js", "{found:?}");
+    }
+
+    /// A developer typing "go" wants ~/go, their Go workspace, not GoLand.
+    #[test]
+    fn a_short_query_keeps_a_folder_of_that_name_above_an_app_starting_with_it() {
+        let mut builder = IndexBuilder::new();
+        let root = builder.push("/home", NO_PARENT, true);
+        builder.push("go", root, true);
+        let index = builder.finish();
+        let apps = applications(&["GoLand", "WeChat"]);
+        let found = ranked(&index, &apps, "go");
+        assert_eq!(found[0], "/home/go", "{found:?}");
+    }
+
+    /// Someone who starts Xcode from the Dock and once opened Xcode-beta through Argus still
+    /// wants Xcode for "xcode", so it must lead on points, not only on its shorter name.
+    #[test]
+    fn an_app_named_exactly_what_was_typed_outscores_a_longer_one() {
+        let index = IndexBuilder::new().finish();
+        let apps = applications(&["Xcode-beta", "Xcode", "Notion Calendar", "Notion"]);
+        let searcher = Searcher::with_threads(2);
+        for (query, exact) in [("xcode", "Xcode"), ("notion", "Notion")] {
+            let hits = searcher
+                .search(&index, &apps, query, searcher.ticket(), 10)
+                .unwrap();
+            assert_eq!(hits.len(), 2, "{query}");
+            assert!(matches!(hits[0].item, Item::App(app) if apps.name(app) == exact));
+            assert!(hits[0].score > hits[1].score, "{query}");
         }
     }
 
