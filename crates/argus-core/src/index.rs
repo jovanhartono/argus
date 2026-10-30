@@ -437,20 +437,6 @@ impl IndexBuilder {
         }
     }
 
-    /// Room for at most `bytes` of names in `count` distinct names, so storing them never
-    /// doubles a list.
-    pub(crate) fn reserve_names(&mut self, bytes: usize, count: usize) {
-        let Self {
-            index,
-            lookup,
-            hasher,
-            ..
-        } = self;
-        index.names.reserve_exact(bytes);
-        index.name_starts.reserve_exact(count);
-        lookup.reserve(count, |&id| hasher.hash_one(index.name_text(id)));
-    }
-
     pub(crate) fn push(&mut self, name: &str, parent: EntryId, is_dir: bool) -> EntryId {
         let kind = if is_dir { Kind::Folder } else { Kind::File };
         self.push_child(name, parent, kind, 0)

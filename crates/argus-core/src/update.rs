@@ -2,13 +2,15 @@
 //! place, so a change costs a few folder reads instead of a rescan.
 
 use crate::index::{EntryId, Index, IndexBuilder, NO_PARENT, NameId, name_fingerprint};
+use crate::name_starts::NameStarts;
 use crate::siblings::{NO_FOLDER, Siblings};
 use crate::walk::{Kind, Listing, Rules, walk};
-use hashbrown::HashSet;
+use hashbrown::{DefaultHashBuilder, HashSet, HashTable};
 use rayon::prelude::*;
 use std::cmp::Ordering;
 use std::ffi::OsStr;
 use std::fs;
+use std::hash::BuildHasher;
 use std::io;
 use std::path::{Component, Path, PathBuf};
 
@@ -283,9 +285,7 @@ impl Index {
     fn compact_past(&mut self, share: usize) -> bool {
         let due = self.past(share);
         if due {
-            let mut parents = self.parents();
-            self.compact(&mut parents);
-            self.siblings = Siblings::from_parents(&parents, &self.folders);
+            self.compact();
         }
         due
     }
@@ -679,73 +679,191 @@ impl Index {
     }
 
     /// Drops the removed entries and stores each name once, keeping the order, so searches are
-    /// as fast as on a fresh scan. The entry lists are rewritten where they are, so the
-    /// rebuild never holds two copies of them.
-    fn compact(&mut self, parents: &mut Vec<EntryId>) {
-        self.name_letters = Vec::new();
-        self.name_digit_starts = Vec::new();
-        self.name_symbols = Vec::new();
-        self.siblings = Siblings::default();
-        let mut names = IndexBuilder::new();
-        names.reserve_names(self.names.len(), self.distinct_names());
-        let mut renamed = vec![NameId::MAX; self.distinct_names()];
-        let mut placed = vec![NO_PARENT; self.folders.len()];
-        let mut folders = Vec::with_capacity(self.folder_count());
-        let mut folder_inodes = Vec::with_capacity(self.folder_count());
-        let mut passages = Vec::new();
-        let mut roots = Vec::with_capacity(self.roots.len());
-        let mut passage = self.passages.iter().peekable();
-        let (mut slot, mut kept) = (0, 0);
-        for entry in 0..self.len() {
-            let is_folder = self.folders.get(slot) == Some(&(entry as EntryId));
-            slot += usize::from(is_folder);
-            let is_passage = passage.next_if_eq(&&(entry as EntryId)).is_some();
-            let parent = match parents[entry] {
-                NO_PARENT if self.is_root(entry as EntryId) => {
-                    roots.push(kept as EntryId);
-                    NO_PARENT
+    /// as fast as on a fresh scan. Each list is rewritten where it stands, one after another,
+    /// so a compaction while you work holds a few small tables beside the index, not a copy.
+    fn compact(&mut self) {
+        // Worked out again once the runs are rewritten.
+        self.siblings.depths = Vec::new();
+        self.siblings.folder_parents = Vec::new();
+        let (placed, used) = self.kept();
+        let renamed = self.compact_names(&used);
+        drop(used);
+        self.compact_entries(&placed, &renamed);
+        (self.removed, self.removed_folders, self.added) = (0, 0, 0);
+    }
+
+    /// Whether `entry`, in the run of the folder at place `folder`, stays: a root, or anything
+    /// in a folder that stays, by `placed`.
+    fn stays(&self, placed: &[u32], folder: u32, entry: usize) -> bool {
+        match folder {
+            NO_FOLDER => self.is_root(entry as EntryId),
+            slot => placed[slot as usize] != NO_FOLDER,
+        }
+    }
+
+    /// Each folder's place among the folders that stay, by its place now, or `NO_FOLDER`; and
+    /// a bit for each name an entry that stays uses.
+    fn kept(&self) -> (Vec<u32>, Vec<u64>) {
+        let mut placed = vec![NO_FOLDER; self.folders.len()];
+        let mut used = vec![0_u64; self.distinct_names().div_ceil(64)];
+        let mut folders = self.folders.iter().enumerate().peekable();
+        let mut next = 0;
+        for run in 0..self.siblings.len() {
+            let folder = self.siblings.folders[run];
+            for entry in self.siblings.entries(run, self.len()) {
+                let is_folder = folders.next_if(|&(_, &at)| at as usize == entry);
+                if !self.stays(&placed, folder, entry) {
+                    continue;
                 }
-                NO_PARENT => continue,
-                parent => match self.folders.binary_search(&parent) {
-                    Ok(at) if placed[at] != NO_PARENT => placed[at],
-                    _ => continue,
-                },
+                mark(&mut used, self.entry_name[entry] as usize);
+                if let Some((slot, _)) = is_folder {
+                    placed[slot] = next;
+                    next += 1;
+                }
+            }
+        }
+        (placed, used)
+    }
+
+    /// Keeps each name `used` marks once, in order, with its fingerprint, moving it down over
+    /// the names that go. Returns each name's new number by its old one.
+    fn compact_names(&mut self, used: &[u64]) -> Vec<NameId> {
+        let count = self.distinct_names();
+        let in_use = || (0..count).filter(|&name| has(used, name));
+        let hasher = DefaultHashBuilder::default();
+        // Only names whose hash shares a bit with another's can repeat one, so the lookup
+        // table holds a tenth of the names; one for all of them would cost 10 MB on a home
+        // folder of a million names.
+        let bits = (count * 8).next_power_of_two().max(64);
+        let shift = 64 - bits.trailing_zeros();
+        let (mut seen, mut shared) = (vec![0; bits / 64], vec![0; bits / 64]);
+        for name in in_use() {
+            let hash = hasher.hash_one(self.name_text(name as NameId).as_bytes());
+            let bit = (hash >> shift) as usize;
+            let list = if has(&seen, bit) {
+                &mut shared
+            } else {
+                &mut seen
             };
-            let id = kept as EntryId;
-            let name = self.entry_name[entry] as usize;
-            if renamed[name] == NameId::MAX {
-                renamed[name] = names.intern(self.name_text(name as NameId));
+            mark(list, bit);
+        }
+        drop(seen);
+        let mut renamed = vec![NameId::MAX; count];
+        let mut text = std::mem::take(&mut self.names).into_bytes();
+        let mut starts = NameStarts::default();
+        starts.reserve_exact(in_use().count() + 1);
+        assert!(starts.push(0));
+        let mut lookup = HashTable::new();
+        let mut kept = 0;
+        for name in in_use() {
+            let (from, to) = (self.name_starts.get(name), self.name_starts.get(name + 1));
+            let hash = hasher.hash_one(&text[from..to]);
+            let shares = has(&shared, (hash >> shift) as usize);
+            let same = |&other: &NameId| text_of(&text, &starts, other) == &text[from..to];
+            if shares && let Some(&other) = lookup.find(hash, same) {
+                renamed[name] = other;
+                continue;
             }
-            self.entry_name[kept] = renamed[name];
-            parents[kept] = parent;
-            if is_folder {
-                placed[slot - 1] = id;
-                folders.push(id);
-                folder_inodes.push(self.folder_inodes[slot - 1]);
+            let at = starts.get(kept as usize);
+            text.copy_within(from..to, at);
+            assert!(
+                starts.push((at + to - from) as u32),
+                "a file name is at most 765 bytes"
+            );
+            self.name_letters[kept as usize] = self.name_letters[name];
+            self.name_digit_starts[kept as usize] = self.name_digit_starts[name];
+            self.name_symbols[kept as usize] = self.name_symbols[name];
+            if shares {
+                lookup.insert_unique(hash, kept, |&other| {
+                    hasher.hash_one(text_of(&text, &starts, other))
+                });
             }
-            if is_passage {
-                passages.push(id);
-            }
+            renamed[name] = kept;
             kept += 1;
         }
-        drop((renamed, placed));
-        for list in [&mut self.entry_name, parents] {
-            list.truncate(kept);
-            list.shrink_to_fit();
-        }
-        let mut names = names.lists();
-        names.names.shrink_to_fit();
-        names.name_starts.shrink_to_fit();
-        self.names = names.names;
-        self.name_starts = names.name_starts;
-        self.folders = folders;
-        self.folder_inodes = folder_inodes;
-        passages.shrink_to_fit();
-        self.passages = passages;
-        self.roots = roots;
-        (self.removed, self.removed_folders, self.added) = (0, 0, 0);
-        self.add_letters();
+        let kept = kept as usize;
+        trim(&mut text, starts.get(kept));
+        self.names = String::from_utf8(text).expect("whole names moved");
+        starts.shrink_to_fit();
+        self.name_starts = starts;
+        trim(&mut self.name_letters, kept);
+        trim(&mut self.name_digit_starts, kept);
+        trim(&mut self.name_symbols, kept);
+        renamed
     }
+
+    /// Moves each entry that stays down over those that go, under its new name, and rewrites
+    /// the runs of siblings for them.
+    fn compact_entries(&mut self, placed: &[u32], renamed: &[NameId]) {
+        let len = self.len();
+        let mut roots = Vec::with_capacity(self.roots.len());
+        let (mut kept, mut runs) = (0, 0);
+        let (mut slot, mut folders, mut passage, mut passages) = (0, 0, 0, 0);
+        for run in 0..self.siblings.len() {
+            let entries = self.siblings.entries(run, len);
+            let folder = self.siblings.folders[run];
+            let first = kept;
+            for entry in entries {
+                let is_folder = self.folders.get(slot) == Some(&(entry as EntryId));
+                slot += usize::from(is_folder);
+                let is_passage = self.passages.get(passage) == Some(&(entry as EntryId));
+                passage += usize::from(is_passage);
+                if !self.stays(placed, folder, entry) {
+                    continue;
+                }
+                if folder == NO_FOLDER {
+                    roots.push(kept as EntryId);
+                }
+                self.entry_name[kept] = renamed[self.entry_name[entry] as usize];
+                if is_folder {
+                    self.folders[folders] = kept as EntryId;
+                    self.folder_inodes[folders] = self.folder_inodes[slot - 1];
+                    folders += 1;
+                }
+                if is_passage {
+                    self.passages[passages] = kept as EntryId;
+                    passages += 1;
+                }
+                kept += 1;
+            }
+            // Each old run leaves one run at most, so this never overwrites one still unread.
+            let folder = match folder {
+                NO_FOLDER => NO_FOLDER,
+                slot => placed[slot as usize],
+            };
+            if kept > first && (runs == 0 || self.siblings.folders[runs - 1] != folder) {
+                self.siblings.starts[runs] = first as EntryId;
+                self.siblings.folders[runs] = folder;
+                runs += 1;
+            }
+        }
+        trim(&mut self.entry_name, kept);
+        trim(&mut self.folders, folders);
+        trim(&mut self.folder_inodes, folders);
+        trim(&mut self.passages, passages);
+        trim(&mut self.siblings.starts, runs);
+        trim(&mut self.siblings.folders, runs);
+        self.siblings.add_depths(&self.folders, kept);
+        self.roots = roots;
+    }
+}
+
+fn text_of<'t>(text: &'t [u8], starts: &NameStarts, name: NameId) -> &'t [u8] {
+    let name = name as usize;
+    &text[starts.get(name)..starts.get(name + 1)]
+}
+
+fn has(bits: &[u64], at: usize) -> bool {
+    bits[at / 64] >> (at % 64) & 1 != 0
+}
+
+fn mark(bits: &mut [u64], at: usize) {
+    bits[at / 64] |= 1 << (at % 64);
+}
+
+fn trim<T>(list: &mut Vec<T>, len: usize) {
+    list.truncate(len);
+    list.shrink_to_fit();
 }
 
 /// The names on the way down from the root, up to anything else, such as a "..".
@@ -1256,9 +1374,7 @@ mod tests {
         let mut index = settings.scan().unwrap().index;
         for _ in 0..3 {
             let started = std::time::Instant::now();
-            let mut parents = index.parents();
-            index.compact(&mut parents);
-            index.siblings = Siblings::from_parents(&parents, &index.folders);
+            index.compact();
             let took = started.elapsed();
             eprintln!("MEASURE compacting {} entries: {took:?}", index.len());
         }

@@ -26,6 +26,7 @@ pub(crate) struct Siblings {
 impl Siblings {
     /// Runs for `parents`, each entry's parent folder, given every folder's entry number.
     /// Each parent must be an earlier folder.
+    #[cfg(test)]
     pub(crate) fn from_parents(parents: &[EntryId], folders: &[EntryId]) -> Self {
         let mut siblings = Self::default();
         let mut last = (NO_PARENT, NO_FOLDER);
