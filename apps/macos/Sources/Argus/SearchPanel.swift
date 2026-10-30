@@ -23,6 +23,7 @@ enum Metric {
     static let children = 50
     static let chip: CGFloat = 240
     static let chipHeight: CGFloat = 24
+    static let copied: TimeInterval = 0.3
 }
 
 enum TextState: Equatable {
@@ -90,7 +91,8 @@ final class KeyButton: NSButton {
 
 @MainActor
 final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTableViewDataSource,
-    NSTableViewDelegate, @preconcurrency QLPreviewPanelDataSource, @preconcurrency QLPreviewPanelDelegate
+    NSTableViewDelegate, NSMenuDelegate, @preconcurrency QLPreviewPanelDataSource,
+    @preconcurrency QLPreviewPanelDelegate
 {
     let panel = Panel(
         contentRect: NSRect(x: 0, y: 0, width: Metric.width, height: Metric.field),
@@ -141,6 +143,9 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
     private var problem: String?
     /// The file you picked was moved or deleted after the list was built.
     private(set) var missing: String?
+    /// ⌥⌘C put the path on the clipboard; the window says so for a moment, then hides.
+    private(set) var copied = false
+    private var rowItems: [NSMenuItem] = []
     private var newest: UInt64 = 0
     private var sentAt: [UInt64: TimeInterval] = [:]
     private(set) var rows: [Row] = []
@@ -249,9 +254,11 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
         stage.putAway(panel)
     }
 
-    /// `needsFinder` shows the Finder line, which only the Finder hotkey's window has.
-    func show(needsFinder: Bool = false) {
+    /// `needsFinder` shows the Finder line, which only the Finder hotkey's window has. `fellBack`
+    /// says in the empty box why the Finder hotkey opened the window as you left it.
+    func show(needsFinder: Bool = false, fellBack: String? = nil) {
         let pressed = pressedAt()
+        field.placeholderString = fellBack.map { "\(placeholder) (\($0))" } ?? placeholder
         hatch?.windowShown(true)
         finderAsks += 1
         recheckAccess()
@@ -287,6 +294,7 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
     func hide() {
         guard shown else { return }
         shown = false
+        copied = false
         hatch?.windowShown(false)
         pending = nil
         textOn = false
@@ -329,6 +337,7 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
     private func heardFinder(_ answer: FinderFolder, ask: Int, pressed: TimeInterval) {
         guard ask == finderAsks, !shown else { return }
         timing.notice("Finder's folder read \(ms(since: pressed), format: .fixed(precision: 2)) ms after the hotkey")
+        var why: String?
         switch answer {
         // Without Full Disk Access, Finder on Downloads would otherwise search an empty list.
         case .folder(let path) where hatch?.holds(folder: path) == true:
@@ -336,14 +345,17 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
             field.stringValue = ""
             showChips()
             search()
-        case .folder, .none:
-            break
+        case .folder(let path):
+            why = "\(FileManager.default.displayName(atPath: path)) isn’t in the list"
+        case .none:
+            why = "no folder open in Finder"
         case .denied:
             return show(needsFinder: true)
         case .failed(let code):
             failures.error("Finder didn't tell its folder: \(code)")
+            why = "Finder didn’t answer"
         }
-        show()
+        show(fellBack: why)
     }
 
     /// ⌘,: the search window steps aside for the health view.
@@ -446,8 +458,10 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
             box.contentView?.addSubview(label)
         }
         chipText.lineBreakMode = .byTruncatingHead
-        textChip.toolTip = "⌘T searches names only again"
+        textChip.toolTip = "Click or press ⌘T to search names only"
         textChipText.setAccessibilityLabel("Searching inside files")
+        chip.addGestureRecognizer(NSClickGestureRecognizer(target: self, action: #selector(leaveFolders(_:))))
+        textChip.addGestureRecognizer(NSClickGestureRecognizer(target: self, action: #selector(toggleText(_:))))
 
         line.boxType = .separator
         line.autoresizingMask = [.width]
@@ -466,6 +480,9 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
         table.delegate = self
         table.target = self
         table.doubleAction = #selector(openClicked(_:))
+        table.menu = rowMenu()
+        // A copy only, as Spotlight does: a drop on a Finder folder never moves the file away.
+        table.setDraggingSourceOperationMask(.copy, forLocal: false)
         scroll.documentView = table
         scroll.drawsBackground = false
         scroll.hasVerticalScroller = true
@@ -504,6 +521,35 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
         let content = TopDown(frame: NSRect(x: 0, y: 0, width: Metric.width, height: Metric.field))
         for view in [glass, textChip, chip, field, line, scroll, message, bar, pane] { content.addSubview(view) }
         panel.contentView = content
+    }
+
+    /// The window's keys, listed where a right-click on a result shows them.
+    private func rowMenu() -> NSMenu {
+        let menu = NSMenu()
+        menu.delegate = self
+        let items: [(String, Selector, String, NSEvent.ModifierFlags)] = [
+            ("Open", #selector(openPicked(_:)), "\r", []),
+            ("Show in Finder", #selector(showInFinder(_:)), "\r", .command),
+            ("Quick Look", #selector(quickLook(_:)), "y", .command),
+            ("Copy Path", #selector(copyPath(_:)), "c", [.command, .option]),
+            ("Details", #selector(toggleDetails(_:)), "i", .command),
+        ]
+        for (title, action, key, modifiers) in items {
+            let item = menu.addItem(withTitle: title, action: action, keyEquivalent: key)
+            item.keyEquivalentModifierMask = modifiers
+            item.target = self
+        }
+        rowItems = menu.items
+        return menu
+    }
+
+    /// The right-clicked result is picked, as in Finder, so each item acts on it. Below the rows
+    /// or on the title above the lines, the menu is empty, so none shows.
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        let index = table.clickedRow
+        let onRow = index >= 0 && index < listed && index != header
+        menu.items = onRow ? rowItems : []
+        if onRow { select(index) }
     }
 
     /// Checked on each show while access is missing, so the line goes once access is switched
@@ -569,6 +615,7 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
 
     var status: String? {
         if let problem { return problem }
+        if copied { return "Path copied" }
         if composing { return nil }
         if !indexed { return "Getting ready…" }
         if let missing { return missing }
@@ -818,12 +865,23 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
         return true
     }
 
+    /// Esc in an empty box, or a click on the folder's label: back to searching everywhere.
+    @objc private func leaveFolders(_ sender: Any?) {
+        scopes = []
+        showChips()
+        search()
+    }
+
+    private var placeholder: String {
+        scopes.last.map { "Search in \($0.name)" } ?? "Search"
+    }
+
     private func showChips() {
         chip.isHidden = scopes.isEmpty
         chipText.stringValue = scopes.map(\.name).joined(separator: " › ")
-        chip.toolTip = scopes.last?.path
+        chip.toolTip = scopes.last.map { "\($0.path)\nClick to search everywhere" }
         chipText.setAccessibilityLabel(scopes.last.map { "Searching in \($0.name)" })
-        field.placeholderString = scopes.last.map { "Search in \($0.name)" } ?? "Search"
+        field.placeholderString = placeholder
         textChip.isHidden = !textOn
         var x: CGFloat = 50
         for (box, label) in [(textChip, textChipText), (chip, chipText)] where !box.isHidden {
@@ -1045,9 +1103,13 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
         timing.notice("details drawn \(ms(since: pressed), format: .fixed(precision: 2)) ms after the arrow key")
     }
 
-    /// A line found inside a file stands for its file.
     var selected: Row? {
-        rows.indices.contains(table.selectedRow) ? rows[table.selectedRow] : hit(at: table.selectedRow)?.file
+        result(at: table.selectedRow)
+    }
+
+    /// A line found inside a file stands for its file.
+    private func result(at index: Int) -> Row? {
+        rows.indices.contains(index) ? rows[index] : hit(at: index)?.file
     }
 
     private func found(_ row: Row) -> Bool {
@@ -1077,6 +1139,10 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
         hatch?.opened(row.path)
     }
 
+    @objc func openPicked(_ sender: Any?) {
+        onceAnswered { [weak self] in self?.open(revealing: false) }
+    }
+
     @objc private func openClicked(_ sender: Any?) {
         open(clicked: table.clickedRow)
     }
@@ -1096,9 +1162,13 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
     @objc func copyPath(_ sender: Any?) {
         onceAnswered { [weak self] in
             guard let self, !composing, let row = selected else { return }
-            NSPasteboard.general.clearContents()
-            NSPasteboard.general.setString(row.path, forType: .string)
-            hide()
+            stage.copy(row.path)
+            copied = true
+            fit()
+            DispatchQueue.main.asyncAfter(deadline: .now() + Metric.copied) { [weak self] in
+                guard let self, copied else { return }
+                hide()
+            }
         }
     }
 
@@ -1195,17 +1265,20 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
         case #selector(NSResponder.moveUp(_:)):
             move(by: -1)
         case #selector(NSResponder.cancelOperation(_:)):
-            // The first Esc clears the box, the second hides the window. A preview closes first.
+            // Esc clears the box, then leaves the folder you were searching in, then hides the
+            // window. A preview closes first.
             if previewing {
                 closePreview()
-            } else if field.stringValue.isEmpty {
-                hide()
-            } else {
+            } else if !field.stringValue.isEmpty {
                 field.stringValue = ""
                 search()
+            } else if !scopes.isEmpty {
+                leaveFolders(nil)
+            } else {
+                hide()
             }
         case #selector(NSResponder.insertNewline(_:)):
-            onceAnswered { [weak self] in self?.open(revealing: false) }
+            openPicked(nil)
         case #selector(NSResponder.insertTab(_:)) where tabIntoFolder():
             break
         case #selector(NSResponder.deleteBackward(_:)):
@@ -1250,6 +1323,11 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
 
     func numberOfRows(in tableView: NSTableView) -> Int {
         listed
+    }
+
+    /// Dragged into Mail, a browser or Terminal, a result goes as its file.
+    func tableView(_ tableView: NSTableView, pasteboardWriterForRow row: Int) -> (any NSPasteboardWriting)? {
+        result(at: row)?.url as NSURL?
     }
 
     func tableView(_ tableView: NSTableView, heightOfRow row: Int) -> CGFloat {

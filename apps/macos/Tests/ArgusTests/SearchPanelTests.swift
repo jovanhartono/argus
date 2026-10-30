@@ -875,7 +875,32 @@ final class SearchPanelTests: XCTestCase {
         XCTAssertTrue(tab(window))
         XCTAssertLessThanOrEqual(window.chip.frame.width, Metric.chip)
         XCTAssertGreaterThan(window.field.frame.width, Metric.width / 2)
-        XCTAssertEqual(window.chip.toolTip, window.scopes.last?.path)
+        XCTAssertEqual(window.chip.toolTip, "\(window.scopes.last?.path ?? "")\nClick to search everywhere")
+    }
+
+    func testAClickOnAChipDropsIt() async throws {
+        try write("x", at: "notes/budget a.txt")
+        try write("x", at: "budget top.txt")
+        let window = try await opened(access: true)
+        window.show()
+        defer { window.hide() }
+        try await type("notes", in: window)
+        try await until { window.rows.first?.name == "notes" }
+        XCTAssertTrue(tab(window))
+        window.toggleText(nil)
+        try await type("budget", in: window)
+        XCTAssertEqual(window.textChip.toolTip, "Click or press ⌘T to search names only")
+
+        try click(window.textChip)
+        XCTAssertFalse(window.textOn)
+        XCTAssertTrue(window.textChip.isHidden)
+        XCTAssertEqual(window.scopes.map(\.name), ["notes"])
+
+        try click(window.chip)
+        XCTAssertTrue(window.scopes.isEmpty)
+        XCTAssertTrue(window.chip.isHidden)
+        XCTAssertEqual(window.field.stringValue, "budget", "what you typed is searched everywhere")
+        try await until { window.rows.count == 2 }
     }
 
     func testTheTextChipSitsBeforeTheFolderChipAndBackspaceLeavesOnlyTheFolder() async throws {
@@ -1011,6 +1036,108 @@ final class SearchPanelTests: XCTestCase {
         XCTAssertFalse(window.chip.isHidden)
     }
 
+    func testEscClearsTheBoxThenLeavesTheFolderThenHides() async throws {
+        try write("x", at: "notes/budget a.txt")
+        try write("x", at: "budget top.txt")
+        let window = try await opened(access: true)
+        window.show()
+        try await type("notes", in: window)
+        try await until { window.rows.first?.name == "notes" }
+        XCTAssertTrue(tab(window))
+        try await type("budget", in: window)
+        try await until { window.rows.map(\.name) == ["budget a.txt"] }
+
+        XCTAssertTrue(esc(window))
+        XCTAssertEqual(window.field.stringValue, "")
+        XCTAssertEqual(window.scopes.map(\.name), ["notes"])
+        XCTAssertTrue(esc(window))
+        XCTAssertTrue(window.scopes.isEmpty)
+        XCTAssertTrue(window.chip.isHidden)
+        XCTAssertEqual(window.field.placeholderString, "Search")
+        XCTAssertTrue(window.shown)
+        XCTAssertTrue(esc(window))
+        XCTAssertFalse(window.shown)
+    }
+
+    func testARightClickPicksTheRowAndListsTheWindowsKeys() async throws {
+        try write("x", at: "budget a.txt")
+        try write("x", at: "budget b.txt")
+        let window = try await opened(access: true)
+        window.show()
+        defer { window.hide() }
+        try await type("budget", in: window)
+        try await until { window.rows.count == 2 }
+        let menu = try XCTUnwrap(window.table.menu)
+
+        try rightClick(row: 1, in: window.table)
+        window.menuNeedsUpdate(menu)
+        XCTAssertEqual(window.table.selectedRow, 1)
+        XCTAssertEqual(menu.items.map(\.title), ["Open", "Show in Finder", "Quick Look", "Copy Path", "Details"])
+        XCTAssertEqual(menu.items.first?.keyEquivalent, "\r")
+        XCTAssertEqual(menu.items.first?.keyEquivalentModifierMask, [])
+        let keys = Dictionary(
+            keyMenu().items.flatMap { $0.submenu?.items ?? [] }.map { ($0.title, $0) }, uniquingKeysWith: { a, _ in a })
+        for item in menu.items.dropFirst() {
+            let same = try XCTUnwrap(keys[item.title], item.title)
+            XCTAssertEqual(item.action, same.action, item.title)
+            XCTAssertEqual(item.keyEquivalent, same.keyEquivalent, item.title)
+            XCTAssertEqual(item.keyEquivalentModifierMask, same.keyEquivalentModifierMask, item.title)
+        }
+        let picked = try XCTUnwrap(window.selected)
+        let reveal = menu.items[1]
+        XCTAssertTrue(NSApp.sendAction(try XCTUnwrap(reveal.action), to: reveal.target, from: reveal))
+        XCTAssertEqual(stage.shownInFinder, [picked.url])
+
+        window.show()
+        try rightClick(row: 5, in: window.table)
+        window.menuNeedsUpdate(menu)
+        XCTAssertEqual(menu.items, [], "below the rows there is nothing to act on")
+    }
+
+    func testAResultDragsOutAsItsFileAndOnlyAsACopy() async throws {
+        try write("x", at: "budget a.txt")
+        let window = try await opened(access: true)
+        window.show()
+        defer { window.hide() }
+        try await type("budget", in: window)
+        try await until { window.rows.count == 1 }
+        let dragged = window.tableView(window.table, pasteboardWriterForRow: 0) as? NSURL
+        XCTAssertEqual(dragged as URL?, window.rows[0].url)
+        XCTAssertNil(window.tableView(window.table, pasteboardWriterForRow: 1))
+        // Asked as AppKit asks when a drag leaves the window; Swift hides this older name.
+        let ask = NSSelectorFromString("draggingSourceOperationMaskForLocal:")
+        let method = try XCTUnwrap(class_getInstanceMethod(NSTableView.self, ask))
+        let mask = unsafeBitCast(
+            method_getImplementation(method), to: (@convention(c) (AnyObject, Selector, Bool) -> UInt).self)
+        XCTAssertEqual(NSDragOperation(rawValue: mask(window.table, ask, false)), .copy, "never a move")
+    }
+
+    func testCopyPathSaysSoForAMomentThenHides() async throws {
+        try write("x", at: "budget a.txt")
+        let window = try await opened(access: true)
+        window.show()
+        try await type("budget", in: window)
+        try await until { window.rows.count == 1 }
+        let path = window.rows[0].path
+
+        window.copyPath(nil)
+        XCTAssertEqual(stage.copied, [path])
+        XCTAssertEqual(window.status, "Path copied")
+        XCTAssertTrue(window.shown)
+        try await until { !window.shown }
+
+        // Hidden and shown again before the moment is up, the window stays.
+        window.show()
+        defer { window.hide() }
+        XCTAssertNil(window.status)
+        window.copyPath(nil)
+        window.hide()
+        window.show()
+        try await Task.sleep(for: .milliseconds(Int(Metric.copied * 1_000) + 200))
+        XCTAssertTrue(window.shown)
+        XCTAssertNil(window.status)
+    }
+
     func testTheFinderHotkeyOpensTheWindowInsideFindersFolder() async throws {
         for path in ["notes/budget a.txt", "budget top.txt"] {
             let file = root.appendingPathComponent(path)
@@ -1047,9 +1174,14 @@ final class SearchPanelTests: XCTestCase {
             XCTAssertTrue(tab(window))
             window.toggleInFinderFolder()
             try await until { window.shown }
-            defer { window.hide() }
             XCTAssertEqual(window.scopes.map(\.name), ["notes"], "\(answer)")
             XCTAssertNil(window.notice)
+            let why = answer == .none ? "no folder open in Finder" : "Finder didn’t answer"
+            XCTAssertEqual(window.field.placeholderString, "Search in notes (\(why))")
+            window.hide()
+            window.show()
+            defer { window.hide() }
+            XCTAssertEqual(window.field.placeholderString, "Search in notes", "only for that one show")
         }
     }
 
@@ -1155,6 +1287,9 @@ final class SearchPanelTests: XCTestCase {
             defer { window.hide() }
             XCTAssertTrue(window.scopes.isEmpty, folder)
             XCTAssertTrue(window.chip.isHidden)
+            let name = FileManager.default.displayName(atPath: folder)
+            XCTAssertEqual(window.field.placeholderString, "Search (\(name) isn’t in the list)")
+            if folder == downloads { XCTAssertEqual(name, "Downloads") }
             XCTAssertEqual(window.notice, access ? nil : .needsAccess, "the line says why Downloads is left out")
             try await type("budget", in: window)
             try await until { !window.rows.isEmpty }
@@ -3303,6 +3438,29 @@ final class SearchPanelTests: XCTestCase {
         else { return }
         NSApp.postEvent(event, atStart: true)
         _ = NSApp.nextEvent(matching: .applicationDefined, until: .distantPast, inMode: .default, dequeue: true)
+    }
+
+    private func esc(_ window: SearchPanel) -> Bool {
+        window.control(NSTextField(), textView: NSTextView(), doCommandBy: #selector(NSResponder.cancelOperation(_:)))
+    }
+
+    /// Runs the chip's click as AppKit does once the mouse comes up on it.
+    private func click(_ chip: NSBox) throws {
+        let click = try XCTUnwrap(chip.gestureRecognizers.first as? NSClickGestureRecognizer)
+        XCTAssertTrue(NSApp.sendAction(try XCTUnwrap(click.action), to: click.target, from: click))
+    }
+
+    /// Asks the table for its menu as a right-click does, which sets the clicked row; no menu shows.
+    private func rightClick(row: Int, in table: NSTableView) throws {
+        let window = try XCTUnwrap(table.window)
+        let rect = table.rect(ofRow: row)
+        let point = rect.isEmpty ? NSPoint(x: 20, y: table.bounds.maxY + 20) : NSPoint(x: rect.midX, y: rect.midY)
+        let event = try XCTUnwrap(
+            NSEvent.mouseEvent(
+                with: .rightMouseDown, location: table.convert(point, to: nil), modifierFlags: [],
+                timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber, context: nil,
+                eventNumber: 0, clickCount: 1, pressure: 1))
+        _ = table.menu(for: event)
     }
 
     private func backspace(_ window: SearchPanel) -> Bool {
