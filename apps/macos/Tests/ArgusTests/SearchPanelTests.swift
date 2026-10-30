@@ -2075,6 +2075,39 @@ final class SearchPanelTests: XCTestCase {
         XCTAssertNil(window.pane.waiting, "an unfinished thumbnail is given up")
     }
 
+    func testAFoldersPaneListsWhatItHoldsAndADoubleClickOpensIt() async throws {
+        let folder = root.appendingPathComponent("budget")
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: false)
+        try Data("abc".utf8).write(to: folder.appendingPathComponent("march.txt"))
+        try Data().write(to: root.appendingPathComponent("budget.txt"))
+        let window = try await opened(access: true)
+        window.show()
+        defer { window.hide() }
+        try await type("budget", in: window)
+        try await until { window.rows.count == 2 }
+        window.toggleDetails(nil)
+        let at = try XCTUnwrap(window.rows.firstIndex { $0.isFolder })
+        window.table.selectRowIndexes([at], byExtendingSelection: false)
+        XCTAssertTrue(window.pane.listsContents)
+        try await until { window.panel.frame.height == Metric.field + 1 + Metric.folderDetails }
+        try await until { window.pane.children.map(\.row.name) == ["march.txt"] }
+        window.table.selectRowIndexes([1 - at], byExtendingSelection: false)
+        XCTAssertFalse(window.pane.listsContents)
+        try await until { window.panel.frame.height == Metric.field + 1 + Metric.details }
+
+        window.table.selectRowIndexes([at], byExtendingSelection: false)
+        try await until { window.pane.children.count == 1 }
+        XCTAssertTrue(window.control(NSTextField(), textView: NSTextView(), doCommandBy: #selector(NSResponder.insertNewline(_:))))
+        XCTAssertEqual(
+            stage.opened.map(\.path), [realRoot.appendingPathComponent("budget").path], "Return still opens the picked folder")
+        window.show()
+        window.table.selectRowIndexes([at], byExtendingSelection: false)
+        try await until { window.pane.children.count == 1 }
+        window.pane.open(child: 0)
+        XCTAssertFalse(window.shown)
+        XCTAssertEqual(stage.opened.map(\.lastPathComponent), ["budget", "march.txt"])
+    }
+
     func testThePaneFollowsTheArrowsAndAClick() async throws {
         let notes = root.appendingPathComponent("notes")
         try FileManager.default.createDirectory(at: notes, withIntermediateDirectories: false)
