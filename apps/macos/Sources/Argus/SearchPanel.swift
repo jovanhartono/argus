@@ -17,6 +17,10 @@ enum Metric {
     static let pane: CGFloat = 260
     static let thumb: CGFloat = 128
     static let details: CGFloat = 286
+    /// Beside a folder the pane is taller, with room for six of what it holds.
+    static let folderDetails: CGFloat = details + 6 * child + 8
+    static let child: CGFloat = 32
+    static let children = 50
     static let chip: CGFloat = 240
     static let chipHeight: CGFloat = 24
 }
@@ -474,6 +478,7 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
         bar.autoresizingMask = [.width]
         bar.isHidden = true
         pane.isHidden = true
+        pane.onOpen = { [weak self] row in self?.open(row, revealing: false) }
         field.nextKeyView = settings
         settings.nextKeyView = field
 
@@ -561,7 +566,7 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
         if listed == 0 { return 0 }
         var list = CGFloat(min(listed, Metric.visibleRows)) * Metric.row + 2 * Metric.inset
         if let header, header < Metric.visibleRows { list -= Metric.row - Metric.header }
-        return detailing ? max(list, Metric.details) : list
+        return detailing ? max(list, pane.listsContents ? Metric.folderDetails : Metric.details) : list
     }
 
     var listed: Int {
@@ -986,7 +991,12 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
 
     /// Japanese and Chinese input pick the half-typed word with Return, so nothing opens then.
     private func open(revealing reveal: Bool) {
-        guard !composing, let row = selected, found(row) else { return }
+        guard !composing, let row = selected else { return }
+        open(row, revealing: reveal)
+    }
+
+    private func open(_ row: Row, revealing reveal: Bool) {
+        guard found(row) else { return }
         hide()
         if reveal {
             stage.showInFinder(row.url)
@@ -1023,13 +1033,16 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
 
     @objc func toggleDetails(_ sender: Any?) {
         detailsOn.toggle()
-        if detailsOn { showDetails() } else { pane.stopThumbnail() }
+        if detailsOn { showDetails() } else { pane.stop() }
         fit()
     }
 
     private func showDetails() {
         guard detailsOn else { return }
+        let tall = pane.listsContents
         pane.show(selected, scale: panel.backingScaleFactor)
+        // Arrowing from a file onto a folder grows the window to fit the folder's contents.
+        if pane.listsContents != tall { fit() }
     }
 
     var previewing: Bool {
