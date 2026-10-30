@@ -4,11 +4,12 @@
 //! The window calls in from its main thread and never waits for a search. `tl_submit` hands
 //! the search to a worker and returns its ticket at once; the worker calls `on_event` when
 //! that ticket's rows are ready; the window then copies them out with `tl_take`.
-//! When files change, `tl_changed` asks a second thread to read the changed folders again into a
-//! copy of the list, or to build it again when macOS lost track; the new list reaches the worker
-//! through the same queue as the searches, so each search sees one whole list.
-//! `tl_volume_added` and `tl_volume_removed` go through that thread too, adding a drive to a
-//! copy of the newest list or taking one out, without reading the home folder again.
+//! When files change, `tl_changed` asks a second thread to read the changed folders again into
+//! the list in use, while new searches wait, or to build a new list beside it when macOS lost
+//! track; a new list reaches the worker through the same queue as the searches, so each search
+//! sees one whole list. `tl_volume_added` and `tl_volume_removed` go through that thread too,
+//! without reading the home folder again: a drive joins a copy of the newest list, as reading
+//! one takes seconds, and one taken out leaves the list in use.
 //! Given a file, a core opens the list saved there instead of scanning, and a third thread
 //! saves each new list to it once files stop changing for a moment.
 //! A text search, inside files, runs the same way on a worker of its own, started with the
@@ -28,7 +29,9 @@ use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError};
+use std::sync::{
+    Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError, RwLock, RwLockReadGuard, TryLockError,
+};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -53,8 +56,8 @@ pub const TL_EVENT_FAILED: u32 = 3;
 /// A problem with your ignore list or the list of opened files. `value` is the address of its
 /// text, NUL-terminated UTF-8, readable only until `on_event` returns.
 pub const TL_EVENT_NOTE: u32 = 4;
-/// A list built again after a change is in use. `value` holds its entry count in the low 32
-/// bits and the milliseconds the rebuild took in the high 32.
+/// A list built again, or patched, after a change is in use. `value` holds its entry count in
+/// the low 32 bits and the milliseconds the rebuild took in the high 32.
 pub const TL_EVENT_REBUILT: u32 = 5;
 /// `value` is the text search ticket whose lines, or whose end, wait for `tl_grep_take`. One
 /// per take: no more come until the window has taken what was waiting.
@@ -112,6 +115,7 @@ pub struct TlRows {
     owner: *mut c_void,
 }
 
+#[derive(Default)]
 struct Packed {
     rows: Vec<TlRow>,
     text: String,
@@ -290,9 +294,9 @@ enum Job {
         /// Only what is inside this folder, a full path.
         folder: Option<String>,
     },
-    /// A list built again, and the milliseconds that took.
+    /// A list built again, or the one in use patched, and the milliseconds that took.
     Swap {
-        index: Arc<Index>,
+        list: List,
         took: u32,
     },
     Opened,
@@ -469,13 +473,13 @@ enum Missed {
     More,
 }
 
-fn missed<P: AsRef<Path>>(scope: &Scope, index: &Index, paths: &[P]) -> Missed {
+fn missed<P: AsRef<Path>>(scope: &Scope, list: &RwLock<Listed>, paths: &[P]) -> Missed {
     let mut folders = Vec::new();
     for path in paths.iter().map(AsRef::as_ref) {
         if scope.changes_rules(path) {
             return Missed::More;
         }
-        if !scope.holds(path, index) {
+        if !holds(scope, list, path) {
             folders.push(path.to_path_buf());
         }
     }
@@ -486,8 +490,33 @@ fn missed<P: AsRef<Path>>(scope: &Scope, index: &Index, paths: &[P]) -> Missed {
     }
 }
 
+/// Whether `list` already matches what a scan by `scope` would keep of `path`. Looks one folder
+/// at a time, so a catch-up of thousands at launch never holds a patch, and searches, back.
+fn holds(scope: &Scope, list: &RwLock<Listed>, path: &Path) -> bool {
+    read(list).is_some_and(|listed| scope.holds(path, &listed.index))
+}
+
+/// A list searches read, patched in place as files change. Each patch moves `version` on, since
+/// it may number the entries anew.
+struct Listed {
+    index: Index,
+    version: u64,
+}
+
+type List = Arc<RwLock<Listed>>;
+
+fn list_of(index: Index) -> List {
+    Arc::new(RwLock::new(Listed { index, version: 0 }))
+}
+
+/// `None` once a bug stopped a patch halfway: that list answers nothing until a whole new one
+/// replaces it.
+fn read(list: &RwLock<Listed>) -> Option<RwLockReadGuard<'_, Listed>> {
+    list.read().ok()
+}
+
 /// The newest list, shared with the worker rather than copied, and the rules it was built by.
-type Newest = Option<(Arc<Scope>, Arc<Index>)>;
+type Newest = Option<(Arc<Scope>, List)>;
 
 /// The folders to watch for changes to the newest list, and the mark of the first change its
 /// rebuild was asked for, or 0 for the first list.
@@ -515,6 +544,9 @@ struct Live {
     resave: Duration,
     saving: Mutex<Saving>,
     save: Condvar,
+    /// Held around each save of the list and each patch of it, so a patch waits out a long save
+    /// without searches queuing behind it.
+    writing: Mutex<()>,
     /// Its `busy` covers only the first list; the plan tells of later ones.
     health: Mutex<TlHealth>,
 }
@@ -536,6 +568,7 @@ impl Default for Live {
             resave: RESAVE,
             saving: Mutex::default(),
             save: Condvar::new(),
+            writing: Mutex::default(),
             health: Mutex::default(),
         }
     }
@@ -559,7 +592,7 @@ struct Kept {
 }
 
 struct Unsaved {
-    index: Arc<Index>,
+    list: List,
     settings: Arc<Settings>,
     unreadable: usize,
     event_id: u64,
@@ -575,28 +608,30 @@ impl Live {
     }
 
     /// Keeps the list and its rules, for judging later changes, and hands the list on.
-    fn publish(&self, built: Built, mark: u64) -> Arc<Index> {
-        let index = Arc::new(built.index);
-        let watched = built
-            .scope
-            .as_ref()
-            .map(|scope| scope.watched(&index))
-            .unwrap_or_default();
+    fn publish(&self, built: Built, mark: u64) -> List {
+        self.publish_list(list_of(built.index), built.scope, mark)
+    }
+
+    /// As `publish`, for a list already shared, as one just patched.
+    fn publish_list(&self, list: List, scope: Option<Scope>, mark: u64) -> List {
+        let (watched, volumes): (_, Vec<PathBuf>) = match (&scope, read(&list)) {
+            (Some(scope), Some(listed)) => (
+                scope.watched(&listed.index),
+                listed.index.volumes().map(Path::to_path_buf).collect(),
+            ),
+            _ => Default::default(),
+        };
         // A list read before a drive was ejected still holds it; its watch must not come back.
         let plan = self.plan.lock().unwrap();
         let watched = watched
             .into_iter()
-            .filter(|(path, _)| {
-                plan.volumes.contains(path) || !index.volumes().any(|volume| volume == path)
-            })
+            .filter(|(path, _)| plan.volumes.contains(path) || !volumes.contains(path))
             .map(|(path, watch)| (path.to_string_lossy().into_owned(), watch))
             .collect();
         *self.watched.lock().unwrap() = (watched, mark);
         drop(plan);
-        *self.newest.lock().unwrap() = built
-            .scope
-            .map(|scope| (Arc::new(scope), Arc::clone(&index)));
-        index
+        *self.newest.lock().unwrap() = scope.map(|scope| (Arc::new(scope), Arc::clone(&list)));
+        list
     }
 
     /// Notes a new list coming into use for `tl_health`: read from the whole folder when it
@@ -615,7 +650,7 @@ impl Live {
         }
     }
 
-    fn keep(&self, index: &Arc<Index>, source: &Source, event_id: u64) {
+    fn keep(&self, list: &List, source: &Source, event_id: u64) {
         let Some((settings, unreadable)) = source.saving() else {
             return;
         };
@@ -632,7 +667,7 @@ impl Live {
             at: Some(now),
         });
         saving.waiting = Some(Unsaved {
-            index: Arc::clone(index),
+            list: Arc::clone(list),
             settings,
             unreadable,
             event_id,
@@ -670,13 +705,13 @@ impl Live {
         let Some(kept) = saving.kept.as_mut().filter(due) else {
             return;
         };
-        let Some((_, index)) = self.newest.lock().unwrap().clone() else {
+        let Some((_, list)) = self.newest.lock().unwrap().clone() else {
             return;
         };
         let now = Instant::now();
         (kept.event_id, kept.at) = (event_id, Some(now));
         saving.waiting = Some(Unsaved {
-            index,
+            list,
             settings: Arc::clone(&kept.settings),
             unreadable: kept.unreadable,
             event_id,
@@ -689,8 +724,8 @@ impl Live {
 
     fn misses(&self, paths: &[PathBuf]) -> Missed {
         let newest = self.newest.lock().unwrap().clone();
-        newest.map_or(Missed::Nothing, |(scope, index)| {
-            missed(&scope, &index, paths)
+        newest.map_or(Missed::Nothing, |(scope, list)| {
+            missed(&scope, &list, paths)
         })
     }
 
@@ -865,16 +900,17 @@ impl Source {
     }
 
     /// The newest list with the volumes added or taken out to match `volumes` and the
-    /// folders in `changes` read again, its root left as it is, or `None` when that changes
-    /// nothing. The newest list stays in use meanwhile, so this works on a copy: the memory
-    /// of a second list for a moment, without reading the home folder.
+    /// folders in `changes` read again, its root left as it is, and its rules, or `None` when
+    /// that changes nothing. Without reading the home folder, the list in use is patched while
+    /// new searches wait. A drive joining takes seconds to read, so it joins a copy instead,
+    /// with the memory of a second list for that moment.
     fn graft(
         &self,
         volumes: &[PathBuf],
         changes: &[PathBuf],
         live: &Live,
         notify: &Notify,
-    ) -> Option<Built> {
+    ) -> Option<(List, Option<Scope>)> {
         let Self::Home {
             settings: Some(settings),
             ..
@@ -882,22 +918,38 @@ impl Source {
         else {
             return None;
         };
-        let newest = live.newest.lock().unwrap().clone()?.1;
-        let gone: Vec<PathBuf> = newest
-            .volumes()
-            .filter(|&held| !volumes.iter().any(|volume| volume == held))
-            .map(Path::to_path_buf)
-            .collect();
-        let new: Vec<PathBuf> = volumes
-            .iter()
-            .filter(|volume| !newest.volumes().any(|held| held == volume.as_path()))
-            .cloned()
-            .collect();
+        let list = live.newest.lock().unwrap().clone()?.1;
+        let (gone, new) = {
+            let listed = read(&list)?;
+            let gone: Vec<PathBuf> = listed
+                .index
+                .volumes()
+                .filter(|&held| !volumes.iter().any(|volume| volume == held))
+                .map(Path::to_path_buf)
+                .collect();
+            let new: Vec<PathBuf> = volumes
+                .iter()
+                .filter(|volume| !listed.index.volumes().any(|held| held == volume.as_path()))
+                .cloned()
+                .collect();
+            (gone, new)
+        };
         if gone.is_empty() && new.is_empty() && changes.is_empty() {
             return None;
         }
-        let mut index = Index::clone(&newest);
-        drop(newest);
+        if new.is_empty() {
+            let mut listed = list.write().ok()?;
+            for volume in &gone {
+                settings.remove_volume(&mut listed.index, volume);
+            }
+            settings.update(&mut listed.index, changes);
+            listed.version += 1;
+            let scope = settings.scope(&listed.index);
+            drop(listed);
+            return Some((list, Some(scope)));
+        }
+        let mut index = Index::clone(&read(&list)?.index);
+        drop(list);
         for volume in &gone {
             settings.remove_volume(&mut index, volume);
         }
@@ -906,9 +958,9 @@ impl Source {
         let joined = live.add_volumes(settings, &mut index, &new, notify);
         // A change read again is promised a new list, even one that lists the same.
         let changed = joined || !gone.is_empty() || !changes.is_empty();
-        changed.then(|| Built {
-            scope: Some(settings.scope(&index)),
-            index,
+        changed.then(|| {
+            let scope = settings.scope(&index);
+            (list_of(index), Some(scope))
         })
     }
 }
@@ -1122,7 +1174,7 @@ fn start(
     }))
 }
 
-fn first_list(source: &mut Source, live: &Live, notify: &Notify) -> io::Result<(Arc<Index>, bool)> {
+fn first_list(source: &mut Source, live: &Live, notify: &Notify) -> io::Result<(List, bool)> {
     let (clutter, now) = {
         let mut plan = live.plan.lock().unwrap();
         (plan.list(), plan.delivered)
@@ -1132,7 +1184,7 @@ fn first_list(source: &mut Source, live: &Live, notify: &Notify) -> io::Result<(
         // An id from a log since reset, or from a list saved without one, can't be caught up
         // from, so a new list follows, as after a change macOS lost track of.
         let caught_up = saved_at != 0 && saved_at <= now;
-        let index = live.publish(built, if caught_up { saved_at } else { 0 });
+        let list = live.publish(built, if caught_up { saved_at } else { 0 });
         if caught_up {
             live.opened(source, saved_at);
         }
@@ -1143,7 +1195,7 @@ fn first_list(source: &mut Source, live: &Live, notify: &Notify) -> io::Result<(
                 plan.want(0);
             }
         });
-        return Ok((index, true));
+        return Ok((list, true));
     }
     let volumes = {
         let mut plan = live.plan.lock().unwrap();
@@ -1151,9 +1203,9 @@ fn first_list(source: &mut Source, live: &Live, notify: &Notify) -> io::Result<(
         plan.volumes().0
     };
     let built = source.build(clutter, &volumes, live, notify)?;
-    let index = live.publish(built, 0);
-    live.keep(&index, source, now);
-    Ok((index, false))
+    let list = live.publish(built, 0);
+    live.keep(&list, source, now);
+    Ok((list, false))
 }
 
 /// Builds or opens the first list, then answers searches. The rebuild thread it starts holds
@@ -1169,7 +1221,7 @@ fn work(
 ) {
     let started = Instant::now();
     let first = panic::catch_unwind(AssertUnwindSafe(|| first_list(&mut source, live, &notify)));
-    let (index, opened) = match first {
+    let (list, opened) = match first {
         Ok(Ok(first)) => first,
         failed => {
             live.plan(|plan| plan.stopped = true);
@@ -1186,12 +1238,9 @@ fn work(
     } else {
         TL_EVENT_INDEXED
     };
-    live.note_list(
-        index.entry_count(),
-        (!opened).then(|| started.elapsed()),
-        false,
-    );
-    notify.send(event, index.entry_count() as u64);
+    let entries = read(&list).map_or(0, |listed| listed.index.entry_count());
+    live.note_list(entries, (!opened).then(|| started.elapsed()), false);
+    notify.send(event, entries as u64);
     let rebuilds = {
         let live = Arc::clone(live);
         thread::Builder::new()
@@ -1204,7 +1253,7 @@ fn work(
             .expect("start the rebuild thread")
     };
     let served = panic::catch_unwind(AssertUnwindSafe(|| {
-        serve(index, searcher, inbox, done, &live.opens, &notify, RERANK);
+        serve(list, searcher, inbox, done, &live.opens, &notify, RERANK);
     }));
     if served.is_err() {
         live.plan(|plan| plan.stopped = true);
@@ -1215,7 +1264,7 @@ fn work(
 }
 
 fn serve(
-    mut index: Arc<Index>,
+    mut list: List,
     searcher: &Searcher,
     inbox: &Receiver<Job>,
     done: &Done,
@@ -1233,18 +1282,24 @@ fn serve(
         let now = unix_now();
         (searcher.boosts(&frecency, index, apps, now), now)
     };
-    let (mut boosts, mut ranked): (Boosts, u64) = rank(&index, &apps);
-    let mut stale = false;
+    let (mut boosts, mut ranked): (Boosts, u64) = (Boosts::default(), 0);
+    let mut stale = true;
     // The folder searched inside, worked out once for every keystroke typed there; `None`
     // beside it when the list holds no such folder.
     let mut inside: Option<(String, Option<Within>)> = None;
+    // The version of the list the boosts and `inside` were worked out on: both name entries by
+    // number, which a patch may change.
+    let mut seen = None;
     loop {
         let job = match inbox.try_recv() {
             Ok(job) => job,
             Err(TryRecvError::Disconnected) => return,
             Err(TryRecvError::Empty) => {
-                if stale {
-                    (boosts, ranked) = rank(&index, &apps);
+                if stale && let Some(listed) = read(&list) {
+                    if seen != Some(listed.version) {
+                        (seen, inside) = (Some(listed.version), None);
+                    }
+                    (boosts, ranked) = rank(&listed.index, &apps);
                     stale = false;
                 }
                 let Ok(job) = inbox.recv() else { return };
@@ -1253,14 +1308,11 @@ fn serve(
         };
         let (ticket, query, folder) = match job {
             // Searches sent before this one ran on the old list; the old list is freed here.
-            Job::Swap { index: fresh, took } => {
-                index = fresh;
-                inside = None;
-                notify.send(
-                    TL_EVENT_REBUILT,
-                    u64::from(took) << 32 | index.entry_count() as u64,
-                );
-                stale = true;
+            Job::Swap { list: fresh, took } => {
+                list = fresh;
+                let entries = read(&list).map_or(0, |listed| listed.index.entry_count());
+                notify.send(TL_EVENT_REBUILT, u64::from(took) << 32 | entries as u64);
+                (seen, stale) = (None, true);
                 continue;
             }
             Job::Opened => {
@@ -1288,12 +1340,22 @@ fn serve(
                 folder,
             } => (ticket, query, folder),
         };
+        // Waits here while the list is patched.
+        let Some(listed) = read(&list) else {
+            *done.lock().unwrap() = Some((ticket, Packed::default()));
+            notify.send(TL_EVENT_READY, ticket.number());
+            continue;
+        };
+        if seen != Some(listed.version) {
+            (seen, inside, stale) = (Some(listed.version), None, true);
+        }
+        let index = &listed.index;
         if stale || unix_now().abs_diff(ranked) >= rerank.as_secs() {
-            (boosts, ranked) = rank(&index, &apps);
+            (boosts, ranked) = rank(index, &apps);
             stale = false;
         }
         let search =
-            |within| searcher.search_with(&index, &apps, within, &query, ticket, ROWS, &boosts);
+            |within| searcher.search_with(index, &apps, within, &query, ticket, ROWS, &boosts);
         let hits = match folder {
             None => {
                 inside = None;
@@ -1301,7 +1363,7 @@ fn serve(
             }
             Some(folder) => {
                 if inside.as_ref().is_none_or(|(path, _)| *path != folder) {
-                    let within = Within::folder(&index, Path::new(&folder));
+                    let within = Within::folder(index, Path::new(&folder));
                     inside = Some((folder, within));
                 }
                 match inside.as_ref().and_then(|(_, within)| within.as_ref()) {
@@ -1319,7 +1381,9 @@ fn serve(
         if searcher.newest() != ticket.number() {
             continue;
         }
-        *done.lock().unwrap() = Some((ticket, pack(&index, &apps, &hits)));
+        let packed = pack(index, &apps, &hits);
+        drop(listed);
+        *done.lock().unwrap() = Some((ticket, packed));
         notify.send(TL_EVENT_READY, ticket.number());
     }
 }
@@ -1359,7 +1423,7 @@ impl Clock for Wall {
 /// Calls `rebuild` for each rebuild wanted until the core stops: one at a time, with changes
 /// made meanwhile waiting as one more, each starting at least `live.gap` after the one before.
 /// `last` is when the first list was started. A turn with only volumes to add or take out,
-/// or folders to read again, works on a copy of the newest list.
+/// or folders to read again, patches the newest list, as `Source::graft` tells.
 fn rebuild_loop(live: &Live, clock: &impl Clock, mut last: Instant, mut rebuild: impl FnMut(Pass)) {
     let mut plan = live.plan.lock().unwrap();
     loop {
@@ -1418,18 +1482,22 @@ fn rebuild(source: &mut Source, pass: Pass, live: &Live, swaps: &Sender<Job>, no
     }
     let started = Instant::now();
     let whole = pass.clutter.is_some();
-    let built = panic::catch_unwind(AssertUnwindSafe(|| {
-        let built = match pass.clutter {
-            Some(clutter) => source.build(clutter, &pass.volumes, live, notify).map(Some),
-            None => Ok(source.graft(&pass.volumes, &pass.changes, live, notify)),
-        };
-        built.map(|built| built.map(|built| live.publish(built, pass.mark)))
+    // Held until the patched list is kept, so a save never pairs it with an older event.
+    let _writing = (!whole).then(|| lock(&live.writing));
+    let built = panic::catch_unwind(AssertUnwindSafe(|| match pass.clutter {
+        Some(clutter) => source
+            .build(clutter, &pass.volumes, live, notify)
+            .map(|built| Some(live.publish(built, pass.mark))),
+        None => Ok(source
+            .graft(&pass.volumes, &pass.changes, live, notify)
+            .map(|(list, scope)| live.publish_list(list, scope, pass.mark))),
     }))
     .unwrap_or_else(|_| Err(io::Error::other("a bug in the engine")));
     match built {
-        Ok(Some(index)) => {
+        Ok(Some(list)) => {
             let elapsed = started.elapsed();
-            live.note_list(index.entry_count(), whole.then_some(elapsed), true);
+            let entries = read(&list).map_or(0, |listed| listed.index.entry_count());
+            live.note_list(entries, whole.then_some(elapsed), true);
             let took = elapsed.as_millis().min(u32::MAX.into()) as u32;
             let missing = {
                 let mut plan = live.plan.lock().unwrap();
@@ -1440,18 +1508,24 @@ fn rebuild(source: &mut Source, pass: Pass, live: &Live, swaps: &Sender<Job>, no
                 plan.failed.is_some()
             };
             if !missing {
-                live.keep(&index, source, pass.current);
+                live.keep(&list, source, pass.current);
             }
             // Fails only once the worker has stopped.
-            let _ = swaps.send(Job::Swap { index, took });
+            let _ = swaps.send(Job::Swap { list, took });
         }
         Ok(None) => {}
         Err(error) => {
+            let newest = live.newest.lock().unwrap().clone();
+            let broken = newest.is_some_and(|(_, list)| list.is_poisoned());
             live.plan(|plan| {
                 plan.failed = Some(
                     plan.failed
                         .map_or(pass.mark, |failed| failed.min(pass.mark)),
                 );
+                // A patch stopped halfway, so search finds nothing until a whole list is read.
+                if broken {
+                    plan.want(pass.mark);
+                }
             });
             notify.note(&format!("the list could not be built again: {error}"));
         }
@@ -1479,27 +1553,37 @@ fn save_loop(live: &Live, notify: Notify) {
             saving = live.save.wait_timeout(saving, due - now).unwrap().0;
             continue;
         }
-        let (Some(file), Some(list)) = (saving.file.clone(), saving.waiting.take()) else {
-            continue;
-        };
         drop(saving);
-        let saved = panic::catch_unwind(AssertUnwindSafe(|| save(&file, &list)))
-            .unwrap_or_else(|_| Err(io::Error::other("a bug in the engine")));
-        drop(list);
-        if let Err(error) = saved {
-            notify.note(&format!("the list could not be saved: {error}"));
+        // Taken only now, past any patch under way, so the list saved is the one it kept.
+        let writing = lock(&live.writing);
+        let (file, list) = {
+            let mut saving = live.saving.lock().unwrap();
+            (saving.file.clone(), saving.waiting.take())
+        };
+        if let (Some(file), Some(list)) = (file, list) {
+            let saved = panic::catch_unwind(AssertUnwindSafe(|| save(&file, &list)))
+                .unwrap_or_else(|_| Err(io::Error::other("a bug in the engine")));
+            drop(list);
+            if let Err(error) = saved {
+                notify.note(&format!("the list could not be saved: {error}"));
+            }
         }
+        drop(writing);
         saving = live.saving.lock().unwrap();
     }
 }
 
 fn save(file: &Path, list: &Unsaved) -> io::Result<()> {
+    // Broken by a bug while patched; the whole list read next is saved instead.
+    let Some(listed) = read(&list.list) else {
+        return Ok(());
+    };
     if let Some(folder) = file.parent() {
         std::fs::create_dir_all(folder)?;
     }
     save_index(
         file,
-        &list.index,
+        &listed.index,
         list.unreadable,
         &list.settings,
         list.event_id,
@@ -1614,8 +1698,8 @@ pub unsafe extern "C" fn tl_apps(core: *const TlCore, folders: *const u8, len: u
 
 /// Tells the core that folders changed. `paths` holds `len` bytes: real paths in UTF-8, each
 /// ending in a NUL byte. Each folder the list reads whose names it no longer matches is read
-/// again into a copy of the list in the background; the whole list is built again when one
-/// may hold your ignore list, or whatever they are when `rescan` isn't 0, as when macOS
+/// again into the list in the background, as searches wait; the whole list is built again
+/// when one may hold your ignore list, or whatever they are when `rescan` isn't 0, as when macOS
 /// dropped changes. `TL_EVENT_REBUILT` follows either way. `mark` is the id of the newest
 /// FSEvents event among them, handed back by `tl_watched`, or 0 for a change FSEvents didn't
 /// report, which counts as the newest id told so far. Returns 1 when a new list is coming,
@@ -1672,12 +1756,14 @@ pub unsafe extern "C" fn tl_changed(
             _ if rescan != 0 => true,
             (_, None) => false,
             (None, _) => true,
-            (Some(paths), Some((scope, index))) if running => {
+            (Some(paths), Some((scope, list))) if running => {
                 // The rebuild under way may have read these folders before they changed. One
                 // keeping everything reads folders the newest list's rules leave out.
                 let changed: Vec<PathBuf> = paths
                     .into_iter()
-                    .filter(|path| everything || scope.in_scope(path) || !scope.holds(path, &index))
+                    .filter(|path| {
+                        everything || scope.in_scope(path) || !holds(&scope, &list, path)
+                    })
                     .map(Path::to_path_buf)
                     .collect();
                 let mut plan = live.plan.lock().unwrap();
@@ -1704,7 +1790,7 @@ pub unsafe extern "C" fn tl_changed(
                 live.wake.notify_all();
                 return 1;
             }
-            (Some(paths), Some((scope, index))) => match missed(&scope, &index, &paths) {
+            (Some(paths), Some((scope, list))) => match missed(&scope, &list, &paths) {
                 Missed::Nothing => false,
                 Missed::More => true,
                 // Read again in place, without the rest of the home folder.
@@ -1957,7 +2043,8 @@ pub unsafe extern "C" fn tl_health(core: *const TlCore, out: *mut TlHealth) -> u
 
 /// 1 when the newest list holds the folder at `path`, a full real path of `len` bytes, so a
 /// search inside it can find something, else 0, as before the first list or for made-up names.
-/// Never waits for a scan or a search. Safe to call from any thread.
+/// Never waits for a scan, a search or the list being patched: while it is, 1 for a folder the
+/// scan reads. Safe to call from any thread.
 ///
 /// # Safety
 /// `core` came from `tl_core_new` or `tl_core_new_stand_in`, and `path` points to `len`
@@ -1973,8 +2060,17 @@ pub unsafe extern "C" fn tl_holds_folder(core: *const TlCore, path: *const u8, l
         let Ok(path) = std::str::from_utf8(bytes) else {
             return 0;
         };
-        let newest = core.live.newest.lock().unwrap().clone();
-        newest.is_some_and(|(_, index)| index.holds_folder(Path::new(path))) as u32
+        let Some((scope, list)) = core.live.newest.lock().unwrap().clone() else {
+            return 0;
+        };
+        let path = Path::new(path);
+        // Asked on the window's main thread as the Finder hotkey opens the window.
+        let held = match list.try_read() {
+            Ok(listed) => listed.index.holds_folder(path),
+            Err(TryLockError::WouldBlock) => scope.in_scope(path),
+            Err(TryLockError::Poisoned(_)) => false,
+        };
+        u32::from(held)
     })
 }
 
@@ -3397,6 +3493,48 @@ mod tests {
         std::fs::remove_dir_all(scratch).unwrap();
     }
 
+    /// How long a search sent while the list is patched waits. Run alone:
+    /// `cargo test -p argus-ffi --release search_stall -- --ignored --nocapture`.
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "indexes the whole home folder with everything on, and needs Full Disk Access"]
+    fn search_stall_with_everything_on() {
+        let home = argus_core::home();
+        let scratch = home.join("Library/Caches/argus-measure");
+        std::fs::create_dir_all(&scratch).unwrap();
+        let events = Events::default();
+        let core = scan_keeping(home.to_str().unwrap(), 1, 1, &events);
+        events.wait_for_event(TL_EVENT_INDEXED);
+        let search = || {
+            let started = Instant::now();
+            let ticket = submit(&core, "budget");
+            events.wait_for(TL_EVENT_READY, ticket);
+            started.elapsed()
+        };
+        let mut alone: Vec<Duration> = (0..21).map(|_| search()).collect();
+        alone.sort();
+        eprintln!(
+            "MEASURE a search alone: {:?} typical, {:?} at most",
+            alone[10], alone[20]
+        );
+        for round in 1..=6_u64 {
+            std::fs::write(scratch.join(format!("{round}.txt")), "").unwrap();
+            let started = Instant::now();
+            assert_eq!(changed_at(&core, &[&scratch], 0, round + 1), 1);
+            let (mut longest, mut searches) = (Duration::ZERO, 0);
+            while events.rebuilt().len() < round as usize {
+                longest = longest.max(search());
+                searches += 1;
+            }
+            eprintln!(
+                "MEASURE round {round}: patched in {:?}, longest of {searches} searches meanwhile {longest:?}",
+                started.elapsed()
+            );
+            thread::sleep(Duration::from_secs(1));
+        }
+        std::fs::remove_dir_all(scratch).unwrap();
+    }
+
     fn saved_at(file: &[u8], journal: &[u8], now: u64) -> TlSaved {
         TlSaved {
             file: file.as_ptr(),
@@ -4109,8 +4247,9 @@ mod tests {
     /// Grafts what the plan holds onto the newest list, which then becomes the newest.
     fn graft(source: &Source, live: &Live, notify: &Notify) -> Option<u64> {
         let (volumes, changes) = live.plan.lock().unwrap().volumes();
-        let built = source.graft(&volumes, &changes, live, notify)?;
-        Some(live.publish(built, 0).entry_count() as u64)
+        let (list, scope) = source.graft(&volumes, &changes, live, notify)?;
+        let list = live.publish_list(list, scope, 0);
+        Some(read(&list).unwrap().index.entry_count() as u64)
     }
 
     #[test]
@@ -4137,9 +4276,9 @@ mod tests {
         let source = home_source(&home, &live, &notify);
         live.plan(|plan| plan.volumes = vec![photos.clone(), music.clone()]);
         let (volumes, changes) = live.plan.lock().unwrap().volumes();
-        let built = source.graft(&volumes, &changes, &live, &notify).unwrap();
+        let (list, scope) = source.graft(&volumes, &changes, &live, &notify).unwrap();
         live.plan(|plan| assert!(plan.forget(&photos)));
-        live.publish(built, 0);
+        live.publish_list(list, scope, 0);
         let watched: Vec<String> = live
             .watched
             .lock()
@@ -4167,8 +4306,10 @@ mod tests {
         live.plan(|plan| plan.volumes = vec![photos.clone(), music.clone()]);
         assert_eq!(graft(&source, &live, &notify), Some(7));
         let newest = live.newest.lock().unwrap().clone().unwrap().1;
-        let held: Vec<&Path> = newest.volumes().collect();
+        let listed = read(&newest).unwrap();
+        let held: Vec<&Path> = listed.index.volumes().collect();
         assert_eq!(held, [photos.as_path(), music.as_path()]);
+        drop(listed);
         assert_eq!(graft(&source, &live, &notify), None, "already held");
     }
 
@@ -4316,6 +4457,45 @@ mod tests {
         events.wait_for(TL_EVENT_READY, ticket);
         assert_eq!(take(&core, ticket).unwrap().len(), 1);
         assert!(events.rebuilt().is_empty());
+    }
+
+    /// A bug that stops a patch halfway leaves a list no search may read: searches find
+    /// nothing, and the core goes on, until a whole new list takes its place.
+    #[test]
+    fn a_list_a_bug_broke_mid_patch_finds_nothing_until_read_whole() {
+        let (_dir, home) = home_with(&["notes/budget.txt"]);
+        let events = Events::default();
+        let core = scan(home.to_str().unwrap(), 1, &events);
+        events.wait_for(TL_EVENT_INDEXED, 3);
+        let live = unsafe { &(*core.0).live };
+        let list = live.newest.lock().unwrap().clone().unwrap().1;
+        let _ = thread::spawn(move || {
+            let _patching = list.write().unwrap();
+            panic!("a bug in the engine");
+        })
+        .join();
+        assert!(found(&core, &events, "budget").is_empty());
+        assert!(!holds(&core, &home.join("notes")));
+        assert_eq!(changed(&core, &[], 1), 1);
+        assert_eq!(events.wait_for_rebuilt(1), 3);
+        assert_eq!(found(&core, &events, "budget"), ["budget.txt"]);
+        assert!(holds(&core, &home.join("notes")));
+        assert_eq!(events.count(TL_EVENT_FAILED, 0), 0);
+    }
+
+    /// The window asks on its main thread, so the answer never waits for a patch: meanwhile,
+    /// a folder the scan reads counts as held.
+    #[test]
+    fn whether_a_folder_is_held_is_told_at_once_during_a_patch() {
+        let (_dir, home) = home_with(&["notes/budget.txt"]);
+        let events = Events::default();
+        let core = scan(home.to_str().unwrap(), 1, &events);
+        events.wait_for(TL_EVENT_INDEXED, 3);
+        let live = unsafe { &(*core.0).live };
+        let list = live.newest.lock().unwrap().clone().unwrap().1;
+        let _patching = list.write().unwrap();
+        assert!(holds(&core, &home.join("notes")));
+        assert!(!holds(&core, Path::new("/")));
     }
 
     #[test]
@@ -4900,11 +5080,122 @@ mod tests {
         assert!(saving.saving.lock().unwrap().waiting.is_none());
     }
 
-    fn index_of(files: &[&str]) -> (tempfile::TempDir, Arc<Index>) {
+    /// A pass reading `changes` again, as `rebuild_loop` hands one on.
+    fn patch(changes: Vec<PathBuf>, event_id: u64) -> Pass {
+        Pass {
+            full_disk: false,
+            clutter: None,
+            mark: event_id,
+            current: event_id,
+            volumes: Vec::new(),
+            changes,
+        }
+    }
+
+    /// A patch waits out a save under way, which reads the list for as long as the disk takes,
+    /// and searches go on meanwhile.
+    #[test]
+    fn a_save_under_way_holds_back_a_patch_but_never_a_search() {
+        let (_h, home) = home_with(&["notes/a.txt"]);
+        let notes = home.join("notes");
+        let (live, events) = (Live::default(), Events::default());
+        let notify = notify_to(&events);
+        let mut source = home_source(&home, &live, &notify);
+        let list = live.newest.lock().unwrap().clone().unwrap().1;
+        let (searcher, done, opens) =
+            (Searcher::with_threads(1), Done::default(), Mutex::default());
+        let (jobs, inbox) = mpsc::channel();
+        let (swaps, swapped) = mpsc::channel();
+        std::fs::write(notes.join("budget.txt"), "").unwrap();
+        thread::scope(|threads| {
+            let (worker_list, searcher, done, opens) =
+                (Arc::clone(&list), &searcher, &done, &opens);
+            threads
+                .spawn(move || serve(worker_list, searcher, &inbox, done, opens, &notify, RERANK));
+            let search = |query: &str| {
+                let ticket = searcher.ticket();
+                let (query, folder) = (query.to_owned(), None);
+                jobs.send(Job::Search {
+                    ticket,
+                    query,
+                    folder,
+                })
+                .unwrap();
+                ticket.number()
+            };
+            // As `save_loop` holds them while it writes the list.
+            let writing = lock(&live.writing);
+            let saving = read(&list).unwrap();
+            let patching = threads.spawn(|| {
+                let pass = patch(vec![notes.clone()], 1);
+                rebuild(&mut source, pass, &live, &swaps, &notify);
+            });
+            // Time for the patch to reach the save and wait.
+            thread::sleep(Duration::from_millis(100));
+            let ticket = search("a");
+            assert!(events.heard(TL_EVENT_READY, ticket), "a search waited");
+            assert!(!patching.is_finished() && swapped.try_recv().is_err());
+            drop((saving, writing));
+            patching.join().unwrap();
+            assert!(matches!(swapped.try_recv(), Ok(Job::Swap { .. })));
+            assert_eq!(read(&list).unwrap().version, 1);
+            let ticket = search("budget");
+            events.wait_for(TL_EVENT_READY, ticket);
+            let (_, found) = done.lock().unwrap().take().unwrap();
+            assert_eq!(paths_of(&found), [notes.join("budget.txt")]);
+            drop(jobs);
+        });
+    }
+
+    /// Every entry's path and kind, sorted, so lists numbered apart compare.
+    fn listing(index: &Index) -> Vec<(PathBuf, bool)> {
+        let kept = index.ids().filter(|&entry| !index.is_removed(entry));
+        let mut listed: Vec<_> = kept
+            .map(|entry| (index.path(entry), index.is_dir(entry)))
+            .collect();
+        listed.sort();
+        listed
+    }
+
+    /// Saved while patches keep coming, the file opens to the list in use, at the event of the
+    /// last patch.
+    #[test]
+    fn a_list_patched_in_place_is_saved_with_its_own_event() {
+        let (_h, home) = home_with(&["notes/a.txt", "work/plan.md"]);
+        let support = tempfile::tempdir().unwrap();
+        let file = support.path().join("index");
+        let live = saving_live(&file, Duration::from_millis(1), Duration::from_millis(5));
+        let events = Events::default();
+        let notify = notify_to(&events);
+        let mut source = home_source(&home, &live, &notify);
+        let notes = home.join("notes");
+        let (swaps, _swapped) = mpsc::channel();
+        with_saver(&live, &events, || {
+            for event_id in 1..=30 {
+                std::fs::write(notes.join(format!("{event_id}.txt")), "").unwrap();
+                if event_id % 3 == 0 {
+                    std::fs::remove_file(notes.join(format!("{}.txt", event_id - 2))).unwrap();
+                }
+                let pass = patch(vec![notes.clone()], event_id);
+                rebuild(&mut source, pass, &live, &swaps, &notify);
+            }
+            wait_until("the last save", || saved_event(&file) == Some(30));
+        });
+        let (settings, _) = source.saving().unwrap();
+        let saved = open_index(&file, &settings).unwrap();
+        let list = live.newest.lock().unwrap().clone().unwrap().1;
+        assert_eq!(read(&list).unwrap().version, 30);
+        let live_listing = listing(&read(&list).unwrap().index);
+        assert_eq!(listing(&saved.scan.index), live_listing);
+        assert_eq!(saved.event_id, 30);
+        assert!(events.notes.lock().unwrap().is_empty());
+    }
+
+    fn index_of(files: &[&str]) -> (tempfile::TempDir, Index) {
         let (dir, home) = home_with(files);
         let ignore = Ignore::default();
         let scan = argus_core::scan(&home, &home, Clutter::Skip, &ignore, Access::Full);
-        (dir, Arc::new(scan.unwrap().index))
+        (dir, scan.unwrap().index)
     }
 
     #[test]
@@ -4933,12 +5224,12 @@ mod tests {
         })
         .unwrap();
         jobs.send(Job::Swap {
-            index: new,
+            list: list_of(new),
             took: 7,
         })
         .unwrap();
         drop(jobs);
-        let opens = Mutex::default();
+        let (old, opens) = (list_of(old), Mutex::default());
         serve(old, &searcher, &inbox, &done, &opens, &notify, RERANK);
         assert_eq!(found(&done), 0);
         let mut seen = std::mem::take(&mut *events.seen.lock().unwrap());
@@ -4953,7 +5244,7 @@ mod tests {
         let (jobs, inbox) = mpsc::channel();
         let after = searcher.ticket();
         jobs.send(Job::Swap {
-            index: newer,
+            list: list_of(newer),
             took: 9,
         })
         .unwrap();
@@ -4965,6 +5256,7 @@ mod tests {
         .unwrap();
         drop(jobs);
         let (_dir, unused) = index_of(&[]);
+        let unused = list_of(unused);
         serve(unused, &searcher, &inbox, &done, &opens, &notify, RERANK);
         assert_eq!(found(&done), 2);
         seen = std::mem::take(&mut *events.seen.lock().unwrap());
@@ -5176,7 +5468,7 @@ mod tests {
         let done = Done::default();
         let (jobs, inbox) = mpsc::channel();
         jobs.send(Job::Swap {
-            index: new,
+            list: list_of(new),
             took: 1,
         })
         .unwrap();
@@ -5190,6 +5482,7 @@ mod tests {
         })
         .unwrap();
         drop(jobs);
+        let old = list_of(old);
         serve(old, &searcher, &inbox, &done, &opens, &notify, RERANK);
         let (_, packed) = done.lock().unwrap().take().unwrap();
         let row = &packed.rows[0];
@@ -5207,6 +5500,7 @@ mod tests {
             .map(|entry| index.path(entry))
             .find(|path| path.ends_with("a/b/plan.md"))
             .unwrap();
+        let list = list_of(index);
         let events = Events::default();
         let notify = Notify {
             ctx: &events as *const Events as *mut c_void,
@@ -5229,8 +5523,8 @@ mod tests {
                 events.wait_for(TL_EVENT_READY, ticket.number());
             };
             thread::scope(|threads| {
-                let (index, searcher, done, opens) = (Arc::clone(&index), &searcher, &done, &opens);
-                threads.spawn(move || serve(index, searcher, &inbox, done, opens, &notify, rerank));
+                let (list, searcher, done, opens) = (Arc::clone(&list), &searcher, &done, &opens);
+                threads.spawn(move || serve(list, searcher, &inbox, done, opens, &notify, rerank));
                 search(&jobs);
                 // Behind the worker's back, as an hour of fading would be.
                 opens.lock().unwrap().frecency.record(&deep, unix_now());
@@ -5243,6 +5537,105 @@ mod tests {
             let first = Path::new(&packed.text[folder]);
             assert_eq!(first == deep.parent().unwrap(), climbs, "{first:?}");
         }
+    }
+
+    /// Each row's folder and name joined back into a path.
+    fn paths_of(packed: &Packed) -> Vec<PathBuf> {
+        let text = |start: u32, len: u32| &packed.text[start as usize..(start + len) as usize];
+        packed
+            .rows
+            .iter()
+            .map(|row| {
+                let folder = text(row.folder_start, row.folder_len);
+                Path::new(folder).join(text(row.name_start, row.name_len))
+            })
+            .collect()
+    }
+
+    /// A search sent while the list is patched waits, then answers from the patched list:
+    /// the folder searched inside and the boosts are worked out again, as the patch numbered
+    /// the entries anew and at times left fewer than before.
+    #[test]
+    fn searches_sent_during_a_patch_answer_from_the_patched_list() {
+        let files = [
+            "notes/keep.md",
+            "notes/r0.md",
+            "plan.md",
+            "deep/a/b/plan.md",
+        ];
+        let (_dir, home) = home_with(&files);
+        let (notes, other, deep) = (
+            home.join("notes"),
+            home.join("other"),
+            home.join("deep/a/b"),
+        );
+        let settings = Settings::new(&home, &home, Clutter::Skip, Ignore::default(), Access::Full);
+        let list = list_of(settings.scan().unwrap().index);
+        let mut frecency = Frecency::default();
+        frecency.record(&deep.join("plan.md"), unix_now());
+        let opens = Mutex::new(Opens {
+            frecency,
+            file: None,
+        });
+        let events = Events::default();
+        let notify = notify_to(&events);
+        let searcher = Searcher::with_threads(1);
+        let done = Done::default();
+        let (jobs, inbox) = mpsc::channel();
+        thread::scope(|threads| {
+            let (worker_list, searcher, done, opens) =
+                (Arc::clone(&list), &searcher, &done, &opens);
+            threads
+                .spawn(move || serve(worker_list, searcher, &inbox, done, opens, &notify, RERANK));
+            let ask = |query: &str, folder: Option<&Path>| {
+                let ticket = searcher.ticket();
+                let query = query.to_owned();
+                let folder = folder.map(|folder| folder.to_string_lossy().into_owned());
+                jobs.send(Job::Search {
+                    ticket,
+                    query,
+                    folder,
+                })
+                .unwrap();
+                events.wait_for(TL_EVENT_READY, ticket.number());
+                paths_of(&done.lock().unwrap().take().unwrap().1)
+            };
+            // Works out the folder and the boosts on the list as first read.
+            assert_eq!(ask("plan", None)[0], deep.join("plan.md"));
+            assert_eq!(ask("md", Some(&notes)).len(), 2);
+            for round in 1..=40 {
+                let renamed = notes.join(format!("r{round}.md"));
+                std::fs::rename(notes.join(format!("r{}.md", round - 1)), &renamed).unwrap();
+                if round % 2 == 1 {
+                    for name in 0..8 {
+                        std::fs::create_dir_all(other.join(format!("{name}"))).unwrap();
+                    }
+                } else {
+                    std::fs::remove_dir_all(&other).unwrap();
+                }
+                let (locked, patching) = mpsc::channel();
+                let (list, settings) = (&list, &settings);
+                let changed = [notes.as_path(), home.as_path()];
+                let patch = threads.spawn(move || {
+                    let mut listed = list.write().unwrap();
+                    locked.send(()).unwrap();
+                    // Long enough that the searches below are sent while it runs.
+                    thread::sleep(Duration::from_millis(5));
+                    let update = settings.update(&mut listed.index, &changed);
+                    assert!(update.compacted);
+                    listed.version += 1;
+                });
+                patching.recv().unwrap();
+                let mut inside = ask("md", Some(&notes));
+                inside.sort();
+                assert_eq!(inside, [notes.join("keep.md"), renamed], "round {round}");
+                let plans = ask("plan", None);
+                assert_eq!(plans.len(), 2, "round {round}");
+                assert!(plans[0].starts_with(&deep), "round {round}: {plans:?}");
+                patch.join().unwrap();
+            }
+            drop(jobs);
+        });
     }
 
     /// A line as the window would copy it: the file's path, the line number, the line, and
