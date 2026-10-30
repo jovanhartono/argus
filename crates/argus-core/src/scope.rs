@@ -189,7 +189,7 @@ impl Scope {
 #[cfg(test)]
 mod tests {
     use super::Watch;
-    use crate::{Access, Clutter, Ignore, Settings};
+    use crate::{Access, Cloud, Clutter, Ignore, Settings};
     use std::fs;
     use std::path::{Path, PathBuf};
 
@@ -267,20 +267,27 @@ mod tests {
         (dir, home)
     }
 
-    fn settings_from(home: &Path, root: &Path, clutter: Clutter, access: Access) -> Settings {
+    fn settings_from(
+        home: &Path,
+        root: &Path,
+        clutter: Clutter,
+        access: Access,
+        cloud: Cloud,
+    ) -> Settings {
         let (ignore, problems) = Ignore::parse(RULES, home, access);
         assert!(problems.is_empty());
-        Settings::new(root, home, clutter, ignore, access)
+        Settings::new(root, home, clutter, ignore, access, cloud)
     }
 
     fn settings(home: &Path, access: Access) -> Settings {
-        settings_from(home, home, Clutter::Skip, access)
+        settings_from(home, home, Clutter::Skip, access, Cloud::Keep)
     }
 
     #[test]
     fn a_folder_is_in_scope_exactly_when_the_scan_reads_it() {
         let (_dir, home) = home();
         let work = home.join("work");
+        let library = home.join("Library");
         let passages = [
             ".config",
             ".cache",
@@ -291,9 +298,14 @@ mod tests {
             (&home, Clutter::Skip),
             (&home, Clutter::Keep),
             (&work, Clutter::Skip),
+            (&library, Clutter::Skip),
         ] {
-            for access in [Access::Full, Access::Limited] {
-                let settings = settings_from(&home, root, clutter, access);
+            for (access, cloud) in [
+                (Access::Full, Cloud::Keep),
+                (Access::Full, Cloud::Skip),
+                (Access::Limited, Cloud::Keep),
+            ] {
+                let settings = settings_from(&home, root, clutter, access, cloud);
                 let index = settings.scan().unwrap().index;
                 let scope = settings.scope(&index);
                 let listed: Vec<PathBuf> = (0..index.len() as u32).map(|e| index.path(e)).collect();
@@ -305,11 +317,34 @@ mod tests {
                     assert_eq!(
                         scope.in_scope(&folder),
                         read,
-                        "{folder:?} with {access:?} and {clutter:?} from {root:?}"
+                        "{folder:?} with {access:?}, {clutter:?} and {cloud:?} from {root:?}"
                     );
                 }
             }
         }
+    }
+
+    #[test]
+    fn cloud_drives_left_out_are_neither_watched_nor_rebuilt_for() {
+        let (_dir, home) = home();
+        let settings = settings_from(&home, &home, Clutter::Skip, Access::Full, Cloud::Skip);
+        let index = settings.scan().unwrap().index;
+        let scope = settings.scope(&index);
+        let dropbox = home.join("Library/CloudStorage/Dropbox/plans");
+        let icloud = home.join("Library/Mobile Documents/com~apple~CloudDocs/cv");
+        for folder in [&dropbox, &icloud] {
+            assert!(!scope.in_scope(folder), "{folder:?}");
+            fs::write(folder.join("new.txt"), "").unwrap();
+            assert!(scope.holds(folder, &index), "{folder:?}");
+        }
+        let watched = scope.watched(&index);
+        let cloud = |(path, _): &(PathBuf, Watch)| path.ends_with("CloudStorage");
+        assert!(!watched.iter().any(cloud));
+        assert!(watched.contains(&(home.join("Library"), Watch::Names)));
+        // A cloud drive appearing in Library, as when Dropbox is installed, changes nothing.
+        fs::create_dir(home.join("Library/CloudStorage/OneDrive")).unwrap();
+        assert!(scope.holds(&home.join("Library"), &index));
+        assert!(scope.holds(&home.join("Library/CloudStorage"), &index));
     }
 
     #[test]
@@ -436,7 +471,14 @@ mod tests {
     fn a_kept_ignore_list_folder_is_watched_once() {
         let (_dir, home) = home();
         let (ignore, _) = Ignore::parse("!~/.config", &home, Access::Full);
-        let settings = Settings::new(&home, &home, Clutter::Skip, ignore, Access::Full);
+        let settings = Settings::new(
+            &home,
+            &home,
+            Clutter::Skip,
+            ignore,
+            Access::Full,
+            Cloud::Keep,
+        );
         let index = settings.scan().unwrap().index;
         let watched = settings.scope(&index).watched(&index);
         assert!(watched.contains(&(home.join(".config"), Watch::Inside)));
@@ -564,7 +606,8 @@ mod tests {
         let tag = "Signature: 8a477f597d28d172789f06886806bc55\n";
         fs::write(home.join("target/CACHEDIR.TAG"), tag).unwrap();
         fs::create_dir(home.join("notes")).unwrap();
-        let settings = Settings::new(&home, &home, Clutter::Skip, Ignore::default(), Access::Full);
+        let none = Ignore::default();
+        let settings = Settings::new(&home, &home, Clutter::Skip, none, Access::Full, Cloud::Keep);
         let index = settings.scan().unwrap().index;
         assert_eq!(
             settings.scope(&index).watched(&index),

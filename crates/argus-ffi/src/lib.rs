@@ -20,8 +20,8 @@
 //! `include/argus.h` repeats everything here for Swift, and a test keeps the two in step.
 
 use argus_core::{
-    Access, Apps, Boosts, Changes, Clutter, Frecency, Hit, Ignore, Index, Item, OpenError, Pages,
-    Refusal, Scope, Searcher, Settings, Ticket, Watch, Within, open_index, remove_old_temps,
+    Access, Apps, Boosts, Changes, Cloud, Clutter, Frecency, Hit, Ignore, Index, Item, OpenError,
+    Pages, Refusal, Scope, Searcher, Settings, Ticket, Watch, Within, open_index, remove_old_temps,
     save_index, unix_now,
 };
 use argus_grep::{Found, Grep, Report};
@@ -39,7 +39,7 @@ use std::time::{Duration, Instant};
 static PAGES: Pages = Pages;
 
 /// Raise this with any change below, so a window built against an older header refuses to start.
-pub const TL_ABI_VERSION: u32 = 14;
+pub const TL_ABI_VERSION: u32 = 15;
 
 pub const TL_OK: u32 = 0;
 /// No rows for that ticket: not ready yet, already taken, or a newer search replaced them.
@@ -271,6 +271,7 @@ struct Find {
     folders: Vec<PathBuf>,
     query: String,
     access: Access,
+    cloud: Cloud,
 }
 
 /// What the newest text search found since the window last took some.
@@ -330,7 +331,11 @@ struct Plan {
     everything: bool,
     /// Clutter is kept in the newest list, or the one being built.
     everything_listed: bool,
-    /// The mark of the switch that `everything` waits on, if any.
+    /// Cloud drives are kept from the next list on.
+    cloud: bool,
+    /// Cloud drives are kept in the newest list, or the one being built.
+    cloud_listed: bool,
+    /// The mark of the switch that `everything` or `cloud` waits on, if any.
     switched: Option<u64>,
     /// The volumes the window said were mounted, by their real paths. Each list reads them
     /// once Full Disk Access is on.
@@ -372,13 +377,31 @@ struct Plan {
 const SETTLE_AFTER_HIDE: Duration = Duration::from_secs(1);
 
 impl Plan {
-    fn new(everything: bool, granted: bool) -> Self {
+    fn new(everything: bool, cloud: bool, granted: bool) -> Self {
         Self {
             everything,
             everything_listed: everything,
+            cloud,
+            cloud_listed: cloud,
             granted,
             ..Self::default()
         }
+    }
+
+    /// A switch waits for a new list.
+    fn switching(&self) -> bool {
+        self.everything != self.everything_listed || self.cloud != self.cloud_listed
+    }
+
+    /// Notes a switch just flipped, whose list waits from `mark` on when `needed`. Returns
+    /// `needed`.
+    fn switch(&mut self, needed: bool, mark: u64) -> bool {
+        if !self.switching() {
+            self.switched = None;
+        } else if needed {
+            self.switched = Some(self.switched.map_or(mark, |switched| switched.min(mark)));
+        }
+        needed
     }
 
     fn want(&mut self, mark: u64) {
@@ -392,8 +415,7 @@ impl Plan {
 
     /// Nothing waits or runs, so the newest list is current to `delivered`.
     fn idle(&self) -> bool {
-        !(self.wanted || self.running || self.patching)
-            && self.everything == self.everything_listed
+        !(self.wanted || self.running || self.patching || self.switching())
             && self.recheck.is_none()
             && self.failed.is_none()
     }
@@ -401,29 +423,27 @@ impl Plan {
     /// A new list is being built or waits to be. Unlike `idle`, a rebuild whose list is in
     /// use counts as done, as the window hears of that list before the rebuild ends.
     fn busy(&self) -> bool {
-        self.wanted
-            || (self.running && !self.listed)
-            || self.patching
-            || self.everything != self.everything_listed
+        self.wanted || (self.running && !self.listed) || self.patching || self.switching()
     }
 
     /// As `busy`, but only for a list read from the whole folder: with everything listed,
     /// ~/Library changes every few seconds, and a spinner for each patch would never rest.
     fn building(&self) -> bool {
-        self.wanted
-            || (self.running && self.whole && !self.listed)
-            || self.everything != self.everything_listed
+        self.wanted || (self.running && self.whole && !self.listed) || self.switching()
     }
 
-    /// The setting for the list about to be built, which brings any switch waiting.
-    fn list(&mut self) -> Clutter {
+    /// The settings for the list about to be built, which bring any switch waiting.
+    fn list(&mut self) -> (Clutter, Cloud) {
         self.everything_listed = self.everything;
+        self.cloud_listed = self.cloud;
         self.switched = None;
-        if self.everything {
+        let clutter = if self.everything {
             Clutter::Keep
         } else {
             Clutter::Skip
-        }
+        };
+        let cloud = if self.cloud { Cloud::Keep } else { Cloud::Skip };
+        (clutter, cloud)
     }
 
     /// The volumes for the list about to be built, and the folders to read again, which
@@ -471,9 +491,9 @@ impl Plan {
 struct Pass {
     /// Full Disk Access came on since the last turn.
     full_disk: bool,
-    /// Whether the new list keeps clutter, or `None` when only volumes changed, which
-    /// leaves the newest list's root as it is.
-    clutter: Option<Clutter>,
+    /// Whether the new list keeps clutter and cloud drives, or `None` when only volumes
+    /// changed, which leaves the newest list's root as it is.
+    rules: Option<(Clutter, Cloud)>,
     /// The mark of the first change the pass reads.
     mark: u64,
     /// The FSEvents event id the list it brings is current to.
@@ -889,7 +909,7 @@ impl Source {
     /// Scans the root, then adds each of `volumes`, as `Live::add_volumes` does.
     fn build(
         &mut self,
-        clutter: Clutter,
+        (clutter, cloud): (Clutter, Cloud),
         volumes: &[PathBuf],
         live: &Live,
         notify: &Notify,
@@ -898,7 +918,7 @@ impl Source {
             let index = argus_core::stand_in(*count);
             return Ok(Built { index, scope: None });
         }
-        let settings = self.settings(clutter, notify)?;
+        let settings = self.settings(clutter, cloud, notify)?;
         let scan = settings.scan()?;
         let mut index = scan.index;
         live.add_volumes(&settings, &mut index, volumes, notify);
@@ -910,14 +930,19 @@ impl Source {
     /// The list saved in `file` and the FSEvents event id it is current to, when it was saved
     /// with the settings a scan would use now. Its volumes are taken out: the window adds
     /// back those still mounted.
-    fn open(&mut self, file: &Path, clutter: Clutter, notify: &Notify) -> Option<(Built, u64)> {
-        let settings = self.settings(clutter, notify).ok()?;
+    fn open(
+        &mut self,
+        file: &Path,
+        (clutter, cloud): (Clutter, Cloud),
+        notify: &Notify,
+    ) -> Option<(Built, u64)> {
+        let settings = self.settings(clutter, cloud, notify).ok()?;
         let saved = match open_index(file, &settings) {
             Ok(saved) => saved,
             Err(why) => {
                 let expected = match &why {
                     OpenError::Io(error) => error.kind() == io::ErrorKind::NotFound,
-                    // Full Disk Access, the ignore list or Argus itself changed.
+                    // Full Disk Access, a switch, the ignore list or Argus itself changed.
                     OpenError::OtherSettings | OpenError::Version(_) => true,
                     _ => false,
                 };
@@ -961,7 +986,12 @@ impl Source {
     }
 
     /// What a home folder's list is built with now, reading the ignore list again.
-    fn settings(&mut self, clutter: Clutter, notify: &Notify) -> io::Result<Settings> {
+    fn settings(
+        &mut self,
+        clutter: Clutter,
+        cloud: Cloud,
+        notify: &Notify,
+    ) -> io::Result<Settings> {
         let Self::Home {
             root,
             access,
@@ -990,7 +1020,7 @@ impl Source {
                 ignore
             }
         };
-        let settings = Settings::new(&home, &home, clutter, ignore, access);
+        let settings = Settings::new(&home, &home, clutter, ignore, access, cloud);
         Ok(match journal {
             Some(journal) => settings.with_journal(journal),
             None => settings,
@@ -1186,8 +1216,9 @@ pub extern "C" fn tl_abi_version() -> u32 {
 
 /// Starts a core that scans `root` in the background as a home folder (the app passes yours),
 /// skipping clutter and the ignore list inside it, or listing everything when `everything`
-/// isn't 0, as `tl_index_everything` does. Without `full_disk` (0), the folders macOS guards
-/// with a pop-up each are left unread. Searches sent before `TL_EVENT_INDEXED` wait for it; a
+/// isn't 0, as `tl_index_everything` does. Cloud drives are left out unless `cloud` isn't 0,
+/// as `tl_index_cloud` does. Without `full_disk` (0), the folders macOS guards with a pop-up
+/// each are left unread. Searches sent before `TL_EVENT_INDEXED` wait for it; a
 /// scan that fails sends `TL_EVENT_FAILED`, and each problem with the ignore list a
 /// `TL_EVENT_NOTE` first. Returns null on failure, without `on_event`, or for a `root`, or a
 /// file or journal in `saved`, that isn't UTF-8.
@@ -1210,6 +1241,7 @@ pub unsafe extern "C" fn tl_core_new(
     root_len: usize,
     full_disk: u32,
     everything: u32,
+    cloud: u32,
     saved: *const TlSaved,
     ctx: *mut c_void,
     on_event: Option<TlEventFn>,
@@ -1250,7 +1282,7 @@ pub unsafe extern "C" fn tl_core_new(
             ctx,
             on_event,
             source,
-            everything != 0,
+            (everything != 0, cloud != 0),
             resume,
             Live::default(),
         )
@@ -1275,19 +1307,20 @@ pub unsafe extern "C" fn tl_core_new_stand_in(
             return std::ptr::null_mut();
         }
         let source = Source::StandIn(count as usize);
-        start(ctx, on_event, source, false, None, Live::default())
+        start(ctx, on_event, source, (false, false), None, Live::default())
     })
 }
 
 /// The saved list's file, and the newest FSEvents event id as the core starts.
 type Resume = (PathBuf, u64);
 
-/// Starts the core's threads over `live`, whose plan and saving it fills in.
+/// Starts the core's threads over `live`, whose plan and saving it fills in, with the
+/// everything and cloud drive switches set as given.
 fn start(
     ctx: *mut c_void,
     on_event: Option<TlEventFn>,
     source: Source,
-    everything: bool,
+    (everything, cloud): (bool, bool),
     resume: Option<Resume>,
     live: Live,
 ) -> *mut TlCore {
@@ -1306,7 +1339,7 @@ fn start(
             (root.clone(), *access == Access::Full, Some(judge))
         }
     };
-    let mut plan = Plan::new(everything, full_disk);
+    let mut plan = Plan::new(everything, cloud, full_disk);
     plan.delivered = resume.as_ref().map_or(0, |&(_, now)| now);
     let live = Arc::new(Live {
         plan: Mutex::new(plan),
@@ -1360,12 +1393,12 @@ fn start(
 }
 
 fn first_list(source: &mut Source, live: &Live, notify: &Notify) -> io::Result<(List, bool)> {
-    let (clutter, now) = {
+    let (rules, now) = {
         let mut plan = live.plan.lock().unwrap();
         (plan.list(), plan.delivered)
     };
     let file = live.saving.lock().unwrap().file.clone();
-    if let Some((built, saved_at)) = file.and_then(|file| source.open(&file, clutter, notify)) {
+    if let Some((built, saved_at)) = file.and_then(|file| source.open(&file, rules, notify)) {
         // An id from a log since reset, or from a list saved without one, can't be caught up
         // from, so a new list follows, as after a change macOS lost track of.
         let caught_up = saved_at != 0 && saved_at <= now;
@@ -1387,7 +1420,7 @@ fn first_list(source: &mut Source, live: &Live, notify: &Notify) -> io::Result<(
         plan.patched = None;
         plan.volumes().0
     };
-    let built = source.build(clutter, &volumes, live, notify)?;
+    let built = source.build(rules, &volumes, live, notify)?;
     let list = live.publish(built, 0);
     live.keep(&list, source, now);
     Ok((list, false))
@@ -1621,7 +1654,7 @@ fn rebuild_loop(live: &Live, clock: &impl Clock, mut last: Instant, mut rebuild:
         if plan.stopped {
             return;
         }
-        let whole = plan.wanted || plan.everything != plan.everything_listed;
+        let whole = plan.wanted || plan.switching();
         if !whole && !plan.patching {
             if plan.deferred && !plan.shown {
                 let now = clock.now();
@@ -1656,14 +1689,14 @@ fn rebuild_loop(live: &Live, clock: &impl Clock, mut last: Instant, mut rebuild:
         let full_disk = std::mem::take(&mut plan.full_disk);
         let mark = [plan.asked.take(), plan.switched, plan.patched.take()];
         let mark = mark.into_iter().flatten().min().unwrap_or_default();
-        let clutter = whole.then(|| plan.list());
+        let rules = whole.then(|| plan.list());
         let (volumes, changes) = plan.volumes();
         let current = plan.delivered;
         drop(plan);
         last = now;
         rebuild(Pass {
             full_disk,
-            clutter,
+            rules,
             mark,
             current,
             volumes,
@@ -1690,10 +1723,10 @@ fn rebuild(source: &mut Source, pass: Pass, live: &Live, swaps: &Sender<Job>, no
         *access = Access::Full;
     }
     let started = Instant::now();
-    let whole = pass.clutter.is_some();
-    let built = panic::catch_unwind(AssertUnwindSafe(|| match pass.clutter {
-        Some(clutter) => source
-            .build(clutter, &pass.volumes, live, notify)
+    let whole = pass.rules.is_some();
+    let built = panic::catch_unwind(AssertUnwindSafe(|| match pass.rules {
+        Some(rules) => source
+            .build(rules, &pass.volumes, live, notify)
             .map(|built| Some((live.publish(built, pass.mark), Duration::ZERO))),
         None => source
             .graft(&pass.volumes, &pass.changes, live, notify)
@@ -1948,7 +1981,7 @@ pub unsafe extern "C" fn tl_changed(
         let live = &core.live;
         // Each change is heard only once it is in the plan, so a list started after it is
         // never saved as current to an event it hasn't read.
-        let (running, everything, mark) = {
+        let (running, wider, mark) = {
             let mut plan = live.plan.lock().unwrap();
             if plan.stopped {
                 return 0;
@@ -1964,7 +1997,8 @@ pub unsafe extern "C" fn tl_changed(
                 plan.heard(mark);
                 return 1;
             }
-            (plan.running, plan.everything_listed, mark)
+            let wider = plan.everything_listed || plan.cloud_listed;
+            (plan.running, wider, mark)
         };
         let bytes = match len {
             0 => &[],
@@ -1985,11 +2019,12 @@ pub unsafe extern "C" fn tl_changed(
             (None, _) => true,
             (Some(paths), Some((scope, list))) if running => {
                 // The rebuild under way may have read these folders before they changed. One
-                // keeping everything reads folders the newest list's rules leave out.
+                // keeping everything, or cloud drives, reads folders the newest list's rules
+                // leave out.
                 let changed: Vec<PathBuf> = paths
                     .into_iter()
                     .filter(|path| {
-                        if everything || scope.in_scope(path) {
+                        if wider || scope.in_scope(path) {
                             live.drive_read(|drive| path.starts_with(drive)).is_some()
                         } else {
                             !holds_unless_leaving(live, &scope, &list, path)
@@ -2094,11 +2129,38 @@ pub unsafe extern "C" fn tl_index_everything(core: *const TlCore, on: u32, mark:
             return 0;
         }
         plan.everything = on;
-        if plan.everything_listed == on {
-            plan.switched = None;
+        let needed = plan.everything_listed != on;
+        if !plan.switch(needed, mark) {
             return 0;
         }
-        plan.switched = Some(mark);
+        drop(plan);
+        core.live.wake.notify_all();
+        1
+    })
+}
+
+/// Lists iCloud Drive and cloud drives such as Dropbox, in ~/Library/Mobile Documents and
+/// ~/Library/CloudStorage, from the next list on when `on` isn't 0, and leaves them out again
+/// when it is. Text searches sent from then on follow it too, except in a folder chosen inside
+/// a cloud drive. Returns as `tl_index_everything` does, and `mark` is as for `tl_changed`.
+/// Safe to call from any thread.
+///
+/// # Safety
+/// `core` came from `tl_core_new` or `tl_core_new_stand_in`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tl_index_cloud(core: *const TlCore, on: u32, mark: u64) -> u32 {
+    guard(0, || {
+        let core = unsafe { &*core };
+        let on = on != 0;
+        let mut plan = core.live.plan.lock().unwrap();
+        if plan.stopped || plan.cloud == on {
+            return 0;
+        }
+        plan.cloud = on;
+        let needed = plan.cloud_listed != on;
+        if !plan.switch(needed, mark) {
+            return 0;
+        }
         drop(plan);
         core.live.wake.notify_all();
         1
@@ -2595,7 +2657,8 @@ fn find_in(
         // leaves name searches alone, and a newer keystroke stops it.
         let scan = grep.install(|| {
             let stop = || stale() || ejected();
-            argus_core::scan_until(&folder, &home, Clutter::Skip, &ignore, find.access, &stop)
+            let (skip, access, cloud) = (Clutter::Skip, find.access, find.cloud);
+            argus_core::scan_until(&folder, &home, skip, &ignore, access, cloud, &stop)
         });
         if stale() {
             return None;
@@ -2666,8 +2729,9 @@ fn tell(mut waiting: MutexGuard<'_, Waiting>, number: u64, notify: Notify) {
 /// failure, as for a folder that isn't UTF-8, leaving the search under way alone. Otherwise
 /// every older text search gives up; name searches never wait for any. `folders` holds
 /// `folders_len` bytes: paths in UTF-8, each ending in a NUL byte. Each is listed as the name
-/// list would be, skipping clutter and the ignore list, and a folder inside another is
-/// searched once; one that can't be listed counts as unreadable.
+/// list would be, skipping clutter and the ignore list, and cloud drives as `tl_index_cloud`
+/// says, and a folder inside another is searched once; one that can't be listed counts as
+/// unreadable.
 /// Upper-case letters in `query` must match exactly; lower-case ones match either case. Up to
 /// 100 lines come in batches, each announced by `TL_EVENT_LINES`, the last with the end.
 ///
@@ -2709,6 +2773,11 @@ pub unsafe extern "C" fn tl_grep_submit(
         } else {
             Access::Limited
         };
+        let cloud = if core.live.plan.lock().unwrap().cloud {
+            Cloud::Keep
+        } else {
+            Cloud::Skip
+        };
         let search = text.search(&core.live);
         let ticket = search.grep.ticket();
         let find = Find {
@@ -2716,6 +2785,7 @@ pub unsafe extern "C" fn tl_grep_submit(
             folders,
             query,
             access,
+            cloud,
         };
         // Fails only if the worker stopped after a bug.
         if search.jobs.send(find).is_ok() {
@@ -2843,6 +2913,9 @@ mod tests {
     use std::sync::Condvar;
     use std::sync::atomic::AtomicPtr;
     use std::time::{Duration, Instant};
+
+    /// A list as the app builds one at first: clutter and cloud drives left out.
+    const DEFAULT: (Clutter, Cloud) = (Clutter::Skip, Cloud::Skip);
 
     #[derive(Default)]
     struct Events {
@@ -3504,20 +3577,31 @@ mod tests {
     }
 
     fn scan_keeping(home: &str, full_disk: u32, everything: u32, events: &Events) -> Core {
-        scan_saving(home, full_disk, everything, std::ptr::null(), events)
+        scan_saving(home, full_disk, (everything, 0), std::ptr::null(), events)
     }
 
+    /// With the everything and cloud drive switches set as given.
     fn scan_saving(
         home: &str,
         full_disk: u32,
-        everything: u32,
+        (everything, cloud): (u32, u32),
         saved: *const TlSaved,
         events: &Events,
     ) -> Core {
         let ctx = events as *const Events as *mut c_void;
         let (root, len) = (home.as_ptr(), home.len());
-        let core =
-            unsafe { tl_core_new(root, len, full_disk, everything, saved, ctx, Some(record)) };
+        let core = unsafe {
+            tl_core_new(
+                root,
+                len,
+                full_disk,
+                everything,
+                cloud,
+                saved,
+                ctx,
+                Some(record),
+            )
+        };
         assert!(!core.is_null());
         Core(core)
     }
@@ -3679,9 +3763,9 @@ mod tests {
         let too_many = unsafe { tl_core_new_stand_in(u64::from(u32::MAX), ctx, Some(record)) };
         assert!(too_many.is_null());
         let none = std::ptr::null();
-        let not_utf8 = unsafe { tl_core_new([0xff].as_ptr(), 1, 1, 0, none, ctx, Some(record)) };
+        let not_utf8 = unsafe { tl_core_new([0xff].as_ptr(), 1, 1, 0, 0, none, ctx, Some(record)) };
         assert!(not_utf8.is_null());
-        let no_root = unsafe { tl_core_new(std::ptr::null(), 0, 1, 0, none, ctx, Some(record)) };
+        let no_root = unsafe { tl_core_new(std::ptr::null(), 0, 1, 0, 0, none, ctx, Some(record)) };
         assert!(no_root.is_null());
 
         let (_dir, home) = home_with(&[]);
@@ -3694,8 +3778,8 @@ mod tests {
             (file.as_bytes(), &bad),
         ] {
             let saved = saved_at(file, journal, 1);
-            let refused =
-                unsafe { tl_core_new(home.as_ptr(), home.len(), 1, 0, &saved, ctx, Some(record)) };
+            let (root, len) = (home.as_ptr(), home.len());
+            let refused = unsafe { tl_core_new(root, len, 1, 0, 0, &saved, ctx, Some(record)) };
             assert!(refused.is_null(), "{file:?} {journal:?}");
         }
         let missing = TlSaved {
@@ -3707,8 +3791,8 @@ mod tests {
             ..saved_at(file.as_bytes(), b"5F2A", 1)
         };
         for saved in [missing, no_journal] {
-            let refused =
-                unsafe { tl_core_new(home.as_ptr(), home.len(), 1, 0, &saved, ctx, Some(record)) };
+            let (root, len) = (home.as_ptr(), home.len());
+            let refused = unsafe { tl_core_new(root, len, 1, 0, 0, &saved, ctx, Some(record)) };
             assert!(refused.is_null());
         }
     }
@@ -3736,6 +3820,33 @@ mod tests {
         info.phys_footprint
     }
 
+    /// Entries, scan time and memory at rest for the whole home folder, with the switches as
+    /// ARGUS_EVERYTHING and ARGUS_CLOUD set them (1 is on), one setting per run:
+    /// `ARGUS_CLOUD=1 cargo test -p argus-ffi --release idle_after -- --ignored --nocapture`.
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "indexes the whole home folder, and needs Full Disk Access"]
+    fn idle_after_the_scan() {
+        let on = |name| std::env::var(name).is_ok_and(|value| value == "1");
+        let switches = (
+            u32::from(on("ARGUS_EVERYTHING")),
+            u32::from(on("ARGUS_CLOUD")),
+        );
+        let home = argus_core::home();
+        let events = Events::default();
+        let none = std::ptr::null();
+        let core = scan_saving(home.to_str().unwrap(), 1, switches, none, &events);
+        let entries = events.wait_for_event(TL_EVENT_INDEXED);
+        let started = Instant::now();
+        while health(&core).scan_ms == 0 && started.elapsed() < Duration::from_secs(5) {
+            thread::sleep(Duration::from_millis(10));
+        }
+        thread::sleep(Duration::from_secs(3));
+        let mb = footprint() as f64 / 1_048_576.0;
+        let ms = health(&core).scan_ms;
+        eprintln!("MEASURE {switches:?}: {entries} entries, scan {ms} ms, idle {mb:.1} MB");
+    }
+
     /// The memory a patch takes, then how long searches wait on a compaction with the window
     /// hidden and open, and how soon one left for later runs once it hides. Run alone:
     /// `cargo test -p argus-ffi --release update_peak -- --ignored --nocapture`.
@@ -3750,7 +3861,7 @@ mod tests {
         let file = saves.path().join("index").to_string_lossy().into_owned();
         let saved = saved_at(file.as_bytes(), b"", 1);
         let events = Events::default();
-        let core = scan_saving(home.to_str().unwrap(), 1, 1, &saved, &events);
+        let core = scan_saving(home.to_str().unwrap(), 1, (1, 0), &saved, &events);
         events.wait_for_event(TL_EVENT_INDEXED);
         thread::sleep(Duration::from_secs(3));
         let mb = |bytes: u64| bytes as f64 / 1_048_576.0;
@@ -4118,7 +4229,7 @@ mod tests {
             ctx,
             Some(on_event),
             Source::StandIn(100),
-            false,
+            (false, false),
             None,
             live,
         ));
@@ -4215,7 +4326,14 @@ mod tests {
             ..Live::default()
         };
         let source = Source::StandIn(100);
-        let core = Core(super::start(ctx, Some(record), source, false, None, live));
+        let core = Core(super::start(
+            ctx,
+            Some(record),
+            source,
+            (false, false),
+            None,
+            live,
+        ));
         events.wait_for(TL_EVENT_INDEXED, 100);
         assert!(!health(&core).busy);
         assert_eq!(changed(&core, &[], 1), 1);
@@ -4382,6 +4500,64 @@ mod tests {
         assert_eq!(events.wait_for_rebuilt(4), 2);
         assert_eq!(events.rebuilt().len(), 4);
         assert_eq!(watched(&core).1, 7);
+    }
+
+    #[test]
+    fn cloud_drives_join_and_leave_without_a_new_core() {
+        let (_dir, home) = home_with(&[
+            "notes/a.txt",
+            "Library/Mobile Documents/com~apple~CloudDocs/cv.pdf",
+            "Library/CloudStorage/Dropbox/plan.md",
+        ]);
+        let dropbox = home.join("Library/CloudStorage/Dropbox");
+        let events = Events::default();
+        let core = scan(home.to_str().unwrap(), 1, &events);
+        // The home folder, notes, a.txt and Library.
+        events.wait_for(TL_EVENT_INDEXED, 4);
+        assert!(found(&core, &events, "plan.md").is_empty());
+        assert!(!watched_within(&core, &dropbox));
+        std::fs::write(dropbox.join("new.md"), "").unwrap();
+        assert_eq!(
+            changed(&core, &[&dropbox], 0),
+            0,
+            "left out, so no new list"
+        );
+
+        let cloud = |on, mark| unsafe { tl_index_cloud(core.0, on, mark) };
+        assert_eq!(cloud(1, 3), 1);
+        assert_eq!(cloud(1, 4), 0, "already on");
+        // Plus Mobile Documents, its iCloud Drive, cv.pdf, CloudStorage, Dropbox and two files.
+        assert_eq!(events.wait_for_rebuilt(1), 11);
+        assert_eq!(found(&core, &events, "plan.md"), ["plan.md"]);
+        assert_eq!(found(&core, &events, "cv.pdf"), ["cv.pdf"]);
+        assert!(watched_within(&core, &dropbox));
+        std::fs::write(dropbox.join("newer.md"), "").unwrap();
+        assert_eq!(changed_at(&core, &[&dropbox], 0, 5), 1);
+        assert_eq!(events.wait_for_rebuilt(2), 12);
+
+        assert_eq!(cloud(0, 6), 1);
+        assert_eq!(events.wait_for_rebuilt(3), 4);
+        assert!(found(&core, &events, "plan.md").is_empty());
+        assert!(!watched_within(&core, &dropbox));
+        assert_eq!(cloud(0, 7), 0, "already off");
+    }
+
+    #[test]
+    fn text_search_follows_the_cloud_switch_but_reads_a_folder_chosen_in_a_cloud_drive() {
+        let (_dir, home) = home_with(&[]);
+        let dropbox = home.join("Library/CloudStorage/Dropbox");
+        write(&dropbox.join("budget.txt"), "budget\n");
+        let events = Events::default();
+        let core = text_core(&home, 1, &events);
+
+        let whole = grep(&core, &[&home], "budget");
+        assert_eq!(grep_all(&core, &events, whole).1.lines_found, 0);
+        let chosen = grep(&core, &[&dropbox], "budget");
+        assert_eq!(grep_all(&core, &events, chosen).1.lines_found, 1);
+
+        assert_eq!(unsafe { tl_index_cloud(core.0, 1, 2) }, 1);
+        let whole = grep(&core, &[&home], "budget");
+        assert_eq!(grep_all(&core, &events, whole).1.lines_found, 1);
     }
 
     #[test]
@@ -4720,7 +4896,14 @@ mod tests {
             ctx: &events as *const Events as *mut c_void,
             on_event: record,
         };
-        let settings = Settings::new(&home, &home, Clutter::Skip, Ignore::default(), Access::Full);
+        let settings = Settings::new(
+            &home,
+            &home,
+            Clutter::Skip,
+            Ignore::default(),
+            Access::Full,
+            Cloud::Skip,
+        );
         let mut index = settings.scan().unwrap().index;
         assert!(!live.add_volumes(&settings, &mut index, &volumes, &notify));
         assert_eq!(index.volumes().count(), 0);
@@ -4793,7 +4976,7 @@ mod tests {
             journal: None,
             unreadable: 0,
         };
-        let built = source.build(Clutter::Skip, &[], live, notify).unwrap();
+        let built = source.build(DEFAULT, &[], live, notify).unwrap();
         live.publish(built, 0);
         live.plan(|plan| plan.granted = true);
         source
@@ -5072,7 +5255,7 @@ mod tests {
 
         drop(dir);
         let whole = Pass {
-            clutter: Some(Clutter::Skip),
+            rules: Some(DEFAULT),
             ..patch(Vec::new(), 2)
         };
         rebuild(&mut source, whole, &live, &swaps, &notify);
@@ -5194,7 +5377,14 @@ mod tests {
             gap,
             ..Live::default()
         };
-        let core = Core(super::start(ctx, Some(record), source, false, None, live));
+        let core = Core(super::start(
+            ctx,
+            Some(record),
+            source,
+            (false, false),
+            None,
+            live,
+        ));
         events.wait_for(TL_EVENT_INDEXED, 100);
         // This one waits out an hour's gap after the first list.
         assert_eq!(changed(&core, &[], 1), 1);
@@ -5236,7 +5426,7 @@ mod tests {
             unreadable: 0,
         };
         let resume = Some((file.to_path_buf(), now));
-        let core = super::start(ctx, Some(record), source, false, resume, live);
+        let core = super::start(ctx, Some(record), source, (false, false), resume, live);
         assert!(!core.is_null());
         Core(core)
     }
@@ -5406,14 +5596,14 @@ mod tests {
         let path = file.to_str().unwrap().as_bytes();
         let events = Events::default();
         let saved = saved_at(path, b"5F2A", 60);
-        let core = scan_saving(home.to_str().unwrap(), 1, 0, &saved, &events);
+        let core = scan_saving(home.to_str().unwrap(), 1, (0, 0), &saved, &events);
         events.wait_for(TL_EVENT_OPENED, 3);
         assert_eq!(watched(&core).1, 50);
         drop(core);
 
         // Without Full Disk Access a scan reads other folders, so the list is scanned.
         let events = Events::default();
-        let _core = scan_saving(home.to_str().unwrap(), 0, 0, &saved, &events);
+        let _core = scan_saving(home.to_str().unwrap(), 0, (0, 0), &saved, &events);
         events.wait_for(TL_EVENT_INDEXED, 3);
         assert_eq!(events.count(TL_EVENT_OPENED, 3), 0);
         assert!(events.notes.lock().unwrap().is_empty());
@@ -5600,22 +5790,21 @@ mod tests {
             journal: Some(b"5F2A".to_vec()),
             unreadable: 0,
         };
-        let mut index = source
-            .build(Clutter::Skip, &[], &live, &notify)
-            .unwrap()
-            .index;
+        let mut index = source.build(DEFAULT, &[], &live, &notify).unwrap().index;
         let (settings, _) = source.saving().unwrap();
         settings.add_volume(&mut index, &volume).unwrap();
         assert_eq!(index.entry_count(), 6);
         save_index(&file, &index, 2, &settings, 9).unwrap();
 
-        let (built, saved_at) = source.open(&file, Clutter::Skip, &notify).unwrap();
+        let (built, saved_at) = source.open(&file, DEFAULT, &notify).unwrap();
         assert_eq!(saved_at, 9);
         assert_eq!(built.index.volumes().count(), 0);
         assert_eq!(built.index.entry_count(), 3);
         assert_eq!(source.saving().unwrap().1, 2);
         // Kept for a list built with other rules.
-        assert!(source.open(&file, Clutter::Keep, &notify).is_none());
+        for rules in [(Clutter::Keep, Cloud::Skip), (Clutter::Skip, Cloud::Keep)] {
+            assert!(source.open(&file, rules, &notify).is_none(), "{rules:?}");
+        }
         assert!(events.notes.lock().unwrap().is_empty());
     }
 
@@ -5770,7 +5959,7 @@ mod tests {
     fn patch(changes: Vec<PathBuf>, event_id: u64) -> Pass {
         Pass {
             full_disk: false,
-            clutter: None,
+            rules: None,
             mark: event_id,
             current: event_id,
             volumes: Vec::new(),
@@ -5933,7 +6122,8 @@ mod tests {
     fn index_of(files: &[&str]) -> (tempfile::TempDir, Index) {
         let (dir, home) = home_with(files);
         let ignore = Ignore::default();
-        let scan = argus_core::scan(&home, &home, Clutter::Skip, &ignore, Access::Full);
+        let (skip, full) = (Clutter::Skip, Access::Full);
+        let scan = argus_core::scan(&home, &home, skip, &ignore, full, Cloud::Skip);
         (dir, scan.unwrap().index)
     }
 
@@ -6311,7 +6501,14 @@ mod tests {
             home.join("other"),
             home.join("deep/a/b"),
         );
-        let settings = Settings::new(&home, &home, Clutter::Skip, Ignore::default(), Access::Full);
+        let settings = Settings::new(
+            &home,
+            &home,
+            Clutter::Skip,
+            Ignore::default(),
+            Access::Full,
+            Cloud::Skip,
+        );
         let list = list_of(settings.scan().unwrap().index);
         let mut frecency = Frecency::default();
         frecency.record(&deep.join("plan.md"), unix_now());
@@ -6868,12 +7065,13 @@ mod tests {
             let send = |query: &str| {
                 let ticket = grep.ticket();
                 let (folders, query) = (Vec::new(), query.to_owned());
-                let access = Access::Full;
+                let (access, cloud) = (Access::Full, Cloud::Skip);
                 let find = Find {
                     ticket,
                     folders,
                     query,
                     access,
+                    cloud,
                 };
                 jobs.send(find).unwrap();
                 ticket.number()
@@ -7084,7 +7282,7 @@ mod tests {
                         at,
                         full_disk: pass.full_disk,
                         mark: pass.mark,
-                        clutter: pass.clutter,
+                        clutter: pass.rules.map(|(clutter, _)| clutter),
                     });
                 });
             })
@@ -7308,8 +7506,14 @@ mod tests {
         let live = live(Duration::ZERO);
         // What a rebuild reading the folder now would hand on.
         let list = || {
-            let settings =
-                Settings::new(&home, &home, Clutter::Skip, Ignore::default(), Access::Full);
+            let settings = Settings::new(
+                &home,
+                &home,
+                Clutter::Skip,
+                Ignore::default(),
+                Access::Full,
+                Cloud::Skip,
+            );
             let index = settings.scan().unwrap().index;
             let scope = Some(settings.scope(&index));
             Built { index, scope }
@@ -7373,7 +7577,14 @@ mod tests {
         let (_dir, home) = home_with(&["notes/a.txt"]);
         let rules = home.join(".config/argus");
         let live = live(Duration::ZERO);
-        let settings = Settings::new(&home, &home, Clutter::Skip, Ignore::default(), Access::Full);
+        let settings = Settings::new(
+            &home,
+            &home,
+            Clutter::Skip,
+            Ignore::default(),
+            Access::Full,
+            Cloud::Skip,
+        );
         let index = settings.scan().unwrap().index;
         let scope = Some(settings.scope(&index));
         live.publish(Built { index, scope }, 0);
@@ -7395,11 +7606,12 @@ mod tests {
     #[test]
     fn a_plan_is_busy_only_while_a_list_is_on_its_way() {
         assert!(!Plan::default().busy());
-        let busy: [fn(&mut Plan); 4] = [
+        let busy: [fn(&mut Plan); 5] = [
             |plan| plan.want(1),
             |plan| plan.running = true,
             |plan| plan.patch(1),
             |plan| plan.everything = true,
+            |plan| plan.cloud = true,
         ];
         for (at, make) in busy.iter().enumerate() {
             let mut plan = Plan::default();
@@ -7415,7 +7627,7 @@ mod tests {
             "a failed rebuild waits for the next change; tl_health tells it apart"
         );
         assert!(
-            !Plan::new(true, false).busy(),
+            !Plan::new(true, true, false).busy(),
             "keeping everything from the start"
         );
         let listed = Plan {
@@ -7430,10 +7642,11 @@ mod tests {
     #[test]
     fn only_a_list_read_from_the_whole_folder_counts_as_building() {
         assert!(!Plan::default().building());
-        let building: [fn(&mut Plan); 3] = [
+        let building: [fn(&mut Plan); 4] = [
             |plan| plan.want(1),
             |plan| (plan.running, plan.whole) = (true, true),
             |plan| plan.everything = true,
+            |plan| plan.cloud = true,
         ];
         for (at, make) in building.iter().enumerate() {
             let mut plan = Plan::default();
@@ -7665,7 +7878,8 @@ mod tests {
         let (_dir, home) = home_with(&["notes/a.txt", "Library/Caches/com.example/cache.db"]);
         let caches = home.join("Library/Caches/com.example");
         let list = |clutter| {
-            let settings = Settings::new(&home, &home, clutter, Ignore::default(), Access::Full);
+            let none = Ignore::default();
+            let settings = Settings::new(&home, &home, clutter, none, Access::Full, Cloud::Skip);
             let index = settings.scan().unwrap().index;
             let scope = Some(settings.scope(&index));
             Built { index, scope }
@@ -7746,7 +7960,7 @@ mod tests {
             let live = Arc::clone(&live);
             thread::spawn(move || {
                 rebuild_loop(&live, &Told(tell), Instant::now(), |pass| {
-                    let _ = began.send((pass.full_disk, pass.clutter, pass.mark));
+                    let _ = began.send((pass.full_disk, pass.rules, pass.mark));
                 });
             });
         }
@@ -7756,16 +7970,25 @@ mod tests {
         let next_start = || starts.recv_timeout(minute);
         asleep();
         assert_eq!(changed_at(&core, &[], 1, 1), 1);
-        assert_eq!(next_start(), Ok((false, Some(Clutter::Skip), 1)));
+        assert_eq!(next_start(), Ok((false, Some(DEFAULT), 1)));
         asleep();
         unsafe { tl_grant_full_disk(core.0, 0, 2) };
-        assert_eq!(next_start(), Ok((true, Some(Clutter::Skip), 2)));
+        assert_eq!(next_start(), Ok((true, Some(DEFAULT), 2)));
         asleep();
         assert_eq!(switch(&core, 1, 3), 1);
-        assert_eq!(next_start(), Ok((false, Some(Clutter::Keep), 3)));
+        assert_eq!(
+            next_start(),
+            Ok((false, Some((Clutter::Keep, Cloud::Skip)), 3))
+        );
         asleep();
         live.plan(|plan| plan.patch(4));
         assert_eq!(next_start(), Ok((false, None, 4)));
+        asleep();
+        assert_eq!(unsafe { tl_index_cloud(core.0, 1, 5) }, 1);
+        assert_eq!(
+            next_start(),
+            Ok((false, Some((Clutter::Keep, Cloud::Keep)), 5))
+        );
     }
 
     #[test]

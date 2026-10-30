@@ -34,6 +34,18 @@ pub enum Access {
     Limited,
 }
 
+/// iCloud Drive and cloud drives such as Dropbox, Google Drive and OneDrive, which live in
+/// ~/Library. `Skip` leaves them out unless your ignore list brings one back; a scan started
+/// inside one still reads it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Cloud {
+    Skip,
+    Keep,
+}
+
+/// The folders in ~/Library that hold iCloud Drive and the other cloud drives.
+const CLOUD: &[&str] = &["Mobile Documents", "CloudStorage"];
+
 /// The guarded folders, by the folder in your home that holds them.
 const GUARDED: &[(&str, &[&str])] = &[
     ("", &["Desktop", "Documents", "Downloads"]),
@@ -69,6 +81,7 @@ type Guarded = Vec<(PathBuf, &'static [&'static str])>;
 pub(crate) struct Rules {
     clutter: Clutter,
     access: Access,
+    cloud: Cloud,
     /// Empty with Full Disk Access.
     guarded: Guarded,
     ignore: Ignore,
@@ -96,7 +109,13 @@ pub(crate) struct Opening {
 
 impl Rules {
     /// `home` is a real path, as `home()` gives it.
-    pub(crate) fn new(home: &Path, clutter: Clutter, ignore: &Ignore, access: Access) -> Self {
+    pub(crate) fn new(
+        home: &Path,
+        clutter: Clutter,
+        ignore: &Ignore,
+        access: Access,
+        cloud: Cloud,
+    ) -> Self {
         let guarded = match access {
             Access::Full => Vec::new(),
             Access::Limited => GUARDED
@@ -107,6 +126,7 @@ impl Rules {
         Self {
             clutter,
             access,
+            cloud,
             guarded,
             ignore: ignore.clone(),
             home: home.to_path_buf(),
@@ -212,10 +232,14 @@ impl Rules {
         name: &OsStr,
         beside: impl Fn(&str) -> bool,
     ) -> Option<bool> {
+        let cloud = CLOUD.iter().any(|cloud| name == *cloud) && parent == self.library;
+        if cloud && self.cloud == Cloud::Skip && !self.ignore.keeps(child, name) {
+            return self.ignore.leads_to_kept(child).then_some(true);
+        }
         if self.clutter == Clutter::Keep {
             return Some(false);
         }
-        let cloud = inside.in_library && (name == "Mobile Documents" || name == "CloudStorage");
+        let cloud = cloud && inside.in_library;
         let wanted = self.ignore.keeps(child, name) || (cloud && !self.ignore.skips(child, name));
         let dropped = inside.passage
             || is_clutter(parent, name, &self.home)
@@ -301,8 +325,9 @@ pub fn scan(
     clutter: Clutter,
     ignore: &Ignore,
     access: Access,
+    cloud: Cloud,
 ) -> io::Result<Scan> {
-    scan_until(root, home, clutter, ignore, access, &|| false)
+    scan_until(root, home, clutter, ignore, access, cloud, &|| false)
 }
 
 /// As `scan`, but once `stop` says so the folders not read yet are left out, for a scan
@@ -313,9 +338,11 @@ pub fn scan_until(
     clutter: Clutter,
     ignore: &Ignore,
     access: Access,
+    cloud: Cloud,
     stop: &(dyn Fn() -> bool + Sync),
 ) -> io::Result<Scan> {
-    scan_with(root, &Rules::new(home, clutter, ignore, access), stop)
+    let rules = Rules::new(home, clutter, ignore, access, cloud);
+    scan_with(root, &rules, stop)
 }
 
 pub(crate) fn scan_with(
@@ -546,11 +573,13 @@ mod tests {
     use std::collections::BTreeSet;
 
     fn scan(root: &Path, clutter: Clutter) -> io::Result<Scan> {
-        super::scan(root, &home(), clutter, &Ignore::default(), Access::Full)
+        let ignore = Ignore::default();
+        super::scan(root, &home(), clutter, &ignore, Access::Full, Cloud::Keep)
     }
 
     fn scan_from(root: &Path, clutter: Clutter, home: PathBuf) -> io::Result<Scan> {
-        super::scan(root, &home, clutter, &Ignore::default(), Access::Full)
+        let ignore = Ignore::default();
+        super::scan(root, &home, clutter, &ignore, Access::Full, Cloud::Keep)
     }
 
     fn paths_below(root: &Path, index: &Index) -> BTreeSet<PathBuf> {
@@ -584,7 +613,15 @@ mod tests {
         let (ignore, problems) = Ignore::parse(rules, root, Access::Full);
         assert!(problems.is_empty());
 
-        let index = super::scan(root, Path::new(""), Clutter::Skip, &ignore, Access::Full).unwrap();
+        let index = super::scan(
+            root,
+            Path::new(""),
+            Clutter::Skip,
+            &ignore,
+            Access::Full,
+            Cloud::Keep,
+        );
+        let index = index.unwrap();
         let expected: BTreeSet<PathBuf> = [
             "work",
             "Movies",
@@ -655,12 +692,13 @@ mod tests {
         let asked = AtomicUsize::new(0);
         let stop = || asked.fetch_add(1, Ordering::Relaxed) >= 1;
         let ignore = Ignore::default();
-        let scan = scan_until(root, root, Clutter::Keep, &ignore, Access::Full, &stop).unwrap();
+        let (keep, full) = (Clutter::Keep, Access::Full);
+        let scan = scan_until(root, root, keep, &ignore, full, Cloud::Keep, &stop).unwrap();
         let expected: BTreeSet<PathBuf> = ["a", "top.txt"].iter().map(PathBuf::from).collect();
         assert_eq!(paths_below(root, &scan.index), expected);
         assert_eq!(asked.load(Ordering::Relaxed), 2);
 
-        let stopped = scan_until(root, root, Clutter::Keep, &ignore, Access::Full, &|| true);
+        let stopped = scan_until(root, root, keep, &ignore, full, Cloud::Keep, &|| true);
         assert_eq!(stopped.unwrap().index.len(), 1);
     }
 
@@ -819,7 +857,8 @@ mod tests {
         }
         let names_with = |root: &Path, rules: &str| {
             let (ignore, _) = Ignore::parse(rules, &home, Access::Full);
-            let index = super::scan(root, &home, Clutter::Skip, &ignore, Access::Full);
+            let (skip, full) = (Clutter::Skip, Access::Full);
+            let index = super::scan(root, &home, skip, &ignore, full, Cloud::Keep);
             let index = index.unwrap().index;
             let mut names: Vec<String> = (1..index.len() as EntryId)
                 .map(|entry| index.name(entry).to_owned())
@@ -844,6 +883,70 @@ mod tests {
         assert!(!found.contains(&"a.db".to_owned()));
         assert!(names_with(&home, "!~/Library").contains(&"a.db".to_owned()));
         assert!(!names_with(&home, "CloudStorage").contains(&"plan.md".to_owned()));
+    }
+
+    #[test]
+    fn leaves_cloud_drives_out_unless_brought_back_or_scanned_from_inside() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = &fs::canonicalize(dir.path()).unwrap();
+        for file in [
+            "Library/Caches/a.db",
+            "Library/Mobile Documents/com~apple~CloudDocs/cv.pdf",
+            "Library/CloudStorage/Dropbox/plan.md",
+            "Library/CloudStorage/GoogleDrive-ana/budget.xlsx",
+            "work/CloudStorage/notes.txt",
+            "work/Library/Mobile Documents/old.txt",
+        ] {
+            fs::create_dir_all(home.join(file).parent().unwrap()).unwrap();
+            fs::write(home.join(file), "").unwrap();
+        }
+        let paths = |root: &Path, clutter: Clutter, rules: &str, cloud: Cloud| {
+            let (ignore, _) = Ignore::parse(rules, home, Access::Full);
+            let scan = super::scan(root, home, clutter, &ignore, Access::Full, cloud).unwrap();
+            paths_below(home, &scan.index)
+        };
+        let cloud = [
+            "Library/Mobile Documents/com~apple~CloudDocs/cv.pdf",
+            "Library/CloudStorage/Dropbox/plan.md",
+            "Library/CloudStorage/GoogleDrive-ana/budget.xlsx",
+        ];
+        let elsewhere = [
+            "work/CloudStorage/notes.txt",
+            "work/Library/Mobile Documents/old.txt",
+        ];
+
+        for clutter in [Clutter::Skip, Clutter::Keep] {
+            let out = paths(home, clutter, "", Cloud::Skip);
+            for path in ["Library/Mobile Documents", "Library/CloudStorage"] {
+                assert!(!out.contains(Path::new(path)), "{path} with {clutter:?}");
+            }
+            for path in elsewhere {
+                assert!(out.contains(Path::new(path)), "{path} with {clutter:?}");
+            }
+            assert!(out.contains(Path::new("Library")));
+            let library = paths(&home.join("Library"), clutter, "", Cloud::Skip);
+            assert!(library.contains(Path::new("Library/Caches/a.db")));
+            assert!(!library.contains(Path::new("Library/CloudStorage")));
+
+            let kept = paths(home, clutter, "", Cloud::Keep);
+            for path in cloud.iter().chain(&elsewhere) {
+                assert!(kept.contains(Path::new(path)), "{path} with {clutter:?}");
+            }
+            // A folder you scan is read, whatever holds it.
+            let inside = paths(&home.join("Library/CloudStorage"), clutter, "", Cloud::Skip);
+            assert!(inside.contains(Path::new(cloud[1])), "{clutter:?}");
+            assert!(inside.contains(Path::new(cloud[2])), "{clutter:?}");
+        }
+
+        let brought_back = paths(
+            home,
+            Clutter::Skip,
+            "!~/Library/CloudStorage/Dropbox",
+            Cloud::Skip,
+        );
+        assert!(brought_back.contains(Path::new(cloud[1])));
+        assert!(!brought_back.contains(Path::new(cloud[0])));
+        assert!(!brought_back.contains(Path::new(cloud[2])));
     }
 
     #[test]
@@ -878,7 +981,7 @@ mod tests {
                      !Group Containers\n!~/Pictures/Family.photoslibrary";
         let (ignore, _) = Ignore::parse(rules, home, Access::Full);
         let paths = |access: Access, clutter: Clutter| {
-            let scan = super::scan(home, home, clutter, &ignore, access).unwrap();
+            let scan = super::scan(home, home, clutter, &ignore, access, Cloud::Keep).unwrap();
             assert_eq!(scan.unreadable_folders, 0);
             paths_below(home, &scan.index)
         };
@@ -934,6 +1037,7 @@ mod tests {
                 Clutter::Skip,
                 &ignore,
                 Access::Limited,
+                Cloud::Keep,
             );
             assert_eq!(
                 limited.err().map(|error| error.kind()),

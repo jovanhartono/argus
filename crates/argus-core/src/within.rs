@@ -107,7 +107,7 @@ impl Index {
 mod tests {
     use super::*;
     use crate::index::IndexBuilder;
-    use crate::{Access, Apps, Clutter, Ignore, Searcher, Settings};
+    use crate::{Access, Apps, Cloud, Clutter, Ignore, Searcher, Settings};
     use std::fs;
     use std::path::PathBuf;
 
@@ -243,7 +243,8 @@ mod tests {
         }
         fs::create_dir(root.join("a1/small")).unwrap();
         fs::write(root.join("a1/small/plan s.md"), "").unwrap();
-        let settings = Settings::new(&root, &root, Clutter::Keep, Ignore::default(), Access::Full);
+        let none = Ignore::default();
+        let settings = Settings::new(&root, &root, Clutter::Keep, none, Access::Full, Cloud::Keep);
         let mut index = settings.scan().unwrap().index;
         fs::remove_dir_all(root.join("a1/small")).unwrap();
         fs::create_dir(root.join("a1/new")).unwrap();

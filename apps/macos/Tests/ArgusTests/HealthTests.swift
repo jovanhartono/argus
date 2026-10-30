@@ -70,6 +70,9 @@ final class HealthFormatTests: XCTestCase {
             english.everything(false), "Includes Library and clutter, about 2.5M items. Needs Full Disk Access.")
         let german = HealthFormat(locale: Locale(identifier: "de_DE"))
         XCTAssertTrue(german.everything(true).contains("about 2,5"), german.everything(true))
+        let cloud = "iCloud Drive, Dropbox, Google Drive, OneDrive and others. Finding a file by name never downloads it."
+        XCTAssertEqual(english.cloud(true), cloud)
+        XCTAssertEqual(english.cloud(false), cloud + " Needs Full Disk Access.")
     }
 }
 
@@ -83,6 +86,8 @@ final class HealthWindowTests: XCTestCase {
     private var folders: TextFolders!
     private var switched: [Bool] = []
     private var everything = false
+    private var cloudSwitched: [Bool] = []
+    private var cloud = false
 
     override func setUp() async throws {
         _ = NSApplication.shared
@@ -101,7 +106,7 @@ final class HealthWindowTests: XCTestCase {
 
     /// The switch as the core takes it: switched back before the new list started, none is built.
     private func window(tick: TimeInterval = 1) -> HealthWindow {
-        let listed = everything
+        let (listed, cloudListed) = (everything, cloud)
         return HealthWindow(
             read: { [unowned self] in
                 reads += 1
@@ -119,7 +124,51 @@ final class HealthWindowTests: XCTestCase {
                 guard fullDisk else { return }
                 (health.busy, health.building) = (on != listed, on != listed)
             },
+            cloud: { [unowned self] in cloud },
+            indexCloud: { [unowned self] on in
+                cloudSwitched.append(on)
+                cloud = on
+                (health.busy, health.building) = (on != cloudListed, on != cloudListed)
+            },
             format: HealthFormat(locale: Locale(identifier: "en_US")), tick: tick)
+    }
+
+    func testTheCloudSwitchIsOffAtFirstAndSpinsWhileTheNewListIsBuilt() {
+        let window = window()
+        window.show()
+        defer { window.hide() }
+        XCTAssertEqual(window.cloud.title, "Include iCloud Drive and cloud storage")
+        XCTAssertEqual(window.cloud.state, .off)
+        XCTAssertTrue(window.cloud.isEnabled)
+        XCTAssertFalse(window.cloudHint.stringValue.hasSuffix("Needs Full Disk Access."))
+
+        window.cloud.performClick(nil)
+        XCTAssertEqual(cloudSwitched, [true])
+        XCTAssertEqual(switched, [], "the other switch stays as it was")
+        XCTAssertFalse(window.progress.isHidden)
+        XCTAssertFalse(window.rebuild.isEnabled)
+
+        window.cloud.performClick(nil)
+        XCTAssertEqual(cloudSwitched, [true, false])
+        XCTAssertTrue(window.progress.isHidden, "nothing to build once switched back before it started")
+        XCTAssertEqual(window.cloud.state, .off)
+    }
+
+    func testWithoutAccessTheCloudSwitchCanBeTurnedOffButNotOn() {
+        fullDisk = false
+        cloud = true
+        let window = window()
+        window.show()
+        defer { window.hide() }
+        XCTAssertEqual(window.cloud.state, .on)
+        XCTAssertTrue(window.cloud.isEnabled)
+        XCTAssertTrue(window.cloudHint.stringValue.hasSuffix("Needs Full Disk Access."))
+        window.cloud.performClick(nil)
+        XCTAssertEqual(cloudSwitched, [false])
+        XCTAssertFalse(window.cloud.isEnabled, "not on again until access comes")
+        fullDisk = true
+        window.refresh()
+        XCTAssertTrue(window.cloud.isEnabled)
     }
 
     func testIndexEverythingSpinsWhileTheNewListIsBuiltAndStopsWhenSwitchedBackInTime() {
@@ -205,13 +254,15 @@ final class HealthWindowTests: XCTestCase {
         window.show()
         defer { window.hide() }
         XCTAssertFalse(window.everything.isEnabled)
+        XCTAssertFalse(window.cloud.isEnabled)
         XCTAssertTrue(window.progress.isHidden)
     }
 
-    func testTabReachesTheSwitch() {
+    func testTabReachesTheSwitches() {
         let window = window()
         XCTAssertTrue(window.settings.nextKeyView === window.everything)
-        XCTAssertTrue(window.everything.nextKeyView === window.folderList)
+        XCTAssertTrue(window.everything.nextKeyView === window.cloud)
+        XCTAssertTrue(window.cloud.nextKeyView === window.folderList)
     }
 
     func testShowingReadsTheCoreAndTakesTheKeysOffStage() {
@@ -482,6 +533,22 @@ final class IndexEverythingTests: XCTestCase {
         XCTAssertFalse(IndexEverything(defaults: defaults).isOn)
         defaults.set("YES", forKey: "indexEverything")
         XCTAssertTrue(IndexEverything(defaults: defaults).isOn, "as `defaults write … -string YES` would")
+    }
+}
+
+@MainActor
+final class CloudDrivesTests: XCTestCase {
+    func testOffAtFirstAndKeptAcrossLaunches() throws {
+        let defaults = MemoryDefaults()
+        let setting = CloudDrives(defaults: defaults)
+        XCTAssertFalse(setting.isOn)
+        setting.isOn = true
+        XCTAssertTrue(CloudDrives(defaults: defaults).isOn)
+        setting.isOn = false
+        XCTAssertFalse(CloudDrives(defaults: defaults).isOn)
+        let loose = CloudDrives()
+        loose.isOn = true
+        XCTAssertFalse(CloudDrives().isOn, "without defaults nothing is kept")
     }
 }
 

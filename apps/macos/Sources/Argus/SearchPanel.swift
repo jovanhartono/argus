@@ -135,6 +135,7 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
     private(set) var rows: [Row] = []
     let textFolders: TextFolders
     let everything: IndexEverything
+    let cloud: CloudDrives
     /// ⌘T's switch. Off at each show, so a plain search never reads a file's text.
     private(set) var textOn = false
     private(set) var hits: [TextHit] = []
@@ -176,17 +177,20 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
 
     /// With `saved`, the list kept in that file at the last launch shows at once. With `opens`,
     /// what you open ranks higher, kept in that file. The apps in `apps` are found by name, and
-    /// words inside the files in `textFolders`. With `everything` on, clutter is listed too.
+    /// words inside the files in `textFolders`. With `everything` on, clutter is listed too, and
+    /// with `cloud` on, iCloud Drive and the other cloud drives.
     /// With `standIn`, that many made-up names are searched instead of `root`.
     init(
         root: String = NSHomeDirectory(), standIn: UInt64? = nil, saved: String? = nil, opens: String? = nil,
         apps: [String] = [],
         textFolders: TextFolders = TextFolders(), everything: IndexEverything = IndexEverything(),
+        cloud: CloudDrives = CloudDrives(),
         hasAccess: @escaping () -> Bool = { Hatch.hasFullDiskAccess() }, stage: any Stage = Screen(),
         finder: @escaping @Sendable () -> FinderFolder = FinderFolder.ask
     ) {
         self.textFolders = textFolders
         self.everything = everything
+        self.cloud = cloud
         self.hasAccess = hasAccess
         self.stage = stage
         self.finder = finder
@@ -203,8 +207,8 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
             // Without Full Disk Access, reading all of ~/Library and the media folders stops on
             // a macOS pop-up for each of several libraries, so the switch waits for access.
             hatch = Hatch(
-                root: root, fullDisk: !lacksAccess, everything: everything.isOn && !lacksAccess, saved: saved,
-                onEvent: onEvent)
+                root: root, fullDisk: !lacksAccess, everything: everything.isOn && !lacksAccess, cloud: cloud.isOn,
+                saved: saved, onEvent: onEvent)
         }
         if hatch == nil { problem = "Search couldn't start. Rebuild Argus." }
         if let opens { hatch?.rankOpens(keptIn: opens) }
@@ -338,6 +342,13 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
                     guard let self else { return }
                     everything.isOn = on
                     if !lacksAccess { hatch?.indexEverything(on) }
+                },
+                cloud: { [weak self] in self?.cloud.isOn ?? false },
+                indexCloud: { [weak self] on in
+                    guard let self else { return }
+                    cloud.isOn = on
+                    // Cloud drives stay unread without access anyway, so the core can hear it now.
+                    hatch?.indexCloud(on)
                 })
         }
         health?.show()
