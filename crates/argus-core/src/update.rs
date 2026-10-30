@@ -15,6 +15,10 @@ use std::path::{Component, Path, PathBuf};
 /// Every search reads the removed entries and the names added entries store again, so the
 /// lists are rebuilt once those pass a 32nd of them.
 const COMPACT_SHARE: usize = 32;
+/// `Changes::apply_deferring` compacts anyway past an 8th, 4 times the usual share, so a window
+/// left open for hours never lets the lists grow without end. On a whole home folder of 2.4
+/// million entries that is 300,000 changed entries, where the lists measured 3.2 MB larger.
+const DEFERRED_SHARE: usize = 8;
 /// Folders read at once; their listings are held until they are compared.
 const READ_CHUNK: usize = 1024;
 
@@ -66,6 +70,16 @@ impl Changes {
     /// the entry numbers read would then be wrong; most such misuse panics, but a change undone
     /// by a compaction can slip past the check.
     pub fn apply(self, index: &mut Index) -> Update {
+        self.apply_compacting_past(index, COMPACT_SHARE)
+    }
+
+    /// As `apply`, but a compaction due is left for `Index::compact_if_due`, as while someone
+    /// searches, unless the index has gone 4 times past due.
+    pub fn apply_deferring(self, index: &mut Index) -> Update {
+        self.apply_compacting_past(index, DEFERRED_SHARE)
+    }
+
+    fn apply_compacting_past(self, index: &mut Index, share: usize) -> Update {
         assert!(
             self.read_from == index.state(),
             "changes applied to the index they were read from, unchanged since"
@@ -83,7 +97,7 @@ impl Changes {
         }
         index.fold_in(&self.removed, &added_parents, first_new);
         if self.compacts {
-            update.compacted = index.compact_if_due();
+            update.compacted = index.compact_past(share);
         }
         update
     }
@@ -234,10 +248,23 @@ impl Index {
             .edited(removed, first_new, added_parents, &self.folders);
     }
 
-    /// Rebuilds the lists once the entries removed, and the names added entries store again,
-    /// pass their share. Returns whether it did.
-    fn compact_if_due(&mut self) -> bool {
-        let due = (self.removed + self.added) * COMPACT_SHARE > self.len();
+    /// The entries removed, and the names added entries store again, passed the share at which
+    /// `apply` rebuilds the lists.
+    pub fn compaction_due(&self) -> bool {
+        self.past(COMPACT_SHARE)
+    }
+
+    /// Rebuilds the lists when `compaction_due`. Returns whether it did.
+    pub fn compact_if_due(&mut self) -> bool {
+        self.compact_past(COMPACT_SHARE)
+    }
+
+    fn past(&self, share: usize) -> bool {
+        (self.removed + self.added) * share > self.len()
+    }
+
+    fn compact_past(&mut self, share: usize) -> bool {
+        let due = self.past(share);
         if due {
             let mut parents = self.parents();
             self.compact(&mut parents);
@@ -1629,6 +1656,39 @@ mod tests {
         fs::remove_file(root.join("f/10")).unwrap();
         assert!(settings.update(&mut index, &[root.join("f")]).compacted);
         assert_current(&settings, &index, &root, "after the rebuild");
+    }
+
+    #[test]
+    fn deferring_leaves_a_due_compaction_until_asked() {
+        let (_dir, root, settings, mut index) = at_the_line();
+        for i in 0..11 {
+            fs::remove_file(root.join(format!("f/{i}"))).unwrap();
+        }
+        let changes = settings.read_update(&index, &[root.join("f")]);
+        let update = changes.apply_deferring(&mut index);
+        assert_eq!((update.removed, update.compacted), (11, false));
+        assert!(index.compaction_due());
+        assert_current(&settings, &index, &root, "before compacting");
+        assert!(index.compact_if_due());
+        assert!(!index.compaction_due() && !index.compact_if_due());
+        assert_eq!(index.len(), 320 - 11);
+        assert_current(&settings, &index, &root, "after compacting");
+    }
+
+    /// 40 of 320 sit on the deferred line, 4 times the usual one, and 41 pass it.
+    #[test]
+    fn deferring_compacts_anyway_past_four_times_the_line() {
+        let (_dir, root, settings, mut index) = at_the_line();
+        for (from, to) in [(0, 40), (40, 41)] {
+            for i in from..to {
+                fs::remove_file(root.join(format!("f/{i}"))).unwrap();
+            }
+            let changes = settings.read_update(&index, &[root.join("f")]);
+            assert_eq!(changes.apply_deferring(&mut index).compacted, to == 41);
+        }
+        assert!(!index.compaction_due());
+        assert_eq!(index.len(), 320 - 41);
+        assert_current(&settings, &index, &root, "after compacting");
     }
 
     #[test]
