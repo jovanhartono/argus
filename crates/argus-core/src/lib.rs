@@ -29,7 +29,7 @@ pub use store::{
 };
 pub use update::{Changes, Update};
 pub use volume::{Refusal, check_volume};
-pub use walk::{Access, Cloud, Clutter, Scan, home, scan, scan_until};
+pub use walk::{Access, Cloud, Clutter, Scan, home, reads_inside, scan, scan_until};
 pub use within::Within;
 
 #[cfg(test)]

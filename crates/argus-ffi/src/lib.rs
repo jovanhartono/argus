@@ -2642,7 +2642,10 @@ fn find_in(
     // Problems with the list are told by the name list already.
     let (ignore, _) = Ignore::load(&home, find.access);
     let mut report = Report::default();
-    for folder in outermost(&find.folders) {
+    let reads = |outer: &Path, inner: &Path| {
+        argus_core::reads_inside(outer, inner, &home, &ignore, find.cloud)
+    };
+    for folder in outermost(&find.folders, reads) {
         let limit = LINES.saturating_sub(report.lines_found);
         if limit == 0 || stale() {
             break;
@@ -2675,8 +2678,9 @@ fn find_in(
     (!stale()).then_some(report)
 }
 
-/// The folders as real paths, each once, leaving out any inside another.
-fn outermost(folders: &[PathBuf]) -> Vec<PathBuf> {
+/// The folders as real paths, each once, leaving out any inside another that `reads(outer,
+/// inner)` says a search of it covers.
+fn outermost(folders: &[PathBuf], reads: impl Fn(&Path, &Path) -> bool) -> Vec<PathBuf> {
     let mut real: Vec<PathBuf> = folders
         .iter()
         .map(|folder| std::fs::canonicalize(folder).unwrap_or_else(|_| folder.clone()))
@@ -2685,7 +2689,10 @@ fn outermost(folders: &[PathBuf]) -> Vec<PathBuf> {
     real.sort();
     let mut kept: Vec<PathBuf> = Vec::with_capacity(real.len());
     for folder in real {
-        if !kept.iter().any(|outer| folder.starts_with(outer)) {
+        if !kept
+            .iter()
+            .any(|outer| folder.starts_with(outer) && reads(outer, &folder))
+        {
             kept.push(folder);
         }
     }
@@ -4554,10 +4561,23 @@ mod tests {
         assert_eq!(grep_all(&core, &events, whole).1.lines_found, 0);
         let chosen = grep(&core, &[&dropbox], "budget");
         assert_eq!(grep_all(&core, &events, chosen).1.lines_found, 1);
+        let both = grep(&core, &[&home, &dropbox], "budget");
+        assert_eq!(grep_all(&core, &events, both).1.lines_found, 1);
+
+        // Brought back by the ignore list, the drive is read once with the home folder.
+        write(
+            &home.join(".config/argus/ignore"),
+            "!~/Library/CloudStorage/Dropbox\n",
+        );
+        let both = grep(&core, &[&home, &dropbox], "budget");
+        assert_eq!(grep_all(&core, &events, both).1.lines_found, 1);
+        std::fs::remove_file(home.join(".config/argus/ignore")).unwrap();
 
         assert_eq!(unsafe { tl_index_cloud(core.0, 1, 2) }, 1);
         let whole = grep(&core, &[&home], "budget");
         assert_eq!(grep_all(&core, &events, whole).1.lines_found, 1);
+        let both = grep(&core, &[&home, &dropbox], "budget");
+        assert_eq!(grep_all(&core, &events, both).1.lines_found, 1);
     }
 
     #[test]
@@ -7113,7 +7133,7 @@ mod tests {
                 .flat_map(|bit| [paths[bit].clone(), paths[bit].clone()])
                 .rev()
                 .collect();
-            let kept = outermost(&chosen);
+            let kept = outermost(&chosen, |_, _| true);
             for folder in &chosen {
                 let outer = kept.iter().filter(|outer| folder.starts_with(outer));
                 assert_eq!(outer.count(), 1, "{folder:?} in {kept:?}");

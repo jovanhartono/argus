@@ -345,6 +345,26 @@ pub fn scan_until(
     scan_with(root, &rules, stop)
 }
 
+/// Whether a scan of `outer` with `cloud` reads `inner`, a real folder inside it, as a scan of
+/// `inner` would: not when the way there crosses a cloud drive left out.
+pub fn reads_inside(
+    outer: &Path,
+    inner: &Path,
+    home: &Path,
+    ignore: &Ignore,
+    cloud: Cloud,
+) -> bool {
+    let library = home.join("Library");
+    cloud == Cloud::Keep
+        || ignore.inside_kept(inner)
+        || CLOUD.iter().all(|name| {
+            let drive = library.join(name);
+            !inner.starts_with(&drive)
+                || outer.starts_with(&drive)
+                || ignore.keeps(&drive, OsStr::new(name))
+        })
+}
+
 pub(crate) fn scan_with(
     root: &Path,
     rules: &Rules,
