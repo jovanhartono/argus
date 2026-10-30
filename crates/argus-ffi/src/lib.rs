@@ -10,7 +10,8 @@
 //! queue as the searches, so each search sees one whole list. `tl_volume_added` and
 //! `tl_volume_removed` go through that thread too, without reading the home folder again: a
 //! drive joins a copy of the newest list, as reading one takes seconds, and one taken out
-//! leaves the list in use.
+//! leaves the list in use. `tl_window_shown` tells that thread whether you may be searching,
+//! so the slow tidy-up of the list in use waits until the window is hidden.
 //! Given a file, a core opens the list saved there instead of scanning, and a third thread
 //! saves each new list to it once files stop changing for a moment.
 //! A text search, inside files, runs the same way on a worker of its own, started with the
@@ -38,7 +39,7 @@ use std::time::{Duration, Instant};
 static PAGES: Pages = Pages;
 
 /// Raise this with any change below, so a window built against an older header refuses to start.
-pub const TL_ABI_VERSION: u32 = 12;
+pub const TL_ABI_VERSION: u32 = 13;
 
 pub const TL_OK: u32 = 0;
 /// No rows for that ticket: not ready yet, already taken, or a newer search replaced them.
@@ -350,7 +351,19 @@ struct Plan {
     /// The mark of the first change a failed rebuild was to read. Lists from then on miss
     /// it, so none is saved, and the next change builds the whole list again.
     failed: Option<u64>,
+    /// The search window is open, so a patch leaves compacting the list for later: that takes
+    /// about 100 ms on a whole home folder, and searches would wait for it.
+    shown: bool,
+    /// A patch left the newest list due to compact, which waits for the window to hide.
+    deferred: bool,
+    /// How many times the window hid, so compacting waits `SETTLE_AFTER_HIDE` from the latest.
+    hid: u64,
 }
+
+/// How long the window stays hidden before a compaction left for it starts. You may press the
+/// hotkey twice by mistake, and a search typed into the window shown again would otherwise
+/// wait about 100 ms for a compaction that began between the two presses.
+const SETTLE_AFTER_HIDE: Duration = Duration::from_secs(1);
 
 impl Plan {
     fn new(everything: bool, granted: bool) -> Self {
@@ -991,10 +1004,47 @@ fn patch_in_place(
     // Waits out a save here rather than at the list, where new searches would queue behind.
     let _writing = lock(&live.writing);
     let waited = asked.elapsed();
+    let shown = live.plan.lock().unwrap().shown;
     let mut listed = list.write().map_err(|_| broken())?;
-    changes.apply(&mut listed.index);
+    if shown {
+        changes.apply_deferring(&mut listed.index);
+    } else {
+        changes.apply(&mut listed.index);
+    }
     listed.version += 1;
+    let due = listed.index.compaction_due();
+    drop(listed);
+    live.plan(|plan| plan.deferred = due);
     Ok(waited)
+}
+
+/// Compacts the newest list, if a patch left that for when the window hides.
+fn compact_hidden(live: &Live) {
+    let Some((_, list)) = live.newest.lock().unwrap().clone() else {
+        return;
+    };
+    if !read(&list).is_some_and(|listed| listed.index.compaction_due()) {
+        return;
+    }
+    let _writing = lock(&live.writing);
+    // Shown again while a save held the list: the next hide tries again.
+    let mut plan = live.plan.lock().unwrap();
+    if plan.shown {
+        plan.deferred = true;
+        return;
+    }
+    drop(plan);
+    let compacted = panic::catch_unwind(AssertUnwindSafe(|| {
+        if let Ok(mut listed) = list.write()
+            && listed.index.compact_if_due()
+        {
+            listed.version += 1;
+        }
+    }));
+    // A bug stopped it halfway, so search finds nothing until a whole list is read.
+    if compacted.is_err() {
+        live.plan(|plan| plan.want(plan.delivered));
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -1458,16 +1508,37 @@ impl Clock for Wall {
 /// Calls `rebuild` for each rebuild wanted until the core stops: one at a time, with changes
 /// made meanwhile waiting as one more, each starting at least `live.gap` after the one before.
 /// `last` is when the first list was started. A turn with only volumes to add or take out,
-/// or folders to read again, patches the newest list, as `Source::graft` tells.
+/// or folders to read again, patches the newest list, as `Source::graft` tells. With nothing
+/// to build and the window hidden, it compacts what patches left while the window showed.
 fn rebuild_loop(live: &Live, clock: &impl Clock, mut last: Instant, mut rebuild: impl FnMut(Pass)) {
     let mut plan = live.plan.lock().unwrap();
+    // The hide a compaction waits to settle after, and when this thread first saw it.
+    let mut settling: Option<(u64, Instant)> = None;
     loop {
         if plan.stopped {
             return;
         }
         let whole = plan.wanted || plan.everything != plan.everything_listed;
         if !whole && !plan.patching {
-            plan = clock.sleep(live, plan, None);
+            if plan.deferred && !plan.shown {
+                let now = clock.now();
+                let since = match settling {
+                    Some((hid, since)) if hid == plan.hid => since,
+                    _ => now,
+                };
+                settling = Some((plan.hid, since));
+                let settled = since + SETTLE_AFTER_HIDE;
+                if now < settled {
+                    plan = clock.sleep(live, plan, Some(settled - now));
+                    continue;
+                }
+                plan.deferred = false;
+                drop(plan);
+                compact_hidden(live);
+                plan = live.plan.lock().unwrap();
+            } else {
+                plan = clock.sleep(live, plan, None);
+            }
             continue;
         }
         let now = clock.now();
@@ -1916,6 +1987,33 @@ pub unsafe extern "C" fn tl_index_everything(core: *const TlCore, on: u32, mark:
             return 0;
         }
         plan.switched = Some(mark);
+        drop(plan);
+        core.live.wake.notify_all();
+        1
+    })
+}
+
+/// Tells the core the search window is open when `shown` isn't 0, and hidden when it is. While
+/// it is open, changes go into the list without the tidy-up that drops removed entries, which
+/// on a whole home folder makes searches wait about 100 ms; once it has stayed hidden for a
+/// second, the list is tidied if it needs it. Starts hidden. Returns 1 when that changed what the core knew, else
+/// 0. Never waits for a scan, a search or the list. Safe to call from any thread.
+///
+/// # Safety
+/// `core` came from `tl_core_new` or `tl_core_new_stand_in`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tl_window_shown(core: *const TlCore, shown: u32) -> u32 {
+    guard(0, || {
+        let core = unsafe { &*core };
+        let shown = shown != 0;
+        let mut plan = core.live.plan.lock().unwrap();
+        if plan.shown == shown {
+            return 0;
+        }
+        plan.shown = shown;
+        if !shown {
+            plan.hid += 1;
+        }
         drop(plan);
         core.live.wake.notify_all();
         1
@@ -3491,7 +3589,9 @@ mod tests {
         info.phys_footprint
     }
 
-    /// Run alone: `cargo test -p argus-ffi --release update_peak -- --ignored --nocapture`.
+    /// The memory a patch takes, then how long searches wait on a compaction with the window
+    /// hidden and open, and how soon one left for later runs once it hides. Run alone:
+    /// `cargo test -p argus-ffi --release update_peak -- --ignored --nocapture`.
     #[cfg(target_os = "macos")]
     #[test]
     #[ignore = "indexes the whole home folder with everything on, and needs Full Disk Access"]
@@ -3510,24 +3610,12 @@ mod tests {
         eprintln!("MEASURE idle after the scan {:.1} MB", mb(footprint()));
         for round in 1..=6_u64 {
             std::fs::write(scratch.join(format!("{round}.txt")), "").unwrap();
-            let stop = Arc::new(AtomicBool::new(false));
-            let sampler = thread::spawn({
-                let stop = Arc::clone(&stop);
-                move || {
-                    let mut peak = 0;
-                    while !stop.load(Ordering::Relaxed) {
-                        peak = peak.max(footprint());
-                        thread::sleep(Duration::from_millis(1));
-                    }
-                    peak
-                }
-            });
             let started = Instant::now();
-            assert_eq!(changed_at(&core, &[&scratch], 0, round + 1), 1);
-            let entries = events.wait_for_rebuilt(round as usize);
+            let (entries, peak) = peak_while(|| {
+                assert_eq!(changed_at(&core, &[&scratch], 0, round + 1), 1);
+                events.wait_for_rebuilt(round as usize)
+            });
             let took = started.elapsed();
-            stop.store(true, Ordering::Relaxed);
-            let peak = sampler.join().unwrap();
             eprintln!(
                 "MEASURE round {round}: peak {:.1} MB, list in use after {took:?}, {entries} entries",
                 mb(peak)
@@ -3535,7 +3623,95 @@ mod tests {
             thread::sleep(Duration::from_secs(2));
         }
         eprintln!("MEASURE idle at the end {:.1} MB", mb(footprint()));
+
+        // 101,001 entries, past the 32nd of the list that makes compacting due.
+        let unzip = |scratch: &Path| {
+            for folder in 0..1000 {
+                let folder = scratch.join(format!("many/{folder}"));
+                std::fs::create_dir_all(&folder).unwrap();
+                for file in 0..100 {
+                    std::fs::write(folder.join(format!("{file}.txt")), "").unwrap();
+                }
+            }
+        };
+        let delete = |scratch: &Path| std::fs::remove_dir_all(scratch.join("many")).unwrap();
+        let search = || {
+            let started = Instant::now();
+            let ticket = submit(&core, "budget");
+            events.wait_for(TL_EVENT_READY, ticket);
+            started.elapsed()
+        };
+        let mut rounds = 6;
+        let mut patch = |what: &str, change: &dyn Fn(&Path)| {
+            change(&scratch);
+            rounds += 1;
+            let ((longest, searches), peak) = peak_while(|| {
+                assert_eq!(changed_at(&core, &[&scratch], 0, rounds + 1), 1);
+                let (mut longest, mut searches) = (Duration::ZERO, 0);
+                while events.rebuilt().len() < rounds as usize {
+                    longest = longest.max(search());
+                    searches += 1;
+                }
+                (longest, searches)
+            });
+            // Past the save that follows each list, which a compaction would wait out.
+            thread::sleep(Duration::from_secs(4));
+            eprintln!(
+                "MEASURE {what}: longest of {searches} searches {longest:?}, peak {:.1} MB, then {:.1} MB, index {:.1} MB, compaction due {}",
+                mb(peak),
+                mb(footprint()),
+                mb(index_bytes(&core)),
+                compaction_due(&core)
+            );
+        };
+        patch("hidden, 101,001 entries added", &unzip);
+        patch("hidden, and deleted", &delete);
+        assert_eq!(window_shown(&core, true), 1);
+        patch("open, 101,001 entries added", &unzip);
+        patch("open, and deleted", &delete);
+        patch("open, added again, 303,003 changed in all", &unzip);
+        patch("open, deleted again, past 4 times the line", &delete);
+        patch("open, added once more", &unzip);
+        let hidden = Instant::now();
+        let ((), peak) = peak_while(|| {
+            assert_eq!(window_shown(&core, false), 1);
+            wait_until("compacting once hidden", || !compaction_due(&core));
+        });
+        let took = hidden.elapsed();
+        thread::sleep(Duration::from_secs(2));
+        eprintln!(
+            "MEASURE hidden: compacted after {took:?}, peak {:.1} MB, then {:.1} MB, index {:.1} MB",
+            mb(peak),
+            mb(footprint()),
+            mb(index_bytes(&core))
+        );
         std::fs::remove_dir_all(scratch).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    fn index_bytes(core: &Core) -> u64 {
+        let live = unsafe { &(*core.0).live };
+        let list = live.newest.lock().unwrap().clone().unwrap().1;
+        read(&list).unwrap().index.heap_bytes() as u64
+    }
+
+    /// Runs `work`, and returns what it did with the highest footprint meanwhile.
+    #[cfg(target_os = "macos")]
+    fn peak_while<T>(work: impl FnOnce() -> T) -> (T, u64) {
+        let stop = AtomicBool::new(false);
+        thread::scope(|threads| {
+            let sampler = threads.spawn(|| {
+                let mut peak = 0;
+                while !stop.load(Ordering::Relaxed) {
+                    peak = peak.max(footprint());
+                    thread::sleep(Duration::from_millis(1));
+                }
+                peak
+            });
+            let done = work();
+            stop.store(true, Ordering::Relaxed);
+            (done, sampler.join().unwrap())
+        })
     }
 
     /// How long a search sent while the list is patched waits. Run alone:
@@ -4612,6 +4788,84 @@ mod tests {
         assert!(!holds(&core, &home.join("notes")));
         drop(patching);
         assert!(holds(&core, &home.join("notes")));
+    }
+
+    fn window_shown(core: &Core, shown: bool) -> u32 {
+        unsafe { tl_window_shown(core.0, u32::from(shown)) }
+    }
+
+    /// 12 entries, so removing a.txt makes compacting due, a 32nd, without passing the 8th at
+    /// which a patch compacts while the window shows.
+    fn twelve_entries() -> (tempfile::TempDir, PathBuf) {
+        let files: Vec<String> = (0..9).map(|n| format!("notes/{n}.md")).collect();
+        let mut files: Vec<&str> = files.iter().map(String::as_str).collect();
+        files.push("notes/a.txt");
+        home_with(&files)
+    }
+
+    fn compaction_due(core: &Core) -> bool {
+        let live = unsafe { &(*core.0).live };
+        let list = live.newest.lock().unwrap().clone().unwrap().1;
+        read(&list).unwrap().index.compaction_due()
+    }
+
+    /// Compacting a whole home folder makes searches wait about 100 ms, so while you search it
+    /// waits, and it runs once the window hides, without another change to bring it.
+    #[test]
+    fn compacting_waits_for_the_window_to_hide() {
+        let (_dir, home) = twelve_entries();
+        let events = Events::default();
+        let core = scan(home.to_str().unwrap(), 1, &events);
+        events.wait_for(TL_EVENT_INDEXED, 12);
+        assert_eq!(window_shown(&core, false), 0, "starts hidden");
+        assert_eq!(window_shown(&core, true), 1);
+        assert_eq!(window_shown(&core, true), 0);
+        std::fs::remove_file(home.join("notes/a.txt")).unwrap();
+        assert_eq!(changed(&core, &[&home.join("notes")], 0), 1);
+        assert_eq!(events.wait_for_rebuilt(1), 11);
+        assert!(compaction_due(&core), "compacted while the window showed");
+        assert!(found(&core, &events, "a.txt").is_empty());
+
+        assert_eq!(window_shown(&core, false), 1);
+        wait_until("compacting once hidden", || !compaction_due(&core));
+        assert_eq!(found(&core, &events, "notes"), ["notes"]);
+        assert_eq!(events.rebuilt().len(), 1, "compacting is no new list");
+    }
+
+    #[test]
+    fn a_patch_while_the_window_is_hidden_compacts_at_once() {
+        let (_dir, home) = twelve_entries();
+        let events = Events::default();
+        let core = scan(home.to_str().unwrap(), 1, &events);
+        events.wait_for(TL_EVENT_INDEXED, 12);
+        std::fs::remove_file(home.join("notes/a.txt")).unwrap();
+        assert_eq!(changed(&core, &[&home.join("notes")], 0), 1);
+        events.wait_for_rebuilt(1);
+        assert!(!compaction_due(&core));
+    }
+
+    /// Shown again before the hidden window's compaction took the list: it waits once more.
+    #[test]
+    fn a_compaction_left_for_a_hidden_window_waits_if_it_shows_again() {
+        let (_dir, home) = twelve_entries();
+        let (live, events) = (Live::default(), Events::default());
+        let notify = notify_to(&events);
+        let mut source = home_source(&home, &live, &notify);
+        live.plan(|plan| plan.shown = true);
+        std::fs::remove_file(home.join("notes/a.txt")).unwrap();
+        let (swaps, _swapped) = mpsc::channel();
+        let pass = patch(vec![home.join("notes")], 1);
+        rebuild(&mut source, pass, &live, &swaps, &notify);
+        assert!(live.plan.lock().unwrap().deferred);
+        let list = live.newest.lock().unwrap().clone().unwrap().1;
+        compact_hidden(&live);
+        assert!(read(&list).unwrap().index.compaction_due());
+        assert!(live.plan.lock().unwrap().deferred);
+        live.plan(|plan| plan.shown = false);
+        compact_hidden(&live);
+        let listed = read(&list).unwrap();
+        assert!(!listed.index.compaction_due());
+        assert_eq!(listed.version, 2, "searches see a new numbering");
     }
 
     #[test]
@@ -6557,6 +6811,37 @@ mod tests {
     }
 
     const LONG_AGO: Duration = Duration::from_secs(600);
+
+    /// The hotkey pressed twice: the window hides and shows again, and searches typed into
+    /// it must not wait for a compaction begun in between.
+    #[test]
+    fn a_compaction_waits_until_the_window_stays_hidden() {
+        let live = live(Duration::ZERO);
+        let rebuilds = rebuilds(&live, LONG_AGO);
+        let hide = |plan: &mut Plan| {
+            plan.shown = false;
+            plan.hid += 1;
+        };
+        live.plan(|plan| {
+            plan.deferred = true;
+            hide(plan);
+        });
+        assert_eq!(rebuilds.step(), Step::Waits(Some(SETTLE_AFTER_HIDE)));
+        rebuilds.set_ms(300);
+        live.plan(|plan| plan.shown = true);
+        assert_eq!(rebuilds.step(), Step::Waits(None));
+        rebuilds.set_ms(600);
+        live.plan(hide);
+        assert_eq!(rebuilds.step(), Step::Waits(Some(SETTLE_AFTER_HIDE)));
+        rebuilds.set_ms(1_200);
+        let left = Duration::from_millis(400);
+        assert_eq!(rebuilds.step(), Step::Waits(Some(left)));
+        assert!(live.plan.lock().unwrap().deferred);
+        rebuilds.set_ms(1_600);
+        assert_eq!(rebuilds.step(), Step::Waits(None));
+        assert!(!live.plan.lock().unwrap().deferred, "compacted");
+        rebuilds.stop(&live);
+    }
 
     #[test]
     fn a_lone_change_rebuilds_at_once() {

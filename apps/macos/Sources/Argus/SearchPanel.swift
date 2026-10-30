@@ -106,7 +106,7 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
     /// How far the pane pushed the window left to fit on the screen; closing it moves the box back.
     private var nudge: CGFloat = 0
 
-    private var hatch: Hatch?
+    private(set) var hatch: Hatch?
     private let hasAccess: () -> Bool
     /// Full Disk Access was off when last checked, so the list leaves the guarded folders out.
     private(set) var lacksAccess = false
@@ -218,6 +218,7 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
     /// `needsFinder` shows the Finder line, which only the Finder hotkey's window has.
     func show(needsFinder: Bool = false) {
         let pressed = pressedAt()
+        hatch?.windowShown(true)
         finderAsks += 1
         recheckAccess()
         if needsFinder != (notice == .needsFinder) {
@@ -250,6 +251,7 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
     func hide() {
         guard shown else { return }
         shown = false
+        hatch?.windowShown(false)
         pending = nil
         stopText()
         textWhole = false

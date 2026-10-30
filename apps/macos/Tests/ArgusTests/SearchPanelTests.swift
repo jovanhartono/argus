@@ -1377,6 +1377,20 @@ final class SearchPanelTests: XCTestCase {
         XCTAssertFalse(stage.isKey(window.panel))
     }
 
+    /// While you search, the core leaves its slow tidy-up of the list for once the window hides.
+    func testShowingAndHidingTellsTheCore() async throws {
+        let window = try await opened(access: true)
+        let hatch = try XCTUnwrap(window.hatch)
+        XCTAssertFalse(hatch.windowShown(false), "the core starts out knowing the window is hidden")
+        window.show()
+        XCTAssertFalse(hatch.windowShown(true), "told on show")
+        window.hide()
+        XCTAssertFalse(hatch.windowShown(false), "told on hide")
+        window.show()
+        defer { window.hide() }
+        XCTAssertFalse(hatch.windowShown(true), "told on each show")
+    }
+
     func testShownAgainWhileFadingOutTheWindowStays() async throws {
         let window = try await opened(access: true)
         window.show()
