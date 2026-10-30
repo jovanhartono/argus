@@ -908,7 +908,9 @@ struct Added {
 mod tests {
     use super::*;
     use crate::store::{is_sound, open_index, save_index};
-    use crate::{Access, Boosts, Clutter, Frecency, Ignore, Scan, Searcher, Settings, Within};
+    use crate::{
+        Access, Boosts, Cloud, Clutter, Frecency, Ignore, Scan, Searcher, Settings, Within,
+    };
     use std::collections::BTreeSet;
 
     /// The root `path` is under, and its entry.
@@ -1054,7 +1056,8 @@ mod tests {
     }
 
     fn keep_all(root: &Path) -> Settings {
-        Settings::new(root, root, Clutter::Keep, Ignore::default(), Access::Full)
+        let none = Ignore::default();
+        Settings::new(root, root, Clutter::Keep, none, Access::Full, Cloud::Keep)
     }
 
     fn temp_root() -> (tempfile::TempDir, PathBuf) {
@@ -1210,15 +1213,18 @@ mod tests {
     /// it, changed too, and now and then ejected and plugged in again.
     fn random_changes(swaps: bool, seeds: u64) {
         let rules = "Old\n!~/.hidden/keep\n!~/node_modules/keep\n!~/vendor/keep\n\
-                     !~/Notes.app/keep\n!~/Library/keep\n";
+                     !~/Notes.app/keep\n!~/Library/keep\n!~/Library/CloudStorage/keep\n";
+        let (full, limited) = (Access::Full, Access::Limited);
         let variants = [
-            (Clutter::Keep, "", Access::Full),
-            (Clutter::Skip, "", Access::Full),
-            (Clutter::Skip, rules, Access::Full),
-            (Clutter::Skip, rules, Access::Limited),
+            (Clutter::Keep, "", full, Cloud::Keep),
+            (Clutter::Keep, "", full, Cloud::Skip),
+            (Clutter::Skip, "", full, Cloud::Skip),
+            (Clutter::Skip, rules, full, Cloud::Keep),
+            (Clutter::Skip, rules, full, Cloud::Skip),
+            (Clutter::Skip, rules, limited, Cloud::Keep),
         ];
         let (mut compacted, mut in_place) = (0, 0);
-        for (variant, &(clutter, rules, access)) in variants.iter().enumerate() {
+        for (variant, &(clutter, rules, access, cloud)) in variants.iter().enumerate() {
             for seed in 1..=seeds {
                 let (_dir, root) = temp_root();
                 // Half the trees are big enough to patch most batches in place.
@@ -1239,7 +1245,7 @@ mod tests {
                 }
                 let (ignore, problems) = Ignore::parse(rules, &root, access);
                 assert!(problems.is_empty());
-                let settings = Settings::new(&root, &root, clutter, ignore, access);
+                let settings = Settings::new(&root, &root, clutter, ignore, access, cloud);
                 let mut index = settings.scan().unwrap().index;
                 if with_volumes {
                     for volume in &volumes {
@@ -1370,7 +1376,8 @@ mod tests {
     #[ignore = "scans the whole home folder with everything kept, and needs Full Disk Access"]
     fn compacting_a_home_folder_with_everything_kept() {
         let home = crate::home();
-        let settings = Settings::new(&home, &home, Clutter::Keep, Ignore::default(), Access::Full);
+        let none = Ignore::default();
+        let settings = Settings::new(&home, &home, Clutter::Keep, none, Access::Full, Cloud::Keep);
         let mut index = settings.scan().unwrap().index;
         for _ in 0..3 {
             let started = std::time::Instant::now();
@@ -1591,7 +1598,14 @@ mod tests {
         pad(&root);
         write(&root, &["site/vendor/lib.php", "site/vendor/keep/k.txt"]);
         let (ignore, _) = Ignore::parse("!~/site/vendor/keep", &root, Access::Full);
-        let settings = Settings::new(&root, &root, Clutter::Skip, ignore, Access::Full);
+        let settings = Settings::new(
+            &root,
+            &root,
+            Clutter::Skip,
+            ignore,
+            Access::Full,
+            Cloud::Keep,
+        );
         let mut index = settings.scan().unwrap().index;
         let vendor = |index: &Index| {
             let found = findable(index, &root);
@@ -1622,7 +1636,14 @@ mod tests {
         write(&root, &files);
         write(&root, &["site/vendor/keep/k.txt"]);
         let (ignore, _) = Ignore::parse("!~/site/vendor/keep", &root, Access::Full);
-        let settings = Settings::new(&root, &root, Clutter::Skip, ignore, Access::Full);
+        let settings = Settings::new(
+            &root,
+            &root,
+            Clutter::Skip,
+            ignore,
+            Access::Full,
+            Cloud::Keep,
+        );
         let mut index = settings.scan().unwrap().index;
         for folder in &folders {
             write(&root, &[&format!("{folder}/b")]);
@@ -1919,7 +1940,14 @@ mod tests {
     }
 
     fn skip_clutter(home: &Path) -> Settings {
-        Settings::new(home, home, Clutter::Skip, Ignore::default(), Access::Full)
+        Settings::new(
+            home,
+            home,
+            Clutter::Skip,
+            Ignore::default(),
+            Access::Full,
+            Cloud::Keep,
+        )
     }
 
     #[test]
@@ -2208,6 +2236,7 @@ mod tests {
             Clutter::Skip,
             Ignore::default(),
             Access::Limited,
+            Cloud::Keep,
         );
         let mut index = limited.scan().unwrap().index;
         let (_o, other) = temp_root();

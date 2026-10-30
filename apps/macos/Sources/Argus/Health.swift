@@ -55,6 +55,11 @@ struct HealthFormat {
         return fullDisk ? what : what + " Needs Full Disk Access."
     }
 
+    func cloud(_ fullDisk: Bool) -> String {
+        let what = "iCloud Drive, Dropbox, Google Drive, OneDrive and others. Finding a file by name never downloads it."
+        return fullDisk ? what : what + " Needs Full Disk Access."
+    }
+
     /// Under a minute, or a clock set back, reads "Just now".
     func ago(_ date: Date, now: Date) -> String {
         guard now.timeIntervalSince(date) >= 60 else { return "Just now" }
@@ -89,7 +94,8 @@ final class HealthPanel: NSPanel {
 
 /// ⌘,'s window: how many entries the list holds, when it was last read in full and last
 /// changed, whether Argus may read every folder, a button to build the list again, the
-/// switch to list everything, and the folders whose files' text a search looks inside.
+/// switches to list everything and cloud drives, and the folders whose files' text a search
+/// looks inside.
 @MainActor
 final class HealthWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, NSTableViewDelegate {
     let panel = HealthPanel(
@@ -106,6 +112,8 @@ final class HealthWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, NST
     /// Spins while a whole new list is built, as after flipping the switch: 10 to 20 s.
     let progress = NSProgressIndicator()
     let everythingHint = NSTextField(wrappingLabelWithString: "")
+    let cloud = NSButton(checkboxWithTitle: "Include iCloud Drive and cloud storage", target: nil, action: nil)
+    let cloudHint = NSTextField(wrappingLabelWithString: "")
     let grid = NSGridView()
     let folderList = NSTableView()
     let noFolders = NSTextField(labelWithString: "No folders yet")
@@ -120,6 +128,8 @@ final class HealthWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, NST
     private let onRebuild: () -> Void
     private let isEverything: () -> Bool
     private let onEverything: (Bool) -> Void
+    private let isCloud: () -> Bool
+    private let onCloud: (Bool) -> Void
     private let stage: any Stage
     private let format: HealthFormat
     private let tick: TimeInterval
@@ -131,7 +141,8 @@ final class HealthWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, NST
     init(
         read: @escaping () -> Health, hasAccess: @escaping () -> Bool, rebuild: @escaping () -> Void,
         stage: any Stage, folders: TextFolders = TextFolders(), everything: @escaping () -> Bool = { false },
-        indexEverything: @escaping (Bool) -> Void = { _ in }, format: HealthFormat = HealthFormat(),
+        indexEverything: @escaping (Bool) -> Void = { _ in }, cloud: @escaping () -> Bool = { false },
+        indexCloud: @escaping (Bool) -> Void = { _ in }, format: HealthFormat = HealthFormat(),
         tick: TimeInterval = 1
     ) {
         self.folders = folders
@@ -140,6 +151,8 @@ final class HealthWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, NST
         onRebuild = rebuild
         isEverything = everything
         onEverything = indexEverything
+        isCloud = cloud
+        onCloud = indexCloud
         self.stage = stage
         self.format = format
         self.tick = tick
@@ -158,11 +171,12 @@ final class HealthWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, NST
             [NSGridCell.emptyContentView, settings],
             [NSGridCell.emptyContentView, rebuild],
             [NSGridCell.emptyContentView, everythingBox()],
+            [NSGridCell.emptyContentView, cloudBox()],
             [label("Search inside files in:"), folderBox()],
         ]
         for row in rows { grid.addRow(with: row) }
         grid.row(at: 7).topPadding = 12
-        grid.row(at: 8).topPadding = 12
+        grid.row(at: 9).topPadding = 12
         panel.title = "Index Health"
         panel.level = .floating
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
@@ -195,7 +209,8 @@ final class HealthWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, NST
         panel.initialFirstResponder = rebuild
         rebuild.nextKeyView = settings
         settings.nextKeyView = everything
-        everything.nextKeyView = folderList
+        everything.nextKeyView = cloud
+        cloud.nextKeyView = folderList
         folderList.nextKeyView = folderButtons
         folderButtons.nextKeyView = rebuild
         panel.setContentSize(content.fittingSize)
@@ -223,6 +238,24 @@ final class HealthWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, NST
 
     @objc func switchEverything(_ sender: Any?) {
         onEverything(everything.state == .on)
+        refresh()
+    }
+
+    private func cloudBox() -> NSView {
+        cloud.target = self
+        cloud.action = #selector(switchCloud(_:))
+        cloudHint.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
+        cloudHint.textColor = .secondaryLabelColor
+        cloudHint.preferredMaxLayoutWidth = 260
+        let box = NSStackView(views: [cloud, cloudHint])
+        box.orientation = .vertical
+        box.alignment = .leading
+        box.spacing = 2
+        return box
+    }
+
+    @objc func switchCloud(_ sender: Any?) {
+        onCloud(cloud.state == .on)
         refresh()
     }
 
@@ -354,6 +387,11 @@ final class HealthWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, NST
         // Without access it can still be turned off, just not on.
         everything.isEnabled = (fullDisk || on) && !health.stopped
         everythingHint.stringValue = format.everything(fullDisk)
+        let cloudOn = isCloud()
+        cloud.state = cloudOn ? .on : .off
+        // Without access cloud drives stay unread, so it can be turned off but not on.
+        cloud.isEnabled = (fullDisk || cloudOn) && !health.stopped
+        cloudHint.stringValue = format.cloud(fullDisk)
         if building == progress.isHidden {
             progress.isHidden = !building
             building ? progress.startAnimation(nil) : progress.stopAnimation(nil)

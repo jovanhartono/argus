@@ -1211,6 +1211,42 @@ final class SearchPanelTests: XCTestCase {
         try await until { health.health.entries == 2 && !health.health.busy }
     }
 
+    func testTheHealthViewsCloudSwitchListsDropboxLiveAndIsKept() async throws {
+        let dropbox = root.appendingPathComponent("Library/CloudStorage/Dropbox")
+        try FileManager.default.createDirectory(at: dropbox, withIntermediateDirectories: true)
+        try Data().write(to: dropbox.appendingPathComponent("plan.md"))
+        let defaults = MemoryDefaults()
+        let window = try await opened(access: true, cloud: CloudDrives(defaults: defaults))
+        window.showHealth(nil)
+        let health = try XCTUnwrap(window.health)
+        defer { health.hide() }
+        XCTAssertEqual(health.cloud.state, .off)
+        XCTAssertEqual(health.entries.stringValue, "2", "the folder and Library")
+
+        health.cloud.performClick(nil)
+        XCTAssertTrue(CloudDrives(defaults: defaults).isOn, "kept for the next launch")
+        // The folder, Library, CloudStorage, Dropbox and plan.md.
+        try await until { health.health.entries == 5 && !health.health.busy }
+
+        health.cloud.performClick(nil)
+        XCTAssertFalse(CloudDrives(defaults: defaults).isOn)
+        try await until { health.health.entries == 2 && !health.health.busy }
+    }
+
+    func testTheCloudSwitchKeptOnListsDropboxFromLaunch() async throws {
+        let dropbox = root.appendingPathComponent("Library/CloudStorage/Dropbox")
+        try FileManager.default.createDirectory(at: dropbox, withIntermediateDirectories: true)
+        try Data().write(to: dropbox.appendingPathComponent("plan.md"))
+        let cloud = CloudDrives()
+        cloud.isOn = true
+        let window = try await opened(access: true, cloud: cloud)
+        window.showHealth(nil)
+        let health = try XCTUnwrap(window.health)
+        defer { health.hide() }
+        XCTAssertEqual(health.cloud.state, .on)
+        XCTAssertEqual(health.entries.stringValue, "5")
+    }
+
     func testTheSwitchKeptOnListsCachesFromLaunch() async throws {
         let caches = root.appendingPathComponent("Library/Caches")
         try FileManager.default.createDirectory(at: caches, withIntermediateDirectories: true)
@@ -2946,7 +2982,7 @@ final class SearchPanelTests: XCTestCase {
     private func opened(
         access: Bool, on stage: (any Stage)? = nil, standIn: UInt64? = nil, saved: String? = nil, opens: String? = nil,
         apps: [String] = [], textFolders: [String] = [], everything: IndexEverything = IndexEverything(),
-        finder: @escaping @Sendable () -> FinderFolder = { .none }
+        cloud: CloudDrives = CloudDrives(), finder: @escaping @Sendable () -> FinderFolder = { .none }
     ) async throws -> SearchPanel {
         self.access = access
         let hasAccess = { [unowned self] in
@@ -2957,7 +2993,7 @@ final class SearchPanelTests: XCTestCase {
         folders.add(textFolders)
         let window = SearchPanel(
             root: root.path, standIn: standIn, saved: saved, opens: opens, apps: apps, textFolders: folders, everything: everything,
-            hasAccess: hasAccess, stage: stage ?? self.stage, finder: finder)
+            cloud: cloud, hasAccess: hasAccess, stage: stage ?? self.stage, finder: finder)
         for _ in 0..<500 where !window.indexed { try await Task.sleep(for: .milliseconds(10)) }
         XCTAssertTrue(window.indexed)
         return window

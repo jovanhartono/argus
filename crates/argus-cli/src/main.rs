@@ -1,6 +1,6 @@
 use argus_core::{
-    Access, Apps, Boosts, Clutter, Frecency, Hit, Ignore, Index, Item, Opened, Searcher, Settings,
-    Within, unix_now,
+    Access, Apps, Boosts, Cloud, Clutter, Frecency, Hit, Ignore, Index, Item, Opened, Searcher,
+    Settings, Within, unix_now,
 };
 use argus_grep::Grep;
 use std::ffi::OsString;
@@ -25,6 +25,7 @@ const USAGE: &str = "usage:
 on a Mac, searches also find the apps in /Applications, /System/Applications and ~/Applications
 add --all to include hidden folders, ~/Library, the insides of packages like Photos Library,
 and tool downloads and caches like node_modules
+add --cloud to include iCloud Drive and cloud drives like Dropbox, which the app leaves out at first
 add --load <file> to open a saved index instead of scanning (it scans when the file is missing,
 damaged or built with other settings, and does not catch up on changes made since it was saved),
 --volume <folder> to then add a mounted drive as the window would, --changes <file> to then
@@ -51,6 +52,7 @@ const MAX_THREADS: usize = 256;
 #[derive(Debug, PartialEq)]
 struct Options {
     clutter: Clutter,
+    cloud: Cloud,
     load: Option<PathBuf>,
     volume: Option<PathBuf>,
     changes: Option<PathBuf>,
@@ -136,7 +138,12 @@ fn parse(mut args: Vec<OsString>) -> Option<(Command, Options)> {
     } else {
         Clutter::Skip
     };
-    args.retain(|arg| arg != "--all");
+    let cloud = if args.iter().any(|arg| arg == "--cloud") {
+        Cloud::Keep
+    } else {
+        Cloud::Skip
+    };
+    args.retain(|arg| arg != "--all" && arg != "--cloud");
     let load = take(&mut args, "--load")?;
     let volume = take(&mut args, "--volume")?;
     let changes = take(&mut args, "--changes")?;
@@ -184,6 +191,7 @@ fn parse(mut args: Vec<OsString>) -> Option<(Command, Options)> {
         command,
         Options {
             clutter,
+            cloud,
             load,
             volume,
             changes,
@@ -243,7 +251,7 @@ fn load(folder: &Path, options: &Options) -> Option<Index> {
         Clutter::Skip => ignore_list(&home),
         Clutter::Keep => Ignore::default(),
     };
-    let settings = Settings::new(folder, &home, clutter, ignore, Access::Full);
+    let settings = Settings::new(folder, &home, clutter, ignore, Access::Full, options.cloud);
     // The command line has no FSEvents of its own, so it keeps the event an opened index had.
     let mut opened_at = None;
     let scan = match &options.load {
@@ -1060,12 +1068,14 @@ mod tests {
 
     #[test]
     fn reads_the_flags_anywhere_on_the_line() {
-        let (found, options) = parse(args("--all grep-bench ~ --load a.idx q.txt 2")).unwrap();
+        let line = "--all grep-bench ~ --load a.idx --cloud q.txt 2";
+        let (found, options) = parse(args(line)).unwrap();
         assert_eq!(found, grep_bench_on(Some(2)));
         assert_eq!(
             options,
             Options {
                 clutter: Clutter::Keep,
+                cloud: Cloud::Keep,
                 load: Some("a.idx".into()),
                 volume: None,
                 changes: None,
@@ -1080,6 +1090,7 @@ mod tests {
             options,
             Options {
                 clutter: Clutter::Skip,
+                cloud: Cloud::Skip,
                 load: None,
                 volume: Some("/Volumes/Photos".into()),
                 changes: Some("c.txt".into()),
@@ -1203,6 +1214,7 @@ mod tests {
     fn saves_again_unless_opened_from_the_same_file_with_no_changes() {
         let options = |load: Option<&str>, changes: Option<&str>, save: Option<&str>| Options {
             clutter: Clutter::Skip,
+            cloud: Cloud::Skip,
             load: load.map(PathBuf::from),
             volume: None,
             changes: changes.map(PathBuf::from),
@@ -1243,7 +1255,8 @@ mod tests {
         let apps = Apps::scan_folders(vec![root.join("Apps")]);
         let files = root.join("files");
         let ignore = Ignore::default();
-        let index = argus_core::scan(&files, &files, Clutter::Skip, &ignore, Access::Full)
+        let (skip, full) = (Clutter::Skip, Access::Full);
+        let index = argus_core::scan(&files, &files, skip, &ignore, full, Cloud::Skip)
             .unwrap()
             .index;
         let searcher = Searcher::with_threads(1);
