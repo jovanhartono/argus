@@ -5,11 +5,12 @@
 //! the search to a worker and returns its ticket at once; the worker calls `on_event` when
 //! that ticket's rows are ready; the window then copies them out with `tl_take`.
 //! When files change, `tl_changed` asks a second thread to read the changed folders again into
-//! the list in use, while new searches wait, or to build a new list beside it when macOS lost
-//! track; a new list reaches the worker through the same queue as the searches, so each search
-//! sees one whole list. `tl_volume_added` and `tl_volume_removed` go through that thread too,
-//! without reading the home folder again: a drive joins a copy of the newest list, as reading
-//! one takes seconds, and one taken out leaves the list in use.
+//! the list in use, where new searches wait only while what was read goes in, or to build a
+//! new list beside it when macOS lost track; a new list reaches the worker through the same
+//! queue as the searches, so each search sees one whole list. `tl_volume_added` and
+//! `tl_volume_removed` go through that thread too, without reading the home folder again: a
+//! drive joins a copy of the newest list, as reading one takes seconds, and one taken out
+//! leaves the list in use.
 //! Given a file, a core opens the list saved there instead of scanning, and a third thread
 //! saves each new list to it once files stop changing for a moment.
 //! A text search, inside files, runs the same way on a worker of its own, started with the
@@ -18,9 +19,9 @@
 //! `include/argus.h` repeats everything here for Swift, and a test keeps the two in step.
 
 use argus_core::{
-    Access, Apps, Boosts, Clutter, Frecency, Hit, Ignore, Index, Item, OpenError, Pages, Refusal,
-    Scope, Searcher, Settings, Ticket, Watch, Within, open_index, remove_old_temps, save_index,
-    unix_now,
+    Access, Apps, Boosts, Changes, Clutter, Frecency, Hit, Ignore, Index, Item, OpenError, Pages,
+    Refusal, Scope, Searcher, Settings, Ticket, Watch, Within, open_index, remove_old_temps,
+    save_index, unix_now,
 };
 use argus_grep::{Found, Grep, Report};
 use std::ffi::{CString, c_void};
@@ -29,9 +30,7 @@ use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
-use std::sync::{
-    Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError, RwLock, RwLockReadGuard, TryLockError,
-};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError, RwLock, RwLockReadGuard};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -294,10 +293,12 @@ enum Job {
         /// Only what is inside this folder, a full path.
         folder: Option<String>,
     },
-    /// A list built again, or the one in use patched, and the milliseconds that took.
+    /// A list built again, or the one in use patched, the milliseconds that took, and its
+    /// entries then, as a patch already under way may change them.
     Swap {
         list: List,
         took: u32,
+        entries: usize,
     },
     Opened,
     /// The folders to read apps from, as `Apps::scan_folders` reads them.
@@ -515,6 +516,10 @@ fn read(list: &RwLock<Listed>) -> Option<RwLockReadGuard<'_, Listed>> {
     list.read().ok()
 }
 
+fn broken() -> io::Error {
+    io::Error::other("a bug broke the list in use")
+}
+
 /// The newest list, shared with the worker rather than copied, and the rules it was built by.
 type Newest = Option<(Arc<Scope>, List)>;
 
@@ -544,8 +549,8 @@ struct Live {
     resave: Duration,
     saving: Mutex<Saving>,
     save: Condvar,
-    /// Held around each save of the list and each patch of it, so a patch waits out a long save
-    /// without searches queuing behind it.
+    /// Held around each save of the list and each patch applied to it, so a patch waits out a
+    /// long save without searches queuing behind it.
     writing: Mutex<()>,
     /// Its `busy` covers only the first list; the plan tells of later ones.
     health: Mutex<TlHealth>,
@@ -900,27 +905,30 @@ impl Source {
     }
 
     /// The newest list with the volumes added or taken out to match `volumes` and the
-    /// folders in `changes` read again, its root left as it is, and its rules, or `None` when
-    /// that changes nothing. Without reading the home folder, the list in use is patched while
-    /// new searches wait. A drive joining takes seconds to read, so it joins a copy instead,
-    /// with the memory of a second list for that moment.
+    /// folders in `changes` read again, its root left as it is, its rules, and how long it
+    /// waited for a save under way; `None` when that changes nothing. Without reading the
+    /// home folder, the list in use is read while searches go on, then patched while new
+    /// searches wait. A drive joining takes seconds to read, so it joins a copy instead, with
+    /// the memory of a second list for that moment.
     fn graft(
         &self,
         volumes: &[PathBuf],
         changes: &[PathBuf],
         live: &Live,
         notify: &Notify,
-    ) -> Option<(List, Option<Scope>)> {
+    ) -> io::Result<Option<(List, Option<Scope>, Duration)>> {
         let Self::Home {
             settings: Some(settings),
             ..
         } = self
         else {
-            return None;
+            return Ok(None);
         };
-        let list = live.newest.lock().unwrap().clone()?.1;
+        let Some((_, list)) = live.newest.lock().unwrap().clone() else {
+            return Ok(None);
+        };
         let (gone, new) = {
-            let listed = read(&list)?;
+            let listed = read(&list).ok_or_else(broken)?;
             let gone: Vec<PathBuf> = listed
                 .index
                 .volumes()
@@ -935,20 +943,24 @@ impl Source {
             (gone, new)
         };
         if gone.is_empty() && new.is_empty() && changes.is_empty() {
-            return None;
+            return Ok(None);
         }
         if new.is_empty() {
-            let mut listed = list.write().ok()?;
+            let mut waited = Duration::ZERO;
             for volume in &gone {
-                settings.remove_volume(&mut listed.index, volume);
+                waited += patch_in_place(live, &list, |index| {
+                    settings.read_volume_removal(index, volume)
+                })?;
             }
-            settings.update(&mut listed.index, changes);
-            listed.version += 1;
-            let scope = settings.scope(&listed.index);
-            drop(listed);
-            return Some((list, Some(scope)));
+            if !changes.is_empty() {
+                waited += patch_in_place(live, &list, |index| {
+                    Some(settings.read_update(index, changes))
+                })?;
+            }
+            let scope = settings.scope(&read(&list).ok_or_else(broken)?.index);
+            return Ok(Some((list, Some(scope), waited)));
         }
-        let mut index = Index::clone(&read(&list)?.index);
+        let mut index = Index::clone(&read(&list).ok_or_else(broken)?.index);
         drop(list);
         for volume in &gone {
             settings.remove_volume(&mut index, volume);
@@ -958,11 +970,31 @@ impl Source {
         let joined = live.add_volumes(settings, &mut index, &new, notify);
         // A change read again is promised a new list, even one that lists the same.
         let changed = joined || !gone.is_empty() || !changes.is_empty();
-        changed.then(|| {
+        Ok(changed.then(|| {
             let scope = settings.scope(&index);
-            (list_of(index), Some(scope))
-        })
+            (list_of(index), Some(scope), Duration::ZERO)
+        }))
     }
+}
+
+/// Applies to `list` what `read_changes` finds in it, reading while searches go on, as a new
+/// folder unzipped may take seconds to walk. Returns how long it waited for a save under way.
+fn patch_in_place(
+    live: &Live,
+    list: &RwLock<Listed>,
+    read_changes: impl FnOnce(&Index) -> Option<Changes>,
+) -> io::Result<Duration> {
+    let Some(changes) = read_changes(&read(list).ok_or_else(broken)?.index) else {
+        return Ok(Duration::ZERO);
+    };
+    let asked = Instant::now();
+    // Waits out a save here rather than at the list, where new searches would queue behind.
+    let _writing = lock(&live.writing);
+    let waited = asked.elapsed();
+    let mut listed = list.write().map_err(|_| broken())?;
+    changes.apply(&mut listed.index);
+    listed.version += 1;
+    Ok(waited)
 }
 
 #[derive(Clone, Copy)]
@@ -1308,9 +1340,12 @@ fn serve(
         };
         let (ticket, query, folder) = match job {
             // Searches sent before this one ran on the old list; the old list is freed here.
-            Job::Swap { list: fresh, took } => {
+            Job::Swap {
+                list: fresh,
+                took,
+                entries,
+            } => {
                 list = fresh;
-                let entries = read(&list).map_or(0, |listed| listed.index.entry_count());
                 notify.send(TL_EVENT_REBUILT, u64::from(took) << 32 | entries as u64);
                 (seen, stale) = (None, true);
                 continue;
@@ -1482,23 +1517,29 @@ fn rebuild(source: &mut Source, pass: Pass, live: &Live, swaps: &Sender<Job>, no
     }
     let started = Instant::now();
     let whole = pass.clutter.is_some();
-    // Held until the patched list is kept, so a save never pairs it with an older event.
-    let _writing = (!whole).then(|| lock(&live.writing));
     let built = panic::catch_unwind(AssertUnwindSafe(|| match pass.clutter {
         Some(clutter) => source
             .build(clutter, &pass.volumes, live, notify)
-            .map(|built| Some(live.publish(built, pass.mark))),
-        None => Ok(source
+            .map(|built| Some((live.publish(built, pass.mark), Duration::ZERO))),
+        None => source
             .graft(&pass.volumes, &pass.changes, live, notify)
-            .map(|(list, scope)| live.publish_list(list, scope, pass.mark))),
+            .map(|grafted| {
+                grafted.map(|(list, scope, waited)| {
+                    (live.publish_list(list, scope, pass.mark), waited)
+                })
+            }),
     }))
     .unwrap_or_else(|_| Err(io::Error::other("a bug in the engine")));
     match built {
-        Ok(Some(list)) => {
+        Ok(Some((list, waited))) => {
             let elapsed = started.elapsed();
             let entries = read(&list).map_or(0, |listed| listed.index.entry_count());
             live.note_list(entries, whole.then_some(elapsed), true);
-            let took = elapsed.as_millis().min(u32::MAX.into()) as u32;
+            // Without the wait for a save under way, which says nothing of the change.
+            let took = elapsed
+                .saturating_sub(waited)
+                .as_millis()
+                .min(u32::MAX.into()) as u32;
             let missing = {
                 let mut plan = live.plan.lock().unwrap();
                 if whole {
@@ -1511,7 +1552,11 @@ fn rebuild(source: &mut Source, pass: Pass, live: &Live, swaps: &Sender<Job>, no
                 live.keep(&list, source, pass.current);
             }
             // Fails only once the worker has stopped.
-            let _ = swaps.send(Job::Swap { list, took });
+            let _ = swaps.send(Job::Swap {
+                list,
+                took,
+                entries,
+            });
         }
         Ok(None) => {}
         Err(error) => {
@@ -1523,7 +1568,8 @@ fn rebuild(source: &mut Source, pass: Pass, live: &Live, swaps: &Sender<Job>, no
                         .map_or(pass.mark, |failed| failed.min(pass.mark)),
                 );
                 // A patch stopped halfway, so search finds nothing until a whole list is read.
-                if broken {
+                // A whole list that failed too waits for the next change, as `failed` asks.
+                if broken && !whole {
                     plan.want(pass.mark);
                 }
             });
@@ -1554,7 +1600,8 @@ fn save_loop(live: &Live, notify: Notify) {
             continue;
         }
         drop(saving);
-        // Taken only now, past any patch under way, so the list saved is the one it kept.
+        // A patch ready to apply waits here meanwhile, rather than at the list, where new
+        // searches would queue behind it until the save ends.
         let writing = lock(&live.writing);
         let (file, list) = {
             let mut saving = live.saving.lock().unwrap();
@@ -1698,12 +1745,13 @@ pub unsafe extern "C" fn tl_apps(core: *const TlCore, folders: *const u8, len: u
 
 /// Tells the core that folders changed. `paths` holds `len` bytes: real paths in UTF-8, each
 /// ending in a NUL byte. Each folder the list reads whose names it no longer matches is read
-/// again into the list in the background, as searches wait; the whole list is built again
-/// when one may hold your ignore list, or whatever they are when `rescan` isn't 0, as when macOS
-/// dropped changes. `TL_EVENT_REBUILT` follows either way. `mark` is the id of the newest
-/// FSEvents event among them, handed back by `tl_watched`, or 0 for a change FSEvents didn't
-/// report, which counts as the newest id told so far. Returns 1 when a new list is coming,
-/// else 0, as once the core has stopped. Safe to call from any thread.
+/// again into the list in the background, as searches go on and then wait while it goes in;
+/// the whole list is built again when one may hold your ignore list, or whatever they are when
+/// `rescan` isn't 0, as when macOS dropped changes. `TL_EVENT_REBUILT` follows either way.
+/// `mark` is the id of the newest FSEvents event among them, handed back by `tl_watched`, or 0
+/// for a change FSEvents didn't report, which counts as the newest id told so far. Returns 1
+/// when a new list is coming, else 0, as once the core has stopped. Safe to call from any
+/// thread.
 ///
 /// # Safety
 /// `core` came from `tl_core_new` or `tl_core_new_stand_in`, and `paths` points to `len` bytes
@@ -2043,8 +2091,8 @@ pub unsafe extern "C" fn tl_health(core: *const TlCore, out: *mut TlHealth) -> u
 
 /// 1 when the newest list holds the folder at `path`, a full real path of `len` bytes, so a
 /// search inside it can find something, else 0, as before the first list or for made-up names.
-/// Never waits for a scan, a search or the list being patched: while it is, 1 for a folder the
-/// scan reads. Safe to call from any thread.
+/// Never waits for a scan, a search or the list being patched, nor touches the disk: in the
+/// moment a patch takes, 0. Safe to call from any thread.
 ///
 /// # Safety
 /// `core` came from `tl_core_new` or `tl_core_new_stand_in`, and `path` points to `len`
@@ -2060,16 +2108,14 @@ pub unsafe extern "C" fn tl_holds_folder(core: *const TlCore, path: *const u8, l
         let Ok(path) = std::str::from_utf8(bytes) else {
             return 0;
         };
-        let Some((scope, list)) = core.live.newest.lock().unwrap().clone() else {
+        let Some((_, list)) = core.live.newest.lock().unwrap().clone() else {
             return 0;
         };
-        let path = Path::new(path);
-        // Asked on the window's main thread as the Finder hotkey opens the window.
-        let held = match list.try_read() {
-            Ok(listed) => listed.index.holds_folder(path),
-            Err(TryLockError::WouldBlock) => scope.in_scope(path),
-            Err(TryLockError::Poisoned(_)) => false,
-        };
+        // Asked on the window's main thread as the Finder hotkey opens the window, which then
+        // searches everything rather than freeze, or wake a sleeping drive.
+        let held = list
+            .try_read()
+            .is_ok_and(|listed| listed.index.holds_folder(Path::new(path)));
         u32::from(held)
     })
 }
@@ -3422,7 +3468,6 @@ mod tests {
         }
     }
 
-    /// Where a core saves its list; an empty `journal` may come without a pointer.
     /// The memory macOS counts against this process, as `footprint` shows it.
     #[cfg(target_os = "macos")]
     fn footprint() -> u64 {
@@ -3517,24 +3562,50 @@ mod tests {
             "MEASURE a search alone: {:?} typical, {:?} at most",
             alone[10], alone[20]
         );
-        for round in 1..=6_u64 {
-            std::fs::write(scratch.join(format!("{round}.txt")), "").unwrap();
+        let mut rounds = 0;
+        let mut patch = |what: &str, change: &dyn Fn(&Path)| {
+            change(&scratch);
+            rounds += 1;
             let started = Instant::now();
-            assert_eq!(changed_at(&core, &[&scratch], 0, round + 1), 1);
+            assert_eq!(changed_at(&core, &[&scratch], 0, rounds + 1), 1);
             let (mut longest, mut searches) = (Duration::ZERO, 0);
-            while events.rebuilt().len() < round as usize {
+            while events.rebuilt().len() < rounds as usize {
                 longest = longest.max(search());
                 searches += 1;
             }
+            let entries = events.rebuilt()[rounds as usize - 1];
             eprintln!(
-                "MEASURE round {round}: patched in {:?}, longest of {searches} searches meanwhile {longest:?}",
+                "MEASURE {what}: patched in {:?}, longest of {searches} searches meanwhile {longest:?}, {entries} entries",
                 started.elapsed()
             );
             thread::sleep(Duration::from_secs(1));
+        };
+        for round in 1..=4 {
+            patch("one new file", &|scratch| {
+                std::fs::write(scratch.join(format!("{round}.txt")), "").unwrap();
+            });
         }
+        // As an unzip leaves them, with a 32nd of the list's entries enough to compact it.
+        let unzip = |name: &'static str, folders: usize| {
+            move |scratch: &Path| {
+                for folder in 0..folders {
+                    let folder = scratch.join(format!("{name}/{folder}"));
+                    std::fs::create_dir_all(&folder).unwrap();
+                    for file in 0..100 {
+                        std::fs::write(folder.join(format!("{file}.txt")), "").unwrap();
+                    }
+                }
+            }
+        };
+        patch("a new folder of 5,051 entries", &unzip("unzipped", 50));
+        patch("a new folder of 101,001 entries", &unzip("many", 1000));
+        patch("those 101,001 entries deleted", &|scratch| {
+            std::fs::remove_dir_all(scratch.join("many")).unwrap();
+        });
         std::fs::remove_dir_all(scratch).unwrap();
     }
 
+    /// Where a core saves its list; an empty `journal` may come without a pointer.
     fn saved_at(file: &[u8], journal: &[u8], now: u64) -> TlSaved {
         TlSaved {
             file: file.as_ptr(),
@@ -4247,7 +4318,7 @@ mod tests {
     /// Grafts what the plan holds onto the newest list, which then becomes the newest.
     fn graft(source: &Source, live: &Live, notify: &Notify) -> Option<u64> {
         let (volumes, changes) = live.plan.lock().unwrap().volumes();
-        let (list, scope) = source.graft(&volumes, &changes, live, notify)?;
+        let (list, scope, _) = source.graft(&volumes, &changes, live, notify).unwrap()?;
         let list = live.publish_list(list, scope, 0);
         Some(read(&list).unwrap().index.entry_count() as u64)
     }
@@ -4276,7 +4347,8 @@ mod tests {
         let source = home_source(&home, &live, &notify);
         live.plan(|plan| plan.volumes = vec![photos.clone(), music.clone()]);
         let (volumes, changes) = live.plan.lock().unwrap().volumes();
-        let (list, scope) = source.graft(&volumes, &changes, &live, &notify).unwrap();
+        let grafted = source.graft(&volumes, &changes, &live, &notify).unwrap();
+        let (list, scope, _) = grafted.unwrap();
         live.plan(|plan| assert!(plan.forget(&photos)));
         live.publish_list(list, scope, 0);
         let watched: Vec<String> = live
@@ -4483,8 +4555,51 @@ mod tests {
         assert_eq!(events.count(TL_EVENT_FAILED, 0), 0);
     }
 
+    /// A patch finding the list broken asks for a whole one. A whole one that fails too, as
+    /// with the home folder gone, waits for the next change rather than read again and again.
+    #[test]
+    fn a_broken_list_asks_for_one_whole_list_at_a_time() {
+        let (dir, home) = home_with(&["notes/budget.txt"]);
+        let (live, events) = (Live::default(), Events::default());
+        let notify = notify_to(&events);
+        let mut source = home_source(&home, &live, &notify);
+        let list = live.newest.lock().unwrap().clone().unwrap().1;
+        let _ = thread::spawn(move || {
+            let _patching = list.write().unwrap();
+            panic!("a bug in the engine");
+        })
+        .join();
+        let (swaps, swapped) = mpsc::channel();
+        let pass = patch(vec![home.join("notes")], 1);
+        rebuild(&mut source, pass, &live, &swaps, &notify);
+        live.plan(|plan| {
+            assert!(plan.wanted);
+            assert_eq!((plan.asked, plan.failed), (Some(1), Some(1)));
+            (plan.wanted, plan.asked) = (false, None);
+        });
+
+        drop(dir);
+        let whole = Pass {
+            clutter: Some(Clutter::Skip),
+            ..patch(Vec::new(), 2)
+        };
+        rebuild(&mut source, whole, &live, &swaps, &notify);
+        live.plan(|plan| {
+            assert!(!plan.wanted);
+            assert_eq!(plan.failed, Some(1));
+        });
+        assert!(swapped.try_recv().is_err());
+        let notes = events.notes.lock().unwrap();
+        assert_eq!(notes.len(), 2);
+        assert!(
+            notes
+                .iter()
+                .all(|note| note.contains("could not be built again"))
+        );
+    }
+
     /// The window asks on its main thread, so the answer never waits for a patch: meanwhile,
-    /// a folder the scan reads counts as held.
+    /// no folder is held, and the window searches everything.
     #[test]
     fn whether_a_folder_is_held_is_told_at_once_during_a_patch() {
         let (_dir, home) = home_with(&["notes/budget.txt"]);
@@ -4493,9 +4608,10 @@ mod tests {
         events.wait_for(TL_EVENT_INDEXED, 3);
         let live = unsafe { &(*core.0).live };
         let list = live.newest.lock().unwrap().clone().unwrap().1;
-        let _patching = list.write().unwrap();
+        let patching = list.write().unwrap();
+        assert!(!holds(&core, &home.join("notes")));
+        drop(patching);
         assert!(holds(&core, &home.join("notes")));
-        assert!(!holds(&core, Path::new("/")));
     }
 
     #[test]
@@ -5130,7 +5246,8 @@ mod tests {
                 let pass = patch(vec![notes.clone()], 1);
                 rebuild(&mut source, pass, &live, &swaps, &notify);
             });
-            // Time for the patch to reach the save and wait.
+            // Time for the patch to read and reach the save; a thread waiting on a lock
+            // shows nothing to wait for instead.
             thread::sleep(Duration::from_millis(100));
             let ticket = search("a");
             assert!(events.heard(TL_EVENT_READY, ticket), "a search waited");
@@ -5143,6 +5260,58 @@ mod tests {
             events.wait_for(TL_EVENT_READY, ticket);
             let (_, found) = done.lock().unwrap().take().unwrap();
             assert_eq!(paths_of(&found), [notes.join("budget.txt")]);
+            drop(jobs);
+        });
+    }
+
+    /// A folder unzipped with thousands of entries takes a while to walk, and searches answer
+    /// meanwhile: only putting what was read into the list makes them wait.
+    #[test]
+    fn searches_answer_while_a_patch_walks_a_big_new_folder() {
+        let (_h, home) = home_with(&["notes/a.txt"]);
+        let (live, events) = (Live::default(), Events::default());
+        let notify = notify_to(&events);
+        let mut source = home_source(&home, &live, &notify);
+        for folder in 0..8000 {
+            let folder = home.join(format!("unzipped/{folder}"));
+            std::fs::create_dir_all(&folder).unwrap();
+            std::fs::write(folder.join("b.txt"), "").unwrap();
+        }
+        let list = live.newest.lock().unwrap().clone().unwrap().1;
+        let (searcher, done, opens) =
+            (Searcher::with_threads(1), Done::default(), Mutex::default());
+        let (jobs, inbox) = mpsc::channel();
+        let (swaps, _swapped) = mpsc::channel();
+        thread::scope(|threads| {
+            let (worker_list, searcher, done, opens) =
+                (Arc::clone(&list), &searcher, &done, &opens);
+            threads
+                .spawn(move || serve(worker_list, searcher, &inbox, done, opens, &notify, RERANK));
+            let started = Instant::now();
+            let patching = threads.spawn(|| {
+                let pass = patch(vec![home.clone()], 1);
+                rebuild(&mut source, pass, &live, &swaps, &notify);
+            });
+            let (mut longest, mut searches) = (Duration::ZERO, 0);
+            while !patching.is_finished() {
+                let (asked, ticket) = (Instant::now(), searcher.ticket());
+                let (query, folder) = ("a".to_owned(), None);
+                jobs.send(Job::Search {
+                    ticket,
+                    query,
+                    folder,
+                })
+                .unwrap();
+                events.wait_for(TL_EVENT_READY, ticket.number());
+                (longest, searches) = (longest.max(asked.elapsed()), searches + 1);
+            }
+            let took = started.elapsed();
+            patching.join().unwrap();
+            assert_eq!(read(&list).unwrap().index.entry_count(), 3 + 1 + 16_000);
+            assert!(
+                searches > 1 && longest * 3 < took,
+                "{searches} searches, the longest {longest:?}, while the patch took {took:?}"
+            );
             drop(jobs);
         });
     }
@@ -5226,6 +5395,7 @@ mod tests {
         jobs.send(Job::Swap {
             list: list_of(new),
             took: 7,
+            entries: new_len as usize,
         })
         .unwrap();
         drop(jobs);
@@ -5246,6 +5416,7 @@ mod tests {
         jobs.send(Job::Swap {
             list: list_of(newer),
             took: 9,
+            entries: newer_len as usize,
         })
         .unwrap();
         jobs.send(Job::Search {
@@ -5470,6 +5641,7 @@ mod tests {
         jobs.send(Job::Swap {
             list: list_of(new),
             took: 1,
+            entries: 0,
         })
         .unwrap();
         let ticket = searcher.ticket();

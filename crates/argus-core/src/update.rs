@@ -31,16 +31,61 @@ pub struct Update {
     pub compacted: bool,
 }
 
-/// What an update changes while it runs, folded into the runs of siblings when it ends, so it
-/// costs a step per run and per change rather than a list as long as the index.
+/// What an update takes out while it reads, folded into the runs of siblings when it is
+/// applied, so it costs a step per run and per change rather than a list as long as the index.
 struct Edit {
     /// Each folder's runs of children. After an update a folder's children may sit in several
     /// runs, and finding them in the runs alone would read every run after the folder.
     runs: Runs,
-    /// Entries this update removed.
+    /// Entries this update removes.
     removed: HashSet<EntryId>,
-    /// The folder of each entry this update added, in order.
-    added_parents: Vec<EntryId>,
+    /// How many of them are folders.
+    removed_folders: usize,
+}
+
+/// Changes read from disk by `Settings::read_update` or `Settings::read_volume_removal`,
+/// waiting for `apply`. Reading takes the time, as it lists folders and walks new ones, and
+/// leaves the index as it is, so searches go on meanwhile; applying takes a moment.
+pub struct Changes {
+    /// The entries to take out, sorted, each with everything inside it.
+    removed: Vec<EntryId>,
+    removed_folders: usize,
+    /// What the new folders hold, and the folder each of its anchors stands for.
+    added: Option<(Index, Vec<EntryId>)>,
+    /// A volume leaving the roots.
+    root: Option<EntryId>,
+    /// Applying may rebuild the lists, unless no changed path was under a root.
+    compacts: bool,
+    update: Update,
+    /// The index as read, which nothing may change before `apply`.
+    read_from: (usize, usize, usize),
+}
+
+impl Changes {
+    /// Brings `index` up to date with what was read. Panics when `index` is not the one read,
+    /// or changed since, as the entry numbers read would then be wrong.
+    pub fn apply(self, index: &mut Index) -> Update {
+        assert!(
+            self.read_from == index.state(),
+            "changes applied to the index they were read from, unchanged since"
+        );
+        let mut update = self.update;
+        if let Some(root) = self.root {
+            index.roots.retain(|&kept| kept != root);
+        }
+        index.removed += update.removed;
+        index.removed_folders += self.removed_folders;
+        let first_new = index.len();
+        let mut added_parents = Vec::new();
+        if let Some((new, anchors)) = &self.added {
+            update.added = index.splice(&mut added_parents, new, anchors);
+        }
+        index.fold_in(&self.removed, &added_parents, first_new);
+        if self.compacts {
+            update.compacted = index.compact_if_due();
+        }
+        update
+    }
 }
 
 /// Each folder's runs, by the folder's place in `folders`.
@@ -93,8 +138,13 @@ impl Index {
     /// an indexed folder updates the deepest indexed folder on its way, so a file's own path,
     /// a new folder's or a deleted one's all work. A path under no root changes nothing.
     pub(crate) fn update<P: AsRef<Path>>(&mut self, rules: &Rules, changed: &[P]) -> Update {
+        self.read_update(rules, changed).apply(self)
+    }
+
+    /// The first half of `update`: reads the changed folders, and walks the new ones, without
+    /// changing the index.
+    pub(crate) fn read_update<P: AsRef<Path>>(&self, rules: &Rules, changed: &[P]) -> Changes {
         let mut update = Update::default();
-        // Copied, as the lists change below while these paths are still read.
         let roots: Vec<(EntryId, PathBuf)> = self
             .roots
             .iter()
@@ -103,9 +153,8 @@ impl Index {
         let changed: Vec<&Path> = changed.iter().map(AsRef::as_ref).collect();
         let under_a_root = |path: &&Path| roots.iter().any(|(_, root)| path.starts_with(root));
         if !changed.iter().any(under_a_root) {
-            return update;
+            return self.changes(None, update);
         }
-        let first_new = self.len();
         let mut edit = self.edit();
         let mut targets = self.changed_folders(&edit, &roots, &changed);
         // Parents first, so a folder its parent replaced is not read into the old one.
@@ -135,31 +184,53 @@ impl Index {
                 }
                 update.folders_read += 1;
                 update.unreadable_folders += usize::from(partial);
-                update.removed += self.apply(&mut edit, folder, listing, partial, &mut added);
+                update.removed += self.compare(&mut edit, folder, listing, partial, &mut added);
             }
         }
+        let mut changes = self.changes(Some(edit), update);
         if !added.anchors.is_empty() {
             let walked = walk(added.builder, rules, NO_PARENT, added.walks, &|| false);
-            update.unreadable_folders += walked.unreadable_folders;
-            let new = walked.builder.lists();
-            update.added = self.splice(&mut edit.added_parents, &new, &added.anchors);
+            changes.update.unreadable_folders += walked.unreadable_folders;
+            changes.added = Some((walked.builder.lists(), added.anchors));
         }
-        self.fold_in(edit, first_new);
-        update.compacted = self.compact_if_due();
-        update
+        changes
     }
 
-    /// Folds what `edit` changed into the runs of siblings; entries from `first_new` on are new.
-    fn fold_in(&mut self, edit: Edit, first_new: usize) {
-        if edit.removed.is_empty() && edit.added_parents.is_empty() {
+    /// Changes taking out what `edit` removed, or nothing without one.
+    fn changes(&self, edit: Option<Edit>, update: Update) -> Changes {
+        let compacts = edit.is_some();
+        let (removed, removed_folders) = edit
+            .map(|edit| {
+                let mut removed: Vec<EntryId> = edit.removed.into_iter().collect();
+                removed.sort_unstable();
+                (removed, edit.removed_folders)
+            })
+            .unwrap_or_default();
+        Changes {
+            removed,
+            removed_folders,
+            added: None,
+            root: None,
+            compacts,
+            update,
+            read_from: self.state(),
+        }
+    }
+
+    /// What tells this index apart from itself after any change.
+    fn state(&self) -> (usize, usize, usize) {
+        (self.len(), self.removed, self.added)
+    }
+
+    /// Folds the entries `removed`, sorted, and those from `first_new` on, each inside its
+    /// folder in `added_parents`, into the runs of siblings.
+    fn fold_in(&mut self, removed: &[EntryId], added_parents: &[EntryId], first_new: usize) {
+        if removed.is_empty() && added_parents.is_empty() {
             return;
         }
-        let mut removed: Vec<EntryId> = edit.removed.into_iter().collect();
-        removed.sort_unstable();
-        let added = &edit.added_parents;
         self.siblings = self
             .siblings
-            .edited(&removed, first_new, added, &self.folders);
+            .edited(removed, first_new, added_parents, &self.folders);
     }
 
     /// Rebuilds the lists once the entries removed, and the names added entries store again,
@@ -250,15 +321,21 @@ impl Index {
     /// Takes a volume and everything inside it out of search. `None` when `volume` is not a
     /// volume this index holds.
     pub(crate) fn remove_volume(&mut self, volume: &Path) -> Option<Update> {
+        Some(self.read_volume_removal(volume)?.apply(self))
+    }
+
+    /// The first half of `remove_volume`, finding everything on the volume, as `read_update`.
+    pub(crate) fn read_volume_removal(&self, volume: &Path) -> Option<Changes> {
         let root = self.root_at(volume).filter(|&root| root != 0)?;
         let mut edit = self.edit();
-        self.roots.retain(|&kept| kept != root);
         let removed = self.remove(&mut edit, root);
-        self.fold_in(edit, self.len());
-        Some(Update {
+        let update = Update {
             removed,
-            compacted: self.compact_if_due(),
             ..Update::default()
+        };
+        Some(Changes {
+            root: Some(root),
+            ..self.changes(Some(edit), update)
         })
     }
 
@@ -395,9 +472,9 @@ impl Index {
     }
 
     /// Compares a folder's listing with its children in the index. Returns how many entries
-    /// were removed; new ones go to `added`.
-    fn apply(
-        &mut self,
+    /// it removes; new ones go to `added`.
+    fn compare(
+        &self,
         edit: &mut Edit,
         folder: EntryId,
         mut listing: Listing,
@@ -463,19 +540,18 @@ impl Index {
         gone.into_iter().map(|entry| self.remove(edit, entry)).sum()
     }
 
-    /// Removes `entry` and everything inside it from search. Returns how many entries that was.
-    fn remove(&mut self, edit: &mut Edit, entry: EntryId) -> usize {
+    /// Marks `entry` and everything inside it for removal. Returns how many entries that is.
+    fn remove(&self, edit: &mut Edit, entry: EntryId) -> usize {
         let mut removed = 0;
         let mut stack = vec![entry];
         while let Some(entry) = stack.pop() {
             if self.is_dir(entry) {
                 stack.extend(self.run_children(edit, entry));
-                self.removed_folders += 1;
+                edit.removed_folders += 1;
             }
             edit.removed.insert(entry);
             removed += 1;
         }
-        self.removed += removed;
         removed
     }
 
@@ -553,7 +629,7 @@ impl Index {
         Edit {
             runs: Runs::new(&self.siblings, self.folders.len()),
             removed: HashSet::new(),
-            added_parents: Vec::new(),
+            removed_folders: 0,
         }
     }
 
@@ -1028,8 +1104,12 @@ mod tests {
                     // Ejected or plugged in again, with changes on it still to come.
                     for volume in volumes.iter().filter(|_| with_volumes && rng.below(8) == 0) {
                         let (live, held) = (index.entry_count(), index.volumes().count());
-                        match settings.remove_volume(&mut index, volume) {
+                        let mut one_step = index.clone();
+                        let changes = settings.read_volume_removal(&index, volume);
+                        match changes.map(|changes| changes.apply(&mut index)) {
                             Some(ejected) => {
+                                let removed = settings.remove_volume(&mut one_step, volume);
+                                assert_eq!((removed, &one_step), (Some(ejected), &index));
                                 assert_eq!(index.entry_count(), live - ejected.removed);
                                 assert_eq!(index.volumes().count(), held - 1, "{context}");
                             }
@@ -1058,7 +1138,20 @@ mod tests {
                     let split = rng.below(changed.len() + 1);
                     for part in [&changed[..split], &changed[split..]] {
                         let live = index.entry_count();
-                        let update = settings.update(&mut index, part);
+                        // Read in one step and applied in the next, it ends as one update does,
+                        // and reading alone changes nothing.
+                        let mut one_step = index.clone();
+                        let changes = settings.read_update(&index, part);
+                        assert_eq!(index, one_step, "{context}");
+                        let update = changes.apply(&mut index);
+                        assert_eq!(settings.update(&mut one_step, part), update, "{context}");
+                        // New folders are read on all cores, so their entries may come in
+                        // another order.
+                        let kept = |index: &Index| {
+                            let counts = (index.len(), index.removed, index.added);
+                            (counts, index.removed_folders, findable(index, &root))
+                        };
+                        assert_eq!(kept(&one_step), kept(&index), "{context}");
                         assert_eq!(
                             index.entry_count(),
                             live + update.added - update.removed,
@@ -1093,6 +1186,37 @@ mod tests {
             compacted > 50 && in_place > 50,
             "rebuilt {compacted} times, patched in place {in_place} times"
         );
+    }
+
+    #[test]
+    #[should_panic(expected = "unchanged since")]
+    fn changes_are_never_applied_to_an_index_changed_since_they_were_read() {
+        let (_dir, root) = temp_root();
+        write(&root, &["a.txt"]);
+        let settings = keep_all(&root);
+        let mut index = settings.scan().unwrap().index;
+        write(&root, &["b.txt"]);
+        let changes = settings.read_update(&index, &[&root]);
+        settings.update(&mut index, &[&root]);
+        changes.apply(&mut index);
+    }
+
+    /// Compacting rewrites every list while searches wait. Run alone:
+    /// `cargo test -p argus-core --release compacting_a_home -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "scans the whole home folder with everything kept, and needs Full Disk Access"]
+    fn compacting_a_home_folder_with_everything_kept() {
+        let home = crate::home();
+        let settings = Settings::new(&home, &home, Clutter::Keep, Ignore::default(), Access::Full);
+        let mut index = settings.scan().unwrap().index;
+        for _ in 0..3 {
+            let started = std::time::Instant::now();
+            let mut parents = index.parents();
+            index.compact(&mut parents);
+            index.siblings = Siblings::from_parents(&parents, &index.folders);
+            let took = started.elapsed();
+            eprintln!("MEASURE compacting {} entries: {took:?}", index.len());
+        }
     }
 
     #[test]
@@ -2067,7 +2191,6 @@ mod tests {
         builder.push("a", root, false);
         let mut index = builder.finish();
         for round in 0..3 {
-            let mut edit = index.edit();
             let mut new = IndexBuilder::new();
             let anchor = new.push("", NO_PARENT, true);
             // 37 names a round, so groups of name starts are split across updates.
@@ -2079,13 +2202,12 @@ mod tests {
                 new.push(name, anchor, false);
             }
             let first_new = index.len();
-            let added = &mut edit.added_parents;
-            assert_eq!(index.splice(added, &new.lists(), &[root]), 37);
+            let mut added = Vec::new();
+            assert_eq!(index.splice(&mut added, &new.lists(), &[root]), 37);
             for (entry, name) in (first_new as EntryId..).zip(&names) {
                 assert_eq!(index.name(entry), name);
             }
-            let added = &edit.added_parents;
-            index.siblings = (index.siblings).edited(&[], first_new, added, &index.folders);
+            index.siblings = (index.siblings).edited(&[], first_new, &added, &index.folders);
         }
         assert_sound(&index);
     }
@@ -2137,13 +2259,14 @@ mod tests {
                     .filter(|&folder| folder == 0 || parents[folder as usize] != NO_PARENT)
                     .collect();
                 let mut parent = *rng.pick(&live);
+                let mut added_parents = Vec::new();
                 for _ in 0..rng.below(12) {
                     if rng.below(2) == 0 {
                         parent = *rng.pick(&live);
                     }
                     let id = index.len() as EntryId;
                     index.entry_name.push(0);
-                    edit.added_parents.push(parent);
+                    added_parents.push(parent);
                     parents.push(parent);
                     if rng.below(3) == 0 {
                         index.folders.push(id);
@@ -2153,12 +2276,8 @@ mod tests {
                 }
                 let mut removed: Vec<EntryId> = edit.removed.iter().copied().collect();
                 removed.sort_unstable();
-                let edited = (index.siblings).edited(
-                    &removed,
-                    first_new,
-                    &edit.added_parents,
-                    &index.folders,
-                );
+                let edited =
+                    (index.siblings).edited(&removed, first_new, &added_parents, &index.folders);
                 assert_eq!(
                     edited,
                     Siblings::from_parents(&parents, &index.folders),

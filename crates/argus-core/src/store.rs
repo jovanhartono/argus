@@ -28,7 +28,7 @@ use crate::index::{EntryId, Index, NameId};
 use crate::name_starts::NameStarts;
 use crate::scope::Scope;
 use crate::siblings::NO_FOLDER;
-use crate::update::Update;
+use crate::update::{Changes, Update};
 use crate::walk::{Access, Clutter, Rules, Scan, scan_with};
 use crc32fast::Hasher;
 use std::fmt;
@@ -124,6 +124,12 @@ impl Settings {
         index.update(&self.rules, changed)
     }
 
+    /// As `update`, in two steps, so searches can go on while the folders are read: this reads
+    /// them against `index`, leaving it as it is, and `Changes::apply` brings it up to date.
+    pub fn read_update<P: AsRef<Path>>(&self, index: &Index, changed: &[P]) -> Changes {
+        index.read_update(&self.rules, changed)
+    }
+
     /// Adds a mounted volume to an index built with these settings, scanned by the same
     /// rules, without reading the root or other volumes again. `volume` may be any path to
     /// it; `check_volume` tells which volumes to add. Fails as `scan` does for a volume
@@ -162,6 +168,11 @@ impl Settings {
     /// volume.
     pub fn remove_volume(&self, index: &mut Index, volume: &Path) -> Option<Update> {
         index.remove_volume(volume)
+    }
+
+    /// As `remove_volume`, in two steps, as `read_update`.
+    pub fn read_volume_removal(&self, index: &Index, volume: &Path) -> Option<Changes> {
+        index.read_volume_removal(volume)
     }
 
     /// The folders `index`, built with these settings, holds: the root and its volumes.
