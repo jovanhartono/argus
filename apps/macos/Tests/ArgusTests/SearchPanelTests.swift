@@ -814,6 +814,30 @@ final class SearchPanelTests: XCTestCase {
         XCTAssertEqual(window.chip.toolTip, window.scopes.last?.path)
     }
 
+    func testTheTextChipSitsBeforeTheFolderChipAndBackspaceLeavesOnlyTheFolder() async throws {
+        try FileManager.default.createDirectory(
+            at: root.appendingPathComponent("notes"), withIntermediateDirectories: false)
+        let window = try await opened(access: true)
+        window.show()
+        defer { window.hide() }
+        try await type("notes", in: window)
+        try await until { window.rows.first?.name == "notes" }
+        XCTAssertTrue(tab(window))
+        window.toggleText(nil)
+        XCTAssertFalse(window.chip.isHidden)
+        XCTAssertFalse(window.textChip.isHidden)
+        XCTAssertEqual(window.textChip.frame.minX, 50)
+        XCTAssertGreaterThan(window.chip.frame.minX, window.textChip.frame.maxX)
+        XCTAssertGreaterThan(window.field.frame.minX, window.chip.frame.maxX)
+        XCTAssertGreaterThanOrEqual(
+            window.textChipText.frame.width, window.textChipText.cell!.cellSize.width, "not cut short")
+
+        XCTAssertTrue(backspace(window))
+        XCTAssertTrue(window.scopes.isEmpty)
+        XCTAssertTrue(window.textOn, "⌘T alone turns it off")
+        XCTAssertGreaterThan(window.field.frame.minX, window.textChip.frame.maxX)
+    }
+
     func testTabPressedBeforeAFileArrivesStillReachesOpenSettings() async throws {
         try Data().write(to: root.appendingPathComponent("budget.txt"))
         let window = try await opened(access: false)
@@ -2260,6 +2284,7 @@ final class SearchPanelTests: XCTestCase {
         let window = try await opened(access: true)
         window.show()
         defer { window.hide() }
+        window.toggleText(nil)
         try await type("budget", in: window)
         try await until { window.status == "No Results" }
         try await Task.sleep(for: .milliseconds(100))
@@ -2274,6 +2299,7 @@ final class SearchPanelTests: XCTestCase {
         let window = try await opened(access: true, textFolders: [root.path])
         window.show()
         defer { window.hide() }
+        window.toggleText(nil)
         try await type("budget", in: window)
         XCTAssertEqual(window.textTicket, 0, "no file is read before the names are drawn")
         try await until { window.rows.map(\.name) == ["budget.txt"] && window.hits.count == 1 }
@@ -2315,6 +2341,7 @@ final class SearchPanelTests: XCTestCase {
         let window = try await opened(access: true, textFolders: [root.path])
         window.show()
         defer { window.hide() }
+        window.toggleText(nil)
         try await type("budget", in: window)
         try await untilClose { window.textTicket != 0 }
         try await type("review", in: window)
@@ -2331,6 +2358,7 @@ final class SearchPanelTests: XCTestCase {
         let window = try await opened(access: true, textFolders: [root.path])
         window.show()
         defer { window.hide() }
+        window.toggleText(nil)
         try await type("zebra", in: window)
         try await until { window.answered != 0 }
         XCTAssertEqual(window.status, window.hits.isEmpty ? "Searching inside files…" : nil)
@@ -2354,6 +2382,7 @@ final class SearchPanelTests: XCTestCase {
         let window = try await opened(access: true, textFolders: [root.path])
         window.show()
         defer { window.hide() }
+        window.toggleText(nil)
         try await type("budget", in: window)
         try await until { window.rows.count == 2 && window.hits.count == 1 }
         XCTAssertEqual(window.header, 2)
@@ -2370,50 +2399,152 @@ final class SearchPanelTests: XCTestCase {
         XCTAssertEqual(clicked, [1], "a click on the title keeps the pick")
     }
 
-    func testAHiddenWindowReadsNoFileUntilShown() async throws {
+    func testAPlainSearchReadsNoFile() async throws {
         try write("the budget", at: "notes/plan.txt")
+        try write("x", at: "notes/budget.txt")
         let window = try await opened(access: true, textFolders: [root.path])
+        window.show()
+        defer { window.hide() }
+        XCTAssertFalse(window.textOn)
+        XCTAssertTrue(window.textChip.isHidden)
         try await type("budget", in: window)
-        try await until { window.answered != 0 }
+        try await until { window.rows.map(\.name) == ["budget.txt"] }
+        try await type("the budget", in: window)
+        try await until { window.answered != 0 && window.rows.isEmpty }
+        XCTAssertEqual(window.status, "No Results", "never Searching inside files…")
         try await Task.sleep(for: .milliseconds(200))
         XCTAssertEqual(window.textTicket, 0)
         XCTAssertEqual(window.hits, [])
-        window.show()
-        defer { window.hide() }
-        try await until { window.hits.count == 1 && window.textTicket == 0 }
-
-        // Shown again, the files are read again, the old line staying up until the new one comes.
-        window.hide()
-        window.show()
-        XCTAssertNotEqual(window.textTicket, 0)
-        XCTAssertEqual(window.hits.count, 1)
-        try await until { window.textTicket == 0 }
-        XCTAssertEqual(window.hits.count, 1, "never listed twice")
+        XCTAssertNil(window.header)
     }
 
-    func testHidingMidSearchKeepsTheLinesAndTheHeightAndShowingReadsAgain() async throws {
+    func testCommandTSearchesTheSameWordsInsideFilesAndBackToNames() async throws {
+        try write("the budget", at: "notes/plan.txt")
+        try write("x", at: "notes/budget.txt")
+        let window = try await opened(access: true, textFolders: [root.path])
+        window.show()
+        defer { window.hide() }
+        try await type("budget", in: window)
+        try await until { window.rows.count == 1 }
+        let wide = window.field.frame
+
+        window.toggleText(nil)
+        XCTAssertTrue(window.textOn)
+        XCTAssertFalse(window.textChip.isHidden)
+        XCTAssertEqual(window.textChipText.stringValue, "Inside Files")
+        XCTAssertGreaterThan(window.field.frame.minX, window.textChip.frame.maxX)
+        XCTAssertEqual(window.field.frame.maxX, wide.maxX)
+        XCTAssertEqual(window.field.stringValue, "budget", "the same words")
+        XCTAssertNotEqual(window.textTicket, 0, "starts at once: the names are already drawn")
+        try await until { window.hits.count == 1 && window.textTicket == 0 }
+        XCTAssertEqual(window.rows.map(\.name), ["budget.txt"])
+        down(window)
+        XCTAssertEqual(window.selected?.name, "plan.txt")
+
+        window.toggleText(nil)
+        XCTAssertFalse(window.textOn)
+        XCTAssertTrue(window.textChip.isHidden)
+        XCTAssertEqual(window.field.frame, wide)
+        XCTAssertEqual(window.hits, [])
+        XCTAssertNil(window.header)
+        XCTAssertEqual(window.table.numberOfRows, 1)
+        XCTAssertEqual(window.table.selectedRow, 0, "the picked line hands the pick to the top name")
+        try await until { window.panel.frame.height == Metric.field + 1 + Metric.row + 2 * Metric.inset }
+    }
+
+    func testCommandTWhileTheNamesAreOnTheirWayWaitsForThem() async throws {
+        try write("the budget", at: "notes/plan.txt")
+        let window = try await opened(access: true, textFolders: [root.path])
+        window.show()
+        defer { window.hide() }
+        try await type("budget", in: window)
+        window.toggleText(nil)
+        try await until { window.answered != 0 && window.hits.count == 1 && window.textTicket == 0 }
+    }
+
+    func testCommandTOffMidSearchStopsItAndItsLinesNeverLand() async throws {
+        try writeMany()
+        for at in 0..<30 { try write("x\nthe budget \(at)\n", at: "filler/\(at)/plan.txt") }
+        let window = try await opened(access: true, textFolders: [root.path])
+        window.show()
+        defer { window.hide() }
+        window.toggleText(nil)
+        try await type("budget", in: window)
+        try await untilClose { window.textTicket != 0 }
+        window.toggleText(nil)
+        XCTAssertEqual(window.textTicket, 0)
+        try await Task.sleep(for: .milliseconds(200))
+        XCTAssertEqual(window.hits, [])
+        XCTAssertEqual(window.status, "No Results")
+    }
+
+    /// Hiding switches back to names; the lines and the chip go once the window is out of sight.
+    func testHidingMidSearchStopsItAndShowingSearchesNamesOnly() async throws {
         try writeMany()
         // Fewer lines than the 100 a search stops at, so it reads every file.
         for at in 0..<30 { try write("x\nthe budget \(at)\n", at: "filler/\(at)/plan.txt") }
         let window = try await opened(access: true, textFolders: [root.path])
         window.show()
         defer { window.hide() }
+        window.toggleText(nil)
         try await type("budget", in: window)
         try await untilClose { window.textTicket != 0 && !window.hits.isEmpty }
         window.hide()
         XCTAssertEqual(window.textTicket, 0, "hiding stops it")
-        let partial = window.hits.count
-        try await Task.sleep(for: .milliseconds(200))
-        XCTAssertEqual(window.hits.count, partial, "nothing lands while hidden")
+        XCTAssertFalse(window.textOn)
+        XCTAssertFalse(window.textChip.isHidden, "nothing moves while the window fades out")
+        try await until { window.hits.isEmpty && window.textChip.isHidden }
         try await settled(window)
-        let height = window.panel.frame.height
 
         window.show()
-        XCTAssertNotEqual(window.textTicket, 0, "the stopped search starts again")
-        XCTAssertEqual(window.hits.count, partial, "the lines stay until the new ones come")
-        XCTAssertEqual(window.panel.frame.height, height)
+        XCTAssertFalse(window.textOn)
+        XCTAssertEqual(window.textTicket, 0, "no file is read on show")
+        try await Task.sleep(for: .milliseconds(200))
+        XCTAssertEqual(window.hits, [])
+
+        window.toggleText(nil)
         try await until { window.textTicket == 0 && window.hits.count == 30 }
         XCTAssertEqual(Set(window.hits.map(\.path)).count, 30, "no line listed twice")
+    }
+
+    func testShownAgainWhileFadingOutTheLinesAndChipGo() async throws {
+        try write("the budget", at: "notes/plan.txt")
+        let window = try await opened(access: true, textFolders: [root.path])
+        window.show()
+        defer { window.hide() }
+        window.toggleText(nil)
+        try await type("budget", in: window)
+        try await until { window.hits.count == 1 && window.textTicket == 0 }
+        down(window)
+        window.hide()
+        window.show()
+        XCTAssertFalse(window.textOn)
+        XCTAssertTrue(window.textChip.isHidden)
+        XCTAssertEqual(window.hits, [])
+        XCTAssertEqual(window.textTicket, 0)
+        XCTAssertNil(window.header)
+    }
+
+    /// Sent as AppKit sends a key equivalent: the menu finds ⌘T's action through the window.
+    func testCommandTIsTheWindowsOwnKeyAndClashesWithNoOther() async throws {
+        let items = keyMenu().items.flatMap { $0.submenu?.items ?? [] }
+        let bound = items.filter { $0.keyEquivalent == "t" && $0.keyEquivalentModifierMask == .command }
+        XCTAssertEqual(bound.map(\.action), [#selector(SearchPanel.toggleText(_:))])
+        let keys = items.map { "\($0.keyEquivalentModifierMask.rawValue) \($0.keyEquivalent)" }
+        XCTAssertEqual(Set(keys).count, keys.count, "no two items share a key")
+
+        let window = try await opened(access: true)
+        window.show()
+        defer { window.hide() }
+        window.panel.makeFirstResponder(window.field)
+        let editor = try XCTUnwrap(window.field.currentEditor())
+        let commandT = key("t", flags: .command)
+        XCTAssertFalse(editor.performKeyEquivalent(with: commandT), "the box leaves ⌘T to the menu")
+        XCTAssertFalse(window.panel.performKeyEquivalent(with: commandT))
+        XCTAssertTrue(window.panel.tryToPerform(try XCTUnwrap(bound.first?.action), with: bound.first))
+        XCTAssertTrue(window.textOn)
+        XCTAssertTrue(window.panel.tryToPerform(try XCTUnwrap(bound.first?.action), with: bound.first))
+        XCTAssertFalse(window.textOn)
     }
 
     func testClearingTheBoxDropsTheLinesAndTypingAgainFindsThem() async throws {
@@ -2421,6 +2552,7 @@ final class SearchPanelTests: XCTestCase {
         let window = try await opened(access: true, textFolders: [root.path])
         window.show()
         defer { window.hide() }
+        window.toggleText(nil)
         try await type("budget", in: window)
         try await until { window.hits.count == 1 && window.textTicket == 0 }
         try await type("", in: window)
@@ -2439,11 +2571,13 @@ final class SearchPanelTests: XCTestCase {
         let window = try await opened(access: true, textFolders: [root.path])
         window.show()
         defer { window.hide() }
+        window.toggleText(nil)
         try await type("budget", in: window)
         try await until { window.hits.map(\.line) == [1] && window.textTicket == 0 }
         window.hide()
         try write("intro\nthe budget", at: "notes/plan.txt")
         window.show()
+        window.toggleText(nil)
         try await until { window.hits.map(\.line) == [2] && window.textTicket == 0 }
         XCTAssertEqual(window.table.selectedRow, 1)
     }
@@ -2453,6 +2587,7 @@ final class SearchPanelTests: XCTestCase {
         let window = try await opened(access: true, textFolders: [root.path])
         window.show()
         defer { window.hide() }
+        window.toggleText(nil)
         try await type("zzqx", in: window)
         try await untilClose { window.answered != 0 }
         try XCTSkipIf(window.textTicket == 0, "the files were read before the names were seen")
@@ -2466,6 +2601,7 @@ final class SearchPanelTests: XCTestCase {
         let window = try await opened(access: true, standIn: 1000, textFolders: [root.path])
         window.show()
         defer { window.hide() }
+        window.toggleText(nil)
         try await type("zzqx", in: window)
         try await until { window.answered != 0 && window.hits.count == 1 && window.textTicket == 0 }
         XCTAssertTrue(window.rows.isEmpty)
@@ -2482,6 +2618,7 @@ final class SearchPanelTests: XCTestCase {
         health.hide()
         window.show()
         defer { window.hide() }
+        window.toggleText(nil)
         try await type("budget", in: window)
         try await until { window.hits.count == 1 }
     }
@@ -2491,6 +2628,7 @@ final class SearchPanelTests: XCTestCase {
         let window = try await opened(access: true, textFolders: [root.path])
         window.show()
         defer { window.hide() }
+        window.toggleText(nil)
         try await type("zzqx", in: window)
         try await until { window.answered != 0 && window.textTicket == 0 }
         XCTAssertEqual(window.status, "No Results")
@@ -2506,6 +2644,7 @@ final class SearchPanelTests: XCTestCase {
         window.toggleInFinderFolder()
         try await until { window.shown }
         defer { window.hide() }
+        window.toggleText(nil)
         try await type("budget", in: window)
         try await until { window.answered != 0 && window.textTicket == 0 && !window.hits.isEmpty }
         XCTAssertEqual(window.hits.map(\.path), [notes + "/plan.txt"])
@@ -2517,6 +2656,7 @@ final class SearchPanelTests: XCTestCase {
         let window = try await opened(access: true, textFolders: [root.path])
         window.show()
         defer { window.hide() }
+        window.toggleText(nil)
         try await type("budget", in: window)
         try await until { window.rows.count == 1 && window.hits.count == 1 && window.textTicket == 0 }
         down(window)
@@ -2540,6 +2680,7 @@ final class SearchPanelTests: XCTestCase {
         let window = try await opened(access: true, textFolders: [root.path])
         window.show()
         defer { window.hide() }
+        window.toggleText(nil)
         try await type("budget", in: window)
         try await until { window.rows.count == 1 && window.hits.count == 1 && window.textTicket == 0 }
         let waiting = (hit: window.hits[0], row: 2)
