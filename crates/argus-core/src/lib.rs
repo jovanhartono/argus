@@ -27,7 +27,7 @@ pub use stand_in::stand_in;
 pub use store::{
     OpenError, Opened, Saved, Settings, open_index, open_or_scan, remove_old_temps, save_index,
 };
-pub use update::Update;
+pub use update::{Changes, Update};
 pub use volume::{Refusal, check_volume};
 pub use walk::{Access, Clutter, Scan, home, scan, scan_until};
 pub use within::Within;
