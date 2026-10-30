@@ -1168,9 +1168,7 @@ final class SearchPanelTests: XCTestCase {
         let caches = root.appendingPathComponent("Library/Caches")
         try FileManager.default.createDirectory(at: caches, withIntermediateDirectories: true)
         try Data().write(to: caches.appendingPathComponent("cached.db"))
-        let name = "argus-tests-\(UUID().uuidString)"
-        let defaults = try XCTUnwrap(UserDefaults(suiteName: name))
-        defer { defaults.removePersistentDomain(forName: name) }
+        let defaults = MemoryDefaults()
         let window = try await opened(access: true, everything: IndexEverything(defaults: defaults))
         window.showHealth(nil)
         let health = try XCTUnwrap(window.health)
