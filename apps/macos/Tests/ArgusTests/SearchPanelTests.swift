@@ -14,6 +14,7 @@ final class SearchPanelTests: XCTestCase {
 
     override func setUp() async throws {
         _ = NSApplication.shared
+        UserDefaults.keepHotkeysInMemory()
         stage = OffStage()
         root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
@@ -1213,7 +1214,7 @@ final class SearchPanelTests: XCTestCase {
         window.hide()
     }
 
-    func testOnlyALoginLaunchStaysHidden() {
+    func testOnlyALoginLaunchStaysHidden() async throws {
         let open = {
             NSAppleEventDescriptor(
                 eventClass: AEEventClass(kCoreEventClass), eventID: AEEventID(kAEOpenApplication), targetDescriptor: nil,
@@ -1221,9 +1222,17 @@ final class SearchPanelTests: XCTestCase {
         }
         let atLogin = open()
         atLogin.setParam(NSAppleEventDescriptor(enumCode: OSType(keyAELaunchedAsLogInItem)), forKeyword: keyAEPropData)
-        XCTAssertTrue(AppDelegate.launchedAtLogin(atLogin))
-        XCTAssertFalse(AppDelegate.launchedAtLogin(open()), "opened from Applications or Quit & Reopen")
-        XCTAssertFalse(AppDelegate.launchedAtLogin(nil), "started from a terminal")
+        let window = try await opened(access: true)
+        let delegate = AppDelegate()
+        delegate.window = window
+        delegate.launched(by: atLogin)
+        XCTAssertFalse(window.shown)
+        XCTAssertEqual(stage.forward, 0)
+        for (event, how) in [(open(), "opened from Applications or Quit & Reopen"), (nil, "started from a terminal")] {
+            delegate.launched(by: event)
+            XCTAssertTrue(window.shown, how)
+            window.hide()
+        }
     }
 
     func testCommandCommaSwapsTheSearchWindowForTheHealthView() async throws {

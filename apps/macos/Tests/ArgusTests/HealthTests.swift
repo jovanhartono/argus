@@ -97,6 +97,7 @@ final class HealthWindowTests: XCTestCase {
 
     override func setUp() async throws {
         _ = NSApplication.shared
+        UserDefaults.keepHotkeysInMemory()
         stage = OffStage()
         folders = TextFolders()
     }
@@ -598,6 +599,76 @@ final class HealthWindowTests: XCTestCase {
         XCTAssertTrue(window.panel.firstResponder === window.folderList, "a recorder with the focus would take keys")
         XCTAssertNil(window.windowKeys.currentEditor())
         XCTAssertNil(window.finderKeys.currentEditor())
+    }
+
+    func testOneShortcutCanOnlyDoOneOfTheTwoJobs() {
+        let window = window()
+        let finders = KeyboardShortcuts.Shortcut(.space, modifiers: [.command, .shift, .option])
+        let opens = KeyboardShortcuts.Shortcut(.space, modifiers: [.command, .shift])
+        XCTAssertEqual(
+            window.windowKeys.validateShortcut?(finders),
+            .disallow(reason: "This shortcut is already used to search Finder’s folder."))
+        XCTAssertEqual(
+            window.finderKeys.validateShortcut?(opens), .disallow(reason: "This shortcut is already used to open Argus."))
+        let free = KeyboardShortcuts.Shortcut(.k, modifiers: [.command, .option])
+        XCTAssertEqual(window.windowKeys.validateShortcut?(free), .allow)
+        XCTAssertEqual(window.windowKeys.validateShortcut?(opens), .allow, "its own keys again")
+    }
+
+    /// The warning a recorder shows, as for ⌘Space that Spotlight uses, is a sheet that takes the keys.
+    func testARecordersWarningLeavesTheWindowUp() {
+        let window = window()
+        window.show()
+        defer { window.hide() }
+        window.windowWillBeginSheet(Notification(name: NSWindow.willBeginSheetNotification))
+        window.windowDidResignKey(Notification(name: NSWindow.didResignKeyNotification))
+        XCTAssertTrue(window.shown)
+        window.windowDidEndSheet(Notification(name: NSWindow.didEndSheetNotification))
+        window.windowDidResignKey(Notification(name: NSWindow.didResignKeyNotification))
+        XCTAssertFalse(window.shown, "with the warning gone, a click in another app hides it again")
+    }
+
+    /// A recorder lets go of the keys before passing Tab on, which used to send Tab back to the
+    /// folder list, so Quit Argus and the rows above it couldn't be reached.
+    func testTabGoesOnFromAHotkeyRecorder() async throws {
+        let window = window()
+        window.show()
+        defer { window.hide() }
+        // A recorder takes Tab only a moment after it joins a window, so it never starts with the focus.
+        try await Task.sleep(for: .milliseconds(50))
+        let tab = { (shift: Bool) in
+            let character = shift ? "\u{19}" : "\t"
+            return NSEvent.keyEvent(
+                with: .keyDown, location: .zero, modifierFlags: shift ? [.shift] : [], timestamp: 0, windowNumber: 0,
+                context: nil, characters: character, charactersIgnoringModifiers: character, isARepeat: false,
+                keyCode: 48)!
+        }
+        for (shift, expected) in [(false, window.windowKeys.nextValidKeyView), (true, window.windowKeys.previousValidKeyView)] {
+            XCTAssertTrue(window.panel.makeFirstResponder(window.windowKeys))
+            XCTAssertTrue(window.panel.makeFirstResponder(nil), "what the recorder does with Tab")
+            window.panel.keyDown(with: tab(shift))
+            let reached = (window.panel.firstResponder as? NSText)?.delegate as? NSView ?? window.panel.firstResponder
+            XCTAssertTrue(reached === expected, "\(String(describing: reached)) after \(shift ? "⇧Tab" : "Tab")")
+        }
+        XCTAssertTrue(window.windowKeys.nextValidKeyView === window.finderKeys, "the next recorder takes Tab")
+        // Recording pauses every hotkey in the process, so none is left recording.
+        window.panel.makeFirstResponder(nil)
+        try await Task.sleep(for: .milliseconds(50))
+    }
+
+    /// 752 to 800 pt tall, it grew under the Dock on a 13" MacBook Air.
+    func testTheWindowStaysAboveTheDock() throws {
+        fullDisk = false
+        let window = window()
+        guard let visible = (window.panel.screen ?? NSScreen.main)?.visibleFrame, visible.height >= 800 else {
+            throw XCTSkip("no screen tall enough to hold it")
+        }
+        window.panel.setFrameOrigin(NSPoint(x: visible.minX, y: visible.minY))
+        window.show()
+        defer { window.hide() }
+        XCTAssertGreaterThan(window.panel.frame.height, 760, "it grew for the Open System Settings row")
+        XCTAssertGreaterThanOrEqual(window.panel.frame.minY, visible.minY)
+        XCTAssertLessThanOrEqual(window.panel.frame.maxY, visible.maxY)
     }
 
     private func key(_ code: Int) -> NSEvent {

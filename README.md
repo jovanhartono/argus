@@ -18,7 +18,7 @@ Needs Xcode 16 or later (Swift 6).
 ```sh
 ./scripts/make-signing-cert.sh               # once per Mac, so permissions survive rebuilds
 ./scripts/build-mac.sh                       # builds build/Argus.app
-open build/Argus.app                     # then press ⌘⇧Space
+open build/Argus.app                     # the search window opens; ⌘⇧Space hides it and brings it back
 swift test --package-path apps/macos
 rustup target add x86_64-apple-darwin        # once, before the first .dmg
 ./scripts/make-dmg.sh                        # builds build/Argus.dmg for Apple and Intel chips

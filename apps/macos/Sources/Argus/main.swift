@@ -13,9 +13,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     var window: SearchPanel?
     private var drives: Drives?
 
-    /// macOS's own "open" event says so when Login Items started Argus.
-    static func launchedAtLogin(_ event: NSAppleEventDescriptor?) -> Bool {
-        event?.paramDescriptor(forKeyword: keyAEPropData)?.enumCodeValue == keyAELaunchedAsLogInItem
+    /// Opened from Applications, as after installing or Quit & Reopen, the window shows so
+    /// something visibly happens. At login, which macOS's own "open" event says, Argus waits
+    /// quietly for the hotkey.
+    func launched(by event: NSAppleEventDescriptor?) {
+        guard event?.paramDescriptor(forKeyword: keyAEPropData)?.enumCodeValue != keyAELaunchedAsLogInItem else {
+            return
+        }
+        window?.show()
     }
 
     func applicationDidFinishLaunching(_ note: Notification) {
@@ -33,9 +38,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         KeyboardShortcuts.onKeyDown(for: .toggleWindow) { window.toggle() }
         KeyboardShortcuts.onKeyDown(for: .searchFinderFolder) { window.toggleInFinderFolder() }
         self.window = window
-        // Opened from Applications, as after installing or Quit & Reopen, the window shows so
-        // something visibly happens. At login Argus waits quietly for the hotkey.
-        if !Self.launchedAtLogin(NSAppleEventManager.shared().currentAppleEvent) { window.show() }
+        launched(by: NSAppleEventManager.shared().currentAppleEvent)
     }
 
     /// Opening Argus again while it runs brings the window up instead of doing nothing.

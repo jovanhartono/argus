@@ -89,9 +89,30 @@ struct HealthFormat {
 /// Esc closes it, as it does the search window.
 final class HealthPanel: NSPanel {
     override var canBecomeKey: Bool { true }
+    /// A hotkey recorder lets go of the keys before passing Tab on, so AppKit would send Tab back
+    /// to the folder list and the rows under the recorders could never be reached.
+    private weak var recorderLeft: NSView?
 
     override func cancelOperation(_ sender: Any?) {
         (delegate as? HealthWindow)?.hide()
+    }
+
+    @discardableResult
+    override func makeFirstResponder(_ responder: NSResponder?) -> Bool {
+        let recorder = (firstResponder as? NSText)?.delegate as? KeyboardShortcuts.RecorderCocoa
+        let made = super.makeFirstResponder(responder)
+        if made { recorderLeft = responder == nil ? recorder : nil }
+        return made
+    }
+
+    override func selectNextKeyView(_ sender: Any?) {
+        guard firstResponder === self, let recorderLeft else { return super.selectNextKeyView(sender) }
+        selectKeyView(following: recorderLeft)
+    }
+
+    override func selectPreviousKeyView(_ sender: Any?) {
+        guard firstResponder === self, let recorderLeft else { return super.selectPreviousKeyView(sender) }
+        selectKeyView(preceding: recorderLeft)
     }
 }
 
@@ -159,6 +180,7 @@ final class HealthWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, NST
     let folders: TextFolders
     /// The open panel takes the keys meanwhile, which must not close this window.
     private(set) var choosing = false
+    private var sheetUp = false
     private let read: () -> Health
     private let hasAccess: () -> Bool
     private let onRebuild: () -> Void
@@ -269,6 +291,16 @@ final class HealthWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, NST
             openLoginItems, quit,
         ]
         for (at, view) in order.enumerated() { view.nextKeyView = order[(at + 1) % order.count] }
+        // One press would run both, and the search window would flash up and straight away.
+        let uses: [(KeyboardShortcuts.RecorderCocoa, KeyboardShortcuts.Name, String)] = [
+            (windowKeys, .searchFinderFolder, "search Finder’s folder"), (finderKeys, .toggleWindow, "open Argus"),
+        ]
+        for (recorder, other, use) in uses {
+            recorder.validateShortcut = { shortcut in
+                shortcut == KeyboardShortcuts.getShortcut(for: other)
+                    ? .disallow(reason: "This shortcut is already used to \(use).") : .allow
+            }
+        }
         panel.setContentSize(content.fittingSize)
         panel.center()
     }
@@ -484,6 +516,10 @@ final class HealthWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, NST
         guard let content = panel.contentView else { return }
         var frame = panel.frameRect(forContentRect: NSRect(origin: .zero, size: content.fittingSize))
         frame.origin = NSPoint(x: panel.frame.minX, y: panel.frame.maxY - frame.height)
+        // Grown downward on a 13" MacBook Air, Quit Argus ended up under the Dock.
+        if let visible = (panel.screen ?? NSScreen.main)?.visibleFrame {
+            frame.origin.y = min(max(frame.minY, visible.minY), visible.maxY - frame.height)
+        }
         if frame != panel.frame { panel.setFrame(frame, display: shown) }
     }
 
@@ -524,9 +560,19 @@ final class HealthWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, NST
         return false
     }
 
+    /// A recorder's warning, as for ⌘Space taken by Spotlight, is a sheet that takes the keys;
+    /// hiding under it left the window stuck on screen.
+    func windowWillBeginSheet(_ note: Notification) {
+        sheetUp = true
+    }
+
+    func windowDidEndSheet(_ note: Notification) {
+        sheetUp = false
+    }
+
     /// Like the search window, it goes once you click in another app.
     func windowDidResignKey(_ note: Notification) {
-        guard !choosing else { return }
+        guard !choosing, !sheetUp else { return }
         hide()
     }
 }
