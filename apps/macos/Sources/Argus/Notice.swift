@@ -18,7 +18,7 @@ enum Notice: Equatable {
 
     var text: String {
         switch self {
-        case .needsAccess: "Allow Full Disk Access to search Desktop, Documents and Downloads."
+        case .needsAccess: "Allow Full Disk Access to search Desktop, Documents, Downloads and external drives."
         case .needsFinder: "Allow Argus to control Finder to search the folder Finder shows."
         }
     }

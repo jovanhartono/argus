@@ -2,7 +2,7 @@ import AppKit
 
 /// Shows a file found by name, a line found inside a file, or the title above those lines. A
 /// row on screen changes from one to another in place as you type.
-final class ResultCell: NSTableCellView {
+final class ResultCell: NSTableCellView, NSViewToolTipOwner {
     static let id = NSUserInterfaceItemIdentifier("result")
 
     let icon = NSImageView(frame: NSRect(x: 6, y: 8, width: 32, height: 32))
@@ -26,32 +26,50 @@ final class ResultCell: NSTableCellView {
         }
         addSubview(icon)
         backgroundStyle = .normal
+        addToolTip(bounds, owner: self, userData: nil)
     }
 
     required init?(coder: NSCoder) { nil }
 
+    /// A name or folder cut short shows whole on hover. Worked out only then: AppKit's own
+    /// expansion tips measured every label as it was set, 1.5-2 ms more per keystroke.
+    func view(
+        _ view: NSView, stringForToolTip tag: NSView.ToolTipTag, point: NSPoint, userData data: UnsafeMutableRawPointer?
+    ) -> String {
+        let label = point.y >= name.frame.minY ? name : folder
+        guard !label.isHidden, label.attributedStringValue.size().width > label.frame.width else { return "" }
+        return label.stringValue
+    }
+
     /// Only what differs is set: each label set again lays itself out again.
-    func show(_ row: Row, icon image: NSImage) {
+    /// Inside `scope`, the folder the chip names, the folder is written from there.
+    func show(_ row: Row, icon image: NSImage, in scope: String? = nil) {
         if hit != nil || isHeader { reset() }
         if name.stringValue != row.name { name.stringValue = row.name }
-        let place = Self.place(row.folder)
+        let place = Self.place(row.folder, in: scope)
         if folder.stringValue != place { folder.stringValue = place }
         if icon.image !== image { icon.image = image }
     }
 
     private static let home = NSHomeDirectory()
 
-    /// A folder on a drive leads with the drive's name, "Photos › trips/2024", kept in view
-    /// when a long path is cut in the middle.
-    static func place(_ folder: String, home: String = ResultCell.home) -> String {
-        guard folder.hasPrefix("/Volumes/"), !folder.isInside(home) else { return folder }
+    /// The home folder is "~", as the details pane writes it. A folder on a drive leads with the
+    /// drive's name, "Photos › trips/2024", and one inside the chip's folder with that folder's
+    /// name, "Budget › invoices", each kept in view when a long path is cut in the middle.
+    static func place(_ folder: String, in scope: String? = nil, home: String = ResultCell.home) -> String {
+        if let scope, folder.isInside(scope) {
+            let name = (scope as NSString).lastPathComponent
+            return folder == scope ? name : "\(name) › \(folder.dropFirst(scope.count).drop { $0 == "/" })"
+        }
+        if folder.isInside(home) { return "~" + folder.dropFirst(home.count) }
+        guard folder.hasPrefix("/Volumes/") else { return folder }
         let parts = folder.dropFirst("/Volumes/".count).split(separator: "/", maxSplits: 1)
         guard let drive = parts.first else { return folder }
         return parts.count == 1 ? String(drive) : "\(drive) › \(parts[1])"
     }
 
     /// "budget.md, line 12 · ~/notes" under the line, the match in bold.
-    func show(_ found: TextHit, icon image: NSImage) {
+    func show(_ found: TextHit, icon image: NSImage, in scope: String? = nil) {
         if isHeader { reset() }
         guard found != hit else { return }
         hit = found
@@ -59,20 +77,22 @@ final class ResultCell: NSTableCellView {
         shown = Self.excerpt(found.text, match: found.match, width: name.frame.width, font: Self.bold)
         paint()
         let file = found.file
-        folder.stringValue = "\(file.name), line \(found.line) · \(Self.place((file.folder as NSString).abbreviatingWithTildeInPath))"
+        folder.stringValue = "\(file.name), line \(found.line) · \(Self.place(file.folder, in: scope))"
         if icon.image !== image { icon.image = image }
     }
 
+    /// The title's words change as the search for lines goes on.
     func showHeader(_ title: String) {
-        guard !isHeader else { return }
-        hit = nil
-        isHeader = true
-        icon.isHidden = true
-        folder.isHidden = true
-        name.frame.origin = NSPoint(x: 18, y: 4)
-        name.font = .systemFont(ofSize: NSFont.smallSystemFontSize, weight: .semibold)
-        name.textColor = .secondaryLabelColor
-        name.stringValue = title
+        if !isHeader {
+            hit = nil
+            isHeader = true
+            icon.isHidden = true
+            folder.isHidden = true
+            name.frame.origin = NSPoint(x: 18, y: 4)
+            name.font = .systemFont(ofSize: NSFont.smallSystemFontSize, weight: .semibold)
+            name.textColor = .secondaryLabelColor
+        }
+        if name.stringValue != title { name.stringValue = title }
     }
 
     private func reset() {
