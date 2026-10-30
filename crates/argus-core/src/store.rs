@@ -130,6 +130,19 @@ impl Settings {
         index.read_update(&self.rules, changed)
     }
 
+    /// As `read_update`, but once `stop` says so no more folders are read and it fails with
+    /// `Interrupted`, so a drive ejected while its folders are read never waits for them.
+    pub fn read_update_until<P: AsRef<Path>>(
+        &self,
+        index: &Index,
+        changed: &[P],
+        stop: &(dyn Fn() -> bool + Sync),
+    ) -> io::Result<Changes> {
+        index
+            .read_update_until(&self.rules, changed, stop)
+            .ok_or_else(|| io::ErrorKind::Interrupted.into())
+    }
+
     /// Adds a mounted volume to an index built with these settings, scanned by the same
     /// rules, without reading the root or other volumes again. `volume` may be any path to
     /// it; `check_volume` tells which volumes to add. Fails as `scan` does for a volume

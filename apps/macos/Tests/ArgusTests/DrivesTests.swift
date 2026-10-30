@@ -1,4 +1,5 @@
 import AppKit
+import DiskArbitration
 import XCTest
 import os
 
@@ -51,6 +52,19 @@ final class DrivesTests: XCTestCase {
         post(NSWorkspace.didUnmountNotification, "/Volumes/Photos")
         post(NSWorkspace.didMountNotification, "/Volumes/Photos")
         XCTAssertEqual(heard, ["+/Volumes/Photos", "-/Volumes/Photos", "+/Volumes/Photos"])
+        _ = drives
+    }
+
+    func testEachUnmountIsToldOnceDoneWithOrWithoutAnEject() {
+        var gone: [String] = []
+        let drives = Drives(
+            center: center, mounted: [], isMounted: { _ in false }, added: { _ in }, removing: { _ in },
+            gone: { gone.append($0) })
+        post(NSWorkspace.willUnmountNotification, "/Volumes/Photos")
+        XCTAssertEqual(gone, [], "still mounted while macOS asks")
+        post(NSWorkspace.didUnmountNotification, "/Volumes/Photos")
+        post(NSWorkspace.didUnmountNotification, "/Volumes/Music")
+        XCTAssertEqual(gone, ["/Volumes/Photos", "/Volumes/Music"])
         _ = drives
     }
 
@@ -119,6 +133,24 @@ final class DrivesTests: XCTestCase {
         try await Task.sleep(for: .milliseconds(600))
         XCTAssertEqual(asked, 1)
         XCTAssertEqual(heard, ["-/Volumes/Photos"])
+        XCTAssertEqual(drives.leaving, [])
+    }
+
+    func testAnEjectTriedAgainStartsTheWaitOver() async throws {
+        let drives = Drives(
+            center: center, mounted: [], isMounted: { [unowned self] in stillMounted.contains($0) },
+            settle: .milliseconds(150), added: { [unowned self] in heard.append("+" + $0) },
+            removing: { [unowned self] in heard.append("-" + $0) })
+        stillMounted = ["/Volumes/Photos"]
+        post(NSWorkspace.willUnmountNotification, "/Volumes/Photos")
+        try await Task.sleep(for: .milliseconds(100))
+        // Refused, then ejected again: macOS asks once more, and that unmount may still be on its way.
+        DispatchQueue.global().sync { drives.unmountAsked("/Volumes/Photos") }
+        try await Task.sleep(for: .milliseconds(100))
+        XCTAssertEqual(heard, ["-/Volumes/Photos"], "not listed again at the first eject's check")
+        XCTAssertEqual(drives.leaving, ["/Volumes/Photos"])
+        try await Task.sleep(for: .milliseconds(250))
+        XCTAssertEqual(heard, ["-/Volumes/Photos", "+/Volumes/Photos"], "refused for good, so listed again once")
         XCTAssertEqual(drives.leaving, [])
     }
 
@@ -362,9 +394,99 @@ final class DriveImageTests: XCTestCase {
         _ = drives
     }
 
+    /// Another app takes 12 s to answer, longer than macOS waits, so the drive unmounts after
+    /// 10.7 s. Listing it again before then would read it while the unmount starts.
+    func testAnEjectWaitingOnASlowAppIsNeverListedAgain() async throws {
+        let (hatch, drives, _) = try await mountedDrive()
+        let slow = SlowApp(volume: drives.volume, answers: [(12, false)])
+        defer { slow.stop() }
+        let asked = ProcessInfo.processInfo.systemUptime
+        let status = try await hdiutilStatus("detach", drives.volume)
+        print("unmounted after \(ms(since: asked)) ms")
+        try await Task.sleep(for: .seconds(6))
+        if status != 0 { try await hdiutil("detach", "-force", drives.volume) }
+        XCTAssertEqual(status, 0, "the drive was in use")
+        XCTAssertEqual(drives.heard, ["+" + drives.volume, "-" + drives.volume], "never listed again")
+        XCTAssertEqual(drives.drives?.leaving, [])
+        _ = hatch
+    }
+
+    /// The first eject is refused, and the second waits 4.5 s on an app: past the first one's
+    /// check, had it not started over.
+    func testAnEjectTriedAgainAfterARefusedOneIsNeverListedAgain() async throws {
+        let (hatch, drives, _) = try await mountedDrive()
+        let slow = SlowApp(volume: drives.volume, answers: [(5, true), (4.5, false)])
+        defer { slow.stop() }
+        let refused = try await hdiutilStatus("detach", drives.volume)
+        XCTAssertNotEqual(refused, 0, "the app said no")
+        try await Task.sleep(for: .seconds(2))
+        let asked = ProcessInfo.processInfo.systemUptime
+        let status = try await hdiutilStatus("detach", drives.volume)
+        print("unmounted \(ms(since: asked)) ms after the second eject")
+        try await Task.sleep(for: .seconds(16))
+        if status != 0 { try await hdiutil("detach", "-force", drives.volume) }
+        XCTAssertEqual(status, 0, "the drive was in use")
+        XCTAssertEqual(drives.heard, ["+" + drives.volume, "-" + drives.volume], "never listed again")
+        _ = hatch
+    }
+
+    func testADriveAnAppWouldNotLetGoIsListedAgain() async throws {
+        let (hatch, drives, lists) = try await mountedDrive()
+        let slow = SlowApp(volume: drives.volume, answers: [(3, true)])
+        defer { slow.stop() }
+        let asked = ProcessInfo.processInfo.systemUptime
+        let refused = try await hdiutilStatus("detach", drives.volume)
+        XCTAssertNotEqual(refused, 0, "the app said no")
+        try await until(seconds: 20) { drives.heard.count == 3 }
+        print("listed again \(ms(since: asked)) ms after the eject")
+        XCTAssertEqual(drives.heard, ["+" + drives.volume, "-" + drives.volume, "+" + drives.volume])
+        // Let go of, then read again.
+        try await until { lists.count == 4 }
+        try await hdiutil("detach", drives.volume)
+        _ = hatch
+    }
+
+    /// A core and the drives it hears of, as the app wires them, with the image mounted and read.
+    private func mountedDrive() async throws -> (Hatch, HeardDrives, Counter) {
+        guard let image = ProcessInfo.processInfo.environment["ARGUS_DRIVE_IMAGE"] else {
+            throw XCTSkip("mounts a disk image; set ARGUS_DRIVE_IMAGE to run it")
+        }
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: root) }
+        let lists = Counter()
+        let hatch = try XCTUnwrap(Hatch(root: root.path, fullDisk: true) { _ in lists.count += 1 })
+        try await until { lists.count == 1 }
+        let heard = HeardDrives()
+        heard.drives = Drives(
+            mounted: [], letGo: { _ = hatch.letGo($0) },
+            added: { path in
+                guard hatch.volumeAdded(path) else { return }
+                heard.volume = path
+                heard.heard.append("+" + path)
+            },
+            removing: { path in
+                guard path == heard.volume else { return }
+                hatch.volumeRemoved(path)
+                heard.heard.append("-" + path)
+            })
+        try await hdiutil("attach", image)
+        try await until { lists.count == 2 }
+        return (hatch, heard, lists)
+    }
+
     /// Waits without holding the main thread, where macOS's mount notes arrive.
     private func hdiutil(_ arguments: String...) async throws {
-        let status = try await withCheckedThrowingContinuation { (done: CheckedContinuation<Int32, any Error>) in
+        let status = try await hdiutilStatus(arguments)
+        XCTAssertEqual(status, 0, "hdiutil \(arguments.joined(separator: " "))")
+    }
+
+    private func hdiutilStatus(_ arguments: String...) async throws -> Int32 {
+        try await hdiutilStatus(arguments)
+    }
+
+    private func hdiutilStatus(_ arguments: [String]) async throws -> Int32 {
+        try await withCheckedThrowingContinuation { (done: CheckedContinuation<Int32, any Error>) in
             do {
                 _ = try Process.run(URL(fileURLWithPath: "/usr/bin/hdiutil"), arguments: arguments) {
                     done.resume(returning: $0.terminationStatus)
@@ -373,17 +495,65 @@ final class DriveImageTests: XCTestCase {
                 done.resume(throwing: error)
             }
         }
-        XCTAssertEqual(status, 0, "hdiutil \(arguments.joined(separator: " "))")
     }
 
-    private func until(_ done: () -> Bool) async throws {
-        let deadline = ProcessInfo.processInfo.systemUptime + 10
+    private func until(seconds: TimeInterval = 10, _ done: () -> Bool) async throws {
+        let deadline = ProcessInfo.processInfo.systemUptime + seconds
         while !done() {
             guard ProcessInfo.processInfo.systemUptime < deadline else { throw CancellationError() }
             try await Task.sleep(for: .milliseconds(2))
         }
     }
 
+}
+
+@MainActor
+private final class Counter {
+    var count = 0
+}
+
+@MainActor
+private final class HeardDrives {
+    var drives: Drives?
+    var volume = ""
+    var heard: [String] = []
+}
+
+/// Another app that answers macOS's question before each unmount of `volume`, slowly: each
+/// answer in turn takes that many seconds and may refuse. Once they run out it says yes at once.
+private final class SlowApp: @unchecked Sendable {
+    private let volume: String
+    private var answers: [(TimeInterval, Bool)]
+    private let session: DASession
+    private let queue = DispatchQueue(label: "slow app")
+
+    init(volume: String, answers: [(TimeInterval, Bool)]) {
+        self.volume = volume
+        self.answers = answers
+        session = DASessionCreate(kCFAllocatorDefault)!
+        DARegisterDiskUnmountApprovalCallback(
+            session, nil,
+            { disk, context in
+                let app = Unmanaged<SlowApp>.fromOpaque(context!).takeUnretainedValue()
+                let description = DADiskCopyDescription(disk) as? [CFString: Any]
+                let path = (description?[kDADiskDescriptionVolumePathKey] as? URL)?.path
+                return path == app.volume ? app.answer() : nil
+            }, Unmanaged.passUnretained(self).toOpaque())
+        DASessionSetDispatchQueue(session, queue)
+    }
+
+    private func answer() -> Unmanaged<DADissenter>? {
+        guard !answers.isEmpty else { return nil }
+        let (seconds, refuses) = answers.removeFirst()
+        Thread.sleep(forTimeInterval: seconds)
+        guard refuses else { return nil }
+        return Unmanaged.passRetained(DADissenterCreate(kCFAllocatorDefault, DAReturn(kDAReturnBusy), nil))
+    }
+
+    func stop() {
+        DASessionSetDispatchQueue(session, nil)
+        queue.sync {}
+    }
 }
 
 private func ms(since start: TimeInterval) -> Int {

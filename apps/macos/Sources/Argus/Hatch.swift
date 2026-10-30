@@ -343,11 +343,18 @@ final class Hatch {
         return held || watching != before
     }
 
-    /// True when the core had the drive; returns once no scan of it is under way. Safe from any
-    /// thread, as macOS asks before an unmount on a queue of its own.
+    /// True when the core had the drive; returns once nothing reads it, from a scan to a text
+    /// search. Safe from any thread, as macOS asks before an unmount on a queue of its own.
     nonisolated func letGo(_ path: String) -> Bool {
         var path = path
         return path.withUTF8 { tl_volume_removed(core, $0.baseAddress, $0.count, FSEventsGetCurrentEventId()) } == 1
+    }
+
+    /// Once macOS has unmounted the drive, so a text search of the folder it was in, as
+    /// /Volumes, reads that folder again.
+    func volumeGone(_ path: String) {
+        var path = path
+        path.withUTF8 { tl_volume_gone(core, $0.baseAddress, $0.count) }
     }
 
     var heardUpTo: FSEventStreamEventId {

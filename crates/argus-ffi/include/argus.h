@@ -7,7 +7,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-static const uint32_t TL_ABI_VERSION = 13;
+static const uint32_t TL_ABI_VERSION = 14;
 
 static const uint32_t TL_OK = 0;
 static const uint32_t TL_GONE = 1;
@@ -101,6 +101,7 @@ uint32_t tl_index_everything(const TlCore *core, uint32_t on, uint64_t mark);
 uint32_t tl_window_shown(const TlCore *core, uint32_t shown);
 uint32_t tl_volume_added(const TlCore *core, const uint8_t *path, size_t len, uint64_t mark);
 uint32_t tl_volume_removed(const TlCore *core, const uint8_t *path, size_t len, uint64_t mark);
+void tl_volume_gone(const TlCore *core, const uint8_t *path, size_t len);
 uint32_t tl_watched(const TlCore *core, TlRows *out, uint64_t *since);
 uint32_t tl_health(const TlCore *core, TlHealth *out);
 uint32_t tl_holds_folder(const TlCore *core, const uint8_t *path, size_t len);

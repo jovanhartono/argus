@@ -139,6 +139,20 @@ impl Grep {
         limit: usize,
         found: impl Fn(Found<'_>) + Sync,
     ) -> Option<Report> {
+        self.search_until(index, text, ticket, limit, &|| false, found)
+    }
+
+    /// As `search`, but once `stop` says so no more files are read and none stays open, as for
+    /// a drive being ejected; the report then counts the files read before.
+    pub fn search_until(
+        &self,
+        index: &Index,
+        text: &str,
+        ticket: Ticket,
+        limit: usize,
+        stop: &(dyn Fn() -> bool + Sync),
+        found: impl Fn(Found<'_>) + Sync,
+    ) -> Option<Report> {
         let stale = || self.tickets.is_stale(ticket);
         // A panic in `found` leaves nothing half-done behind the lock, so later searches go on.
         let _turn = self.turn.lock().unwrap_or_else(PoisonError::into_inner);
@@ -148,13 +162,14 @@ impl Grep {
         let Some(matcher) = Literal::new(text) else {
             return Some(Report::default());
         };
+        let quit = || stale() || stop();
         let job = Job {
             matcher: &matcher,
             limit,
             delivered: AtomicUsize::new(0),
             report: Mutex::default(),
             found: &found,
-            stale: &stale,
+            stale: &quit,
             cloud_only: self.cloud_only,
         };
         self.pool.install(|| {
