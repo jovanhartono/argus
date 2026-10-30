@@ -278,6 +278,13 @@ final class Hatch {
         tl_index_everything(core, on ? 1 : 0, FSEventsGetCurrentEventId()) == 1
     }
 
+    /// Tells the core whether the search window is open, so the list's slow tidy-up waits until
+    /// it hides. True when the core didn't know yet.
+    @discardableResult
+    func windowShown(_ shown: Bool) -> Bool {
+        tl_window_shown(core, shown ? 1 : 0) == 1
+    }
+
     /// Never waits for a scan or a search.
     func health() -> Health {
         var out = TlHealth()
