@@ -142,8 +142,9 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
     /// window doesn't shrink and grow back.
     private var replacing = false
     /// The line picked when that search started, until a later batch of its lines brings it back;
-    /// row is where the pick waits, so an arrow pressed meanwhile wins.
-    private var repick: (hit: TextHit, row: Int)?
+    /// row is where the pick waits. Any arrow or click on a row meanwhile drops it, so the user's
+    /// choice wins even when it lands back on that row.
+    var repick: (hit: TextHit, row: Int)?
     private var filesChangedAt: TimeInterval = 0
     /// When macOS told of each drive plugged in, until a list holding it is in use.
     var drivesTold: [String: TimeInterval] = [:]
@@ -884,6 +885,7 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
 
     /// The first arrow after "can't be found" brings the list back, on the same row.
     private func move(by step: Int) {
+        repick = nil
         if missing != nil {
             missing = nil
             return fit()
@@ -1079,6 +1081,7 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
     func tableView(_ tableView: NSTableView, selectionIndexesForProposedSelection proposed: IndexSet) -> IndexSet {
         var proposed = proposed
         if let header { proposed.remove(header) }
+        if !proposed.isEmpty { repick = nil }
         return proposed.isEmpty ? tableView.selectedRowIndexes : proposed
     }
 

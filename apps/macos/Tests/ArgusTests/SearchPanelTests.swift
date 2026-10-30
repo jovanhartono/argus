@@ -2534,6 +2534,28 @@ final class SearchPanelTests: XCTestCase {
         XCTAssertEqual(window.table.rect(ofRow: 2).height, Metric.header)
     }
 
+    func testArrowsOrAClickWhileThePickedLineIsAwaitedKeepTheUsersRow() async throws {
+        try write("x", at: "notes/budget a.txt")
+        try write("the budget", at: "notes/plan.txt")
+        let window = try await opened(access: true, textFolders: [root.path])
+        window.show()
+        defer { window.hide() }
+        try await type("budget", in: window)
+        try await until { window.rows.count == 1 && window.hits.count == 1 && window.textTicket == 0 }
+        let waiting = (hit: window.hits[0], row: 2)
+
+        window.repick = waiting
+        down(window)
+        XCTAssertTrue(window.control(NSTextField(), textView: NSTextView(), doCommandBy: #selector(NSResponder.moveUp(_:))))
+        XCTAssertNil(window.repick, "Down then Up back onto the waiting row is still the user's pick")
+
+        window.repick = waiting
+        _ = window.tableView(window.table, selectionIndexesForProposedSelection: [])
+        XCTAssertNotNil(window.repick, "a click below the rows picks nothing")
+        _ = window.tableView(window.table, selectionIndexesForProposedSelection: [2])
+        XCTAssertNil(window.repick, "a click on the waiting row keeps that row")
+    }
+
     func testACellChangesBetweenANameALineAndTheTitle() {
         let cell = ResultCell()
         let icon = NSImage()
