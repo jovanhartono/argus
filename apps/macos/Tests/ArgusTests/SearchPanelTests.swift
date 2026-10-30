@@ -2075,6 +2075,75 @@ final class SearchPanelTests: XCTestCase {
         XCTAssertNil(window.pane.waiting, "an unfinished thumbnail is given up")
     }
 
+    func testAFoldersPaneListsWhatItHoldsAndADoubleClickOpensIt() async throws {
+        let folder = root.appendingPathComponent("budget")
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: false)
+        for (name, day) in [("march.txt", 1_700_086_400.0), ("april.txt", 1_700_000_000.0)] {
+            let file = folder.appendingPathComponent(name)
+            try Data("abc".utf8).write(to: file)
+            try FileManager.default.setAttributes(
+                [.modificationDate: Date(timeIntervalSince1970: day)], ofItemAtPath: file.path)
+        }
+        try Data().write(to: root.appendingPathComponent("budget.txt"))
+        let window = try await opened(access: true)
+        window.show()
+        defer { window.hide() }
+        try await type("budget", in: window)
+        try await until { window.rows.count == 2 }
+        window.toggleDetails(nil)
+        let at = try XCTUnwrap(window.rows.firstIndex { $0.isFolder })
+        window.table.selectRowIndexes([at], byExtendingSelection: false)
+        XCTAssertTrue(window.pane.listsContents)
+        try await until { window.panel.frame.height == Metric.field + 1 + Metric.folderDetails }
+        try await until { window.pane.children.map(\.row.name) == ["march.txt", "april.txt"] }
+        window.table.selectRowIndexes([1 - at], byExtendingSelection: false)
+        XCTAssertFalse(window.pane.listsContents)
+        try await until { window.panel.frame.height == Metric.field + 1 + Metric.details }
+
+        window.table.selectRowIndexes([at], byExtendingSelection: false)
+        try await until { window.pane.children.count == 2 }
+        XCTAssertTrue(window.control(NSTextField(), textView: NSTextView(), doCommandBy: #selector(NSResponder.insertNewline(_:))))
+        XCTAssertEqual(
+            stage.opened.map(\.path), [realRoot.appendingPathComponent("budget").path], "Return still opens the picked folder")
+        window.show()
+        window.table.selectRowIndexes([at], byExtendingSelection: false)
+        try await until { window.pane.children.count == 2 }
+        try await until { window.panel.frame.height == Metric.field + 1 + Metric.folderDetails }
+        try doubleClick(row: 1, in: window.pane.contents)
+        XCTAssertFalse(window.shown)
+        XCTAssertEqual(stage.opened.map(\.lastPathComponent), ["budget", "april.txt"])
+    }
+
+    /// Feeds the table a real double-click without the mouse: the release waits in the queue so
+    /// the table's click tracking ends at once, and nothing reaches the screen.
+    private func doubleClick(row: Int, in table: NSTableView) throws {
+        let window = try XCTUnwrap(table.window)
+        let rect = table.rect(ofRow: row)
+        let point = table.convert(NSPoint(x: rect.midX, y: rect.midY), to: nil)
+        func click(_ type: NSEvent.EventType) throws -> NSEvent {
+            try XCTUnwrap(
+                NSEvent.mouseEvent(
+                    with: type, location: point, modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime,
+                    windowNumber: window.windowNumber, context: nil, eventNumber: 0, clickCount: 2, pressure: 1))
+        }
+        NSApp.postEvent(try click(.leftMouseUp), atStart: false)
+        try asIfKey(window) { table.mouseDown(with: try click(.leftMouseDown)) }
+        XCTAssertNil(NSApp.nextEvent(matching: .leftMouseUp, until: .distantPast, inMode: .default, dequeue: true))
+    }
+
+    /// A table ignores clicks in a titled window that isn't key. The window only claims to be key
+    /// for the click, so the user's keyboard and focus stay where they are.
+    private func asIfKey(_ window: NSWindow, _ body: () throws -> Void) throws {
+        let getter = #selector(getter: NSWindow.isKeyWindow)
+        let method = try XCTUnwrap(class_getInstanceMethod(NSWindow.self, getter))
+        let original = method_getImplementation(method)
+        let isKey = unsafeBitCast(original, to: (@convention(c) (AnyObject, Selector) -> Bool).self)
+        let claim: @convention(block) (AnyObject) -> Bool = { $0 === window || isKey($0, getter) }
+        method_setImplementation(method, imp_implementationWithBlock(claim))
+        defer { method_setImplementation(method, original) }
+        try body()
+    }
+
     func testThePaneFollowsTheArrowsAndAClick() async throws {
         let notes = root.appendingPathComponent("notes")
         try FileManager.default.createDirectory(at: notes, withIntermediateDirectories: false)
