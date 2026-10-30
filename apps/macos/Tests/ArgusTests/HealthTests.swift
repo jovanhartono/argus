@@ -464,9 +464,7 @@ private final class HeldStage: Stage {
 @MainActor
 final class IndexEverythingTests: XCTestCase {
     func testOffAtFirstAndKeptAcrossLaunches() throws {
-        let name = "argus-tests-\(UUID().uuidString)"
-        let defaults = try XCTUnwrap(UserDefaults(suiteName: name))
-        defer { defaults.removePersistentDomain(forName: name) }
+        let defaults = MemoryDefaults()
         let setting = IndexEverything(defaults: defaults)
         XCTAssertFalse(setting.isOn)
         setting.isOn = true
@@ -479,9 +477,7 @@ final class IndexEverythingTests: XCTestCase {
     }
 
     func testAValueThatIsNoBooleanReadsAsOff() throws {
-        let name = "argus-tests-\(UUID().uuidString)"
-        let defaults = try XCTUnwrap(UserDefaults(suiteName: name))
-        defer { defaults.removePersistentDomain(forName: name) }
+        let defaults = MemoryDefaults()
         defaults.set("maybe", forKey: "indexEverything")
         XCTAssertFalse(IndexEverything(defaults: defaults).isOn)
         defaults.set("YES", forKey: "indexEverything")
@@ -492,9 +488,7 @@ final class IndexEverythingTests: XCTestCase {
 @MainActor
 final class TextFoldersTests: XCTestCase {
     func testFoldersAreKeptOnceInOrderAndAcrossLaunches() throws {
-        let name = "argus-tests-\(UUID().uuidString)"
-        let defaults = try XCTUnwrap(UserDefaults(suiteName: name))
-        defer { defaults.removePersistentDomain(forName: name) }
+        let defaults = MemoryDefaults()
         let folders = TextFolders(defaults: defaults)
         XCTAssertEqual(folders.paths, [], "none at first")
         folders.add(["/b", "/a", "/b"])
