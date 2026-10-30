@@ -252,7 +252,7 @@ final class HealthWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, NST
         folderButtons.setToolTip("Add Folder", forSegment: 0)
         folderButtons.setToolTip("Remove Folder", forSegment: 1)
         folderButtons.setEnabled(false, forSegment: 1)
-        let hint = NSTextField(wrappingLabelWithString: "Typing also finds words inside the files in these folders.")
+        let hint = NSTextField(wrappingLabelWithString: "Press ⌘T in the search window to find words inside the files in these folders.")
         hint.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
         hint.textColor = .secondaryLabelColor
         hint.preferredMaxLayoutWidth = 260

@@ -37,7 +37,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
 /// Never shown, but AppKit finds ⌘Q, ⌘V, ⌘A, ⌘Z and the search window's own keys through it.
 @MainActor
-private func keyMenu() -> NSMenu {
+func keyMenu() -> NSMenu {
     let file = NSMenu(title: "File")
     file.addItem(withTitle: "Show in Finder", action: #selector(SearchPanel.showInFinder(_:)), keyEquivalent: "\r")
     // Finder's own "Copy as Pathname" key; ⌘⇧C belongs to clipboard managers such as Maccy.
@@ -45,6 +45,7 @@ private func keyMenu() -> NSMenu {
         .keyEquivalentModifierMask = [.command, .option]
     file.addItem(withTitle: "Quick Look", action: #selector(SearchPanel.quickLook(_:)), keyEquivalent: "y")
     file.addItem(withTitle: "Details", action: #selector(SearchPanel.toggleDetails(_:)), keyEquivalent: "i")
+    file.addItem(withTitle: "Search Inside Files", action: #selector(SearchPanel.toggleText(_:)), keyEquivalent: "t")
     let edit = NSMenu(title: "Edit")
     edit.addItem(withTitle: "Undo", action: Selector(("undo:")), keyEquivalent: "z")
     edit.addItem(withTitle: "Redo", action: Selector(("redo:")), keyEquivalent: "Z")
