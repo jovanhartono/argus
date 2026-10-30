@@ -2463,15 +2463,15 @@ final class SearchPanelTests: XCTestCase {
         XCTAssertEqual(window.status, "No Results")
     }
 
-    func testTheMadeUpNamesStillReadTheChosenFoldersAndEndOnNoResults() async throws {
+    func testTheMadeUpNamesStillReadTheChosenFolders() async throws {
+        try write("the zzqx plan", at: "notes/plan.txt")
         let window = try await opened(access: true, standIn: 1000, textFolders: [root.path])
         window.show()
         defer { window.hide() }
         try await type("zzqx", in: window)
-        try await until { window.answered != 0 && window.textTicket == 0 }
+        try await until { window.answered != 0 && window.hits.count == 1 && window.textTicket == 0 }
         XCTAssertTrue(window.rows.isEmpty)
-        XCTAssertTrue(window.hits.isEmpty)
-        XCTAssertEqual(window.status, "No Results", "never stuck on Searching inside files…")
+        XCTAssertNil(window.status, "never stuck on Searching inside files…")
     }
 
     func testFoldersAddedInTheHealthViewAreSearchedFromTheWindow() async throws {
