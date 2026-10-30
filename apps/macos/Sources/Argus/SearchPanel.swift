@@ -168,8 +168,10 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
     /// With `saved`, the list kept in that file at the last launch shows at once. With `opens`,
     /// what you open ranks higher, kept in that file. The apps in `apps` are found by name, and
     /// words inside the files in `textFolders`. With `everything` on, clutter is listed too.
+    /// With `standIn`, that many made-up names are searched instead of `root`.
     init(
-        root: String = NSHomeDirectory(), saved: String? = nil, opens: String? = nil, apps: [String] = [],
+        root: String = NSHomeDirectory(), standIn: UInt64? = nil, saved: String? = nil, opens: String? = nil,
+        apps: [String] = [],
         textFolders: TextFolders = TextFolders(), everything: IndexEverything = IndexEverything(),
         hasAccess: @escaping () -> Bool = { Hatch.hasFullDiskAccess() }, stage: any Stage = Screen(),
         finder: @escaping @Sendable () -> FinderFolder = FinderFolder.ask
@@ -183,10 +185,8 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
         super.init()
         build()
         let onEvent: (Hatch.Event) -> Void = { [weak self] event in self?.heard(event) }
-        // ARGUS_STAND_IN=1000000 searches made-up names instead of your files, and 0 measures
-        // the window's own memory without any list.
         indexingSince = ProcessInfo.processInfo.systemUptime
-        if let count = ProcessInfo.processInfo.environment["ARGUS_STAND_IN"].flatMap(UInt64.init) {
+        if let count = standIn {
             hatch = Hatch(standIn: count, onEvent: onEvent)
         } else {
             lacksAccess = !hasAccess()

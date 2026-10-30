@@ -14,7 +14,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var drives: Drives?
 
     func applicationDidFinishLaunching(_ note: Notification) {
+        // ARGUS_STAND_IN=1000000 searches made-up names instead of your files, and 0 measures
+        // the window's own memory without any list.
         let window = SearchPanel(
+            standIn: ProcessInfo.processInfo.environment["ARGUS_STAND_IN"].flatMap(UInt64.init),
             saved: Hatch.savedList, opens: Hatch.openedList, apps: Hatch.appFolders,
             textFolders: TextFolders(defaults: .standard), everything: IndexEverything(defaults: .standard))
         window.warmUp()
