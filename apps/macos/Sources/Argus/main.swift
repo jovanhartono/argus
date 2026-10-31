@@ -10,8 +10,18 @@ extension KeyboardShortcuts.Name {
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
-    private var window: SearchPanel?
+    var window: SearchPanel?
     private var drives: Drives?
+
+    /// Opened from Applications, as after installing or Quit & Reopen, the window shows so
+    /// something visibly happens. At login, which macOS's own "open" event says, Argus waits
+    /// quietly for the hotkey.
+    func launched(by event: NSAppleEventDescriptor?) {
+        guard event?.paramDescriptor(forKeyword: keyAEPropData)?.enumCodeValue != keyAELaunchedAsLogInItem else {
+            return
+        }
+        window?.show()
+    }
 
     func applicationDidFinishLaunching(_ note: Notification) {
         // ARGUS_STAND_IN=1000000 searches made-up names instead of your files, and 0 measures
@@ -28,6 +38,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         KeyboardShortcuts.onKeyDown(for: .toggleWindow) { window.toggle() }
         KeyboardShortcuts.onKeyDown(for: .searchFinderFolder) { window.toggleInFinderFolder() }
         self.window = window
+        launched(by: NSAppleEventManager.shared().currentAppleEvent)
+    }
+
+    /// Opening Argus again while it runs brings the window up instead of doing nothing.
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        window?.show()
+        return false
     }
 
     /// ⌘, while the health view itself is key, which the search window's chain doesn't reach.
@@ -56,7 +73,7 @@ func keyMenu() -> NSMenu {
     edit.addItem(withTitle: "Select All", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
     file.addItem(withTitle: "Close", action: #selector(NSWindow.performClose(_:)), keyEquivalent: "w")
     let app = NSMenu(title: "Argus")
-    app.addItem(withTitle: "Index Health…", action: #selector(SearchPanel.showHealth(_:)), keyEquivalent: ",")
+    app.addItem(withTitle: "Settings…", action: #selector(SearchPanel.showHealth(_:)), keyEquivalent: ",")
     app.addItem(withTitle: "Quit Argus", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
     let bar = NSMenu()
     for menu in [app, file, edit] {

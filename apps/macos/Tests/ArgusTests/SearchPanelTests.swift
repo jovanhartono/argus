@@ -14,6 +14,7 @@ final class SearchPanelTests: XCTestCase {
 
     override func setUp() async throws {
         _ = NSApplication.shared
+        UserDefaults.keepHotkeysInMemory()
         stage = OffStage()
         root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
@@ -1198,6 +1199,40 @@ final class SearchPanelTests: XCTestCase {
         let action = #selector(SearchPanel.showHealth(_:))
         XCTAssertFalse(health.responds(to: action))
         XCTAssertTrue(AppDelegate().responds(to: action))
+        let item = keyMenu().items.flatMap { $0.submenu?.items ?? [] }.first { $0.action == action }
+        XCTAssertEqual(item?.title, "Settings…", "⌘, means Settings on a Mac")
+    }
+
+    /// Double-clicking Argus in Applications while it runs used to do nothing at all.
+    func testOpeningArgusAgainShowsTheWindow() async throws {
+        let window = try await opened(access: true)
+        let delegate = AppDelegate()
+        delegate.window = window
+        XCTAssertFalse(delegate.applicationShouldHandleReopen(NSApp, hasVisibleWindows: false))
+        XCTAssertTrue(window.shown)
+        XCTAssertTrue(stage.key === window.panel)
+        window.hide()
+    }
+
+    func testOnlyALoginLaunchStaysHidden() async throws {
+        let open = {
+            NSAppleEventDescriptor(
+                eventClass: AEEventClass(kCoreEventClass), eventID: AEEventID(kAEOpenApplication), targetDescriptor: nil,
+                returnID: AEReturnID(kAutoGenerateReturnID), transactionID: AETransactionID(kAnyTransactionID))
+        }
+        let atLogin = open()
+        atLogin.setParam(NSAppleEventDescriptor(enumCode: OSType(keyAELaunchedAsLogInItem)), forKeyword: keyAEPropData)
+        let window = try await opened(access: true)
+        let delegate = AppDelegate()
+        delegate.window = window
+        delegate.launched(by: atLogin)
+        XCTAssertFalse(window.shown)
+        XCTAssertEqual(stage.forward, 0)
+        for (event, how) in [(open(), "opened from Applications or Quit & Reopen"), (nil, "started from a terminal")] {
+            delegate.launched(by: event)
+            XCTAssertTrue(window.shown, how)
+            window.hide()
+        }
     }
 
     func testCommandCommaSwapsTheSearchWindowForTheHealthView() async throws {

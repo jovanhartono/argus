@@ -38,7 +38,7 @@ let failures = Logger(subsystem: "io.github.jovanhartono.argus", category: "fail
 final class Panel: NSPanel {
     override var canBecomeKey: Bool { true }
 
-    /// Esc while Open Settings has the focus; the box handles its own Esc. A preview closes first.
+    /// Esc while Open System Settings has the focus; the box handles its own Esc. A preview closes first.
     override func cancelOperation(_ sender: Any?) {
         guard let search = delegate as? SearchPanel else { return }
         search.previewing ? search.closePreview() : search.hide()
@@ -113,7 +113,7 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
     private let bar = TopDown(frame: NSRect(x: 0, y: Metric.field, width: Metric.width, height: 1 + Metric.message))
     private let barLine = NSBox(frame: NSRect(x: 0, y: 0, width: Metric.width, height: 1))
     let barText = NSTextField(labelWithString: "")
-    let settings = KeyButton(title: "Open Settings", target: nil, action: nil)
+    let settings = KeyButton(title: "Open System Settings", target: nil, action: nil)
     let pane = DetailsPane()
     /// ⌘I's switch, kept while the window hides; the pane itself shows only beside a picked row.
     private(set) var detailsOn = false
@@ -780,7 +780,7 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
     }
 
     /// Pressed a moment after typing, Tab waits for the results for what you typed, as Return
-    /// does; if they start with a file, it still reaches Open Settings.
+    /// does; if they start with a file, it still reaches Open System Settings.
     private func tabIntoFolder() -> Bool {
         guard indexed, !composing, !field.stringValue.isEmpty else { return false }
         if newest == answered && selected?.isFolder != true { return false }
