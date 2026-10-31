@@ -144,9 +144,9 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
     private var newest: UInt64 = 0
     private var sentAt: [UInt64: TimeInterval] = [:]
     private(set) var rows: [Row] = []
-    /// Every name found for the box; `rows` lists only the first few while lines show.
+    /// Every name found for the box; `rows` lists only the first few while ⌘T is on.
     private var names: [Row] = []
-    /// How many names stay above the lines: three, or down to the one picked when they came.
+    /// How many names stay above the lines: three, or down to the one picked when ⌘T came on.
     private var kept = 3
     let textFolders: TextFolders
     let everything: IndexEverything
@@ -610,6 +610,13 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
         if listed == 0 { return 0 }
         var list = CGFloat(min(listed, Metric.visibleRows)) * Metric.row + 2 * Metric.inset
         if let header, header < Metric.visibleRows { list -= Metric.row - Metric.header }
+        // Shrinking to three names at each keystroke, then growing for the lines a moment later,
+        // slowed the names tenfold for the slowest keystrokes. The window keeps its height while
+        // the files are read, and the first letter in an empty box makes room for the lines.
+        if textState == .searching {
+            let full = CGFloat(Metric.visibleRows - 1) * Metric.row + Metric.header + 2 * Metric.inset
+            list = max(list, scroll.isHidden ? full : scroll.frame.height)
+        }
         return detailing ? max(list, pane.listsContents ? Metric.folderDetails : Metric.details) : list
     }
 
@@ -840,6 +847,7 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
         // A file you picked stays picked when a change moves it up or down the list.
         let keeping = rerun == ticket ? selected?.path : nil
         let keepingLine = rerun == ticket ? table.selectedRow - rows.count - 1 : -1
+        if rerun != ticket { kept = 3 }
         rerun = 0
         let ask = textAsk()
         // Lines found for what was typed before go with its names.
@@ -918,8 +926,11 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
             return namesOnly()
         }
         showChips()
+        // Someone who arrowed down to the fifth name, then pressed ⌘T and Return, opens that name.
+        kept = max(3, table.selectedRow < rows.count ? table.selectedRow + 1 : 0)
         // Names still on their way start it once drawn, as after a keystroke.
         if answered == newest { startText(textAsk(), typedAt: pressedAt()) }
+        if let header { table.scrollRowToVisible(header) }
     }
 
     /// A picked line hands the pick to the top name.
@@ -943,7 +954,6 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
         textAsked = nil
         textWhole = false
         textStopped = false
-        kept = 3
         replacing = false
         repick = nil
     }
@@ -963,9 +973,6 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
             hits = []
         }
         let first = hits.isEmpty && !batch.hits.isEmpty
-        // Someone who arrowed down to the fifth name while the files were read, then pressed
-        // Return, opens that name, not the top one.
-        if first, table.selectedRow < rows.count { kept = max(3, table.selectedRow + 1) }
         if replaced || !batch.hits.isEmpty {
             hits += batch.hits
             refill()
@@ -1264,9 +1271,9 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
 
     /// reloadData throws every row away and builds it again, most of the wait after a keystroke.
     private func refill() {
-        // Once ⌘T finds lines, a dozen names would push them all below the window's edge.
-        rows = hits.isEmpty ? names : Array(names.prefix(kept))
         textState = readTextState()
+        // While ⌘T is on, a dozen names would push "Inside Files" and its lines below the window's edge.
+        rows = hits.isEmpty && textState == nil ? names : Array(names.prefix(kept))
         table.noteNumberOfRowsChanged()
         // The table keeps the old heights through noteNumberOfRowsChanged, so the title's old
         // row would stay short.

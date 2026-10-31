@@ -2468,10 +2468,15 @@ final class SearchPanelTests: XCTestCase {
         try await settled(window)
         XCTAssertEqual(cell(window, 1)?.name.stringValue, none)
         XCTAssertEqual(window.table.numberOfRows, 2)
+
+        for at in 0..<10 { try write("x", at: "notes/budget \(at).txt") }
+        try await until { window.rows.count == 3 && window.header == 3 }
+        try await assertTitleInView(window)
+        XCTAssertEqual(cell(window, 3)?.name.stringValue, none)
     }
 
     func testInsideAFolderNoChosenOneReachesTheTitleSaysSo() async throws {
-        try write("x", at: "work/budget.txt")
+        for at in 0..<10 { try write("x", at: "work/budget \(at).txt") }
         try write("the budget", at: "notes/plan.txt")
         let window = try await opened(access: true, textFolders: [root.appendingPathComponent("notes").path])
         window.show()
@@ -2481,9 +2486,10 @@ final class SearchPanelTests: XCTestCase {
         XCTAssertTrue(tab(window))
         window.toggleText(nil)
         try await type("budget", in: window)
-        try await until { window.rows.map(\.name) == ["budget.txt"] && window.header == 1 }
+        try await until { window.rows.count == 3 && window.header == 3 }
         XCTAssertEqual(window.textTitle, "None of your chosen folders are inside work.")
         XCTAssertEqual(window.textTicket, 0)
+        try await assertTitleInView(window)
 
         try await type("zzzz", in: window)
         try await until {
@@ -2493,61 +2499,78 @@ final class SearchPanelTests: XCTestCase {
 
     func testTheTitleShowsFromTheStartAndSaysWhenNoLineIsFound() async throws {
         try writeMany()
-        try write("x", at: "notes/budget.txt")
+        for at in 0..<10 { try write("x", at: "notes/budget \(at).txt") }
         let window = try await opened(access: true, textFolders: [root.path])
         window.show()
         defer { window.hide() }
         window.toggleText(nil)
         try await type("budget", in: window)
         try await untilClose { window.textTicket != 0 }
-        XCTAssertEqual(window.header, 1, "before any line is found")
+        XCTAssertEqual(window.header, 3, "before any line is found")
         XCTAssertEqual(window.textTitle, "Inside Files: searching…")
+        try await assertTitleInView(window)
         try await until { window.textTicket == 0 }
         XCTAssertEqual(window.hits, [])
-        XCTAssertEqual(window.header, 1)
+        XCTAssertEqual(window.header, 3)
         XCTAssertEqual(window.textTitle, "Inside Files: no lines found")
-        try await settled(window)
-        XCTAssertEqual(cell(window, 1)?.name.stringValue, "Inside Files: no lines found")
-        XCTAssertEqual(window.panel.frame.height, Metric.field + 1 + Metric.row + Metric.header + 2 * Metric.inset)
+        try await assertTitleInView(window)
+        XCTAssertEqual(cell(window, 3)?.name.stringValue, "Inside Files: no lines found")
+        XCTAssertEqual(window.panel.frame.height, Metric.field + 1 + 3 * Metric.row + Metric.header + 2 * Metric.inset)
 
         window.toggleText(nil)
         XCTAssertNil(window.header)
-        XCTAssertEqual(window.table.numberOfRows, 1)
+        XCTAssertEqual(window.table.numberOfRows, 10)
     }
 
-    func testOnceLinesAreFoundOnlyThreeNamesStayAboveThem() async throws {
-        for at in 0..<6 { try write("x", at: "notes/budget \(at).txt") }
+    func testWhileCommandTIsOnOnlyThreeNamesStayAboveTheTitle() async throws {
+        for at in 0..<10 { try write("x", at: "notes/budget \(at).txt") }
         try write("the budget", at: "notes/plan.txt")
         let window = try await opened(access: true, textFolders: [root.path])
         window.show()
         defer { window.hide() }
         try await type("budget", in: window)
-        try await until { window.rows.count == 6 }
+        try await until { window.rows.count == 10 }
         for _ in 0..<4 { down(window) }
         XCTAssertEqual(window.table.selectedRow, 4)
 
         window.toggleText(nil)
-        try await until { window.hits.count == 1 && window.textTicket == 0 }
+        XCTAssertEqual(window.hits, [], "before any line is found")
         XCTAssertEqual(window.rows.count, 5, "names down to the picked one stay")
         XCTAssertEqual(window.header, 5)
-        XCTAssertEqual(window.table.selectedRow, 4, "Return still opens the name picked before the lines came")
+        XCTAssertEqual(window.textTitle, "Inside Files: searching…")
+        XCTAssertEqual(window.table.selectedRow, 4, "Return still opens the name picked before ⌘T")
+        try await assertTitleInView(window)
+        try await until { window.hits.count == 1 && window.textTicket == 0 }
+        XCTAssertEqual(window.rows.count, 5)
+        XCTAssertEqual(window.header, 5)
+        XCTAssertEqual(window.table.selectedRow, 4)
 
         window.toggleText(nil)
-        XCTAssertEqual(window.rows.count, 6, "every name comes back")
-        XCTAssertEqual(window.table.numberOfRows, 6)
+        XCTAssertEqual(window.rows.count, 10, "every name comes back")
+        XCTAssertEqual(window.table.numberOfRows, 10)
 
         for _ in 0..<3 {
             _ = window.control(NSTextField(), textView: NSTextView(), doCommandBy: #selector(NSResponder.moveUp(_:)))
         }
         XCTAssertEqual(window.table.selectedRow, 1)
         window.toggleText(nil)
-        try await until { window.hits.count == 1 && window.textTicket == 0 }
         XCTAssertEqual(window.rows.count, 3)
         XCTAssertEqual(window.header, 3)
+        try await until { window.hits.count == 1 && window.textTicket == 0 }
         XCTAssertEqual(window.textTitle, "Inside Files")
         XCTAssertEqual(window.table.numberOfRows, 5)
         XCTAssertEqual(window.table.selectedRow, 1)
         try await until { window.panel.frame.height == Metric.field + 1 + 4 * Metric.row + Metric.header + 2 * Metric.inset }
+
+        window.toggleText(nil)
+        for _ in 0..<5 { down(window) }
+        XCTAssertEqual(window.table.selectedRow, 6)
+        window.toggleText(nil)
+        XCTAssertEqual(window.rows.count, 7)
+        try await type("budge", in: window)
+        try await until { window.rows.count == 3 && window.textTicket == 0 && window.hits.count == 1 }
+        XCTAssertEqual(window.header, 3, "a new keystroke starts from three names again")
+        XCTAssertEqual(window.table.selectedRow, 0)
     }
 
     func testLinesInsideFilesListUnderTheNamesAndAfterThem() async throws {
@@ -3052,6 +3075,16 @@ final class SearchPanelTests: XCTestCase {
         let scroll = try XCTUnwrap(window.table.enclosingScrollView, file: file, line: line)
         try await until({ abs(window.panel.frame.height - scroll.frame.maxY) < 0.5 }, file: file, line: line)
         window.panel.displayIfNeeded()
+    }
+
+    /// With a dozen names found, "Inside Files" sat below the eighth row, out of sight.
+    private func assertTitleInView(_ window: SearchPanel, file: StaticString = #filePath, line: UInt = #line) async throws {
+        try await settled(window, file: file, line: line)
+        let header = try XCTUnwrap(window.header, file: file, line: line)
+        XCTAssertLessThan(header, Metric.visibleRows, file: file, line: line)
+        let title = window.table.rect(ofRow: header)
+        let shown = window.table.visibleRect
+        XCTAssertTrue(shown.contains(title), "\(title) is outside \(shown)", file: file, line: line)
     }
 
     private func cell(_ window: SearchPanel, _ row: Int) -> ResultCell? {
