@@ -5,7 +5,7 @@ import XCTest
 final class NoticeTests: XCTestCase {
     func testTheLineNamesEveryKindOfFolderLeftOut() {
         let text = Notice.needsAccess.text
-        XCTAssertTrue(text.contains("Desktop, Documents, Downloads and external drives"), text)
+        XCTAssertTrue(text.contains("Desktop, Documents, Downloads and drives"), text)
     }
 
     func testSettingsOpensOnFullDiskAccess() {
