@@ -3246,6 +3246,111 @@ final class SearchPanelTests: XCTestCase {
         XCTAssertNil(window.repick, "a click on the waiting row keeps that row")
     }
 
+    /// Any file saved in your home folder reads the lines again, a few at a time; the preview
+    /// of a line far down closed when the first few came back.
+    func testThePreviewOfAFoundLineStaysOpenWhileItsLinesAreReadAgain() async throws {
+        try writeMany()
+        for at in 0..<30 { try write("x\nthe budget \(at)\n", at: "filler/\(at)/plan.txt") }
+        let window = try await opened(access: true, textFolders: [root.path])
+        window.show()
+        defer { window.hide() }
+        window.toggleText(nil)
+        try await type("budget", in: window)
+        try await until { window.answered != 0 && window.textTicket == 0 && window.hits.count == 30 }
+        for _ in 0..<29 { down(window) }
+        let picked = try XCTUnwrap(window.selected)
+        XCTAssertEqual(window.table.selectedRow, window.listed - 1)
+        window.quickLook(nil)
+        XCTAssertEqual(window.inPreview, picked.url)
+
+        try write("x", at: "notes/budget b.txt")
+        try await until { window.rows.count == 1 }
+        try XCTSkipIf(window.textTicket == 0, "the lines were read again before the names were seen")
+        try await until { window.textTicket == 0 }
+        XCTAssertEqual(stage.closes, 0)
+        XCTAssertTrue(window.previewing)
+        XCTAssertEqual(window.selected, picked)
+        XCTAssertEqual(window.inPreview, picked.url)
+    }
+
+    func testThePreviewStaysOpenWhileLinesArrive() async throws {
+        try writeMany()
+        try write("x", at: "notes/budget.txt")
+        for at in 0..<30 { try write("x\nthe budget \(at)\n", at: "filler/\(at)/plan.txt") }
+        let window = try await opened(access: true, textFolders: [root.path])
+        window.show()
+        defer { window.hide() }
+        window.toggleText(nil)
+
+        // On a name, opened before the first line comes.
+        try await type("budget", in: window)
+        window.quickLook(nil)
+        try await until { window.previewing }
+        let name = try XCTUnwrap(window.selected)
+        try await until { window.textTicket == 0 && window.hits.count == 30 }
+        XCTAssertEqual(stage.closes, 0)
+        XCTAssertEqual(window.inPreview, name.url)
+        window.quickLook(nil)
+        stage.finishFade()
+
+        // On a line, opened while more are on their way.
+        try await type("the budget", in: window)
+        try await untilClose { window.textTicket != 0 && !window.hits.isEmpty }
+        let line = try XCTUnwrap(window.selected)
+        XCTAssertNotNil(window.header)
+        window.quickLook(nil)
+        XCTAssertEqual(window.inPreview, line.url)
+        try await until { window.textTicket == 0 && window.hits.count == 30 }
+        XCTAssertEqual(stage.closes, 1, "only ⌘Y closed it")
+        XCTAssertTrue(window.previewing)
+        XCTAssertEqual(window.selected, line)
+        XCTAssertEqual(window.inPreview, line.url)
+    }
+
+    func testCommandTKeepsThePreviewOnTheSameFile() async throws {
+        for name in ["budget a.txt", "budget b.txt", "budget c.txt", "budget d.txt"] {
+            try write("x", at: "notes/\(name)")
+        }
+        try write("the budget", at: "notes/old budget.txt")
+        try write("the budget", at: "notes/plan.txt")
+        let window = try await opened(access: true, textFolders: [root.path])
+        window.show()
+        defer { window.hide() }
+        try await type("budget", in: window)
+        try await until { window.rows.count == 5 }
+        let file = realRoot.appendingPathComponent("notes/old budget.txt").path
+        XCTAssertNotEqual(window.rows[0].path, file)
+        for _ in 0..<4 { down(window) }
+        let fifth = try XCTUnwrap(window.selected)
+        window.quickLook(nil)
+
+        window.toggleText(nil)
+        try await until { window.hits.count == 2 && window.textTicket == 0 }
+        XCTAssertEqual(window.selected, fifth)
+        XCTAssertEqual(window.inPreview, fifth.url)
+
+        // Off on a line whose file is also listed by name, the preview stays on that file.
+        let at = try XCTUnwrap(window.hits.firstIndex { $0.path == file })
+        for _ in 0..<9 where window.table.selectedRow != window.rows.count + 1 + at { down(window) }
+        XCTAssertEqual(window.inPreview?.path, file)
+        window.toggleText(nil)
+        XCTAssertTrue(window.previewing)
+        XCTAssertEqual(window.selected?.path, file)
+        XCTAssertEqual(window.inPreview?.path, file)
+
+        // On a line whose file isn't, it moves to the top name.
+        window.toggleText(nil)
+        try await until { window.hits.count == 2 && window.textTicket == 0 }
+        let plan = try XCTUnwrap(window.hits.firstIndex { $0.path.hasSuffix("/plan.txt") })
+        for _ in 0..<9 where window.table.selectedRow != window.rows.count + 1 + plan { down(window) }
+        XCTAssertEqual(window.selected?.name, "plan.txt")
+        window.toggleText(nil)
+        XCTAssertEqual(window.table.selectedRow, 0)
+        XCTAssertEqual(window.inPreview, window.rows[0].url)
+        XCTAssertEqual(stage.closes, 0)
+        XCTAssertTrue(window.previewing)
+    }
+
     func testACellChangesBetweenANameALineAndTheTitle() {
         let cell = ResultCell()
         let icon = NSImage()
