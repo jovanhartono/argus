@@ -32,10 +32,17 @@ pub fn query(text: &str) -> Option<String> {
     (!query.is_empty()).then_some(query)
 }
 
-/// The files inside `scopes` that Spotlight says hold the words of `text`, at most
-/// `SPOTLIGHT_FILES`, in no useful order. Asks again every 10 ms whether the search is `stale`,
-/// and then stops Spotlight's own work too and returns `None`. Runs a run loop on this thread
-/// while it waits, so it never runs on the main thread.
+/// `query` narrowed to the files changed in the last week.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn recent(query: &str) -> String {
+    format!("({query}) && kMDItemFSContentChangeDate >= $time.today(-7)")
+}
+
+/// The files inside `scopes` that Spotlight says hold the words of `text`, in no useful order:
+/// at most `SPOTLIGHT_FILES`, and when that many come, also up to as many changed in the last
+/// week. Asks again every 10 ms whether the search is `stale`, and then stops Spotlight's own
+/// work too and returns `None`. Runs a run loop on this thread while it waits, so it never
+/// runs on the main thread.
 pub fn files(text: &str, scopes: &[PathBuf], stale: &dyn Fn() -> bool) -> Option<Vec<PathBuf>> {
     files_up_to(SPOTLIGHT_FILES, text, scopes, stale)
 }
@@ -51,7 +58,19 @@ fn files_up_to(
     };
     #[cfg(target_os = "macos")]
     {
-        mac::files(&query, scopes, cap, stale)
+        let mut found = mac::files(&query, scopes, cap, stale)?;
+        // A common word fills the cap with whatever Spotlight met first, which can leave out
+        // the invoice you edited yesterday.
+        if found.len() >= cap {
+            let recent = mac::files(&recent(&query), scopes, cap, stale)?;
+            let have: std::collections::HashSet<&PathBuf> = found.iter().collect();
+            let fresh: Vec<PathBuf> = recent
+                .into_iter()
+                .filter(|file| !have.contains(file))
+                .collect();
+            found.extend(fresh);
+        }
+        Some(found)
     }
     #[cfg(not(target_os = "macos"))]
     {
@@ -346,6 +365,17 @@ mod tests {
     }
 
     #[test]
+    fn the_recent_ask_keeps_every_word() {
+        assert_eq!(
+            recent(&query("refund diskon").unwrap()),
+            concat!(
+                r#"(kMDItemTextContent == "refund*"cdw && kMDItemTextContent == "diskon*"cdw)"#,
+                " && kMDItemFSContentChangeDate >= $time.today(-7)"
+            )
+        );
+    }
+
+    #[test]
     fn nothing_to_ask_without_a_letter_or_digit() {
         assert_eq!(query(""), None);
         assert_eq!(query("   "), None);
@@ -365,7 +395,9 @@ mod tests {
             .unwrap()
             .unwrap();
         println!("\"the\": {} files", found.len());
-        assert!(found.len() <= SPOTLIGHT_FILES);
+        assert!(found.len() <= 2 * SPOTLIGHT_FILES);
+        let unique: std::collections::HashSet<&PathBuf> = found.iter().collect();
+        assert_eq!(unique.len(), found.len());
         assert!(found.iter().all(|path| path.is_absolute()));
         let started = std::time::Instant::now();
         let stopped = files("a", &[argus_core::home()], &|| {

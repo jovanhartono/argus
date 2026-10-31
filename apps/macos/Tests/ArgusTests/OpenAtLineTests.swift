@@ -21,6 +21,13 @@ final class OpenAtLineTests: XCTestCase {
         XCTAssertEqual(link("com.apple.dt.Xcode"), "xed --line 12 /Users/me/notes/plan.rs")
     }
 
+    /// The Xcode that opens the file runs it, not /usr/bin/xed, which fails while the developer
+    /// folder is the Command Line Tools.
+    func testXedComesFromTheXcodeThatOpensTheFile() {
+        let xcode = URL(fileURLWithPath: "/Applications/Xcode-beta.app", isDirectory: true)
+        XCTAssertEqual(LineLink.xed(in: xcode).path, "/Applications/Xcode-beta.app/Contents/Developer/usr/bin/xed")
+    }
+
     func testTextEditAndOtherAppsOpenTheFileAtItsTop() {
         XCTAssertNil(link("com.apple.TextEdit"))
         XCTAssertNil(link("com.apple.Preview"))

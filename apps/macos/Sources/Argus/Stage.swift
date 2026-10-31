@@ -88,8 +88,12 @@ final class Screen: Stage {
             NSWorkspace.shared.open([link], withApplicationAt: app, configuration: NSWorkspace.OpenConfiguration())
         case .xed(let arguments):
             let xed = Process()
-            xed.executableURL = URL(fileURLWithPath: "/usr/bin/xed")
+            xed.executableURL = LineLink.xed(in: app)
             xed.arguments = arguments
+            xed.terminationHandler = { xed in
+                guard xed.terminationStatus != 0 else { return }
+                Task { @MainActor in NSWorkspace.shared.open(url) }
+            }
             do { try xed.run() } catch { open(url) }
         }
     }

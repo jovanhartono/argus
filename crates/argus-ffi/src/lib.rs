@@ -25,7 +25,7 @@ use argus_core::{
     save_index, unix_now,
 };
 use argus_grep::{Found, Grep, Report};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::{CString, c_void};
 use std::io;
 use std::panic::{self, AssertUnwindSafe};
@@ -72,6 +72,9 @@ pub const TL_EVENT_RERANKED: u32 = 8;
 const ROWS: usize = 50;
 /// Lines a text search shows, across all its folders.
 const LINES: usize = 100;
+/// Files you opened that a text search reads beside Spotlight's capped answer: each one that
+/// doesn't hold the words still costs a read before the first line.
+const OPENED_FILES: usize = 100;
 
 /// Rebuilds start at least this far apart while files keep changing, so a long download
 /// doesn't keep a core busy. A change is findable within FSEvents' 0.2 s, plus this, plus
@@ -2648,7 +2651,8 @@ fn find_loop(
 }
 
 /// Searches inside the files of `find`'s folder, or of the core's whole folder, until `LINES`
-/// lines. Inside the folder Spotlight covers, only the files it names are read; elsewhere,
+/// lines. Inside the folder Spotlight covers, only the files it names are read, and only where
+/// the name list keeps files; elsewhere,
 /// as on a drive, the folder is listed as the name list would list it, then every file is read.
 /// A drive being ejected counts as unreadable, and one ejected midway is read no further.
 /// `None` once a newer search or a cancel took over.
@@ -2679,10 +2683,14 @@ fn find_in(
     {
         let (skip, access, cloud) = (Clutter::Skip, find.access, find.cloud);
         let scope = Settings::new(&home, &home, skip, ignore.clone(), access, cloud).root_scope();
-        // A Finder folder inside a cloud drive while its switch is off is still read whole.
-        if folder == home || scope.keeps_files_in(&folder) {
+        if argus_grep::spotlight::query(&find.query).is_some() {
             let files = spotlit(grep, find, &folder, &home, &scope, asker, live)?;
             return grep.search_files(&files, &find.query, find.ticket, LINES, &|| false, add);
+        }
+        // Spotlight can't look for text with no letter or digit, as "=>", so a folder the list
+        // keeps is read whole instead; one it only walks through or seals stays unread.
+        if !scope.keeps_files_in(&folder) {
+            return Some(Report::default());
         }
     }
     let unreadable = Report {
@@ -2724,18 +2732,31 @@ fn spotlit(
 ) -> Option<Vec<PathBuf>> {
     let number = find.ticket.number();
     let stale = || grep.newest() != number;
-    // Asked about the whole home folder, Spotlight filled its cap from ~/Library's caches.
-    let within = if folder == home {
-        kept_folders(scope, home)
+    let keeps_own = scope.keeps_files_in(folder);
+    // Asked about the whole home folder, Spotlight filled its cap from ~/Library's caches; a
+    // folder the list only walks through, as ~/Library, is asked about where the list reads.
+    let (within, mut named) = if folder != home && keeps_own {
+        (vec![folder.to_path_buf()], Vec::new())
     } else {
-        vec![folder.to_path_buf()]
+        (kept_folders(scope, folder), own_files(folder, keeps_own))
     };
-    let named = (asker.files)(&find.query, &within, &stale)?;
+    if !within.is_empty() {
+        let answer = (asker.files)(&find.query, &within, &stale)?;
+        // Spotlight's cap holds whatever it met first, so the files you open most are read too.
+        if answer.len() >= argus_grep::spotlight::SPOTLIGHT_FILES {
+            named.extend(opened(live, folder));
+        }
+        named.extend(answer);
+    }
     // Stats on the text search threads, below name search.
     grep.install(|| {
         let mut keeps: HashMap<PathBuf, bool> = HashMap::new();
+        let mut seen: HashSet<PathBuf> = HashSet::with_capacity(named.len());
         let mut ranked = Vec::with_capacity(named.len());
         for file in named {
+            if !seen.insert(file.clone()) {
+                continue;
+            }
             if stale() {
                 return None;
             }
@@ -2767,6 +2788,36 @@ fn spotlit(
         ranked.sort_unstable_by(|a, b| b.0.total_cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
         Some(ranked.into_iter().map(|(_, _, file)| file).collect())
     })
+}
+
+/// The files right inside `folder` when the list keeps them, as ~/todo.md: Spotlight can only
+/// be asked about a folder with everything inside it.
+fn own_files(folder: &Path, keeps: bool) -> Vec<PathBuf> {
+    let Some(entries) = std::fs::read_dir(folder).ok().filter(|_| keeps) else {
+        return Vec::new();
+    };
+    let files = entries
+        .flatten()
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()));
+    files.map(|entry| entry.path()).collect()
+}
+
+/// At most `OPENED_FILES` of the files you open most inside `folder`, strongest first.
+fn opened(live: &Live, folder: &Path) -> Vec<PathBuf> {
+    let now = unix_now();
+    let opens = lock(&live.opens);
+    let mut opened: Vec<(f64, &Path)> = opens
+        .frecency
+        .files()
+        .filter(|file| file.starts_with(folder))
+        .map(|file| (opens.frecency.score(file, now), file))
+        .collect();
+    opened.sort_unstable_by(|a, b| b.0.total_cmp(&a.0));
+    opened.truncate(OPENED_FILES);
+    opened
+        .into_iter()
+        .map(|(_, file)| file.to_path_buf())
+        .collect()
 }
 
 /// The folders inside `folder` whose files the name list keeps, going through those it reads
@@ -2832,7 +2883,8 @@ fn tell(mut waiting: MutexGuard<'_, Waiting>, number: u64, notify: Notify) {
 /// ticket, or 0 on failure, as for a folder that isn't UTF-8, leaving the search under way
 /// alone. Otherwise every older text search gives up; name searches never wait for any.
 /// Inside your home folder, Spotlight names the files that hold each typed word at the start of
-/// one of their words, and only the files you open most and the newest of those are read.
+/// one of their words, and only the files you open most and the newest of those are read; a
+/// query with no letter or digit, which Spotlight can't look for, reads the folder whole.
 /// Elsewhere, as on a drive, the folder is listed as the name list would be and every file is
 /// read; one that can't be listed counts as unreadable. Either way clutter, the ignore list
 /// and cloud drives, as `tl_index_cloud` says, are left out.
@@ -7355,20 +7407,95 @@ mod tests {
         );
     }
 
-    /// As when ⌥⌘⇧Space searches the Finder window showing a Dropbox folder, cloud switch off.
+    /// As a Dropbox folder passed in with its switch off, or a chip on node_modules that the
+    /// ignore list walks through to bring one package back.
     #[test]
-    fn a_folder_the_list_leaves_out_is_read_whole_without_spotlight() {
+    fn a_folder_the_list_leaves_out_is_read_only_where_the_list_reads() {
         let (_dir, home) = home_with(&[]);
         let dropbox = home.join("Library/CloudStorage/Dropbox");
-        write(&dropbox.join("notes/a.txt"), "zebra-left\n");
-        name("zebra-left", &[]);
+        let modules = home.join("work/node_modules");
+        let files = [
+            dropbox.join("notes/a.txt"),
+            modules.join("mylib/b.js"),
+            modules.join("other/c.js"),
+        ];
+        for file in &files {
+            write(file, "zebra-left\n");
+        }
+        write(
+            &home.join(".config/argus/ignore"),
+            "!~/work/node_modules/mylib\n",
+        );
+        name("zebra-left", &files);
         let events = Events::default();
         let core = spotlit_core(&home, &home, 1, &events);
         let ticket = grep(&core, Some(&dropbox), "zebra-left");
         let (lines, report) = grep_all(&core, &events, ticket);
-        assert_eq!(lines.len(), 1, "{lines:?}");
-        assert_eq!(report.files_searched, 1);
-        assert!(asked("zebra-left").is_empty());
+        assert!(lines.is_empty(), "{lines:?}");
+        assert_eq!(report.files_searched, 0);
+        assert!(asked("zebra-left").is_empty(), "nothing in it is read");
+
+        let ticket = grep(&core, Some(&modules), "zebra-left");
+        let (lines, _) = grep_all(&core, &events, ticket);
+        let shown: Vec<&str> = lines.iter().map(|line| line.0.as_str()).collect();
+        assert_eq!(shown, [files[1].to_str().unwrap()]);
+        assert_eq!(asked("zebra-left"), [vec![modules.join("mylib")]]);
+    }
+
+    #[test]
+    fn files_right_inside_the_home_folder_are_read_too() {
+        let (_dir, home) = home_with(&[]);
+        write(&home.join("todo.md"), "call dentist about zebra-top\n");
+        write(&home.join("notes/a.txt"), "zebra-top\n");
+        name("zebra-top", &[home.join("notes/a.txt")]);
+        let events = Events::default();
+        let core = spotlit_core(&home, &home, 1, &events);
+        let ticket = grep(&core, None, "zebra-top");
+        let (lines, _) = grep_all(&core, &events, ticket);
+        let mut shown: Vec<&str> = lines.iter().map(|line| line.0.as_str()).collect();
+        shown.sort_unstable();
+        let expected = [home.join("notes/a.txt"), home.join("todo.md")];
+        assert_eq!(shown, expected.each_ref().map(|f| f.to_str().unwrap()));
+    }
+
+    /// Spotlight can't look for "=>", so the home folder is read as the name list keeps it.
+    #[test]
+    fn text_without_a_letter_or_digit_is_read_without_spotlight() {
+        let (_dir, home) = home_with(&[]);
+        write(&home.join("work/a.rs"), "let f = |x| x =>> 1;\n");
+        write(&home.join("work/node_modules/b.js"), "=>>\n");
+        let events = Events::default();
+        let core = spotlit_core(&home, &home, 1, &events);
+        let ticket = grep(&core, None, "=>>");
+        let (lines, _) = grep_all(&core, &events, ticket);
+        let shown: Vec<&str> = lines.iter().map(|line| line.0.as_str()).collect();
+        assert_eq!(shown, [home.join("work/a.rs").to_str().unwrap()]);
+        assert!(asked("=>>").is_empty());
+    }
+
+    /// A common word fills Spotlight's cap with files it met first, maybe without yours.
+    #[test]
+    fn a_file_you_opened_is_read_even_when_spotlights_cap_leaves_it_out() {
+        let (_dir, home) = home_with(&[]);
+        let opened = home.join("notes/opened.txt");
+        write(&opened, "zebra-capped\n");
+        write(&home.join("notes/other.txt"), "zebra-capped\n");
+        let mut answer: Vec<PathBuf> = (0..argus_grep::spotlight::SPOTLIGHT_FILES - 1)
+            .map(|at| home.join(format!("notes/gone{at}.txt")))
+            .collect();
+        answer.push(home.join("notes/other.txt"));
+        name("zebra-capped", &answer);
+        let events = Events::default();
+        let core = spotlit_core(&home, &home, 1, &events);
+        let path = opened.to_str().unwrap();
+        assert_eq!(unsafe { tl_opened(core.0, path.as_ptr(), path.len()) }, 1);
+        let ticket = grep(&core, None, "zebra-capped");
+        let (lines, _) = grep_in_order(&core, &events, ticket, 0);
+        let order: Vec<&str> = lines.iter().map(|line| line.0.as_str()).collect();
+        assert_eq!(
+            order,
+            [path, home.join("notes/other.txt").to_str().unwrap()]
+        );
     }
 
     #[test]

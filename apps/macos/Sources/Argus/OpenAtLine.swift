@@ -5,8 +5,14 @@ import Foundation
 enum LineLink: Equatable {
     /// Sent to the editor itself, so another app that claims the same scheme can't take it.
     case url(URL)
-    /// The arguments for /usr/bin/xed.
+    /// The arguments for the xed inside Xcode.
     case xed([String])
+
+    /// The xed inside `xcode` itself: /usr/bin/xed fails when the Mac's developer folder is the
+    /// Command Line Tools, as after installing them before Xcode.
+    static func xed(in xcode: URL) -> URL {
+        xcode.appendingPathComponent("Contents/Developer/usr/bin/xed")
+    }
 
     /// Nil for TextEdit and any app without a known way: they open the file at its top.
     static func link(app: String, path: String, line: UInt64) -> LineLink? {

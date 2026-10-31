@@ -162,6 +162,11 @@ impl Frecency {
             .map_or(0.0, |&at| score(at, now))
     }
 
+    /// Every file with opens counted, in no order.
+    pub fn files(&self) -> impl Iterator<Item = &Path> {
+        self.at.keys().map(|path| Path::new(&**path))
+    }
+
     /// Counts one open of `path` at `now`, then forgets the files whose score fell under 1/16
     /// and, past 1024 files, the weakest other than `path`. False for a path that is not
     /// UTF-8, which no index holds, or one longer than 4096 bytes.
