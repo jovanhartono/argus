@@ -1,7 +1,7 @@
 import AppKit
 
-/// Shows a file found by name, a line found inside a file, or the title above those lines. A
-/// row on screen changes from one to another in place as you type.
+/// Shows a file found by name or by its text, a line found inside a file under that file, or
+/// the title above those. A row on screen changes from one to another in place as you type.
 final class ResultCell: NSTableCellView, NSViewToolTipOwner {
     static let id = NSUserInterfaceItemIdentifier("result")
 
@@ -68,17 +68,24 @@ final class ResultCell: NSTableCellView, NSViewToolTipOwner {
         return parts.count == 1 ? String(drive) : "\(drive) › \(parts[1])"
     }
 
-    /// "budget.md, line 12 · ~/notes" under the line, the match in bold.
-    func show(_ found: TextHit, icon image: NSImage, in scope: String? = nil) {
+    /// "12  Budget for 2026" under its file's row, half as tall: the line number in grey, the
+    /// match in bold.
+    func show(line found: TextHit) {
         if isHeader { reset() }
         guard found != hit else { return }
+        if hit == nil {
+            icon.isHidden = true
+            folder.frame = NSRect(x: 40, y: 5, width: 40, height: 14)
+            folder.alignment = .right
+            folder.font = .monospacedDigitSystemFont(ofSize: NSFont.smallSystemFontSize, weight: .regular)
+            name.frame = NSRect(x: 88, y: 4, width: bounds.width - 120, height: 17)
+            name.lineBreakMode = .byTruncatingTail
+        }
         hit = found
-        name.lineBreakMode = .byTruncatingTail
         shown = Self.excerpt(found.text, match: found.match, width: name.frame.width, font: Self.bold)
         paint()
-        let file = found.file
-        folder.stringValue = "\(file.name), line \(found.line) · \(Self.place(file.folder, in: scope))"
-        if icon.image !== image { icon.image = image }
+        folder.stringValue = String(found.line)
+        setAccessibilityLabel("line \(found.line): \(found.text)")
     }
 
     /// The title's words change as the search for lines goes on.
@@ -86,6 +93,7 @@ final class ResultCell: NSTableCellView, NSViewToolTipOwner {
         if !isHeader {
             hit = nil
             isHeader = true
+            setAccessibilityLabel(nil)
             icon.isHidden = true
             folder.isHidden = true
             name.frame.origin = NSPoint(x: 18, y: 4)
@@ -100,11 +108,15 @@ final class ResultCell: NSTableCellView, NSViewToolTipOwner {
         isHeader = false
         icon.isHidden = false
         folder.isHidden = false
-        name.frame.origin = NSPoint(x: 48, y: 24)
+        name.frame = NSRect(x: 48, y: 24, width: bounds.width - 80, height: 17)
+        folder.frame = NSRect(x: 48, y: 8, width: bounds.width - 80, height: 15)
         name.font = .systemFont(ofSize: NSFont.systemFontSize)
+        folder.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
+        folder.alignment = .natural
         name.lineBreakMode = .byTruncatingMiddle
         name.stringValue = ""
         folder.stringValue = ""
+        setAccessibilityLabel(nil)
         backgroundStyle = backgroundStyle
     }
 

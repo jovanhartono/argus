@@ -27,7 +27,7 @@ final class HatchTextTests: XCTestCase {
     }
 
     func testLinesComeBackWithTheMatchCountedAsAppKitCounts() async throws {
-        let (hits, end) = try await found("budget", in: [root.path])
+        let (hits, end) = try await found("budget", in: root.path)
         XCTAssertEqual(hits.map(\.line), [1, 3])
         XCTAssertEqual(hits.map(\.text), ["café crème budget ✓", "🚀 Budget rocket"], "spaces around a line are dropped")
         XCTAssertEqual(hits.map(\.match), [NSRange(location: 11, length: 6), NSRange(location: 3, length: 6)])
@@ -39,31 +39,30 @@ final class HatchTextTests: XCTestCase {
         XCTAssertEqual(end.filesSearched, 1)
     }
 
-    func testCapitalsMustMatchExactly() async throws {
-        let (hits, _) = try await found("Budget", in: [root.path])
-        XCTAssertEqual(hits.map(\.line), [3])
-    }
-
-    func testAFolderInsideAnotherIsReadOnce() async throws {
-        let (hits, end) = try await found("budget", in: [notes.path, root.path, notes.path])
-        XCTAssertEqual(hits.count, 2)
+    /// Nothing to set up first: with no folder named, the whole searched folder is read.
+    func testWithNoFolderNamedLinesComeFromEverywhere() async throws {
+        let (hits, end) = try await found("budget", in: nil)
+        XCTAssertEqual(hits.map(\.line), [1, 3])
         XCTAssertEqual(end.filesSearched, 1)
     }
 
-    func testNoFolderAMissingOneOrNothingToFindEndsEmpty() async throws {
-        let asks: [(String, [String])] = [
-            ("budget", []), ("budget", [root.appendingPathComponent("gone").path]), ("zebra", [root.path]),
-        ]
-        for (query, folders) in asks {
-            let (hits, end) = try await found(query, in: folders)
-            XCTAssertEqual(hits, [], "\(query) in \(folders)")
+    func testCapitalsMustMatchExactly() async throws {
+        let (hits, _) = try await found("Budget", in: root.path)
+        XCTAssertEqual(hits.map(\.line), [3])
+    }
+
+    func testAMissingFolderOrNothingToFindEndsEmpty() async throws {
+        let asks: [(String, String?)] = [("budget", root.appendingPathComponent("gone").path), ("zebra", nil)]
+        for (query, folder) in asks {
+            let (hits, end) = try await found(query, in: folder)
+            XCTAssertEqual(hits, [], "\(query) in \(folder ?? "everywhere")")
             XCTAssertTrue(end.done)
         }
     }
 
     func testOnlyTheNewestSearchHandsLinesOver() async throws {
-        let older = hatch.searchText("budget", in: [root.path])
-        let newer = hatch.searchText("rocket", in: [root.path])
+        let older = hatch.searchText("budget", in: root.path)
+        let newer = hatch.searchText("rocket", in: root.path)
         XCTAssertNotEqual(older, 0)
         XCTAssertNil(hatch.takeText(older))
         let (hits, _) = try await drain(newer)
@@ -73,10 +72,10 @@ final class HatchTextTests: XCTestCase {
     }
 
     func testACancelledSearchHandsNothingOverAndTheNextOneRuns() async throws {
-        let cancelled = hatch.searchText("budget", in: [root.path])
+        let cancelled = hatch.searchText("budget", in: root.path)
         hatch.cancelText()
         XCTAssertNil(hatch.takeText(cancelled))
-        let (hits, end) = try await found("rocket", in: [root.path])
+        let (hits, end) = try await found("rocket", in: root.path)
         XCTAssertEqual(hits.map(\.text), ["🚀 Budget rocket"], "no line of the stopped search comes with it")
         XCTAssertEqual(end.filesSearched, 1)
     }
@@ -85,7 +84,7 @@ final class HatchTextTests: XCTestCase {
         let before = String(repeating: "é ", count: 150)
         let line = before + "budget" + String(repeating: " ✓", count: 40)
         try line.write(to: notes.appendingPathComponent("long.txt"), atomically: true, encoding: .utf8)
-        let (hits, _) = try await found("budget", in: [notes.path])
+        let (hits, _) = try await found("budget", in: notes.path)
         let hit = try XCTUnwrap(hits.first { $0.path.hasSuffix("/long.txt") })
         XCTAssertLessThanOrEqual(hit.text.utf8.count, 200)
         XCTAssertLessThan(hit.text.utf16.count, line.utf16.count, "cut")
@@ -93,8 +92,8 @@ final class HatchTextTests: XCTestCase {
         XCTAssertGreaterThan(hit.match.location, 0, "a little of what comes before stays")
     }
 
-    private func found(_ query: String, in folders: [String]) async throws -> ([TextHit], TextBatch) {
-        let ticket = hatch.searchText(query, in: folders)
+    private func found(_ query: String, in folder: String?) async throws -> ([TextHit], TextBatch) {
+        let ticket = hatch.searchText(query, in: folder)
         XCTAssertNotEqual(ticket, 0)
         return try await drain(ticket)
     }

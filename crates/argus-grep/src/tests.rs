@@ -1,5 +1,6 @@
 use super::*;
 use argus_core::{Access, Cloud, Clutter, Ignore};
+use std::cell::{Cell, RefCell};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
@@ -44,19 +45,17 @@ fn grep_with(grep: &Grep, folder: &Folder, text: &str, limit: usize) -> (Vec<Str
     let shown = Literal::new(text.trim_ascii());
     let lines = Mutex::new(Vec::new());
     let report = grep
-        .search(&index, text, grep.ticket(), limit, |found| {
-            assert_eq!(index.path(found.entry), found.path);
-            if let Some(shown) = &shown {
-                let matched = found.text[found.matched.clone()].trim_ascii();
-                let whole = shown.find(matched.as_bytes()).unwrap();
-                assert_eq!(whole.map(|m| m.start()..m.end()), Some(0..matched.len()));
+        .search(&index, text, grep.ticket(), limit, |file| {
+            assert!(!file.is_empty() && file.len() <= LINES_PER_FILE);
+            for found in file {
+                assert_eq!(found.path, file[0].path, "one file per call");
+                if let Some(shown) = &shown {
+                    let matched = found.text[found.matched.clone()].trim_ascii();
+                    let whole = shown.find(matched.as_bytes()).unwrap();
+                    assert_eq!(whole.map(|m| m.start()..m.end()), Some(0..matched.len()));
+                }
+                lines.lock().unwrap().push(shown_as(folder, found));
             }
-            let path = found.path.strip_prefix(&folder.root).unwrap();
-            let path = path.to_string_lossy().replace('\\', "/");
-            lines
-                .lock()
-                .unwrap()
-                .push(format!("{path}:{}:{}", found.line, found.text));
         })
         .unwrap();
     let mut lines = lines.into_inner().unwrap();
@@ -67,6 +66,32 @@ fn grep_with(grep: &Grep, folder: &Folder, text: &str, limit: usize) -> (Vec<Str
 
 fn grep(folder: &Folder, text: &str) -> (Vec<String>, Report) {
     grep_with(&Grep::with_threads(2), folder, text, 1000)
+}
+
+/// "path:line:text", the path from the folder's root.
+fn shown_as(folder: &Folder, found: &Found<'_>) -> String {
+    let path = found.path.strip_prefix(&folder.root).unwrap();
+    let path = path.to_string_lossy().replace('\\', "/");
+    format!("{path}:{}:{}", found.line, found.text)
+}
+
+/// The lines `search_files` hands over for `files`, in the order handed, one call per file.
+fn grep_files(
+    grep: &Grep,
+    folder: &Folder,
+    files: &[&str],
+    text: &str,
+    limit: usize,
+) -> (Vec<Vec<String>>, Report) {
+    let files: Vec<PathBuf> = files.iter().map(|name| folder.root.join(name)).collect();
+    let calls = RefCell::new(Vec::new());
+    let report = grep
+        .search_files(&files, text, grep.ticket(), limit, &|| false, |file| {
+            let lines = file.iter().map(|found| shown_as(folder, found)).collect();
+            calls.borrow_mut().push(lines);
+        })
+        .unwrap();
+    (calls.into_inner(), report)
 }
 
 /// Keeps anyone else from opening `path`, or `None` when this user opens any file anyway,
@@ -372,14 +397,112 @@ fn a_replaced_search_hands_over_no_more_lines() {
     let folder = folder(&[("big.txt", &big)]);
     let index = index(&folder);
     let grep = Grep::with_threads(2);
-    let lines = AtomicUsize::new(0);
-    let result = grep.search(&index, "milk", grep.ticket(), usize::MAX, |_| {
-        if lines.fetch_add(1, Ordering::Relaxed) == 0 {
+    let calls = AtomicUsize::new(0);
+    let result = grep.search(&index, "milk", grep.ticket(), usize::MAX, |file| {
+        assert_eq!(file.len(), LINES_PER_FILE);
+        if calls.fetch_add(1, Ordering::Relaxed) == 0 {
             grep.ticket();
         }
     });
     assert_eq!(result, None);
-    assert_eq!(lines.load(Ordering::Relaxed), 1);
+    assert_eq!(calls.load(Ordering::Relaxed), 1);
+}
+
+#[test]
+fn a_file_shows_its_first_three_lines_together() {
+    let folder = folder(&[("a.log", &b"milk\n".repeat(10)), ("b.txt", b"milk\n")]);
+    let index = index(&folder);
+    let grep = Grep::with_threads(2);
+    let calls = Mutex::new(Vec::new());
+    let report = grep
+        .search(&index, "milk", grep.ticket(), 100, |file| {
+            let lines = file.iter().map(|found| shown_as(&folder, found)).collect();
+            calls.lock().unwrap().push(lines);
+        })
+        .unwrap();
+    let mut calls: Vec<Vec<String>> = calls.into_inner().unwrap();
+    calls.sort();
+    assert_eq!(
+        calls,
+        [
+            vec!["a.log:1:milk", "a.log:2:milk", "a.log:3:milk"],
+            vec!["b.txt:1:milk"]
+        ]
+    );
+    assert_eq!((report.lines_found, report.files_searched), (4, 2));
+}
+
+#[test]
+fn files_given_in_order_hand_over_their_lines_in_that_order() {
+    let names: Vec<String> = (0..50).map(|i| format!("d{}/{i}.txt", i % 3)).collect();
+    let folder = many(50, |i| format!("d{}/{i}.txt", i % 3), b"x\nmilk\n");
+    // Fewer threads than files, so the files come in several groups.
+    let grep = Grep::with_threads(2);
+    let mut order: Vec<&str> = names.iter().map(String::as_str).rev().collect();
+    order.insert(10, "missing.txt");
+    let (calls, report) = grep_files(&grep, &folder, &order, "milk", 100);
+    let expected: Vec<Vec<String>> = names
+        .iter()
+        .rev()
+        .map(|name| vec![format!("{name}:2:milk")])
+        .collect();
+    assert_eq!(calls, expected);
+    assert_eq!((report.files_searched, report.unreadable), (50, 1));
+}
+
+#[test]
+fn files_given_in_order_stop_at_the_limit_keeping_the_first() {
+    let folder = many(40, |i| format!("{i}.txt"), b"milk\nmilk\nmilk\nmilk\n");
+    let grep = Grep::with_threads(4);
+    let order: Vec<String> = (0..40).map(|i| format!("{i}.txt")).collect();
+    let order: Vec<&str> = order.iter().map(String::as_str).collect();
+    for limit in [0, 1, 7, 100] {
+        let (calls, report) = grep_files(&grep, &folder, &order, "milk", limit);
+        let lines: Vec<String> = calls.concat();
+        assert_eq!(lines.len(), limit, "{limit}");
+        assert_eq!(report.lines_found, limit);
+        let expected: Vec<String> = (0..limit)
+            .map(|at| format!("{}.txt:{}:milk", at / 3, at % 3 + 1))
+            .collect();
+        assert_eq!(lines, expected);
+        // Only the groups needed are read: one more group at most past the limit.
+        assert!(
+            report.files_searched <= limit.div_ceil(3) + 2 * grep.threads(),
+            "{limit}: {report:?}"
+        );
+    }
+}
+
+#[test]
+fn files_given_in_order_stop_between_groups_once_stale() {
+    static OPENED: AtomicUsize = AtomicUsize::new(0);
+    let folder = many(200, |i| format!("{i}.txt"), b"milk\n");
+    let order: Vec<PathBuf> = (0..200)
+        .map(|i| folder.root.join(format!("{i}.txt")))
+        .collect();
+    let mut grep = Grep::with_threads(2);
+    grep.cloud_only = |_, _| {
+        OPENED.fetch_add(1, Ordering::Relaxed);
+        false
+    };
+    let calls = Cell::new(0);
+    let result = grep.search_files(&order, "milk", grep.ticket(), 1000, &|| false, |_| {
+        calls.set(calls.get() + 1);
+        if calls.get() == 1 {
+            grep.ticket();
+        }
+    });
+    assert_eq!(result, None);
+    assert_eq!(
+        calls.get(),
+        1,
+        "the rest of the first group is never handed over"
+    );
+    assert_eq!(
+        OPENED.load(Ordering::Relaxed),
+        2 * grep.threads(),
+        "one group read"
+    );
 }
 
 #[test]
@@ -447,7 +570,6 @@ fn a_file_stops_at_the_next_read_once_the_search_is_over() {
             limit,
             delivered: AtomicUsize::new(0),
             report: Mutex::default(),
-            found: &|_: Found<'_>| {},
             stale: &stale,
             cloud_only: cloud::is_cloud_only,
         };
@@ -479,23 +601,47 @@ fn a_file_the_search_ends_before_a_line_counts_nowhere() {
             limit,
             delivered: AtomicUsize::new(0),
             report: Mutex::default(),
-            found: &|_: Found<'_>| {},
             stale: &stale,
             cloud_only: cloud::is_cloud_only,
         };
-        job.file(0, &path, &mut searcher())
+        let (report, lines) = job.file(&path, &mut searcher());
+        (report, lines.len())
     };
     let searched = Report {
         files_searched: 1,
-        lines_found: 1,
         ..Report::default()
     };
-    assert_eq!(file(usize::MAX, 10), searched);
-    // Stale at the first read, or after it but before the line is handed over.
-    assert_eq!(file(0, 10), Report::default());
-    assert_eq!(file(1, 10), Report::default());
+    assert_eq!(file(usize::MAX, 10), (searched, 1));
+    // Stale at the first read, or after it but before the line is kept.
+    assert_eq!(file(0, 10), (Report::default(), 0));
+    assert_eq!(file(1, 10), (Report::default(), 0));
     // Other threads already found all the lines.
-    assert_eq!(file(usize::MAX, 0), Report::default());
+    assert_eq!(file(usize::MAX, 0), (Report::default(), 0));
+}
+
+#[test]
+fn lines_read_but_never_handed_over_count_nowhere() {
+    let matcher = Literal::new("milk").unwrap();
+    let stale = || true;
+    let job = Job {
+        matcher: &matcher,
+        limit: 10,
+        delivered: AtomicUsize::new(0),
+        report: Mutex::default(),
+        stale: &stale,
+        cloud_only: cloud::is_cloud_only,
+    };
+    let read = Report {
+        files_searched: 1,
+        ..Report::default()
+    };
+    let line = Line {
+        line: 1,
+        text: "milk".into(),
+        matched: 0..4,
+    };
+    job.hand_over(Path::new("a.txt"), read, &[line], &|_| panic!());
+    assert_eq!(job.report.into_inner().unwrap(), Report::default());
 }
 
 #[test]
@@ -787,6 +933,7 @@ fn any_search_agrees_with_a_plain_line_by_line_check() {
                 let lines = bytes.split(|&byte| byte == b'\n').enumerate();
                 lines
                     .filter(|(_, line)| plainly_holds(line, &text))
+                    .take(LINES_PER_FILE)
                     .map(move |(at, line)| {
                         let shown = String::from_utf8_lossy(line.trim_ascii());
                         format!("{name}:{}:{shown}", at + 1)

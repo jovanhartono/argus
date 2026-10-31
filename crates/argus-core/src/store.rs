@@ -208,6 +208,16 @@ impl Settings {
             self.rules.ignore_folder(),
         )
     }
+
+    /// The folders a scan of the root with these settings would read, without building a list.
+    pub fn root_scope(&self) -> Scope {
+        Scope::new(
+            self.root.clone(),
+            Vec::new(),
+            self.rules.clone(),
+            self.rules.ignore_folder(),
+        )
+    }
 }
 
 impl PartialEq for Settings {

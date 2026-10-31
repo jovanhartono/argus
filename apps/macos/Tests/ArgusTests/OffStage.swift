@@ -65,6 +65,12 @@ final class OffStage: Stage {
         opened.append(url)
     }
 
+    private(set) var openedAtLine: [(URL, UInt64)] = []
+
+    func open(_ url: URL, line: UInt64) {
+        openedAtLine.append((url, line))
+    }
+
     private(set) var openedAsText: [URL] = []
 
     func openAsText(_ url: URL) {
@@ -79,21 +85,5 @@ final class OffStage: Stage {
 
     func copy(_ text: String) {
         copied.append(text)
-    }
-
-    /// What the open panel answers; the test sets it before the click.
-    var chosen: [URL] = []
-    private(set) var choosing = 0
-    private(set) weak var sheetOn: NSWindow?
-    private(set) var handedBack = 0
-
-    func chooseFolders(on window: NSWindow, _ done: @escaping @MainActor ([URL]) -> Void) {
-        choosing += 1
-        sheetOn = window
-        done(chosen)
-    }
-
-    func handBack() {
-        handedBack += 1
     }
 }
