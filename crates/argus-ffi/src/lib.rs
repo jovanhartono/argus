@@ -2688,8 +2688,9 @@ fn find_in(
             return grep.search_files(&files, &find.query, find.ticket, LINES, &|| false, add);
         }
         // Spotlight can't look for text with no letter or digit, as "=>", so a folder the list
-        // keeps is read whole instead; one it only walks through or seals stays unread.
-        if !scope.keeps_files_in(&folder) {
+        // keeps is read whole instead; one it only walks through or seals stays unread, and so
+        // does the whole home folder, which would take seconds and never reach 100 lines.
+        if folder == home || !scope.keeps_files_in(&folder) {
             return Some(Report::default());
         }
     }
@@ -2791,14 +2792,16 @@ fn spotlit(
 }
 
 /// The files right inside `folder` when the list keeps them, as ~/todo.md: Spotlight can only
-/// be asked about a folder with everything inside it.
+/// be asked about a folder with everything inside it. Hidden ones, as ~/.zsh_history, are left
+/// out as Spotlight leaves them out; rewritten all the time, they'd take the top of the list.
 fn own_files(folder: &Path, keeps: bool) -> Vec<PathBuf> {
     let Some(entries) = std::fs::read_dir(folder).ok().filter(|_| keeps) else {
         return Vec::new();
     };
-    let files = entries
-        .flatten()
-        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()));
+    let files = entries.flatten().filter(|entry| {
+        !entry.file_name().as_encoded_bytes().starts_with(b".")
+            && entry.file_type().is_ok_and(|kind| kind.is_file())
+    });
     files.map(|entry| entry.path()).collect()
 }
 
@@ -2884,7 +2887,8 @@ fn tell(mut waiting: MutexGuard<'_, Waiting>, number: u64, notify: Notify) {
 /// alone. Otherwise every older text search gives up; name searches never wait for any.
 /// Inside your home folder, Spotlight names the files that hold each typed word at the start of
 /// one of their words, and only the files you open most and the newest of those are read; a
-/// query with no letter or digit, which Spotlight can't look for, reads the folder whole.
+/// query with no letter or digit, which Spotlight can't look for, reads the folder whole, except
+/// the whole home folder, which it leaves unread.
 /// Elsewhere, as on a drive, the folder is listed as the name list would be and every file is
 /// read; one that can't be listed counts as unreadable. Either way clutter, the ignore list
 /// and cloud drives, as `tl_index_cloud` says, are left out.
@@ -7446,6 +7450,7 @@ mod tests {
     fn files_right_inside_the_home_folder_are_read_too() {
         let (_dir, home) = home_with(&[]);
         write(&home.join("todo.md"), "call dentist about zebra-top\n");
+        write(&home.join(".zsh_history"), "grep zebra-top\n");
         write(&home.join("notes/a.txt"), "zebra-top\n");
         name("zebra-top", &[home.join("notes/a.txt")]);
         let events = Events::default();
@@ -7458,7 +7463,8 @@ mod tests {
         assert_eq!(shown, expected.each_ref().map(|f| f.to_str().unwrap()));
     }
 
-    /// Spotlight can't look for "=>", so the home folder is read as the name list keeps it.
+    /// Spotlight can't look for "=>", so a kept folder is read as the name list keeps it; the
+    /// whole home folder is too big to read that way.
     #[test]
     fn text_without_a_letter_or_digit_is_read_without_spotlight() {
         let (_dir, home) = home_with(&[]);
@@ -7466,11 +7472,16 @@ mod tests {
         write(&home.join("work/node_modules/b.js"), "=>>\n");
         let events = Events::default();
         let core = spotlit_core(&home, &home, 1, &events);
-        let ticket = grep(&core, None, "=>>");
+        let ticket = grep(&core, Some(&home.join("work")), "=>>");
         let (lines, _) = grep_all(&core, &events, ticket);
         let shown: Vec<&str> = lines.iter().map(|line| line.0.as_str()).collect();
         assert_eq!(shown, [home.join("work/a.rs").to_str().unwrap()]);
         assert!(asked("=>>").is_empty());
+
+        let ticket = grep(&core, None, "=>>");
+        let (lines, report) = grep_all(&core, &events, ticket);
+        assert!(lines.is_empty(), "{lines:?}");
+        assert_eq!(report.files_searched, 0);
     }
 
     /// A common word fills Spotlight's cap with files it met first, maybe without yours.

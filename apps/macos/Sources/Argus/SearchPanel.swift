@@ -1189,6 +1189,8 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
     /// The accent follows the keys between the results and the pane's list; the preview follows
     /// the pick.
     private func paneChanged() {
+        // Stepping in or clicking in the pane's list is the user's pick; re-read lines leave it be.
+        if pane.inside { repick = nil }
         table.enumerateAvailableRowViews { view, _ in (view as? AccentRow)?.muted = pane.inside }
         follow()
     }

@@ -3530,6 +3530,25 @@ final class SearchPanelTests: XCTestCase {
         XCTAssertNil(window.repick, "a click on the waiting row keeps that row")
     }
 
+    func testSteppingIntoTheDetailsPaneWhileALineIsAwaitedKeepsThePanesPick() async throws {
+        try writeArchive()
+        try write("the archive", at: "notes/plan.txt")
+        let window = try await opened(access: true)
+        window.show()
+        defer { window.hide() }
+        window.toggleText(nil)
+        try await type("archive", in: window)
+        try await until { window.rows.map(\.name) == ["archive"] && window.hits.count == 1 && window.textTicket == 0 }
+        window.toggleDetails(nil)
+        try await until { window.pane.children.map(\.row.name) == ["natural_images", "data"] }
+        window.repick = (window.textRows[1], 0)
+
+        XCTAssertTrue(right(window))
+        try await until { window.pane.inside }
+        XCTAssertNil(window.repick, "a line read again later must not pull the keys out of the pane")
+        XCTAssertEqual(window.picked?.name, "natural_images")
+    }
+
     /// Any file saved in your home folder reads the lines again, a few at a time; the preview
     /// of a line far down closed when the first few came back.
     func testThePreviewOfAFoundLineStaysOpenWhileItsLinesAreReadAgain() async throws {
