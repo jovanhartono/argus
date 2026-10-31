@@ -405,6 +405,90 @@ final class DetailsTests: XCTestCase {
         XCTAssertEqual(pane.reading, rows[0].url, "⌘I off and on again reads it again")
     }
 
+    /// A deeper level is read in the background like the first, and ← meanwhile drops the read.
+    @MainActor
+    func testSteppingDeeperReadsInTheBackgroundAndSteppingBackDropsTheRead() async throws {
+        let top = root.appendingPathComponent("top")
+        let inner = top.appendingPathComponent("inner")
+        for folder in [inner, top.appendingPathComponent("Fake.app")] {
+            try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        }
+        try touch("deep.txt", in: inner, at: 1_700_000_000)
+        try touch("a.txt", in: top, at: 1_700_000_100)
+        for (folder, seconds) in [(inner, 1_700_000_900.0), (top.appendingPathComponent("Fake.app"), 1_700_000_500)] {
+            try FileManager.default.setAttributes(
+                [.modificationDate: Date(timeIntervalSince1970: seconds)], ofItemAtPath: folder.path)
+        }
+        let pane = DetailsPane(format: us)
+        defer { pane.stop() }
+        var picks = 0
+        pane.onPick = { picks += 1 }
+        let row = Row(name: "top", folder: root.path, isFolder: true)
+        XCTAssertFalse(pane.stepIn(at: 0), "nothing picked, nothing to step into")
+        pane.show(row, scale: 2)
+        try await until { pane.reading == nil }
+        XCTAssertEqual(pane.children.map(\.row.name), ["inner", "Fake.app", "a.txt"])
+        XCTAssertNil(pane.picked, "not inside, the result is what the keys act on")
+
+        XCTAssertTrue(pane.stepIn(at: ProcessInfo.processInfo.systemUptime))
+        XCTAssertEqual(pane.trail, [row])
+        XCTAssertEqual(pane.picked?.name, "inner")
+        XCTAssertGreaterThan(picks, 0)
+        XCTAssertTrue(pane.stepIn(at: ProcessInfo.processInfo.systemUptime))
+        XCTAssertEqual(pane.reading?.path, inner.path, "read in the background, so the key returns at once")
+        XCTAssertEqual(pane.children, [])
+        XCTAssertNil(pane.picked)
+        pane.move(by: 1)
+        XCTAssertNil(pane.picked, "nothing to move to until the list comes")
+        pane.stepOut()
+        XCTAssertNil(pane.reading, "stepping back gives up the read")
+        XCTAssertEqual(pane.picked?.name, "inner")
+        try await Task.sleep(for: .milliseconds(100))
+        XCTAssertEqual(pane.children.map(\.row.name), ["inner", "Fake.app", "a.txt"], "the dropped read never lands")
+
+        pane.move(by: 1)
+        XCTAssertEqual(pane.picked?.name, "Fake.app")
+        XCTAssertFalse(pane.stepIn(at: 0), "an app opens instead of showing inside")
+        pane.move(by: 1)
+        XCTAssertFalse(pane.stepIn(at: 0), "a file has nothing inside")
+        pane.move(by: -2)
+        XCTAssertTrue(pane.stepIn(at: ProcessInfo.processInfo.systemUptime))
+        try await until { pane.picked?.name == "deep.txt" }
+        XCTAssertEqual(pane.trail.map(\.name), ["top", "inner"])
+
+        pane.show(row, scale: 2)
+        XCTAssertEqual(pane.trail.count, 2, "the same result shown again keeps you inside")
+        pane.show(Row(name: "a.txt", folder: top.path, isFolder: false), scale: 2)
+        XCTAssertFalse(pane.inside, "another result goes back to the results")
+    }
+
+    /// A folder that changed is read again; landing after you stepped in, the list keeps your item.
+    @MainActor
+    func testAReReadLandingAfterSteppingInKeepsThePickedItem() async throws {
+        let top = root.appendingPathComponent("top")
+        try FileManager.default.createDirectory(at: top, withIntermediateDirectories: true)
+        try touch("a.txt", in: top, at: 1_700_000_200)
+        try touch("b.txt", in: top, at: 1_700_000_100)
+        try FileManager.default.setAttributes(
+            [.modificationDate: Date(timeIntervalSince1970: 1_700_000_300)], ofItemAtPath: top.path)
+        let pane = DetailsPane(format: us)
+        defer { pane.stop() }
+        let row = Row(name: "top", folder: root.path, isFolder: true)
+        pane.show(row, scale: 2)
+        try await until { pane.reading == nil }
+        XCTAssertEqual(pane.children.map(\.row.name), ["a.txt", "b.txt"])
+
+        try touch("new.txt", in: top, at: 1_700_000_900)
+        pane.show(row, scale: 2)
+        XCTAssertNotNil(pane.reading, "the changed folder is read again")
+        XCTAssertTrue(pane.stepIn(at: ProcessInfo.processInfo.systemUptime))
+        pane.move(by: 1)
+        XCTAssertEqual(pane.picked?.name, "b.txt")
+        try await until { pane.reading == nil }
+        XCTAssertEqual(pane.children.map(\.row.name), ["new.txt", "a.txt", "b.txt"])
+        XCTAssertEqual(pane.picked?.name, "b.txt", "the item you arrowed to stays picked")
+    }
+
     @MainActor
     private func until(_ done: () -> Bool, file: StaticString = #filePath, line: UInt = #line) async throws {
         for _ in 0..<500 where !done() { try await Task.sleep(for: .milliseconds(10)) }
