@@ -673,7 +673,7 @@ fn one_search_at_a_time() {
             })
         });
         // A wrong pass shows as soon as a line is found, unless the search threads, at
-        // background priority, wait longer than this for a core; a right one never depends on it.
+        // a low priority, wait longer than this for a core; a right one never depends on it.
         let waited = newer_found_any.recv_timeout(Duration::from_millis(250));
         assert_eq!(waited, Err(mpsc::RecvTimeoutError::Timeout));
         assert_eq!(newer_lines.load(Ordering::Relaxed), 0);
