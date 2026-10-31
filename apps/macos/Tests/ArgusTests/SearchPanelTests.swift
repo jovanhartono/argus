@@ -2553,6 +2553,58 @@ final class SearchPanelTests: XCTestCase {
         XCTAssertEqual(window.field.stringValue, "", "then Esc clears the box as before")
     }
 
+    func testInsideAnEmptyFolderTheKeysActOnItNotOnTheResult() async throws {
+        try writeArchive()
+        let empty = root.appendingPathComponent("archive/empty")
+        try FileManager.default.createDirectory(at: empty, withIntermediateDirectories: true)
+        try FileManager.default.setAttributes(
+            [.modificationDate: Date(timeIntervalSince1970: 1_700_000_000)], ofItemAtPath: empty.path)
+        let window = try await opened(access: true)
+        window.show()
+        defer { window.hide() }
+        try await type("archive", in: window)
+        try await until { window.rows.map(\.name) == ["archive"] }
+        window.toggleDetails(nil)
+        try await until { window.pane.children.count == 3 }
+        XCTAssertTrue(right(window))
+        try await until { window.pane.inside }
+        down(window)
+        down(window)
+        XCTAssertEqual(window.picked?.name, "empty")
+        XCTAssertTrue(right(window))
+        XCTAssertEqual(window.picked?.name, "empty", "while it is read, the keys act on the folder you are in")
+        try await until { window.pane.reading == nil }
+        XCTAssertEqual(window.pane.contentsNote.stringValue, "Empty folder")
+        XCTAssertEqual(window.picked?.name, "empty")
+        window.copyPath(nil)
+        XCTAssertEqual(stage.copied, [realRoot.appendingPathComponent("archive/empty").path])
+    }
+
+    func testEscAndLeftWithThePaneHiddenBehindAMessageActAsWithoutIt() async throws {
+        try writeArchive()
+        let window = try await opened(access: true)
+        window.show()
+        defer { window.hide() }
+        try await type("archive", in: window)
+        try await until { window.rows.map(\.name) == ["archive"] }
+        window.toggleDetails(nil)
+        try await until { window.pane.children.count == 2 }
+        XCTAssertTrue(right(window))
+        try await until { window.pane.inside }
+        XCTAssertTrue(right(window))
+        try await until { window.picked?.name == "cat.jpg" }
+        try FileManager.default.removeItem(at: root.appendingPathComponent("archive/natural_images/cat.jpg"))
+        XCTAssertTrue(window.control(NSTextField(), textView: NSTextView(), doCommandBy: #selector(NSResponder.insertNewline(_:))))
+        try await until { window.status == "“cat.jpg” can’t be found." }
+        XCTAssertFalse(window.detailing)
+        XCTAssertFalse(left(window), "← moves the text cursor while the pane is hidden")
+        XCTAssertFalse(right(window), "→ too")
+        XCTAssertEqual(window.pane.trail.count, 2)
+        XCTAssertTrue(esc(window))
+        XCTAssertEqual(window.field.stringValue, "", "the first Esc clears the box, as without the pane")
+        XCTAssertFalse(window.pane.inside)
+    }
+
     func testRightWithThePaneOffTurnsItOnAndStepsIn() async throws {
         try writeArchive()
         try write("x", at: "archive notes.txt")

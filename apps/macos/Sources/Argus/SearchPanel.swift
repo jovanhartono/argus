@@ -1117,14 +1117,22 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
     }
 
     /// What the keys act on: the item picked in the pane's list while inside, else the result.
+    /// Inside an empty folder, or one still being read, they act on that folder, never on the
+    /// result levels above it.
     var picked: Row? {
-        pane.picked ?? selected
+        pane.inside ? pane.picked ?? pane.trail.last : selected
+    }
+
+    /// Hidden behind a message, the pane's list doesn't have the keys.
+    private var inPane: Bool {
+        pane.inside && detailing
     }
 
     /// → with the text cursor at the end of the box steps into the picked folder, turning the
     /// pane on if it was off; inside, → steps into a folder picked in the list.
     private func stepIn(_ editor: NSTextView) -> Bool {
         if pane.inside {
+            guard detailing else { return false }
             _ = pane.stepIn(at: pressedAt())
             return true
         }
@@ -1311,14 +1319,14 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
             move(by: -1)
         case #selector(NSResponder.moveRight(_:)):
             return stepIn(textView)
-        case #selector(NSResponder.moveLeft(_:)) where pane.inside:
+        case #selector(NSResponder.moveLeft(_:)) where inPane:
             pane.stepOut()
         case #selector(NSResponder.cancelOperation(_:)):
             // Esc steps out of the pane's list, clears the box, then leaves the folder you were
             // searching in, then hides the window. A preview closes first.
             if previewing {
                 closePreview()
-            } else if pane.inside {
+            } else if inPane {
                 pane.leave()
             } else if !field.stringValue.isEmpty {
                 field.stringValue = ""

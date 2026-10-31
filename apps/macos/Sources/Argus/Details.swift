@@ -458,9 +458,11 @@ final class DetailsPane: NSView, NSTableViewDataSource, NSTableViewDelegate {
         guard !Task.isCancelled else { return }
         listing = nil
         reading = nil
+        // A re-read of a folder you stepped into keeps your item picked, wherever it moved to;
+        // stepped in before the list came, the first item is picked once it does.
+        let was = picked?.path
         showChildren(found)
-        // Stepped in before the list came, the first item is picked once it does.
-        if inside, contents.selectedRow < 0, !children.isEmpty { pick(0) }
+        if inside, !children.isEmpty { pick(children.firstIndex { $0.row.path == was } ?? 0) }
         if steppedAt != nil { return timeStep() }
         let took = (ProcessInfo.processInfo.systemUptime - asked) * 1000
         timing.notice(
