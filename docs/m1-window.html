@@ -234,7 +234,7 @@ footer { border-top: 0.5px solid var(--line); margin-top: 36px; padding-top: 20p
       <tbody>
         <tr><td class="n"><kbd>⌘</kbd> <kbd>⇧</kbd> <kbd>Space</kbd></td><td>Show or hide the window</td><td>M1 step 2</td></tr>
         <tr><td class="n"><kbd>↑</kbd> <kbd>↓</kbd></td><td>Move the selection</td><td>M1 step 2</td></tr>
-        <tr><td class="n"><kbd>Esc</kbd></td><td>Clear the box; a second <kbd>Esc</kbd> hides the window</td><td>M1 step 2</td></tr>
+        <tr><td class="n"><kbd>Esc</kbd></td><td>Clear the box; a second <kbd>Esc</kbd> hides the window. Inside a folder you tabbed into, the second <kbd>Esc</kbd> leaves the folder first and a third hides the window (<a href="https://github.com/jovanhartono/argus/issues/102">#102</a>)</td><td>M1 step 2</td></tr>
         <tr><td class="n"><kbd>Return</kbd></td><td>Open the selected file or folder</td><td>M1 step 3</td></tr>
         <tr><td class="n"><kbd>⌘</kbd> <kbd>Return</kbd></td><td>Show it in Finder</td><td>M1 step 3</td></tr>
         <tr><td class="n"><kbd>⌥</kbd> <kbd>⌘</kbd> <kbd>C</kbd></td><td>Copy its full path, as in Finder (<kbd>⌘</kbd> <kbd>⇧</kbd> <kbd>C</kbd> is taken by clipboard apps such as Maccy)</td><td>M1 step 3</td></tr>
@@ -334,7 +334,7 @@ footer { border-top: 0.5px solid var(--line); margin-top: 36px; padding-top: 20p
       <tbody>
         <tr><td class="n">1</td><td>Row layout</td><td>Two lines: name, then folder underneath</td><td>One line, folder in grey on the right; fits about 11 rows instead of 8</td></tr>
         <tr><td class="n">2</td><td>Fewer than 8 results</td><td>The window shrinks to fit them</td><td>Always 8 rows tall, so it never changes size</td></tr>
-        <tr><td class="n">3</td><td><kbd>Esc</kbd></td><td>Clears the box; a second <kbd>Esc</kbd> hides the window</td><td>Always hides at once</td></tr>
+        <tr><td class="n">3</td><td><kbd>Esc</kbd></td><td>Clears the box; a second <kbd>Esc</kbd> hides the window. Since <a href="https://github.com/jovanhartono/argus/issues/102">#102</a>, inside a folder, an <kbd>Esc</kbd> in the empty box leaves the folder before one hides the window, so a folder from earlier never sticks</td><td>Always hides at once</td></tr>
         <tr><td class="n">4</td><td>Opening it again</td><td>Shows your last search, selected, so typing replaces it (Spotlight does this)</td><td>Always starts empty</td></tr>
         <tr><td class="n">5</td><td>Position</td><td>Always the same spot, a fifth of the way down the screen</td><td>Remembers where you dragged it</td></tr>
         <tr><td class="n">6</td><td>Idle memory</td><td>Judge the window alone against 22 MB, and report the made-up list on its own line: 1M names take about 45 MB by themselves (measured in step 5; the first estimate was 25-30 MB)</td><td>Keep 22 MB for everything and cut the made-up list to about 100,000 names</td></tr>
