@@ -127,19 +127,6 @@ impl Ignore {
                 .any(|keep| same(keep.as_os_str(), path.as_os_str()))
     }
 
-    /// Whether `folder` is one you brought back by its path, or sits inside one.
-    pub(crate) fn inside_kept(&self, folder: &Path) -> bool {
-        let folder = folder.as_os_str().as_encoded_bytes();
-        self.keep_paths.iter().any(|keep| {
-            let keep = keep.as_os_str().as_encoded_bytes();
-            folder.len() >= keep.len()
-                && folder[..keep.len()].eq_ignore_ascii_case(keep)
-                && folder
-                    .get(keep.len())
-                    .is_none_or(|&byte| byte == MAIN_SEPARATOR as u8)
-        })
-    }
-
     /// Whether a folder you brought back sits somewhere inside `folder`.
     pub(crate) fn leads_to_kept(&self, folder: &Path) -> bool {
         let folder = folder.as_os_str().as_encoded_bytes();

@@ -58,6 +58,12 @@ impl Scope {
         self.reach(path).is_some()
     }
 
+    /// Whether the scan keeps the files right inside folder `path`: not in a folder it never
+    /// opens, nor in one it only walks through to reach a folder your ignore list brings back.
+    pub fn keeps_files_in(&self, path: &Path) -> bool {
+        self.reach(path).is_some_and(|inside| !inside.passage)
+    }
+
     /// Whether `index`, built by these rules, already lists what a scan would keep from
     /// `path` now, so a change there needs no rebuild: a file saved over, or a hidden file
     /// replaced, as apps do to their settings in the home folder all day. Reads the folder's
@@ -320,6 +326,29 @@ mod tests {
                         "{folder:?} with {access:?}, {clutter:?} and {cloud:?} from {root:?}"
                     );
                 }
+            }
+        }
+    }
+
+    /// What ⌘T asks before opening a file Spotlight named, with no list built.
+    #[test]
+    fn files_are_kept_exactly_where_the_scan_lists_them() {
+        let (_dir, home) = home();
+        for (access, cloud) in [
+            (Access::Full, Cloud::Keep),
+            (Access::Full, Cloud::Skip),
+            (Access::Limited, Cloud::Keep),
+        ] {
+            let settings = settings_from(&home, &home, Clutter::Skip, access, cloud);
+            let index = settings.scan().unwrap().index;
+            let listed: Vec<PathBuf> = (0..index.len() as u32).map(|e| index.path(e)).collect();
+            let scope = settings.root_scope();
+            for folder in every_folder(&home) {
+                assert_eq!(
+                    scope.keeps_files_in(&folder),
+                    listed.contains(&folder.join("probe.txt")),
+                    "{folder:?} with {access:?} and {cloud:?}"
+                );
             }
         }
     }

@@ -1,9 +1,11 @@
 //! Argus's text search: finds typed text inside the text and code files of a scanned
-//! folder, live, on threads of its own so name results never wait for it.
+//! folder, or of the files Spotlight names, on threads of its own so name results never wait
+//! for it.
 
 mod cloud;
 mod literal;
 mod priority;
+pub mod spotlight;
 
 pub use argus_core::Ticket;
 use argus_core::{EntryId, Index, Tickets};
@@ -16,7 +18,7 @@ use std::fs::{self, File, Metadata};
 use std::io::{self, Read};
 use std::num::NonZero;
 use std::ops::{Add, Range};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, PoisonError};
 
@@ -28,11 +30,12 @@ const MAX_LINE_BYTES: usize = 1 << 20;
 /// How much of a long line a result shows, and how much of it comes before the match.
 pub const MAX_TEXT_BYTES: usize = 200;
 const BEFORE_MATCH: usize = 40;
+/// A file shows at most this many lines, so one long log can't fill the list.
+pub const LINES_PER_FILE: usize = 3;
 
 /// One matching line, lent to the caller while it is handed over.
 #[derive(Debug)]
 pub struct Found<'a> {
-    pub entry: EntryId,
     pub path: &'a Path,
     /// Counted from 1.
     pub line: u64,
@@ -127,17 +130,18 @@ impl Grep {
         self.pool.install(work)
     }
 
-    /// Hands each matching line to `found` as soon as it is read, from several threads at
-    /// once and in no set order, until `limit` lines. Upper-case letters in `text` must match
-    /// exactly; lower-case ones match either case. Returns `None` when a newer ticket arrived
-    /// first, though some lines may have been handed over by then.
+    /// Hands each file's matching lines, up to `LINES_PER_FILE`, to `found` in one call once
+    /// the file is read, from several threads at once and in no set order, until `limit` lines.
+    /// Upper-case letters in `text` must match exactly; lower-case ones match either case.
+    /// Returns `None` when a newer ticket arrived first, though some lines may have been
+    /// handed over by then.
     pub fn search(
         &self,
         index: &Index,
         text: &str,
         ticket: Ticket,
         limit: usize,
-        found: impl Fn(Found<'_>) + Sync,
+        found: impl Fn(&[Found<'_>]) + Sync,
     ) -> Option<Report> {
         self.search_until(index, text, ticket, limit, &|| false, found)
     }
@@ -151,7 +155,58 @@ impl Grep {
         ticket: Ticket,
         limit: usize,
         stop: &(dyn Fn() -> bool + Sync),
-        found: impl Fn(Found<'_>) + Sync,
+        found: impl Fn(&[Found<'_>]) + Sync,
+    ) -> Option<Report> {
+        self.run(text, ticket, limit, stop, |job| {
+            self.pool.install(|| {
+                index
+                    .ids()
+                    .into_par_iter()
+                    .try_for_each_init(searcher, |searcher, entry| {
+                        job.entry(index, entry, searcher, &found)
+                    })
+            });
+        })
+    }
+
+    /// As `search_until`, for `files` in the order given, as Spotlight's best first: a few
+    /// are read at once and handed over in that order, so the first files' lines fill the
+    /// limit and come first.
+    pub fn search_files(
+        &self,
+        files: &[PathBuf],
+        text: &str,
+        ticket: Ticket,
+        limit: usize,
+        stop: &(dyn Fn() -> bool + Sync),
+        found: impl Fn(&[Found<'_>]),
+    ) -> Option<Report> {
+        let group = 2 * self.threads();
+        self.run(text, ticket, limit, stop, |job| {
+            for files in files.chunks(group) {
+                if (job.stale)() || job.done() {
+                    break;
+                }
+                let read: Vec<_> = self.pool.install(|| {
+                    files
+                        .par_iter()
+                        .map_init(searcher, |searcher, path| job.file(path, searcher))
+                        .collect()
+                });
+                for (path, (report, lines)) in files.iter().zip(read) {
+                    job.hand_over(path, report, &lines, &found);
+                }
+            }
+        })
+    }
+
+    fn run(
+        &self,
+        text: &str,
+        ticket: Ticket,
+        limit: usize,
+        stop: &(dyn Fn() -> bool + Sync),
+        read: impl FnOnce(&Job<'_>),
     ) -> Option<Report> {
         let stale = || self.tickets.is_stale(ticket);
         // A panic in `found` leaves nothing half-done behind the lock, so later searches go on.
@@ -168,18 +223,10 @@ impl Grep {
             limit,
             delivered: AtomicUsize::new(0),
             report: Mutex::default(),
-            found: &found,
             stale: &quit,
             cloud_only: self.cloud_only,
         };
-        self.pool.install(|| {
-            index
-                .ids()
-                .into_par_iter()
-                .try_for_each_init(searcher, |searcher, entry| {
-                    job.entry(index, entry, searcher)
-                })
-        });
+        read(&job);
         let report = job.report.into_inner().unwrap();
         (!stale()).then_some(report)
     }
@@ -197,33 +244,83 @@ fn searcher() -> Searcher {
         .build()
 }
 
-struct Job<'a, F, S> {
+struct Job<'a> {
     matcher: &'a Literal,
     limit: usize,
+    /// Lines handed over, or about to be.
     delivered: AtomicUsize,
     /// Kept here rather than folded, so files finished while the walk stops still count.
     report: Mutex<Report>,
-    found: &'a F,
-    stale: &'a S,
+    stale: &'a (dyn Fn() -> bool + Sync),
     cloud_only: fn(&Path, &Metadata) -> bool,
 }
 
-impl<F: Fn(Found<'_>) + Sync, S: Fn() -> bool + Sync> Job<'_, F, S> {
+/// A matching line, kept until its file's lines are handed over together.
+struct Line {
+    line: u64,
+    text: String,
+    matched: Range<usize>,
+}
+
+impl Job<'_> {
     fn done(&self) -> bool {
         self.delivered.load(Ordering::Relaxed) >= self.limit
     }
 
     /// `None` stops the walk, once the search is no longer wanted or has all its lines.
-    fn entry(&self, index: &Index, entry: EntryId, searcher: &mut Searcher) -> Option<()> {
+    fn entry(
+        &self,
+        index: &Index,
+        entry: EntryId,
+        searcher: &mut Searcher,
+        found: &impl Fn(&[Found<'_>]),
+    ) -> Option<()> {
         if (self.stale)() || self.done() {
             return None;
         }
         if !index.is_dir(entry) && !index.is_removed(entry) {
-            let file = self.file(entry, &index.path(entry), searcher);
-            let mut report = self.report.lock().unwrap();
-            *report = *report + file;
+            let path = index.path(entry);
+            let (report, lines) = self.file(&path, searcher);
+            self.hand_over(&path, report, &lines, found);
         }
         Some(())
+    }
+
+    /// Hands over as many of a file's `lines` as the limit leaves room for, while the search
+    /// is still wanted, and counts the file.
+    fn hand_over(
+        &self,
+        path: &Path,
+        mut report: Report,
+        lines: &[Line],
+        found: &impl Fn(&[Found<'_>]),
+    ) {
+        if !lines.is_empty() {
+            let room = if (self.stale)() {
+                0
+            } else {
+                let before = self.delivered.fetch_add(lines.len(), Ordering::Relaxed);
+                self.limit.saturating_sub(before).min(lines.len())
+            };
+            if room == 0 {
+                // Ended by the search before any line: neither searched nor skipped.
+                report = Report::default();
+            } else {
+                let shown: Vec<Found<'_>> = lines[..room]
+                    .iter()
+                    .map(|line| Found {
+                        path,
+                        line: line.line,
+                        text: &line.text,
+                        matched: line.matched.clone(),
+                    })
+                    .collect();
+                found(&shown);
+                report.lines_found = room;
+            }
+        }
+        let mut total = self.report.lock().unwrap();
+        *total = *total + report;
     }
 
     /// Opening failed, or reading did with downloads off: the file may have just been moved to
@@ -237,33 +334,33 @@ impl<F: Fn(Found<'_>) + Sync, S: Fn() -> bool + Sync> Job<'_, F, S> {
         }
     }
 
-    fn file(&self, entry: EntryId, path: &Path, searcher: &mut Searcher) -> Report {
+    /// Reads the file's first `LINES_PER_FILE` matching lines. The report counts no lines; the
+    /// hand-over does.
+    fn file(&self, path: &Path, searcher: &mut Searcher) -> (Report, Vec<Line>) {
         let mut report = Report::default();
         // Links are not followed, as in the scan.
         let Ok(metadata) = fs::symlink_metadata(path) else {
             report.unreadable = 1;
-            return report;
+            return (report, Vec::new());
         };
         if !metadata.is_file() {
-            return report;
+            return (report, Vec::new());
         }
         // Checked before opening: opening a cloud-only file can start its download.
         if (self.cloud_only)(path, &metadata) {
             report.cloud_only = 1;
-            return report;
+            return (report, Vec::new());
         }
         if metadata.len() > MAX_FILE_BYTES {
             report.too_large = 1;
-            return report;
+            return (report, Vec::new());
         }
         let Ok(file) = File::open(path) else {
-            return self.failed(path);
+            return (self.failed(path), Vec::new());
         };
         let mut sink = Lines {
             job: self,
-            entry,
-            path,
-            count: 0,
+            lines: Vec::new(),
             binary: false,
             stopped: false,
         };
@@ -273,7 +370,7 @@ impl<F: Fn(Found<'_>) + Sync, S: Fn() -> bool + Sync> Job<'_, F, S> {
             stopped: false,
         };
         match searcher.search_reader(self.matcher, &mut reader, &mut sink) {
-            _ if sink.count > 0 => report.files_searched = 1,
+            _ if !sink.lines.is_empty() => report.files_searched = 1,
             // Ended by the search before any line: neither searched nor skipped.
             _ if reader.stopped || sink.stopped => {}
             Ok(()) if sink.binary => report.binary = 1,
@@ -283,18 +380,17 @@ impl<F: Fn(Found<'_>) + Sync, S: Fn() -> bool + Sync> Job<'_, F, S> {
             Err(error) if error.raw_os_error().is_none() => report.too_large = 1,
             Err(_) => report = self.failed(path),
         }
-        report.lines_found = sink.count;
-        report
+        (report, sink.lines)
     }
 }
 
-struct Stoppable<'a, F, S> {
+struct Stoppable<'a> {
     file: File,
-    job: &'a Job<'a, F, S>,
+    job: &'a Job<'a>,
     stopped: bool,
 }
 
-impl<F: Fn(Found<'_>) + Sync, S: Fn() -> bool + Sync> Read for Stoppable<'_, F, S> {
+impl Read for Stoppable<'_> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         if (self.job.stale)() || self.job.done() {
             self.stopped = true;
@@ -304,35 +400,28 @@ impl<F: Fn(Found<'_>) + Sync, S: Fn() -> bool + Sync> Read for Stoppable<'_, F, 
     }
 }
 
-struct Lines<'a, F, S> {
-    job: &'a Job<'a, F, S>,
-    entry: EntryId,
-    path: &'a Path,
-    count: usize,
+struct Lines<'a> {
+    job: &'a Job<'a>,
+    lines: Vec<Line>,
     binary: bool,
     stopped: bool,
 }
 
-impl<F: Fn(Found<'_>) + Sync, S: Fn() -> bool + Sync> Sink for Lines<'_, F, S> {
+impl Sink for Lines<'_> {
     type Error = io::Error;
 
     fn matched(&mut self, _: &Searcher, line: &SinkMatch<'_>) -> io::Result<bool> {
-        if (self.job.stale)()
-            || self.job.delivered.fetch_add(1, Ordering::Relaxed) >= self.job.limit
-        {
+        if (self.job.stale)() || self.job.done() {
             self.stopped = true;
             return Ok(false);
         }
-        let (text, span) = excerpt(self.job.matcher, line.bytes());
-        (self.job.found)(Found {
-            entry: self.entry,
-            path: self.path,
+        let (text, matched) = excerpt(self.job.matcher, line.bytes());
+        self.lines.push(Line {
             line: line.line_number().unwrap_or(0),
-            text: &text,
-            matched: span,
+            text: text.into_owned(),
+            matched,
         });
-        self.count += 1;
-        Ok(true)
+        Ok(self.lines.len() < LINES_PER_FILE)
     }
 
     fn binary_data(&mut self, _: &Searcher, _: u64) -> io::Result<bool> {

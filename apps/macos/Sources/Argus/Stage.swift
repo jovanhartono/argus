@@ -22,14 +22,12 @@ protocol Stage: AnyObject {
     func reloadPreview()
     /// In its own app, or launched when it is an app.
     func open(_ url: URL)
+    /// At that line when its app is a code editor with a way to say so; at the top otherwise.
+    func open(_ url: URL, line: UInt64)
     /// In your text editor, for a file with no extension that macOS has no app for.
     func openAsText(_ url: URL)
     func showInFinder(_ url: URL)
     func copy(_ text: String)
-    /// Asks for folders with the open panel, as a sheet on `window`; `done` gets none when cancelled.
-    func chooseFolders(on window: NSWindow, _ done: @escaping @MainActor ([URL]) -> Void)
-    /// Gives the keys back to the app you were in, if Argus took them for the open panel.
-    func handBack()
 }
 
 @MainActor
@@ -79,6 +77,27 @@ final class Screen: Stage {
         NSWorkspace.shared.open(url)
     }
 
+    /// Asking macOS for the file's app takes 13 ms the first time, then about 1 ms.
+    func open(_ url: URL, line: UInt64) {
+        guard let app = NSWorkspace.shared.urlForApplication(toOpen: url),
+            let id = Bundle(url: app)?.bundleIdentifier,
+            let link = LineLink.link(app: id, path: url.path, line: line)
+        else { return open(url) }
+        switch link {
+        case .url(let link):
+            NSWorkspace.shared.open([link], withApplicationAt: app, configuration: NSWorkspace.OpenConfiguration())
+        case .xed(let arguments):
+            let xed = Process()
+            xed.executableURL = LineLink.xed(in: app)
+            xed.arguments = arguments
+            xed.terminationHandler = { xed in
+                guard xed.terminationStatus != 0 else { return }
+                Task { @MainActor in NSWorkspace.shared.open(url) }
+            }
+            do { try xed.run() } catch { open(url) }
+        }
+    }
+
     func openAsText(_ url: URL) {
         guard let editor = NSWorkspace.shared.urlForApplication(toOpen: .plainText) else { return open(url) }
         NSWorkspace.shared.open([url], withApplicationAt: editor, configuration: NSWorkspace.OpenConfiguration())
@@ -91,30 +110,5 @@ final class Screen: Stage {
     func copy(_ text: String) {
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(text, forType: .string)
-    }
-
-    private var lent = false
-
-    func chooseFolders(on window: NSWindow, _ done: @escaping @MainActor ([URL]) -> Void) {
-        let choose = NSOpenPanel()
-        choose.canChooseFiles = false
-        choose.canChooseDirectories = true
-        choose.allowsMultipleSelection = true
-        choose.prompt = "Add"
-        choose.message = "Argus will also search the text inside the files in these folders."
-        // The open panel takes no typing while another app is active.
-        if !NSApp.isActive {
-            lent = true
-            NSApp.activate(ignoringOtherApps: true)
-        }
-        choose.beginSheetModal(for: window) { response in
-            MainActor.assumeIsolated { done(response == .OK ? choose.urls : []) }
-        }
-    }
-
-    func handBack() {
-        guard lent else { return }
-        lent = false
-        if NSApp.isActive && NSApp.keyWindow == nil { NSApp.deactivate() }
     }
 }

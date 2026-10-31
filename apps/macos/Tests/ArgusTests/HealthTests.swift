@@ -89,7 +89,6 @@ final class HealthWindowTests: XCTestCase {
     private var rebuilds = 0
     private var fullDisk = true
     private var health = Health(entries: 48_127, scannedAt: Date(), scanMs: 90)
-    private var folders: TextFolders!
     private var switched: [Bool] = []
     private var everything = false
     private var cloudSwitched: [Bool] = []
@@ -100,7 +99,6 @@ final class HealthWindowTests: XCTestCase {
         _ = NSApplication.shared
         UserDefaults.keepHotkeysInMemory()
         stage = OffStage()
-        folders = TextFolders()
     }
 
     override func tearDown() async throws {
@@ -130,7 +128,7 @@ final class HealthWindowTests: XCTestCase {
                 rebuilds += 1
                 (health.busy, health.building) = (true, true)
             },
-            stage: stage, folders: folders, everything: { [unowned self] in everything },
+            stage: stage, everything: { [unowned self] in everything },
             indexEverything: { [unowned self] on in
                 switched.append(on)
                 everything = on
@@ -282,8 +280,7 @@ final class HealthWindowTests: XCTestCase {
     func testTabGoesTopToBottomAndRoundAgain() {
         let window = window()
         let order: [NSView] = [
-            window.settings, window.rebuild, window.everything, window.cloud, window.folderList, window.folderButtons,
-            window.editIgnore, window.windowKeys, window.finderKeys, window.openLoginItems, window.quit,
+            window.settings, window.rebuild, window.everything, window.cloud, window.editIgnore, window.windowKeys, window.finderKeys, window.openLoginItems, window.quit,
             window.settings,
         ]
         for (view, next) in zip(order, order.dropFirst()) {
@@ -302,7 +299,8 @@ final class HealthWindowTests: XCTestCase {
         XCTAssertEqual(window.panel.title, "Settings")
         let content = try XCTUnwrap(window.panel.contentView)
         XCTAssertEqual(content.frame.height, window.page.fittingSize.height, "Quit Argus at the bottom isn't cut off")
-        XCTAssertTrue(window.panel.firstResponder === window.folderList, "Space mustn't start a rebuild")
+        XCTAssertTrue(window.panel.firstResponder === window.panel, "Space mustn't start a rebuild")
+        XCTAssertFalse(window.grid.subviews.contains { ($0 as? NSTextField)?.stringValue == "Search inside files in:" })
         XCTAssertEqual(window.entries.stringValue, "48,127")
         XCTAssertEqual(window.scanned.stringValue, "Just now, took 90 ms")
         XCTAssertNotNil(window.scanned.toolTip)
@@ -426,129 +424,6 @@ final class HealthWindowTests: XCTestCase {
         XCTAssertEqual(window.panel.frame.size, frame.size)
     }
 
-    func testNoFolderIsSearchedInsideUntilYouAddOne() {
-        let window = window()
-        window.show()
-        defer { window.hide() }
-        XCTAssertEqual(window.folderList.numberOfRows, 0)
-        XCTAssertTrue(window.folderButtons.isEnabled(forSegment: 0))
-        XCTAssertFalse(window.folderButtons.isEnabled(forSegment: 1), "nothing to remove")
-    }
-
-    func testAddingFoldersListsEachOnceAndKeepsTheWindowUp() {
-        let home = NSHomeDirectory()
-        let window = window()
-        window.show()
-        defer { window.hide() }
-        stage.chosen = [URL(fileURLWithPath: home + "/notes"), URL(fileURLWithPath: "/Volumes/Work")]
-        stage.key = nil
-        window.addFolders()
-        XCTAssertEqual(stage.choosing, 1)
-        XCTAssertTrue(stage.sheetOn === window.panel, "the open panel hangs from this window, never behind it")
-        XCTAssertEqual(folders.paths, [home + "/notes", "/Volumes/Work"])
-        XCTAssertEqual(window.folderList.numberOfRows, 2)
-        let first = window.folderList.view(atColumn: 0, row: 0, makeIfNecessary: true) as? NSTextField
-        XCTAssertEqual(first?.stringValue, "~/notes")
-        XCTAssertEqual(first?.toolTip, home + "/notes")
-        XCTAssertTrue(stage.key === window.panel, "the keys come back once the open panel goes")
-        XCTAssertTrue(window.shown)
-
-        stage.chosen = [URL(fileURLWithPath: "/Volumes/Work")]
-        window.addFolders()
-        XCTAssertEqual(folders.paths.count, 2, "a folder chosen again is listed once")
-        stage.chosen = []
-        window.addFolders()
-        XCTAssertEqual(folders.paths.count, 2, "Cancel adds nothing")
-    }
-
-    func testTheOpenPanelTakingTheKeysLeavesTheWindowUp() {
-        let held = HeldStage()
-        let holding = HealthWindow(
-            read: { Health() }, hasAccess: { true }, rebuild: {}, stage: held, folders: folders)
-        holding.show()
-        defer { holding.hide() }
-        holding.addFolders()
-        XCTAssertTrue(holding.choosing)
-        holding.windowDidResignKey(Notification(name: NSWindow.didResignKeyNotification))
-        XCTAssertTrue(holding.shown, "the open panel took the keys")
-        held.answer([URL(fileURLWithPath: "/tmp/notes")])
-        XCTAssertFalse(holding.choosing)
-        XCTAssertEqual(folders.paths, ["/tmp/notes"])
-        holding.windowDidResignKey(Notification(name: NSWindow.didResignKeyNotification))
-        XCTAssertFalse(holding.shown, "with the open panel gone, a click in another app hides it again")
-    }
-
-    func testHidingHandsTheKeysBack() {
-        let window = window()
-        window.show()
-        XCTAssertEqual(stage.handedBack, 0)
-        window.hide()
-        XCTAssertEqual(stage.handedBack, 1)
-        window.hide()
-        XCTAssertEqual(stage.handedBack, 1, "only when it was showing")
-    }
-
-    func testAnEmptyListSaysNoFoldersYetUntilOneIsAdded() {
-        let held = HeldStage()
-        let empty = HealthWindow(
-            read: { Health() }, hasAccess: { true }, rebuild: {}, stage: held, folders: folders)
-        empty.show()
-        defer { empty.hide() }
-        XCTAssertFalse(empty.noFolders.isHidden)
-        XCTAssertEqual(empty.noFolders.stringValue, "No folders yet")
-        empty.addFolders()
-        held.answer([URL(fileURLWithPath: "/tmp/notes")])
-        XCTAssertTrue(empty.noFolders.isHidden, "a folder is listed")
-        empty.folderList.selectRowIndexes([0], byExtendingSelection: false)
-        empty.removeFolders()
-        XCTAssertFalse(empty.noFolders.isHidden, "the last folder is gone")
-        folders.add(["/a"])
-        XCTAssertTrue(window().noFolders.isHidden, "a window opened over a kept list")
-    }
-
-    func testRemoveTakesTheSelectedFolders() {
-        folders.add(["/a", "/b", "/c"])
-        let window = window()
-        window.show()
-        defer { window.hide() }
-        XCTAssertEqual(window.folderList.numberOfRows, 3)
-        window.folderList.selectRowIndexes([0, 2], byExtendingSelection: false)
-        XCTAssertTrue(window.folderButtons.isEnabled(forSegment: 1))
-        window.removeFolders()
-        XCTAssertEqual(folders.paths, ["/b"])
-        XCTAssertEqual(window.folderList.numberOfRows, 1)
-        XCTAssertFalse(window.folderButtons.isEnabled(forSegment: 1))
-    }
-
-    func testDeleteAndForwardDeleteRemoveTheChosenFolders() {
-        folders.add(["/a", "/b", "/c"])
-        let window = window()
-        window.show()
-        defer { window.hide() }
-        window.folderList.selectRowIndexes([1], byExtendingSelection: false)
-        window.folderList.keyDown(with: key(NSDeleteCharacter))
-        XCTAssertEqual(folders.paths, ["/a", "/c"])
-        window.folderList.selectRowIndexes([0], byExtendingSelection: false)
-        window.folderList.keyDown(with: key(NSDeleteFunctionKey))
-        XCTAssertEqual(folders.paths, ["/c"])
-        XCTAssertFalse(window.folderButtons.isEnabled(forSegment: 1))
-    }
-
-    func testAnEmptyListSaysSoInItsMiddleWithoutStripes() throws {
-        let window = window()
-        window.show()
-        defer { window.hide() }
-        window.panel.contentView?.layoutSubtreeIfNeeded()
-        let list = try XCTUnwrap(window.noFolders.superview)
-        XCTAssertFalse(list is NSScrollView, "a scroll view would place the note itself")
-        XCTAssertEqual(window.noFolders.frame.midX, list.bounds.midX, accuracy: 1)
-        XCTAssertEqual(window.noFolders.frame.midY, list.bounds.midY, accuracy: 1)
-        XCTAssertFalse(window.folderList.usesAlternatingRowBackgroundColors)
-        stage.chosen = [URL(fileURLWithPath: "/tmp/notes")]
-        window.addFolders()
-        XCTAssertTrue(window.folderList.usesAlternatingRowBackgroundColors)
-    }
-
     func testEditMakesAnIgnoreListThatExplainsItselfOnceAndOpensIt() throws {
         let home = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: home) }
@@ -601,7 +476,7 @@ final class HealthWindowTests: XCTestCase {
         defer { window.hide() }
         XCTAssertEqual(window.windowKeys.shortcutName, .toggleWindow)
         XCTAssertEqual(window.finderKeys.shortcutName, .searchFinderFolder)
-        XCTAssertTrue(window.panel.firstResponder === window.folderList, "a recorder with the focus would take keys")
+        XCTAssertTrue(window.panel.firstResponder === window.panel, "a recorder with the focus would take keys")
         XCTAssertNil(window.windowKeys.currentEditor())
         XCTAssertNil(window.finderKeys.currentEditor())
     }
@@ -669,15 +544,15 @@ final class HealthWindowTests: XCTestCase {
         window.panel.setFrameOrigin(NSPoint(x: visible.minX, y: visible.minY))
         window.show()
         defer { window.hide() }
-        XCTAssertGreaterThan(window.panel.frame.height, 760, "it grew for the Open System Settings row")
+        XCTAssertGreaterThan(window.panel.frame.height, 600, "it grew for the Open System Settings row")
         XCTAssertGreaterThanOrEqual(window.panel.frame.minY, visible.minY)
         XCTAssertLessThanOrEqual(window.panel.frame.maxY, visible.maxY)
     }
 
-    /// A screen that looks like 1280 × 800 leaves about 705 pt under the menu bar and above the Dock.
+    /// A screen that looks like 1024 × 640 leaves about 545 pt under the menu bar and above the Dock.
     func testOnAShortScreenTheWindowFitsAndQuitScrollsIntoView() throws {
         fullDisk = false
-        let visible = NSRect(x: 0, y: 70, width: 1280, height: 705)
+        let visible = NSRect(x: 0, y: 70, width: 1024, height: 545)
         let window = window(area: visible)
         window.show()
         defer { window.hide() }
@@ -712,7 +587,7 @@ final class HealthWindowTests: XCTestCase {
         window.show()
         let whole = window.panel.frame.size
         window.hide()
-        area = NSRect(x: 0, y: 70, width: 1280, height: 705)
+        area = NSRect(x: 0, y: 70, width: 1024, height: 545)
         window.show()
         XCTAssertEqual(window.panel.frame.height, area.height, "Quit Argus scrolls into view on the shorter screen")
         XCTAssertGreaterThanOrEqual(window.panel.frame.minY, area.minY)
@@ -724,7 +599,7 @@ final class HealthWindowTests: XCTestCase {
     }
 
     func testTabOntoARowBelowTheBottomEdgeScrollsItIntoView() async throws {
-        let window = window(area: NSRect(x: 0, y: 0, width: 1280, height: 480))
+        let window = window(area: NSRect(x: 0, y: 0, width: 1280, height: 400))
         window.show()
         defer { window.hide() }
         try await Task.sleep(for: .milliseconds(50))
@@ -744,36 +619,6 @@ final class HealthWindowTests: XCTestCase {
         window.panel.makeFirstResponder(nil)
         try await Task.sleep(for: .milliseconds(50))
     }
-
-    private func key(_ code: Int) -> NSEvent {
-        let characters = String(UnicodeScalar(UInt16(code)).map(Character.init)!)
-        return NSEvent.keyEvent(
-            with: .keyDown, location: .zero, modifierFlags: [], timestamp: 0, windowNumber: 0, context: nil,
-            characters: characters, charactersIgnoringModifiers: characters, isARepeat: false, keyCode: 0)!
-    }
-}
-
-/// Holds the open panel's answer until the test gives it.
-@MainActor
-private final class HeldStage: Stage {
-    private var done: (@MainActor ([URL]) -> Void)?
-    var isActive = false
-    var previewShows = false
-    var previewIsKey = false
-    func isKey(_ window: NSWindow) -> Bool { false }
-    func bringForward(_ window: NSWindow) {}
-    func putAway(_ window: NSWindow) {}
-    func makeKey(_ window: NSWindow) {}
-    func openPreview() {}
-    func closePreview() {}
-    func reloadPreview() {}
-    func open(_ url: URL) {}
-    func openAsText(_ url: URL) {}
-    func showInFinder(_ url: URL) {}
-    func copy(_ text: String) {}
-    func chooseFolders(on window: NSWindow, _ done: @escaping @MainActor ([URL]) -> Void) { self.done = done }
-    func handBack() {}
-    func answer(_ urls: [URL]) { done?(urls) }
 }
 
 @MainActor
@@ -813,51 +658,5 @@ final class CloudDrivesTests: XCTestCase {
         let loose = CloudDrives()
         loose.isOn = true
         XCTAssertFalse(CloudDrives().isOn, "without defaults nothing is kept")
-    }
-}
-
-@MainActor
-final class TextFoldersTests: XCTestCase {
-    func testFoldersAreKeptOnceInOrderAndAcrossLaunches() throws {
-        let defaults = MemoryDefaults()
-        let folders = TextFolders(defaults: defaults)
-        XCTAssertEqual(folders.paths, [], "none at first")
-        folders.add(["/b", "/a", "/b"])
-        folders.add(["/a", "/c"])
-        XCTAssertEqual(folders.paths, ["/b", "/a", "/c"])
-        XCTAssertEqual(TextFolders(defaults: defaults).paths, ["/b", "/a", "/c"])
-        folders.remove(at: [0, 2, 7])
-        XCTAssertEqual(folders.paths, ["/a"])
-        XCTAssertEqual(TextFolders(defaults: defaults).paths, ["/a"])
-        XCTAssertEqual(TextFolders().paths, [], "without defaults nothing is read")
-    }
-
-    func testASearchInsideAFolderReachesOnlyTheChosenFoldersThere() {
-        let folders = TextFolders()
-        folders.add(["/Users/me/notes", "/Users/me/code/app", "/Volumes/Work/"])
-        XCTAssertEqual(folders.reached(within: nil), folders.paths)
-        XCTAssertEqual(folders.reached(within: "/Users/me/notes/2026"), ["/Users/me/notes/2026"])
-        XCTAssertEqual(folders.reached(within: "/Users/me/notes"), ["/Users/me/notes"])
-        XCTAssertEqual(folders.reached(within: "/Users/me"), ["/Users/me/notes", "/Users/me/code/app"])
-        XCTAssertEqual(folders.reached(within: "/Users/me/code"), ["/Users/me/code/app"])
-        XCTAssertEqual(folders.reached(within: "/Users/me/notes2"), [], "a name that only starts the same")
-        XCTAssertEqual(folders.reached(within: "/Users/me/downloads"), [])
-        XCTAssertEqual(folders.reached(within: "/Volumes/Work/plans"), ["/Volumes/Work/plans"])
-        XCTAssertEqual(folders.reached(within: "/"), folders.paths)
-    }
-
-    func testAFolderChosenThroughALinkIsKeptAtItsRealPlace() throws {
-        let home = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
-        let notes = home.appendingPathComponent("notes")
-        try FileManager.default.createDirectory(at: notes, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: home) }
-        let link = home.appendingPathComponent("link")
-        try FileManager.default.createSymbolicLink(at: link, withDestinationURL: notes)
-        let real = String(cString: realpath(notes.path, nil))
-        XCTAssertTrue(notes.path.hasPrefix("/var/"), "the temporary folder is reached through /var")
-        let folders = TextFolders()
-        folders.add([notes.path, link.path])
-        XCTAssertEqual(folders.paths, [real], "both name the same folder")
-        XCTAssertEqual(folders.reached(within: real + "/2026"), [real + "/2026"])
     }
 }

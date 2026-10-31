@@ -7,7 +7,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-static const uint32_t TL_ABI_VERSION = 15;
+static const uint32_t TL_ABI_VERSION = 16;
 
 static const uint32_t TL_OK = 0;
 static const uint32_t TL_GONE = 1;
@@ -110,7 +110,7 @@ uint32_t tl_take(const TlCore *core, uint64_t ticket, TlRows *out);
 void tl_rows_free(TlRows rows);
 uint32_t tl_frecency_open(const TlCore *core, const uint8_t *file, size_t len);
 uint32_t tl_opened(const TlCore *core, const uint8_t *path, size_t len);
-uint64_t tl_grep_submit(const TlCore *core, const uint8_t *folders, size_t folders_len, const uint8_t *query, size_t query_len);
+uint64_t tl_grep_submit(const TlCore *core, const uint8_t *folder, size_t folder_len, const uint8_t *query, size_t query_len);
 uint32_t tl_grep_take(const TlCore *core, uint64_t ticket, TlLines *out);
 void tl_grep_cancel(const TlCore *core);
 void tl_lines_free(TlLines lines);

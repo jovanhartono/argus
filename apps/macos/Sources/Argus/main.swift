@@ -29,8 +29,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let window = SearchPanel(
             standIn: ProcessInfo.processInfo.environment["ARGUS_STAND_IN"].flatMap(UInt64.init),
             saved: Hatch.savedList, opens: Hatch.openedList, apps: Hatch.appFolders,
-            textFolders: TextFolders(defaults: .standard), everything: IndexEverything(defaults: .standard),
-            cloud: CloudDrives(defaults: .standard))
+            everything: IndexEverything(defaults: .standard), cloud: CloudDrives(defaults: .standard))
         window.warmUp()
         drives = Drives(
             letGo: window.letGoOfDrive, added: window.driveMounted, removing: window.driveUnmounting,
