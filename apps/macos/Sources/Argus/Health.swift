@@ -40,7 +40,7 @@ struct HealthFormat {
     }
 
     func state(_ health: Health) -> String {
-        if health.stopped { return "Stopped: quit and reopen Argus" }
+        if health.stopped { return "Stopped: press ⌘Q, then open Argus again" }
         // With Index everything on, ~/Library changes every few seconds; those small patches
         // aren't worth a word.
         if health.building { return "Building the index…" }
@@ -102,7 +102,16 @@ final class HealthPanel: NSPanel {
         let recorder = (firstResponder as? NSText)?.delegate as? KeyboardShortcuts.RecorderCocoa
         let made = super.makeFirstResponder(responder)
         if made { recorderLeft = responder == nil ? recorder : nil }
+        if made, let view = responder as? NSView { reveal(view) }
         return made
+    }
+
+    /// On a short screen the window scrolls, and Tab can land on a row below the bottom edge.
+    private func reveal(_ view: NSView) {
+        guard let page = (contentView as? NSScrollView)?.documentView, view.isDescendant(of: page) else { return }
+        // The folder list scrolls inside its own box; that box is what has to be in view.
+        let shown = view.enclosingScrollView.flatMap { $0.isDescendant(of: page) ? $0 : nil } ?? view
+        page.scrollToVisible(shown.convert(shown.bounds, to: page))
     }
 
     override func selectNextKeyView(_ sender: Any?) {
@@ -114,6 +123,11 @@ final class HealthPanel: NSPanel {
         guard firstResponder === self, let recorderLeft else { return super.selectPreviousKeyView(sender) }
         selectKeyView(preceding: recorderLeft)
     }
+}
+
+/// Settings' rows, laid from the top so a short window shows Entries first and scrolls down.
+final class SettingsPage: NSView {
+    override var isFlipped: Bool { true }
 }
 
 /// Delete removes the chosen folders, as in any macOS list with + and − under it.
@@ -167,6 +181,8 @@ final class HealthWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, NST
     let cloud = NSButton(checkboxWithTitle: "Include iCloud Drive and cloud storage", target: nil, action: nil)
     let cloudHint = NSTextField(wrappingLabelWithString: "")
     let grid = NSGridView()
+    let scroll = NSScrollView()
+    let page = SettingsPage()
     let folderList = FolderList()
     let noFolders = NSTextField(labelWithString: "No folders yet")
     let editIgnore = KeyButton(title: "Edit…", target: nil, action: nil)
@@ -193,6 +209,8 @@ final class HealthWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, NST
     private let onQuit: () -> Void
     private let format: HealthFormat
     private let tick: TimeInterval
+    /// The screen under the menu bar and above the Dock.
+    private let usableArea: @MainActor (NSWindow) -> NSRect?
     private let dates = DetailsFormat()
     private var ticking: Timer?
     private var fitted = false
@@ -205,8 +223,10 @@ final class HealthWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, NST
         indexEverything: @escaping (Bool) -> Void = { _ in }, cloud: @escaping () -> Bool = { false },
         indexCloud: @escaping (Bool) -> Void = { _ in }, ignoreList: URL = HealthWindow.ignoreList,
         quit: @escaping () -> Void = { NSApp.terminate(nil) }, format: HealthFormat = HealthFormat(),
-        tick: TimeInterval = 1
+        tick: TimeInterval = 1,
+        usableArea: @escaping @MainActor (NSWindow) -> NSRect? = { ($0.screen ?? NSScreen.main)?.visibleFrame }
     ) {
+        self.usableArea = usableArea
         self.folders = folders
         self.read = read
         self.hasAccess = hasAccess
@@ -273,16 +293,22 @@ final class HealthWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, NST
         grid.columnSpacing = 8
         grid.row(at: 6).topPadding = 12
         grid.translatesAutoresizingMaskIntoConstraints = false
-        let content = NSView()
-        content.addSubview(grid)
+        page.addSubview(grid)
+        page.translatesAutoresizingMaskIntoConstraints = false
+        scroll.documentView = page
+        scroll.drawsBackground = false
+        scroll.hasVerticalScroller = true
+        scroll.autohidesScrollers = true
         NSLayoutConstraint.activate([
-            grid.topAnchor.constraint(equalTo: content.topAnchor, constant: 20),
-            grid.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -20),
-            grid.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 20),
-            grid.trailingAnchor.constraint(lessThanOrEqualTo: content.trailingAnchor, constant: -20),
-            content.widthAnchor.constraint(equalToConstant: 460),
+            grid.topAnchor.constraint(equalTo: page.topAnchor, constant: 20),
+            grid.bottomAnchor.constraint(equalTo: page.bottomAnchor, constant: -20),
+            grid.leadingAnchor.constraint(equalTo: page.leadingAnchor, constant: 20),
+            grid.trailingAnchor.constraint(lessThanOrEqualTo: page.trailingAnchor, constant: -20),
+            page.widthAnchor.constraint(equalToConstant: 460),
+            page.topAnchor.constraint(equalTo: scroll.contentView.topAnchor),
+            page.leadingAnchor.constraint(equalTo: scroll.contentView.leadingAnchor),
         ])
-        panel.contentView = content
+        panel.contentView = scroll
         // Focus starts on the folder list, where Space does nothing; on Rebuild Index it started a
         // 10 to 20 s rebuild.
         panel.initialFirstResponder = folderList
@@ -301,7 +327,7 @@ final class HealthWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, NST
                     ? .disallow(reason: "This shortcut is already used to \(use).") : .allow
             }
         }
-        panel.setContentSize(content.fittingSize)
+        panel.setContentSize(page.fittingSize)
         panel.center()
     }
 
@@ -513,11 +539,23 @@ final class HealthWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, NST
 
     /// The Open System Settings row comes and goes; the title bar stays where it was.
     private func fitKeepingTop() {
-        guard let content = panel.contentView else { return }
-        var frame = panel.frameRect(forContentRect: NSRect(origin: .zero, size: content.fittingSize))
+        let rows = page.fittingSize
+        var frame = panel.frameRect(forContentRect: NSRect(origin: .zero, size: rows))
+        // On a screen that looks like 1280 × 800 the whole window is taller than the room under
+        // the menu bar, so it takes that room and the rows scroll.
+        let visible = usableArea(panel)
+        if let visible, frame.height > visible.height {
+            // With scroll bars set to show always, the scroller takes room beside the rows.
+            let content = NSScrollView.frameSize(
+                forContentSize: rows, horizontalScrollerClass: nil, verticalScrollerClass: NSScroller.self,
+                borderType: .noBorder, controlSize: .regular, scrollerStyle: scroll.scrollerStyle)
+            frame.size = NSSize(
+                width: panel.frameRect(forContentRect: NSRect(origin: .zero, size: content)).width,
+                height: visible.height)
+        }
         frame.origin = NSPoint(x: panel.frame.minX, y: panel.frame.maxY - frame.height)
         // Grown downward on a 13" MacBook Air, Quit Argus ended up under the Dock.
-        if let visible = (panel.screen ?? NSScreen.main)?.visibleFrame {
+        if let visible {
             frame.origin.y = min(max(frame.minY, visible.minY), visible.maxY - frame.height)
         }
         if frame != panel.frame { panel.setFrame(frame, display: shown) }

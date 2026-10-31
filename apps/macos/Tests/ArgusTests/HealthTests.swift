@@ -65,7 +65,7 @@ final class HealthFormatTests: XCTestCase {
         XCTAssertEqual(english.state(Health(busy: true, behind: true)), "Missing a change: rebuild the index")
         XCTAssertEqual(
             english.state(Health(busy: true, building: true, behind: true)), "Building the index…", "the rebuild reads it")
-        XCTAssertEqual(english.state(Health(stopped: true)), "Stopped: quit and reopen Argus")
+        XCTAssertEqual(english.state(Health(stopped: true)), "Stopped: press ⌘Q, then open Argus again")
         XCTAssertEqual(
             english.state(Health(busy: true, building: true, behind: true, stopped: true)),
             english.state(Health(stopped: true)))
@@ -112,8 +112,10 @@ final class HealthWindowTests: XCTestCase {
     }
 
     /// The switch as the core takes it: switched back before the new list started, none is built.
+    /// Room for the whole window unless a test gives a shorter screen.
     private func window(
-        tick: TimeInterval = 1, ignoreList: URL = HealthWindow.ignoreList, quit: @escaping () -> Void = {}
+        tick: TimeInterval = 1, ignoreList: URL = HealthWindow.ignoreList, quit: @escaping () -> Void = {},
+        area: NSRect = NSRect(x: 0, y: 0, width: 1920, height: 1200)
     ) -> HealthWindow {
         let (listed, cloudListed) = (everything, cloud)
         return HealthWindow(
@@ -139,7 +141,8 @@ final class HealthWindowTests: XCTestCase {
                 cloud = on
                 (health.busy, health.building) = (on != cloudListed, on != cloudListed)
             },
-            ignoreList: ignoreList, quit: quit, format: HealthFormat(locale: Locale(identifier: "en_US")), tick: tick)
+            ignoreList: ignoreList, quit: quit, format: HealthFormat(locale: Locale(identifier: "en_US")), tick: tick,
+            usableArea: { _ in area })
     }
 
     func testTheCloudSwitchIsOffAtFirstAndSpinsWhileTheNewListIsBuilt() {
@@ -296,7 +299,7 @@ final class HealthWindowTests: XCTestCase {
         XCTAssertTrue(stage.key === window.panel)
         XCTAssertEqual(window.panel.title, "Settings")
         let content = try XCTUnwrap(window.panel.contentView)
-        XCTAssertEqual(content.frame.height, content.fittingSize.height, "Quit Argus at the bottom isn't cut off")
+        XCTAssertEqual(content.frame.height, window.page.fittingSize.height, "Quit Argus at the bottom isn't cut off")
         XCTAssertTrue(window.panel.firstResponder === window.folderList, "Space mustn't start a rebuild")
         XCTAssertEqual(window.entries.stringValue, "48,127")
         XCTAssertEqual(window.scanned.stringValue, "Just now, took 90 ms")
@@ -396,7 +399,7 @@ final class HealthWindowTests: XCTestCase {
         defer { window.hide() }
         XCTAssertEqual(window.entries.stringValue, "0")
         XCTAssertEqual(window.scanned.stringValue, "Didn’t finish")
-        XCTAssertEqual(window.state.stringValue, "Stopped: quit and reopen Argus")
+        XCTAssertEqual(window.state.stringValue, "Stopped: press ⌘Q, then open Argus again", "as the search window says")
         XCTAssertFalse(window.rebuild.isEnabled)
     }
 
@@ -659,16 +662,68 @@ final class HealthWindowTests: XCTestCase {
     /// 752 to 800 pt tall, it grew under the Dock on a 13" MacBook Air.
     func testTheWindowStaysAboveTheDock() throws {
         fullDisk = false
-        let window = window()
-        guard let visible = (window.panel.screen ?? NSScreen.main)?.visibleFrame, visible.height >= 800 else {
-            throw XCTSkip("no screen tall enough to hold it")
-        }
+        let visible = NSRect(x: 0, y: 80, width: 1470, height: 876)
+        let window = window(area: visible)
         window.panel.setFrameOrigin(NSPoint(x: visible.minX, y: visible.minY))
         window.show()
         defer { window.hide() }
         XCTAssertGreaterThan(window.panel.frame.height, 760, "it grew for the Open System Settings row")
         XCTAssertGreaterThanOrEqual(window.panel.frame.minY, visible.minY)
         XCTAssertLessThanOrEqual(window.panel.frame.maxY, visible.maxY)
+    }
+
+    /// A screen that looks like 1280 × 800 leaves about 705 pt under the menu bar and above the Dock.
+    func testOnAShortScreenTheWindowFitsAndQuitScrollsIntoView() throws {
+        fullDisk = false
+        let visible = NSRect(x: 0, y: 70, width: 1280, height: 705)
+        let window = window(area: visible)
+        window.show()
+        defer { window.hide() }
+        XCTAssertEqual(window.panel.frame.height, visible.height)
+        XCTAssertGreaterThanOrEqual(window.panel.frame.minY, visible.minY)
+        XCTAssertLessThanOrEqual(window.panel.frame.maxY, visible.maxY)
+        XCTAssertGreaterThanOrEqual(window.scroll.contentView.frame.width, 460, "no row is cut at the side")
+        window.scroll.layoutSubtreeIfNeeded()
+        let clip = window.scroll.contentView
+        XCTAssertLessThan(clip.bounds.height, window.page.frame.height, "the rows scroll")
+        XCTAssertEqual(clip.bounds.minY, 0, "it opens at Entries")
+        let quit = { window.quit.convert(window.quit.bounds, to: clip) }
+        XCTAssertFalse(clip.bounds.contains(quit()))
+        window.quit.scrollToVisible(window.quit.bounds)
+        XCTAssertTrue(clip.bounds.contains(quit()), "Quit Argus can be scrolled to")
+    }
+
+    func testOnATallScreenItLooksAsBeforeWithNothingToScroll() throws {
+        let window = window()
+        window.show()
+        defer { window.hide() }
+        window.scroll.layoutSubtreeIfNeeded()
+        let whole = window.panel.frameRect(forContentRect: NSRect(origin: .zero, size: window.page.fittingSize))
+        XCTAssertEqual(window.panel.frame.size, whole.size)
+        XCTAssertEqual(window.scroll.contentView.bounds.height, window.page.frame.height)
+        XCTAssertTrue(window.scroll.verticalScroller?.isHidden ?? true, "no scroller shows")
+    }
+
+    func testTabOntoARowBelowTheBottomEdgeScrollsItIntoView() async throws {
+        let window = window(area: NSRect(x: 0, y: 0, width: 1280, height: 480))
+        window.show()
+        defer { window.hide() }
+        try await Task.sleep(for: .milliseconds(50))
+        window.scroll.layoutSubtreeIfNeeded()
+        let clip = window.scroll.contentView
+        XCTAssertTrue(window.panel.makeFirstResponder(window.windowKeys))
+        XCTAssertTrue(window.panel.makeFirstResponder(nil), "what the recorder does with Tab")
+        window.page.scroll(.zero)
+        let finder = { window.finderKeys.convert(window.finderKeys.bounds, to: clip) }
+        XCTAssertFalse(clip.bounds.contains(finder()))
+        window.panel.keyDown(
+            with: NSEvent.keyEvent(
+                with: .keyDown, location: .zero, modifierFlags: [], timestamp: 0, windowNumber: 0, context: nil,
+                characters: "\t", charactersIgnoringModifiers: "\t", isARepeat: false, keyCode: 48)!)
+        XCTAssertTrue((window.panel.firstResponder as? NSText)?.delegate === window.finderKeys)
+        XCTAssertTrue(clip.bounds.contains(finder()), "the row Tab reached is in view")
+        window.panel.makeFirstResponder(nil)
+        try await Task.sleep(for: .milliseconds(50))
     }
 
     private func key(_ code: Int) -> NSEvent {
