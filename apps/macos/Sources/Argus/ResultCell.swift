@@ -152,17 +152,27 @@ final class ResultCell: NSTableCellView, NSViewToolTipOwner {
     }
 }
 
-/// The panel is the key window whenever it is on screen, so the selection always takes the
-/// accent colour, inset and rounded like AppKit's own inset lists.
+/// The panel is the key window whenever it is on screen, so the selection takes the accent
+/// colour, inset and rounded like AppKit's own inset lists.
 final class AccentRow: NSTableRowView {
+    /// Gray while the keys are on the other list: the results' or the details pane's.
+    var muted = false {
+        didSet {
+            guard muted != oldValue else { return }
+            needsDisplay = true
+            for case let cell as NSTableCellView in subviews { cell.backgroundStyle = interiorBackgroundStyle }
+        }
+    }
+    var inset = Metric.inset
+
     override var isEmphasized: Bool {
-        get { true }
+        get { !muted }
         set {}
     }
 
     override func drawSelection(in dirtyRect: NSRect) {
-        NSColor.selectedContentBackgroundColor.setFill()
-        let pill = bounds.insetBy(dx: Metric.inset, dy: 0)
+        (muted ? NSColor.unemphasizedSelectedContentBackgroundColor : .selectedContentBackgroundColor).setFill()
+        let pill = bounds.insetBy(dx: inset, dy: 0)
         NSBezierPath(roundedRect: pill, xRadius: 8, yRadius: 8).fill()
     }
 }

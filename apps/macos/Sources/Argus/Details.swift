@@ -188,6 +188,19 @@ final class DetailsPane: NSView, NSTableViewDataSource, NSTableViewDelegate {
     private var icons: [String: NSImage] = [:]
     /// A double-click on something in the folder.
     var onOpen: ((Row) -> Void)?
+    /// The folders → stepped into, starting with the picked result; empty while the keys are on
+    /// the results.
+    private(set) var trail: [Row] = []
+    /// Each outer level's list and pick, so ← lands back on the folder it came out of.
+    private var outer: [(children: [Child], picked: Int)] = []
+    /// When → was pressed, until the list it opened is drawn.
+    private var steppedAt: TimeInterval?
+    /// Where you are while inside, "archive › natural_images".
+    let steps = NSTextField(labelWithString: "")
+    /// The picture and the facts, which make room for the list while inside.
+    private var upper: [NSView] = []
+    /// Something else got picked or stepped into or out of.
+    var onPick: (() -> Void)?
 
     init(format: DetailsFormat = DetailsFormat()) {
         self.format = format
@@ -208,6 +221,7 @@ final class DetailsPane: NSView, NSTableViewDataSource, NSTableViewDelegate {
         rule.boxType = .separator
         rule.frame = NSRect(x: 17, y: 204, width: text, height: 1)
         for view in [edge, picture, name, summary, rule] { addSubview(view) }
+        upper = [picture, name, summary, rule]
         for (index, (title, value)) in [("Where", place), ("Created", created), ("Modified", modified)].enumerated() {
             let y = 216 + CGFloat(index) * 19
             let label = NSTextField(labelWithString: title)
@@ -219,8 +233,15 @@ final class DetailsPane: NSView, NSTableViewDataSource, NSTableViewDelegate {
             for field in [label, value] {
                 field.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
                 addSubview(field)
+                upper.append(field)
             }
         }
+        steps.frame = NSRect(x: 17, y: 16, width: text, height: 17)
+        steps.font = .systemFont(ofSize: NSFont.systemFontSize, weight: .semibold)
+        // The folder you are in stays in view when a deep path is cut short.
+        steps.lineBreakMode = .byTruncatingHead
+        steps.isHidden = true
+        addSubview(steps)
         summary.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
         summary.textColor = .secondaryLabelColor
         contentsRule.boxType = .separator
@@ -240,6 +261,7 @@ final class DetailsPane: NSView, NSTableViewDataSource, NSTableViewDelegate {
         contents.delegate = self
         contents.target = self
         contents.doubleAction = #selector(openChild(_:))
+        contents.setDraggingSourceOperationMask(.copy, forLocal: false)
         contents.setAccessibilityLabel("Contents")
         contentsScroll.documentView = contents
         contentsScroll.drawsBackground = false
@@ -279,8 +301,8 @@ final class DetailsPane: NSView, NSTableViewDataSource, NSTableViewDelegate {
         set(place, format.folder((row.path as NSString).deletingLastPathComponent))
         set(created, format.date(details.created))
         set(modified, format.date(details.modified))
-        // Finder opens an app or a package such as a Photos library instead of showing inside it.
-        let lists = details.found && row.isFolder && !row.isApp && !details.type.conforms(to: .package)
+        let lists = Self.lists(row, details)
+        if other || !lists { leave() }
         if lists != listsContents {
             listsContents = lists
             contentsRule.isHidden = !lists
@@ -300,12 +322,112 @@ final class DetailsPane: NSView, NSTableViewDataSource, NSTableViewDelegate {
             contentsNote.isHidden = true
         }
         // A folder that keeps changing, such as Downloads mid-download, can't keep restarting a read.
-        if lists, reading == nil { list(row) }
+        if lists, reading == nil, !inside { list(row) }
+    }
+
+    /// Finder opens an app or a package such as a Photos library instead of showing inside it.
+    static func lists(_ row: Row, _ details: Details) -> Bool {
+        details.found && row.isFolder && !row.isApp && !details.type.conforms(to: .package)
+    }
+
+    var inside: Bool { !trail.isEmpty }
+
+    /// What Return, ⌘Y and the window's other keys act on while inside.
+    var picked: Row? {
+        inside && children.indices.contains(contents.selectedRow) ? children[contents.selectedRow].row : nil
+    }
+
+    /// → on the picked result's folder, then on a folder picked in the list. The first level is
+    /// the list already shown; each deeper one is read in the background as the first was.
+    func stepIn(at pressed: TimeInterval) -> Bool {
+        if inside {
+            let at = contents.selectedRow
+            guard children.indices.contains(at), Self.lists(children[at].row, children[at].details) else { return false }
+            outer.append((children, at))
+            trail.append(children[at].row)
+            stopListing()
+            children = []
+            contents.reloadData()
+            contentsNote.isHidden = true
+            list(trail[trail.count - 1], asked: pressed)
+        } else {
+            guard listsContents, let row else { return false }
+            trail = [row]
+        }
+        steppedAt = pressed
+        layOut()
+        if !children.isEmpty { pick(0) }
+        if reading == nil { timeStep() }
+        return true
+    }
+
+    /// ← one level; out of the first, the keys go back to the results.
+    func stepOut() {
+        guard inside else { return }
+        trail.removeLast()
+        steppedAt = nil
+        if let (list, at) = outer.popLast() {
+            stopListing()
+            showChildren(list)
+            pick(at)
+        } else {
+            contents.deselectAll(nil)
+        }
+        layOut()
+    }
+
+    /// Back to the results with the picked result's own list.
+    func leave() {
+        guard inside else { return }
+        if let (list, _) = outer.first {
+            stopListing()
+            showChildren(list)
+        }
+        trail = []
+        outer = []
+        steppedAt = nil
+        contents.deselectAll(nil)
+        layOut()
+    }
+
+    /// ↑ and ↓ while inside.
+    func move(by step: Int) {
+        guard inside, !children.isEmpty else { return }
+        pick(min(max(contents.selectedRow + step, 0), children.count - 1))
+    }
+
+    private func pick(_ index: Int) {
+        contents.selectRowIndexes([index], byExtendingSelection: false)
+        contents.scrollRowToVisible(index)
+    }
+
+    /// Inside, the path line takes the top and the list the rest, so the pane keeps its height.
+    private func layOut() {
+        for view in upper { view.isHidden = inside }
+        steps.isHidden = !inside
+        steps.stringValue = trail.map(\.name).joined(separator: " › ")
+        steps.toolTip = trail.last?.path
+        let top = inside ? 44 : Metric.details
+        contentsRule.frame.origin.y = top - 4
+        contentsScroll.frame = NSRect(x: 9, y: top, width: Metric.pane - 16, height: Metric.folderDetails - top - 8)
+        contentsNote.frame.origin.y = top + 8
+        contents.enumerateAvailableRowViews { view, _ in (view as? AccentRow)?.muted = !inside }
+        onPick?()
+    }
+
+    /// From the → key to its list drawn with the first item picked.
+    private func timeStep() {
+        guard let stepped = steppedAt else { return }
+        steppedAt = nil
+        window?.displayIfNeeded()
+        let took = (ProcessInfo.processInfo.systemUptime - stepped) * 1000
+        timing.notice("\(self.children.count) folder items drawn \(took, format: .fixed(precision: 2)) ms after stepping in")
     }
 
     /// Given up before they landed, the thumbnail and the folder's contents are asked for again
     /// when the same row shows next.
     func stop() {
+        leave()
         guard waiting != nil || reading != nil else { return }
         cancelThumbnail()
         stopListing()
@@ -321,9 +443,8 @@ final class DetailsPane: NSView, NSTableViewDataSource, NSTableViewDelegate {
 
     /// Read in the background; another pick cancels the read, so arrowing past folders leaves
     /// no reads behind.
-    private func list(_ folder: Row) {
+    private func list(_ folder: Row, asked: TimeInterval = ProcessInfo.processInfo.systemUptime) {
         reading = folder.url
-        let asked = ProcessInfo.processInfo.systemUptime
         let path = folder.path
         // Detached, the read starts at once instead of waiting for the arrow key's frame to be drawn.
         listing = Task.detached(priority: .userInitiated) { [weak self] in
@@ -337,7 +458,12 @@ final class DetailsPane: NSView, NSTableViewDataSource, NSTableViewDelegate {
         guard !Task.isCancelled else { return }
         listing = nil
         reading = nil
+        // A re-read of a folder you stepped into keeps your item picked, wherever it moved to;
+        // stepped in before the list came, the first item is picked once it does.
+        let was = picked?.path
         showChildren(found)
+        if inside, !children.isEmpty { pick(children.firstIndex { $0.row.path == was } ?? 0) }
+        if steppedAt != nil { return timeStep() }
         let took = (ProcessInfo.processInfo.systemUptime - asked) * 1000
         timing.notice(
             "\(self.children.count) folder items shown \(took, format: .fixed(precision: 2)) ms after the selection")
@@ -363,6 +489,23 @@ final class DetailsPane: NSView, NSTableViewDataSource, NSTableViewDelegate {
         cell.summary.stringValue = format.summary(children[row].details)
         cell.icon.image = icon(for: children[row].details.type)
         return cell
+    }
+
+    /// The accent only while the list has the keys.
+    func tableView(_ tableView: NSTableView, rowViewForRow row: Int) -> NSTableRowView? {
+        let view = AccentRow()
+        view.inset = 0
+        view.muted = !inside
+        return view
+    }
+
+    func tableViewSelectionDidChange(_ notification: Notification) {
+        onPick?()
+    }
+
+    /// Dragged out, an item goes as its file, as a result does.
+    func tableView(_ tableView: NSTableView, pasteboardWriterForRow row: Int) -> (any NSPasteboardWriting)? {
+        children.indices.contains(row) ? children[row].row.url as NSURL : nil
     }
 
     /// One per kind, as the result list keeps them.
@@ -437,6 +580,15 @@ final class ChildCell: NSTableCellView {
     }
 
     required init?(coder: NSCoder) { nil }
+
+    override var backgroundStyle: NSView.BackgroundStyle {
+        didSet {
+            let picked = backgroundStyle == .emphasized
+            name.textColor = picked ? .alternateSelectedControlTextColor : .labelColor
+            summary.textColor =
+                picked ? .alternateSelectedControlTextColor.withAlphaComponent(0.8) : .secondaryLabelColor
+        }
+    }
 }
 
 /// Quick Look draws off the main thread; only the finished picture comes back. Cancelling the
