@@ -3,8 +3,9 @@ import QuickLookUI
 import UniformTypeIdentifiers
 
 /// Everything that reaches the screen or the keyboard: the search window coming forward and
-/// taking the keys, Quick Look, and the file, app or Finder window a result opens. Tests pass a
-/// stand-in, so a test run never takes the screen from whoever is using the Mac.
+/// taking the keys, Quick Look, the file, app or Finder window a result opens, and the clipboard.
+/// Tests pass a stand-in, so a test run never takes the screen or the clipboard from whoever is
+/// using the Mac.
 @MainActor
 protocol Stage: AnyObject {
     /// Argus is the active app, as after a click on the preview.
@@ -24,6 +25,7 @@ protocol Stage: AnyObject {
     /// In your text editor, for a file with no extension that macOS has no app for.
     func openAsText(_ url: URL)
     func showInFinder(_ url: URL)
+    func copy(_ text: String)
     /// Asks for folders with the open panel, as a sheet on `window`; `done` gets none when cancelled.
     func chooseFolders(on window: NSWindow, _ done: @escaping @MainActor ([URL]) -> Void)
     /// Gives the keys back to the app you were in, if Argus took them for the open panel.
@@ -84,6 +86,11 @@ final class Screen: Stage {
 
     func showInFinder(_ url: URL) {
         NSWorkspace.shared.activateFileViewerSelecting([url])
+    }
+
+    func copy(_ text: String) {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(text, forType: .string)
     }
 
     private var lent = false

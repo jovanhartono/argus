@@ -45,6 +45,26 @@ Opening Argus again from Applications while it runs brings up the search window 
 
 To start Argus when you log in, open System Settings → General → Login Items & Extensions (Open Login Items… in Argus's Settings goes straight there), click + under Open at Login, and choose Argus in Applications. Started at login, Argus stays out of sight until you press the hotkey.
 
+## Keys
+
+| Key | Does |
+| --- | --- |
+| ⌘⇧Space | Show or hide the search window |
+| ⌥⌘⇧Space | Search inside the folder the front Finder window shows |
+| ↑ ↓ | Move the selection |
+| Return | Open the selected file, folder or app |
+| ⌘Return | Show it in Finder |
+| ⌥⌘C | Copy its path |
+| ⌘Y | Preview it with Quick Look |
+| ⌘I | Show or hide the details pane |
+| ⌘T | Search inside files too; choose which folders in Settings (⌘,) |
+| Tab | Search inside the selected folder; ⌫ in an empty box steps back out |
+| Esc | Clear the box, then leave the folder, then hide the window |
+| ⌘, | Settings |
+| ⌘Q | Quit Argus |
+
+Right-click a result for the same actions, or drag it into another app, such as Mail, to give that app a copy. Both hotkeys can be changed in Settings (⌘,).
+
 ## Update to a new release
 
 1. Press ⌘⇧Space, then ⌘Q to quit Argus.

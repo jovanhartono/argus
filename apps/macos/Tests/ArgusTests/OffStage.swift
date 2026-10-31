@@ -75,6 +75,12 @@ final class OffStage: Stage {
         shownInFinder.append(url)
     }
 
+    private(set) var copied: [String] = []
+
+    func copy(_ text: String) {
+        copied.append(text)
+    }
+
     /// What the open panel answers; the test sets it before the click.
     var chosen: [URL] = []
     private(set) var choosing = 0

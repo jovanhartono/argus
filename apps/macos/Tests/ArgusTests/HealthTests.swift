@@ -770,6 +770,7 @@ private final class HeldStage: Stage {
     func open(_ url: URL) {}
     func openAsText(_ url: URL) {}
     func showInFinder(_ url: URL) {}
+    func copy(_ text: String) {}
     func chooseFolders(on window: NSWindow, _ done: @escaping @MainActor ([URL]) -> Void) { self.done = done }
     func handBack() {}
     func answer(_ urls: [URL]) { done?(urls) }
