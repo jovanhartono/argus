@@ -148,6 +148,8 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
     private var names: [Row] = []
     /// How many names stay above the lines: three, or down to the one picked when ⌘T came on.
     private var kept = 3
+    /// The rows' own height at the last fit, without the details pane beside them.
+    private var listHeight: CGFloat = 0
     let textFolders: TextFolders
     let everything: IndexEverything
     let cloud: CloudDrives
@@ -615,8 +617,9 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
         // the files are read, and the first letter in an empty box makes room for the lines.
         if textState == .searching {
             let full = CGFloat(Metric.visibleRows - 1) * Metric.row + Metric.header + 2 * Metric.inset
-            list = max(list, scroll.isHidden ? full : scroll.frame.height)
+            list = max(list, scroll.isHidden ? full : listHeight)
         }
+        listHeight = list
         return detailing ? max(list, pane.listsContents ? Metric.folderDetails : Metric.details) : list
     }
 
@@ -847,7 +850,11 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
         // A file you picked stays picked when a change moves it up or down the list.
         let keeping = rerun == ticket ? selected?.path : nil
         let keepingLine = rerun == ticket ? table.selectedRow - rows.count - 1 : -1
-        if rerun != ticket { kept = 3 }
+        if rerun != ticket {
+            kept = 3
+        } else if keepingLine < 0, let at = fresh.firstIndex(where: { $0.path == keeping }) {
+            kept = max(kept, at + 1)
+        }
         rerun = 0
         let ask = textAsk()
         // Lines found for what was typed before go with its names.

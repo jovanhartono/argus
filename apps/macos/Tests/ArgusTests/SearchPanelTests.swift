@@ -2573,6 +2573,48 @@ final class SearchPanelTests: XCTestCase {
         XCTAssertEqual(window.table.selectedRow, 0)
     }
 
+    func testAPickedNameStaysWhenANewFileRanksAboveIt() async throws {
+        for at in 0..<10 { try write("x", at: "notes/budget \(at).txt") }
+        let window = try await opened(access: true)
+        window.show()
+        defer { window.hide() }
+        window.toggleText(nil)
+        try await type("budget", in: window)
+        try await until { window.rows.count == 3 && window.header == 3 }
+        down(window)
+        down(window)
+        let picked = try XCTUnwrap(window.selected?.path)
+
+        try write("x", at: "notes/budget.txt")
+        try await until { window.rows.contains { $0.name == "budget.txt" } }
+        XCTAssertEqual(window.selected?.path, picked, "Return still opens the file picked before the change")
+        XCTAssertEqual(window.rows.count, 4)
+        XCTAssertEqual(window.header, 4)
+    }
+
+    func testWhileLinesAreReadTheWindowShrinksWhenThePaneGoes() async throws {
+        try FileManager.default.createDirectory(
+            at: root.appendingPathComponent("budget"), withIntermediateDirectories: false)
+        try Data().write(to: root.appendingPathComponent("budget.txt"))
+        let text = String(repeating: "a line of notes\n", count: 2000) + "the budget\n"
+        for at in 0..<300 { try write(text, at: "notes/\(at).txt") }
+        let window = try await opened(access: true, textFolders: [root.path])
+        window.show()
+        defer { window.hide() }
+        window.toggleDetails(nil)
+        window.toggleText(nil)
+        try await type("budget", in: window)
+        try await untilClose { window.rows.count == 2 && window.textTicket != 0 }
+        let scroll = try XCTUnwrap(window.table.enclosingScrollView)
+        let at = try XCTUnwrap(window.rows.firstIndex { $0.isFolder })
+        window.table.selectRowIndexes([at], byExtendingSelection: false)
+        XCTAssertEqual(scroll.frame.height, Metric.folderDetails)
+
+        window.toggleDetails(nil)
+        try XCTSkipIf(window.textTicket == 0, "the files were read before the pane went")
+        XCTAssertEqual(scroll.frame.height, CGFloat(Metric.visibleRows - 1) * Metric.row + Metric.header + 2 * Metric.inset)
+    }
+
     func testLinesInsideFilesListUnderTheNamesAndAfterThem() async throws {
         try write("nothing to see", at: "notes/budget.txt")
         try write("intro\n\tq3 budget review\n", at: "notes/plan.txt")
