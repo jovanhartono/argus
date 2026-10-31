@@ -40,7 +40,7 @@ struct HealthFormat {
     }
 
     func state(_ health: Health) -> String {
-        if health.stopped { return "Stopped: quit and reopen Argus" }
+        if health.stopped { return "Stopped: press ⌘Q, then open Argus again" }
         // With Index everything on, ~/Library changes every few seconds; those small patches
         // aren't worth a word.
         if health.building { return "Building the index…" }

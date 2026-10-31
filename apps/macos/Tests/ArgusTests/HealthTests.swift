@@ -65,7 +65,7 @@ final class HealthFormatTests: XCTestCase {
         XCTAssertEqual(english.state(Health(busy: true, behind: true)), "Missing a change: rebuild the index")
         XCTAssertEqual(
             english.state(Health(busy: true, building: true, behind: true)), "Building the index…", "the rebuild reads it")
-        XCTAssertEqual(english.state(Health(stopped: true)), "Stopped: quit and reopen Argus")
+        XCTAssertEqual(english.state(Health(stopped: true)), "Stopped: press ⌘Q, then open Argus again")
         XCTAssertEqual(
             english.state(Health(busy: true, building: true, behind: true, stopped: true)),
             english.state(Health(stopped: true)))
@@ -401,7 +401,7 @@ final class HealthWindowTests: XCTestCase {
         defer { window.hide() }
         XCTAssertEqual(window.entries.stringValue, "0")
         XCTAssertEqual(window.scanned.stringValue, "Didn’t finish")
-        XCTAssertEqual(window.state.stringValue, "Stopped: quit and reopen Argus", "as the search window says")
+        XCTAssertEqual(window.state.stringValue, "Stopped: press ⌘Q, then open Argus again", "as the search window says")
         XCTAssertFalse(window.rebuild.isEnabled)
     }
 
