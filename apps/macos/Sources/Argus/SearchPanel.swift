@@ -1001,16 +1001,16 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
         if let header { table.scrollRowToVisible(header) }
     }
 
-    /// A picked line hands the pick to the top name.
+    /// A picked line hands the pick to its file's name, or to the top name.
     private func namesOnly() {
         showChips()
         guard textAsked != nil || !hits.isEmpty else { return fit() }
-        let pickedLine = hit(at: table.selectedRow) != nil
+        let pickedLine = hit(at: table.selectedRow)
         dropLines()
         refill()
-        if pickedLine, let top {
-            select(top)
-        } else if pickedLine {
+        if let pickedLine, let top {
+            select(rows.firstIndex { $0.path == pickedLine.path } ?? top)
+        } else if pickedLine != nil {
             showDetails()
             follow()
         }
@@ -1216,13 +1216,13 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
         stage.closePreview()
     }
 
-    /// The preview moves with the selection, and closes once nothing is selected. It closes
+    /// The preview moves with the selection, and closes once nothing is left to pick. It closes
     /// quietly on a file gone since the list was built; "can't be found" is for ⌘Y and Return.
     private func follow() {
         guard previewing else { return }
-        guard let row = selected, FileManager.default.fileExists(atPath: row.path) else {
-            return closePreview()
-        }
+        // Lines read again a few at a time drop the pick for a moment, until it lands again.
+        guard let row = selected else { return listed == 0 ? closePreview() : () }
+        guard FileManager.default.fileExists(atPath: row.path) else { return closePreview() }
         guard row.url != inPreview else { return }
         inPreview = row.url
         stage.reloadPreview()
