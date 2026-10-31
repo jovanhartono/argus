@@ -19,10 +19,16 @@ enum Metric {
     static let details: CGFloat = 286
     /// Beside a folder the pane is taller, with room for six of what it holds.
     static let folderDetails: CGFloat = details + 6 * child + 8
-    static let child: CGFloat = 32
+    static let child: CGFloat = 36
     static let children = 50
     static let chip: CGFloat = 240
     static let chipHeight: CGFloat = 24
+}
+
+enum TextState: Equatable {
+    case searching, stopped, done
+    /// No chosen folder lies where the box searches; says what to do.
+    case unreached(String)
 }
 
 /// Read with `log show --last 5m --predicate 'subsystem == "io.github.jovanhartono.argus"'`.
@@ -103,7 +109,8 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
     private let scroll = NSScrollView()
     let table = NSTableView()
     private let message = NSTextField(labelWithString: "")
-    private let bar = TopDown()
+    /// Made at its full width, so Open Settings, pinned to its right edge, starts inside it.
+    private let bar = TopDown(frame: NSRect(x: 0, y: Metric.field, width: Metric.width, height: 1 + Metric.message))
     private let barLine = NSBox(frame: NSRect(x: 0, y: 0, width: Metric.width, height: 1))
     let barText = NSTextField(labelWithString: "")
     let settings = KeyButton(title: "Open Settings", target: nil, action: nil)
@@ -137,6 +144,12 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
     private var newest: UInt64 = 0
     private var sentAt: [UInt64: TimeInterval] = [:]
     private(set) var rows: [Row] = []
+    /// Every name found for the box; `rows` lists only the first few while ⌘T is on.
+    private var names: [Row] = []
+    /// How many names stay above the lines: three, or down to the one picked when ⌘T came on.
+    private var kept = 3
+    /// The rows' own height at the last fit, without the details pane beside them.
+    private var listHeight: CGFloat = 0
     let textFolders: TextFolders
     let everything: IndexEverything
     let cloud: CloudDrives
@@ -148,6 +161,10 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
     /// The search for those lines ran to the end while the window showed, and no file changed
     /// since it started. Editing a file's text brings no new list, so each ⌘T reads again.
     private var textWhole = false
+    /// The last search for lines ended early.
+    private var textStopped = false
+    /// How the search for lines is going, as last shown; nil while ⌘T is off.
+    private(set) var textState: TextState?
     /// A search run again for the same words leaves the old lines up until its own come, so the
     /// window doesn't shrink and grow back.
     private var replacing = false
@@ -214,7 +231,7 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
                 root: root, fullDisk: !lacksAccess, everything: everything.isOn && !lacksAccess, cloud: cloud.isOn,
                 saved: saved, onEvent: onEvent)
         }
-        if hatch == nil { problem = "Search couldn't start. Rebuild Argus." }
+        if hatch == nil { problem = "Search couldn’t start. Reinstall Argus from the latest .dmg." }
         if let opens { hatch?.rankOpens(keptIn: opens) }
         fit()
     }
@@ -447,6 +464,8 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
         table.refusesFirstResponder = true
         table.dataSource = self
         table.delegate = self
+        table.target = self
+        table.doubleAction = #selector(openClicked(_:))
         scroll.documentView = table
         scroll.drawsBackground = false
         scroll.hasVerticalScroller = true
@@ -474,7 +493,6 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
                 y: 1 + (Metric.message - settings.frame.height) / 2))
         settings.autoresizingMask = [.minXMargin]
         for view in [barLine, barText, settings] { bar.addSubview(view) }
-        bar.frame = NSRect(x: 0, y: Metric.field, width: Metric.width, height: 1 + Metric.message)
         bar.autoresizingMask = [.width]
         bar.isHidden = true
         pane.isHidden = true
@@ -554,27 +572,65 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
         if composing { return nil }
         if !indexed { return "Getting ready…" }
         if let missing { return missing }
-        if answered != 0 && rows.isEmpty && hits.isEmpty {
-            return textTicket == 0 && !textDue ? "No Results" : "Searching inside files…"
+        guard answered != 0 && rows.isEmpty && hits.isEmpty else { return nil }
+        switch textState {
+        case .searching: return "Searching inside files…"
+        case .stopped: return "Searching inside files stopped early."
+        case .unreached(let why): return scopes.isEmpty ? why : "\(why) Press ⌫ to search everywhere."
+        case .done, nil:
+            return scopes.last.map { "No results in \($0.name). Press ⌫ to search everywhere." } ?? "No Results"
         }
-        return nil
+    }
+
+    /// What the title above the lines says.
+    var textTitle: String {
+        switch textState {
+        case .searching: "Inside Files: searching…"
+        case .stopped: "Inside Files: stopped early"
+        case .unreached(let why): why
+        case .done where hits.isEmpty: "Inside Files: no lines found"
+        case .done, nil: "Inside Files"
+        }
+    }
+
+    private func readTextState() -> TextState? {
+        guard textOn, answered != 0, !field.stringValue.isEmpty, !composing else { return nil }
+        if textFolders.reached(within: scopes.last?.path).isEmpty {
+            guard let scope = scopes.last, !textFolders.paths.isEmpty else {
+                return .unreached("No folders chosen for searching inside files. Press ⌘, to add one.")
+            }
+            return .unreached("None of your chosen folders are inside \(scope.name).")
+        }
+        if textTicket != 0 || textDue || textAsked == nil || answered != newest { return .searching }
+        return textStopped ? .stopped : .done
     }
 
     private func bodyHeight(_ status: String?, _ detailing: Bool) -> CGFloat {
-        if field.stringValue.isEmpty { return 0 }
+        // A broken engine says so on show, before anything is typed.
+        if field.stringValue.isEmpty && problem == nil { return 0 }
         if status != nil { return Metric.message }
         if listed == 0 { return 0 }
         var list = CGFloat(min(listed, Metric.visibleRows)) * Metric.row + 2 * Metric.inset
         if let header, header < Metric.visibleRows { list -= Metric.row - Metric.header }
+        // Shrinking to three names at each keystroke, then growing for the lines a moment later,
+        // slowed the names tenfold for the slowest keystrokes. The window keeps its height while
+        // the files are read, and the first letter in an empty box makes room for the lines.
+        if textState == .searching {
+            let full = CGFloat(Metric.visibleRows - 1) * Metric.row + Metric.header + 2 * Metric.inset
+            list = max(list, scroll.isHidden ? full : listHeight)
+        }
+        listHeight = list
         return detailing ? max(list, pane.listsContents ? Metric.folderDetails : Metric.details) : list
     }
 
     var listed: Int {
-        rows.count + (hits.isEmpty ? 0 : 1 + hits.count)
+        rows.count + (header == nil ? 0 : 1 + hits.count)
     }
 
+    /// Under the names from the moment ⌘T asks, so a search still running, one that found
+    /// nothing and one with nowhere to look each say so.
     var header: Int? {
-        hits.isEmpty ? nil : rows.count
+        hits.isEmpty && (rows.isEmpty || textState == nil) ? nil : rows.count
     }
 
     private func hit(at index: Int) -> TextHit? {
@@ -597,6 +653,7 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
     /// The box alone while it is empty; it grows downward to fit up to 8 rows, and to the right
     /// while the details pane is on.
     private func fit() {
+        if readTextState() != textState { refill() }
         let status = self.status
         let detailing = self.detailing
         let body = bodyHeight(status, detailing)
@@ -681,11 +738,14 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
         case .failed(let code) where code != 0:
             let reason = String(cString: strerror(code))
             failures.error("home folder scan failed: \(reason, privacy: .public)")
-            problem = "Argus can't read your home folder: \(reason)."
+            problem =
+                code == EPERM || code == EACCES
+                ? "Argus isn’t allowed to read your home folder. Allow Full Disk Access in System Settings."
+                : "Argus can’t read your home folder: \(reason)."
             fit()
         case .failed:
             failures.error("the engine stopped")
-            problem = "Search stopped working. Quit and reopen Argus."
+            problem = "Search stopped working. Press ⌘Q, then open Argus again."
             fit()
         }
     }
@@ -699,7 +759,7 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
             // A reply to what was typed before the box was cleared must not fill it again.
             newest = 0
             sentAt = [:]
-            rows = []
+            names = []
             dropLines()
             answered = 0
             refill()
@@ -790,11 +850,16 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
         // A file you picked stays picked when a change moves it up or down the list.
         let keeping = rerun == ticket ? selected?.path : nil
         let keepingLine = rerun == ticket ? table.selectedRow - rows.count - 1 : -1
+        if rerun != ticket {
+            kept = 3
+        } else if keepingLine < 0, let at = fresh.firstIndex(where: { $0.path == keeping }) {
+            kept = max(kept, at + 1)
+        }
         rerun = 0
         let ask = textAsk()
         // Lines found for what was typed before go with its names.
         if ask != textAsked { dropLines() }
-        rows = fresh
+        names = fresh
         answered = ticket
         refill()
         if hits.indices.contains(keepingLine) {
@@ -848,6 +913,7 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
         guard let ask, needsText(ask) else { return fit() }
         replacing = !hits.isEmpty
         repick = nil
+        textStopped = false
         textAsked = ask
         textTypedAt = typed
         textStartedAt = ProcessInfo.processInfo.systemUptime
@@ -867,8 +933,11 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
             return namesOnly()
         }
         showChips()
+        // Someone who arrowed down to the fifth name, then pressed ⌘T and Return, opens that name.
+        kept = max(3, table.selectedRow < rows.count ? table.selectedRow + 1 : 0)
         // Names still on their way start it once drawn, as after a keystroke.
         if answered == newest { startText(textAsk(), typedAt: pressedAt()) }
+        if let header { table.scrollRowToVisible(header) }
     }
 
     /// A picked line hands the pick to the top name.
@@ -891,6 +960,7 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
         hits = []
         textAsked = nil
         textWhole = false
+        textStopped = false
         replacing = false
         repick = nil
     }
@@ -931,6 +1001,7 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
             repick = nil
             textTicket = 0
             textWhole = !batch.failed && filesChangedAt < textStartedAt
+            textStopped = batch.failed
             if batch.failed { failures.error("a text search stopped early") }
             let took = ms(since: textStartedAt)
             timing.notice(
@@ -1004,6 +1075,18 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
             stage.open(row.url)
         }
         hatch?.opened(row.path)
+    }
+
+    @objc private func openClicked(_ sender: Any?) {
+        open(clicked: table.clickedRow)
+    }
+
+    /// A double-click opens the row as Return does, as in Finder; below the rows or on the
+    /// title above the lines, it opens nothing.
+    func open(clicked index: Int) {
+        guard index >= 0, index < listed, index != header else { return }
+        select(index)
+        open(revealing: false)
     }
 
     @objc func showInFinder(_ sender: Any?) {
@@ -1185,16 +1268,19 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
 
     private func show(_ row: Int, in cell: ResultCell) {
         if rows.indices.contains(row) {
-            cell.show(rows[row], icon: icon(for: rows[row]))
+            cell.show(rows[row], icon: icon(for: rows[row]), in: scopes.last?.path)
         } else if row == header {
-            cell.showHeader("Inside Files")
+            cell.showHeader(textTitle)
         } else if let hit = hit(at: row) {
-            cell.show(hit, icon: icon(for: hit.file))
+            cell.show(hit, icon: icon(for: hit.file), in: scopes.last?.path)
         }
     }
 
     /// reloadData throws every row away and builds it again, most of the wait after a keystroke.
     private func refill() {
+        textState = readTextState()
+        // While ⌘T is on, a dozen names would push "Inside Files" and its lines below the window's edge.
+        rows = hits.isEmpty && textState == nil ? names : Array(names.prefix(kept))
         table.noteNumberOfRowsChanged()
         // The table keeps the old heights through noteNumberOfRowsChanged, so the title's old
         // row would stay short.
@@ -1249,7 +1335,7 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
                 guard rows.indices.contains(row), rows[row].path == path,
                     let cell = view.view(atColumn: 0) as? ResultCell
                 else { return }
-                cell.show(rows[row], icon: image)
+                cell.show(rows[row], icon: image, in: scopes.last?.path)
             }
         }
     }
@@ -1257,7 +1343,7 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
 
 /// Handed the icon itself, a row's image view asks macOS for a stand-in picture each time, most
 /// of the time spent filling the rows. Drawn from a copy, it doesn't.
-private func rowIcon(_ system: NSImage) -> NSImage {
+func rowIcon(_ system: NSImage) -> NSImage {
     NSImage(size: NSSize(width: 32, height: 32), flipped: false) { @Sendable rect in
         system.draw(in: rect)
         return true

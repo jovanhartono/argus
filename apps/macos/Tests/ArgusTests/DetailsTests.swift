@@ -309,6 +309,13 @@ final class DetailsTests: XCTestCase {
         let cell = try XCTUnwrap(pane.contents.view(atColumn: 0, row: 1, makeIfNecessary: true) as? ChildCell)
         XCTAssertEqual(cell.name.stringValue, "old.txt")
         XCTAssertEqual(cell.summary.stringValue, "Plain Text Document – 3 bytes")
+        XCTAssertNotNil(cell.icon.image)
+        XCTAssertGreaterThanOrEqual(cell.name.frame.minX, cell.icon.frame.maxX, "the name starts after the icon")
+        XCTAssertGreaterThanOrEqual(cell.name.frame.minY, cell.summary.frame.maxY, "the two lines don't touch")
+        XCTAssertTrue(cell.name.allowsExpansionToolTips && cell.summary.allowsExpansionToolTips)
+        let again = try XCTUnwrap(pane.tableView(pane.contents, viewFor: nil, row: 1) as? ChildCell)
+        XCTAssertTrue(again.icon.image === cell.icon.image, "one icon per kind")
+        XCTAssertTrue(pane.name.allowsExpansionToolTips && pane.place.allowsExpansionToolTips)
 
         XCTAssertTrue(pane.contents.target === pane)
         NSApp.sendAction(try XCTUnwrap(pane.contents.doubleAction), to: pane.contents.target, from: pane.contents)

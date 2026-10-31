@@ -218,15 +218,26 @@ final class DrivesTests: XCTestCase {
         XCTAssertEqual(ResultCell.place("/Volumes/Photos/trips"), "Photos › trips")
         XCTAssertEqual(ResultCell.place("/Volumes/My Drive/trips/2024 summer"), "My Drive › trips/2024 summer")
         let home = "/Volumes/Data/Users/me"
-        XCTAssertEqual(ResultCell.place("/Volumes/Data/Users/me/notes", home: home), "/Volumes/Data/Users/me/notes")
-        XCTAssertEqual(ResultCell.place(home, home: home), home)
+        XCTAssertEqual(ResultCell.place("/Volumes/Data/Users/me/notes", home: home), "~/notes")
+        XCTAssertEqual(ResultCell.place(home, home: home), "~")
         XCTAssertEqual(ResultCell.place("/Volumes/Data/Users/you", home: home), "Data › Users/you")
-        XCTAssertEqual(ResultCell.place("/Users/me/notes"), "/Users/me/notes")
+        XCTAssertEqual(ResultCell.place("/Users/me/notes", home: "/Users/me"), "~/notes")
+        XCTAssertEqual(ResultCell.place("/Users/meg/notes", home: "/Users/me"), "/Users/meg/notes")
+        XCTAssertEqual(ResultCell.place("/Users/me/notes", home: "/Users/jan"), "/Users/me/notes")
         XCTAssertEqual(ResultCell.place("~/notes"), "~/notes")
         XCTAssertEqual(ResultCell.place("/Volumes"), "/Volumes")
         XCTAssertEqual(ResultCell.place("/Volumes/"), "/Volumes/")
         XCTAssertEqual(ResultCell.place("/VolumesX/a"), "/VolumesX/a")
         XCTAssertEqual(ResultCell.place(""), "")
+    }
+
+    func testAFolderInsideTheChipsFolderIsWrittenFromThere() {
+        let home = "/Users/me"
+        XCTAssertEqual(ResultCell.place("/Users/me/Budget", in: "/Users/me/Budget", home: home), "Budget")
+        XCTAssertEqual(
+            ResultCell.place("/Users/me/Budget/Invoices/2024", in: "/Users/me/Budget", home: home), "Budget › Invoices/2024")
+        XCTAssertEqual(ResultCell.place("/Users/me/Budgets", in: "/Users/me/Budget", home: home), "~/Budgets")
+        XCTAssertEqual(ResultCell.place("/Volumes/Photos/trips/2024", in: "/Volumes/Photos/trips", home: home), "trips › 2024")
     }
 
     func testARowOnADriveShowsTheDrivesName() {
