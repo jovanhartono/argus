@@ -2403,6 +2403,214 @@ final class SearchPanelTests: XCTestCase {
         XCTAssertEqual(stage.opened.map(\.lastPathComponent), ["budget", "april.txt"])
     }
 
+    func testRightStepsInOnlyAtTheEndOfTheTextAndLeftStepsBackOut() async throws {
+        try writeArchive()
+        let window = try await opened(access: true)
+        window.show()
+        defer { window.hide() }
+        try await type("archive", in: window)
+        try await until { window.rows.map(\.name) == ["archive"] }
+        window.toggleDetails(nil)
+        try await until { window.pane.children.map(\.row.name) == ["natural_images", "data"] }
+        try await until { window.panel.frame.height == Metric.field + 1 + Metric.folderDetails }
+        let height = window.panel.frame.height
+        let result = try accentRow(window.table, 0)
+        XCTAssertFalse(result.muted)
+
+        XCTAssertFalse(right(window, cursorAt: 3), "mid-text, → moves the text cursor")
+        XCTAssertFalse(left(window), "← moves the text cursor while the results have the keys")
+        XCTAssertFalse(window.pane.inside)
+        XCTAssertTrue(right(window))
+        try await until { window.pane.inside }
+        XCTAssertEqual(window.pane.trail.map(\.name), ["archive"])
+        XCTAssertEqual(window.pane.steps.stringValue, "archive")
+        XCTAssertFalse(window.pane.steps.isHidden)
+        XCTAssertTrue(window.pane.picture.isHidden && window.pane.place.isHidden, "the list takes the whole pane")
+        XCTAssertEqual(window.picked?.name, "natural_images")
+        XCTAssertEqual(window.selected?.name, "archive", "the result stays picked underneath")
+        XCTAssertTrue(result.muted, "the result's accent turns gray")
+        XCTAssertEqual((result.view(atColumn: 0) as? NSTableCellView)?.backgroundStyle, .normal)
+        let child = try accentRow(window.pane.contents, 0)
+        XCTAssertFalse(child.muted)
+        XCTAssertEqual((child.view(atColumn: 0) as? ChildCell)?.backgroundStyle, .emphasized)
+
+        down(window)
+        XCTAssertEqual(window.picked?.name, "data")
+        down(window)
+        XCTAssertEqual(window.picked?.name, "data", "the last item stays picked")
+        up(window)
+        XCTAssertEqual(window.picked?.name, "natural_images")
+        XCTAssertEqual(window.selected?.name, "archive")
+
+        XCTAssertTrue(right(window, cursorAt: 3), "inside, → steps deeper wherever the text cursor is")
+        XCTAssertEqual(window.pane.steps.stringValue, "archive › natural_images")
+        try await until { window.picked?.name == "cat.jpg" }
+        XCTAssertEqual(window.pane.children.map(\.row.name), ["cat.jpg", "dog.jpg"])
+        XCTAssertTrue(right(window), "→ on a file stays put")
+        XCTAssertEqual(window.pane.trail.count, 2)
+        XCTAssertEqual(window.panel.frame.height, height, "the window keeps its height")
+
+        XCTAssertTrue(left(window))
+        XCTAssertEqual(window.pane.trail.map(\.name), ["archive"])
+        XCTAssertEqual(window.pane.children.map(\.row.name), ["natural_images", "data"])
+        XCTAssertEqual(window.picked?.name, "natural_images", "back on the folder it came out of")
+        XCTAssertTrue(left(window))
+        XCTAssertFalse(window.pane.inside)
+        XCTAssertEqual(window.picked?.name, "archive")
+        XCTAssertTrue(window.pane.steps.isHidden)
+        XCTAssertFalse(window.pane.picture.isHidden)
+        XCTAssertFalse(result.muted)
+        XCTAssertEqual((result.view(atColumn: 0) as? NSTableCellView)?.backgroundStyle, .emphasized)
+        XCTAssertEqual(window.pane.children.map(\.row.name), ["natural_images", "data"])
+        XCTAssertFalse(left(window), "back on the results, ← moves the text cursor again")
+        XCTAssertEqual(window.panel.frame.height, height)
+    }
+
+    func testWhileInsideTheWindowsKeysActOnThePickedItem() async throws {
+        try writeArchive()
+        let window = try await opened(access: true)
+        window.show()
+        defer { window.hide() }
+        try await type("archive", in: window)
+        try await until { window.rows.map(\.name) == ["archive"] }
+        window.toggleDetails(nil)
+        try await until { window.pane.children.count == 2 }
+        func intoPictures() async throws {
+            XCTAssertTrue(right(window))
+            try await until { window.pane.inside }
+            XCTAssertTrue(right(window))
+            try await until { window.picked?.name == "cat.jpg" }
+        }
+        try await intoPictures()
+        let cat = try XCTUnwrap(window.picked)
+        down(window)
+        let dog = try XCTUnwrap(window.picked)
+        XCTAssertEqual(dog.name, "dog.jpg")
+
+        window.quickLook(nil)
+        XCTAssertTrue(window.previewing)
+        XCTAssertEqual(item(window), dog.url)
+        up(window)
+        XCTAssertEqual(stage.reloads, 1, "the preview follows the pick")
+        XCTAssertEqual(item(window), cat.url)
+        XCTAssertTrue(esc(window))
+        XCTAssertFalse(window.previewing, "Esc closes the preview first")
+        XCTAssertTrue(window.pane.inside)
+        stage.finishFade()
+
+        let dragged = window.pane.tableView(window.pane.contents, pasteboardWriterForRow: 1) as? NSURL
+        XCTAssertEqual(dragged as URL?, dog.url)
+        XCTAssertNil(window.pane.tableView(window.pane.contents, pasteboardWriterForRow: 2))
+        // Asked as AppKit asks when a drag leaves the window; Swift hides this older name.
+        let ask = NSSelectorFromString("draggingSourceOperationMaskForLocal:")
+        let method = try XCTUnwrap(class_getInstanceMethod(NSTableView.self, ask))
+        let mask = unsafeBitCast(
+            method_getImplementation(method), to: (@convention(c) (AnyObject, Selector, Bool) -> UInt).self)
+        XCTAssertEqual(NSDragOperation(rawValue: mask(window.pane.contents, ask, false)), .copy, "never a move")
+
+        window.copyPath(nil)
+        XCTAssertEqual(stage.copied, [cat.path])
+        try await until { !window.shown }
+        window.show()
+        XCTAssertFalse(window.pane.inside, "shown again, the keys are on the results")
+        try await intoPictures()
+        XCTAssertTrue(window.control(NSTextField(), textView: NSTextView(), doCommandBy: #selector(NSResponder.insertNewline(_:))))
+        // A new list for the files written above can still be on its way; Return waits for it.
+        try await until { stage.opened == [cat.url] }
+        window.show()
+        try await intoPictures()
+        window.showInFinder(nil)
+        try await until { stage.shownInFinder == [cat.url] }
+        XCTAssertEqual(cat.path, realRoot.appendingPathComponent("archive/natural_images/cat.jpg").path)
+    }
+
+    func testEscOrTypingWhileInsideStepsAllTheWayOut() async throws {
+        try writeArchive()
+        let window = try await opened(access: true)
+        window.show()
+        defer { window.hide() }
+        try await type("archive", in: window)
+        try await until { window.rows.map(\.name) == ["archive"] }
+        window.toggleDetails(nil)
+        try await until { window.pane.children.count == 2 }
+        XCTAssertTrue(right(window))
+        try await until { window.pane.inside }
+        XCTAssertTrue(right(window))
+        try await until { window.picked?.name == "cat.jpg" }
+
+        XCTAssertTrue(esc(window))
+        XCTAssertFalse(window.pane.inside)
+        XCTAssertEqual(window.field.stringValue, "archive", "the box keeps its text")
+        XCTAssertEqual(window.pane.children.map(\.row.name), ["natural_images", "data"], "the result's own list is back")
+        XCTAssertEqual(window.picked?.name, "archive")
+        XCTAssertTrue(window.shown)
+
+        XCTAssertTrue(right(window))
+        try await until { window.pane.inside }
+        try await type("archiv", in: window)
+        XCTAssertFalse(window.pane.inside, "typing goes back to the box")
+        XCTAssertTrue(esc(window))
+        XCTAssertEqual(window.field.stringValue, "", "then Esc clears the box as before")
+    }
+
+    func testRightWithThePaneOffTurnsItOnAndStepsIn() async throws {
+        try writeArchive()
+        try write("x", at: "archive notes.txt")
+        let window = try await opened(access: true)
+        window.show()
+        defer { window.hide() }
+        try await type("archive", in: window)
+        try await until { window.rows.count == 2 }
+        let file = try XCTUnwrap(window.rows.firstIndex { !$0.isFolder })
+        window.table.selectRowIndexes([file], byExtendingSelection: false)
+        XCTAssertTrue(right(window))
+        XCTAssertFalse(window.pane.inside, "a file has nothing to step into")
+        XCTAssertFalse(window.detailsOn)
+
+        window.table.selectRowIndexes([1 - file], byExtendingSelection: false)
+        XCTAssertTrue(right(window))
+        try await until { window.pane.inside }
+        XCTAssertTrue(window.detailsOn)
+        try await until { window.picked?.name == "natural_images" }
+        try await until { window.panel.frame.height == Metric.field + 1 + Metric.folderDetails }
+        window.table.selectRowIndexes([file], byExtendingSelection: false)
+        XCTAssertFalse(window.pane.inside, "another result goes back to the results")
+    }
+
+    /// archive holds natural_images, changed last, and data; natural_images holds two pictures.
+    private func writeArchive() throws {
+        let dates: [(String, TimeInterval)] = [
+            ("archive/data/notes.txt", 1_700_000_000), ("archive/natural_images/cat.jpg", 1_700_000_600),
+            ("archive/natural_images/dog.jpg", 1_700_000_300), ("archive/data", 1_700_000_100),
+            ("archive/natural_images", 1_700_000_900),
+        ]
+        for (path, _) in dates where path.contains(".") { try write("x", at: path) }
+        for (path, date) in dates {
+            try FileManager.default.setAttributes(
+                [.modificationDate: Date(timeIntervalSince1970: date)], ofItemAtPath: root.appendingPathComponent(path).path)
+        }
+    }
+
+    private func accentRow(_ table: NSTableView, _ row: Int) throws -> AccentRow {
+        try XCTUnwrap(table.rowView(atRow: row, makeIfNecessary: true) as? AccentRow)
+    }
+
+    /// → with the box's text cursor at `cursorAt`, or at the end of the text.
+    private func right(_ window: SearchPanel, cursorAt at: Int? = nil) -> Bool {
+        let editor = NSTextView()
+        editor.string = window.field.stringValue
+        editor.setSelectedRange(NSRange(location: at ?? (editor.string as NSString).length, length: 0))
+        return window.control(NSTextField(), textView: editor, doCommandBy: #selector(NSResponder.moveRight(_:)))
+    }
+
+    private func left(_ window: SearchPanel) -> Bool {
+        window.control(NSTextField(), textView: NSTextView(), doCommandBy: #selector(NSResponder.moveLeft(_:)))
+    }
+
+    private func up(_ window: SearchPanel) {
+        XCTAssertTrue(window.control(NSTextField(), textView: NSTextView(), doCommandBy: #selector(NSResponder.moveUp(_:))))
+    }
+
     /// Feeds the table a real double-click without the mouse: the release waits in the queue so
     /// the table's click tracking ends at once, and nothing reaches the screen.
     private func doubleClick(row: Int, in table: NSTableView) throws {

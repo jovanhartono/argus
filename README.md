@@ -59,7 +59,8 @@ To start Argus when you log in, open System Settings → General → Login Items
 | ⌘I | Show or hide the details pane |
 | ⌘T | Search inside files too; choose which folders in Settings (⌘,) |
 | Tab | Search inside the selected folder; ⌫ in an empty box steps back out |
-| Esc | Clear the box, then leave the folder, then hide the window |
+| → ← | Step into the selected folder in the details pane, and back out |
+| Esc | Step out of the details pane, clear the box, then leave the folder, then hide the window |
 | ⌘, | Settings |
 | ⌘Q | Quit Argus |
 

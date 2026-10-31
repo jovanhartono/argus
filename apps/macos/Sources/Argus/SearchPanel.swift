@@ -296,6 +296,7 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
         guard shown else { return }
         shown = false
         copied = false
+        pane.leave()
         hatch?.windowShown(false)
         pending = nil
         textOn = false
@@ -515,6 +516,7 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
         bar.isHidden = true
         pane.isHidden = true
         pane.onOpen = { [weak self] row in self?.open(row, revealing: false) }
+        pane.onPick = { [weak self] in self?.paneChanged() }
         field.nextKeyView = settings
         settings.nextKeyView = field
 
@@ -552,6 +554,7 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
         menu.items = onRow ? rowItems : []
         guard onRow else { return }
         repick = nil
+        pane.leave()
         select(index)
     }
 
@@ -803,6 +806,8 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
     private func search(typedAt typed: TimeInterval = ProcessInfo.processInfo.systemUptime) {
         missing = nil
         pending = nil
+        // Typing while inside the pane's list goes back to the results.
+        pane.leave()
         // Each key stops the text search at once; the next starts once the names are drawn.
         stopText()
         if field.stringValue.isEmpty {
@@ -1094,6 +1099,7 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
             missing = nil
             return fit()
         }
+        if pane.inside { return pane.move(by: step) }
         guard listed > 0 else { return }
         let pressed = pressedAt()
         let before = table.selectedRow
@@ -1108,6 +1114,39 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
 
     var selected: Row? {
         result(at: table.selectedRow)
+    }
+
+    /// What the keys act on: the item picked in the pane's list while inside, else the result.
+    var picked: Row? {
+        pane.picked ?? selected
+    }
+
+    /// → with the text cursor at the end of the box steps into the picked folder, turning the
+    /// pane on if it was off; inside, → steps into a folder picked in the list.
+    private func stepIn(_ editor: NSTextView) -> Bool {
+        if pane.inside {
+            _ = pane.stepIn(at: pressedAt())
+            return true
+        }
+        let end = (editor.string as NSString).length
+        guard editor.selectedRange() == NSRange(location: end, length: 0), !composing else { return false }
+        let pressed = pressedAt()
+        // Pressed a moment after typing, → waits for the results for what you typed, as Return does.
+        onceAnswered { [weak self] in
+            guard let self, status == nil, let row = selected,
+                detailsOn ? pane.listsContents : DetailsPane.lists(row, Details.read(row))
+            else { return }
+            if !detailsOn { toggleDetails(nil) }
+            _ = pane.stepIn(at: pressed)
+        }
+        return true
+    }
+
+    /// The accent follows the keys between the results and the pane's list; the preview follows
+    /// the pick.
+    private func paneChanged() {
+        table.enumerateAvailableRowViews { view, _ in (view as? AccentRow)?.muted = pane.inside }
+        follow()
     }
 
     /// A line found inside a file stands for its file.
@@ -1127,7 +1166,7 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
 
     /// Japanese and Chinese input pick the half-typed word with Return, so nothing opens then.
     private func open(revealing reveal: Bool) {
-        guard !composing, let row = selected else { return }
+        guard !composing, let row = picked else { return }
         open(row, revealing: reveal)
     }
 
@@ -1164,7 +1203,7 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
 
     @objc func copyPath(_ sender: Any?) {
         onceAnswered { [weak self] in
-            guard let self, !composing, let row = selected else { return }
+            guard let self, !composing, let row = picked else { return }
             stage.copy(row.path)
             copied = true
             fit()
@@ -1182,7 +1221,7 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
     @objc func quickLook(_ sender: Any?) {
         if previewing { return closePreview() }
         onceAnswered { [weak self] in
-            guard let self, !composing, let row = selected, found(row) else { return }
+            guard let self, !composing, let row = picked, found(row) else { return }
             // In front but not key, so typing and the arrows stay in the box.
             inPreview = row.url
             closing = false
@@ -1221,7 +1260,7 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
     private func follow() {
         guard previewing else { return }
         // Lines read again a few at a time drop the pick for a moment, until it lands again.
-        guard let row = selected else { return listed == 0 ? closePreview() : () }
+        guard let row = picked else { return listed == 0 ? closePreview() : () }
         guard FileManager.default.fileExists(atPath: row.path) else { return closePreview() }
         guard row.url != inPreview else { return }
         inPreview = row.url
@@ -1240,11 +1279,11 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
     }
 
     func numberOfPreviewItems(in panel: QLPreviewPanel!) -> Int {
-        selected == nil ? 0 : 1
+        picked == nil ? 0 : 1
     }
 
     func previewPanel(_ panel: QLPreviewPanel!, previewItemAt index: Int) -> QLPreviewItem! {
-        selected?.real as NSURL?
+        picked?.real as NSURL?
     }
 
     /// The arrows still pick the next result while the preview has the keys.
@@ -1270,11 +1309,17 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
             move(by: 1)
         case #selector(NSResponder.moveUp(_:)):
             move(by: -1)
+        case #selector(NSResponder.moveRight(_:)):
+            return stepIn(textView)
+        case #selector(NSResponder.moveLeft(_:)) where pane.inside:
+            pane.stepOut()
         case #selector(NSResponder.cancelOperation(_:)):
-            // Esc clears the box, then leaves the folder you were searching in, then hides the
-            // window. A preview closes first.
+            // Esc steps out of the pane's list, clears the box, then leaves the folder you were
+            // searching in, then hides the window. A preview closes first.
             if previewing {
                 closePreview()
+            } else if pane.inside {
+                pane.leave()
             } else if !field.stringValue.isEmpty {
                 field.stringValue = ""
                 search()
@@ -1323,7 +1368,10 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
     func tableView(_ tableView: NSTableView, selectionIndexesForProposedSelection proposed: IndexSet) -> IndexSet {
         var proposed = proposed
         if let header { proposed.remove(header) }
-        if !proposed.isEmpty { repick = nil }
+        if !proposed.isEmpty {
+            repick = nil
+            pane.leave()
+        }
         return proposed.isEmpty ? tableView.selectedRowIndexes : proposed
     }
 
@@ -1341,7 +1389,9 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
     }
 
     func tableView(_ tableView: NSTableView, rowViewForRow row: Int) -> NSTableRowView? {
-        AccentRow()
+        let view = AccentRow()
+        view.muted = pane.inside
+        return view
     }
 
     func tableView(_ tableView: NSTableView, viewFor column: NSTableColumn?, row: Int) -> NSView? {
