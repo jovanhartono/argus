@@ -40,7 +40,7 @@ struct HealthFormat {
     }
 
     func state(_ health: Health) -> String {
-        if health.stopped { return "Stopped: press ⌘Q, then open Argus again" }
+        if health.stopped { return "Stopped: quit and reopen Argus" }
         // With Index everything on, ~/Library changes every few seconds; those small patches
         // aren't worth a word.
         if health.building { return "Building the index…" }
@@ -213,7 +213,7 @@ final class HealthWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, NST
     private let usableArea: @MainActor (NSWindow) -> NSRect?
     private let dates = DetailsFormat()
     private var ticking: Timer?
-    private var fitted = false
+    private var fittedTo = NSRect.null
     private(set) var shown = false
     private(set) var health = Health()
 
@@ -474,12 +474,9 @@ final class HealthWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, NST
     func show() {
         shown = true
         refresh()
-        // Built before any words were set, so the first show fits it to them; later, only the
-        // Open System Settings row changes its height.
-        if !fitted {
-            fitted = true
-            fitKeepingTop()
-        }
+        // A new display resolution or another screen since the last show would leave Quit Argus
+        // below the edge; measuring the rows takes about 6 ms, so only then.
+        if (usableArea(panel) ?? .zero) != fittedTo { fitKeepingTop() }
         stage.bringForward(panel)
         stage.makeKey(panel)
         panel.makeFirstResponder(folderList)
@@ -544,6 +541,7 @@ final class HealthWindow: NSObject, NSWindowDelegate, NSTableViewDataSource, NST
         // On a screen that looks like 1280 × 800 the whole window is taller than the room under
         // the menu bar, so it takes that room and the rows scroll.
         let visible = usableArea(panel)
+        fittedTo = visible ?? .zero
         if let visible, frame.height > visible.height {
             // With scroll bars set to show always, the scroller takes room beside the rows.
             let content = NSScrollView.frameSize(

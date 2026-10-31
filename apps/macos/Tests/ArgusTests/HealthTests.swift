@@ -65,7 +65,7 @@ final class HealthFormatTests: XCTestCase {
         XCTAssertEqual(english.state(Health(busy: true, behind: true)), "Missing a change: rebuild the index")
         XCTAssertEqual(
             english.state(Health(busy: true, building: true, behind: true)), "Building the index…", "the rebuild reads it")
-        XCTAssertEqual(english.state(Health(stopped: true)), "Stopped: press ⌘Q, then open Argus again")
+        XCTAssertEqual(english.state(Health(stopped: true)), "Stopped: quit and reopen Argus")
         XCTAssertEqual(
             english.state(Health(busy: true, building: true, behind: true, stopped: true)),
             english.state(Health(stopped: true)))
@@ -94,6 +94,7 @@ final class HealthWindowTests: XCTestCase {
     private var everything = false
     private var cloudSwitched: [Bool] = []
     private var cloud = false
+    private var area = NSRect(x: 0, y: 0, width: 1920, height: 1200)
 
     override func setUp() async throws {
         _ = NSApplication.shared
@@ -115,8 +116,9 @@ final class HealthWindowTests: XCTestCase {
     /// Room for the whole window unless a test gives a shorter screen.
     private func window(
         tick: TimeInterval = 1, ignoreList: URL = HealthWindow.ignoreList, quit: @escaping () -> Void = {},
-        area: NSRect = NSRect(x: 0, y: 0, width: 1920, height: 1200)
+        area: NSRect? = nil
     ) -> HealthWindow {
+        if let area { self.area = area }
         let (listed, cloudListed) = (everything, cloud)
         return HealthWindow(
             read: { [unowned self] in
@@ -142,7 +144,7 @@ final class HealthWindowTests: XCTestCase {
                 (health.busy, health.building) = (on != cloudListed, on != cloudListed)
             },
             ignoreList: ignoreList, quit: quit, format: HealthFormat(locale: Locale(identifier: "en_US")), tick: tick,
-            usableArea: { _ in area })
+            usableArea: { [unowned self] _ in self.area })
     }
 
     func testTheCloudSwitchIsOffAtFirstAndSpinsWhileTheNewListIsBuilt() {
@@ -399,7 +401,7 @@ final class HealthWindowTests: XCTestCase {
         defer { window.hide() }
         XCTAssertEqual(window.entries.stringValue, "0")
         XCTAssertEqual(window.scanned.stringValue, "Didn’t finish")
-        XCTAssertEqual(window.state.stringValue, "Stopped: press ⌘Q, then open Argus again", "as the search window says")
+        XCTAssertEqual(window.state.stringValue, "Stopped: quit and reopen Argus", "as the search window says")
         XCTAssertFalse(window.rebuild.isEnabled)
     }
 
@@ -702,6 +704,23 @@ final class HealthWindowTests: XCTestCase {
         XCTAssertEqual(window.panel.frame.size, whole.size)
         XCTAssertEqual(window.scroll.contentView.bounds.height, window.page.frame.height)
         XCTAssertTrue(window.scroll.verticalScroller?.isHidden ?? true, "no scroller shows")
+    }
+
+    /// A new display resolution, or a tall monitor unplugged, between two presses of ⌘,.
+    func testItFitsTheScreenAgainEachTimeItShows() throws {
+        let window = window()
+        window.show()
+        let whole = window.panel.frame.size
+        window.hide()
+        area = NSRect(x: 0, y: 70, width: 1280, height: 705)
+        window.show()
+        XCTAssertEqual(window.panel.frame.height, area.height, "Quit Argus scrolls into view on the shorter screen")
+        XCTAssertGreaterThanOrEqual(window.panel.frame.minY, area.minY)
+        window.hide()
+        area = NSRect(x: 0, y: 0, width: 1920, height: 1200)
+        window.show()
+        defer { window.hide() }
+        XCTAssertEqual(window.panel.frame.size, whole, "back to the whole window, with no scroll bar")
     }
 
     func testTabOntoARowBelowTheBottomEdgeScrollsItIntoView() async throws {
