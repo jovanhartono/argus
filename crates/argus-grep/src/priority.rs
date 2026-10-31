@@ -5,7 +5,7 @@ mod qos {
     use std::ffi::{c_int, c_uint};
 
     // From sys/qos.h.
-    pub(super) const QOS_CLASS_BACKGROUND: c_uint = 0x09;
+    pub(super) const QOS_CLASS_UTILITY: c_uint = 0x11;
 
     // SAFETY: the signatures match pthread/qos.h and sys/qos.h; both take and return plain
     // integers and touch no memory of ours, so any arguments are safe.
@@ -19,19 +19,19 @@ mod qos {
     }
 }
 
-/// Lowers this thread's priority. At the utility class, a running text search still pushed
-/// name searches over default folders from 2.5 to 10.8 ms at p95; at background it left them
-/// at 2.5 ms. The text search took a quarter longer over the home folder, and about twice as
-/// long over 50,000 tiny files on a busy Mac. Background also holds back disk reads while other
-/// programs use the disk; that was measured only with files already cached.
+/// Lowers this thread's priority to utility. At background, the lowest, macOS held back its
+/// disk reads while Spotlight took in an npm install's new files, and ⌘T took up to 2 s to
+/// its first line instead of 35 ms. Background with a normal disk policy can't be had: setting
+/// one drops the thread to the window's own priority. Utility slowed name search no more than
+/// background did (1 Nov, docs/m4-text-search.html decision 4).
 pub(crate) fn yield_to_names() {
     #[cfg(target_os = "macos")]
-    qos::pthread_set_qos_class_self_np(qos::QOS_CLASS_BACKGROUND, 0);
+    qos::pthread_set_qos_class_self_np(qos::QOS_CLASS_UTILITY, 0);
 }
 
 #[cfg(all(test, target_os = "macos"))]
 pub(crate) fn lowered() -> bool {
-    qos::qos_class_self() == qos::QOS_CLASS_BACKGROUND
+    qos::qos_class_self() == qos::QOS_CLASS_UTILITY
 }
 
 #[cfg(all(test, target_os = "macos"))]
@@ -42,7 +42,7 @@ mod tests {
     fn the_class_is_one_macos_accepts() {
         std::thread::spawn(|| {
             assert_eq!(
-                qos::pthread_set_qos_class_self_np(qos::QOS_CLASS_BACKGROUND, 0),
+                qos::pthread_set_qos_class_self_np(qos::QOS_CLASS_UTILITY, 0),
                 0
             );
         })
