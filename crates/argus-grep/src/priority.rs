@@ -22,7 +22,7 @@ mod qos {
 /// Lowers this thread's priority to utility. At background, the lowest, macOS held back its
 /// disk reads while Spotlight took in an npm install's new files, and ⌘T took up to 2 s to
 /// its first line instead of 35 ms. Background with a normal disk policy can't be had: setting
-/// one drops the thread to the window's own priority. Utility slowed name search no more than
+/// one removes the priority and lifts the thread to the window's own. Utility slowed name search no more than
 /// background did (1 Nov, docs/m4-text-search.html decision 4).
 pub(crate) fn yield_to_names() {
     #[cfg(target_os = "macos")]

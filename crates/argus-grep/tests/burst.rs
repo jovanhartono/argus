@@ -1,6 +1,6 @@
 //! How long ⌘T takes to its first line around a burst of 3,000 new files, as an npm install
 //! leaves them: Argus's own capped Spotlight ask, then the files looked at and read on the text
-//! search threads, as the app does it. Off by default; it writes ~/ArgusBurst and deletes it
+//! search threads, as the app does it. Off by default; it writes ~/ArgusBurst-<pid> and deletes it
 //! after: `cargo test -p argus-grep --release --test burst -- --ignored --nocapture`.
 
 use argus_grep::{Grep, spotlight};
@@ -36,11 +36,17 @@ fn ms(since: Instant) -> f64 {
 
 fn watch(what: &str, grep: &Grep, notes: &Path, for_how_long: Duration) {
     let started = Instant::now();
-    let (mut firsts, mut lasts) = (Vec::new(), Vec::new());
+    let (mut firsts, mut lasts, mut empty) = (Vec::new(), Vec::new(), 0);
     while started.elapsed() < for_how_long {
         let (first, last, lines) = command_t(grep, notes);
-        firsts.push(first.unwrap_or(last));
-        lasts.push(last);
+        // A search Spotlight answered with nothing ends fast and would pass for a quick one.
+        match first {
+            Some(first) => {
+                firsts.push(first);
+                lasts.push(last);
+            }
+            None => empty += 1,
+        }
         println!(
             "BURST {what} +{:.1}s: first line {:.0} ms, all {last:.0} ms, {lines} lines",
             started.elapsed().as_secs_f64(),
@@ -48,12 +54,13 @@ fn watch(what: &str, grep: &Grep, notes: &Path, for_how_long: Duration) {
         );
         std::thread::sleep(Duration::from_millis(250));
     }
+    assert!(!firsts.is_empty(), "{what}: no search found a line");
     let at = |times: &mut Vec<f64>, share: usize| {
         times.sort_by(f64::total_cmp);
         times[(times.len() * share / 100).min(times.len() - 1)]
     };
     println!(
-        "BURST {what}: {} searches, first line p50 {:.0} p95 {:.0} ms, all p95 {:.0} ms",
+        "BURST {what}: {} searches ({empty} found nothing, left out), first line p50 {:.0} p95 {:.0} ms, all p95 {:.0} ms",
         firsts.len(),
         at(&mut firsts, 50),
         at(&mut firsts, 95),
@@ -72,10 +79,13 @@ impl Drop for Gone {
 #[test]
 #[ignore]
 fn command_t_around_a_burst() {
-    let root = PathBuf::from(std::env::var("HOME").unwrap()).join("ArgusBurst");
+    // A folder of this run's own: two worktrees running it at once must not delete each other's.
+    let home = PathBuf::from(std::env::var("HOME").unwrap());
+    let root = home.join(format!("ArgusBurst-{}", std::process::id()));
+    fs::create_dir(&root).expect("a new folder, never one already there");
     let _gone = Gone(root.clone());
     let notes = root.join("Notes");
-    fs::create_dir_all(&notes).unwrap();
+    fs::create_dir(&notes).unwrap();
     for n in 0..150 {
         let text = format!("Note {n}\nBudget for the offsite needs sign-off from finance.\n");
         fs::write(notes.join(format!("note-{n}.md")), text).unwrap();
@@ -86,6 +96,10 @@ fn command_t_around_a_burst() {
         std::thread::sleep(Duration::from_secs(1));
     }
     let took = started.elapsed().as_secs_f64();
+    assert!(
+        command_t(&grep, &notes).2 >= 100,
+        "Spotlight never listed the notes in 90 s"
+    );
     println!("BURST Spotlight took in the notes after {took:.1}s");
     watch("quiet", &grep, &notes, Duration::from_secs(5));
     let modules = root.join("node_modules");
