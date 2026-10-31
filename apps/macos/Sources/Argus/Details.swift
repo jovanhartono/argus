@@ -185,6 +185,7 @@ final class DetailsPane: NSView, NSTableViewDataSource, NSTableViewDelegate {
     /// The folder being read, given up as soon as another row is picked.
     private(set) var reading: URL?
     private var listing: Task<Void, Never>?
+    private var icons: [String: NSImage] = [:]
     /// A double-click on something in the folder.
     var onOpen: ((Row) -> Void)?
 
@@ -202,6 +203,7 @@ final class DetailsPane: NSView, NSTableViewDataSource, NSTableViewDelegate {
         for label in [name, summary] {
             label.alignment = .center
             label.lineBreakMode = .byTruncatingMiddle
+            label.allowsExpansionToolTips = true
         }
         rule.boxType = .separator
         rule.frame = NSRect(x: 17, y: 204, width: text, height: 1)
@@ -213,6 +215,7 @@ final class DetailsPane: NSView, NSTableViewDataSource, NSTableViewDelegate {
             label.textColor = .secondaryLabelColor
             value.frame = NSRect(x: 81, y: y, width: text - 64, height: 15)
             value.lineBreakMode = .byTruncatingMiddle
+            value.allowsExpansionToolTips = true
             for field in [label, value] {
                 field.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
                 addSubview(field)
@@ -358,7 +361,16 @@ final class DetailsPane: NSView, NSTableViewDataSource, NSTableViewDelegate {
         let cell = tableView.makeView(withIdentifier: ChildCell.id, owner: nil) as? ChildCell ?? ChildCell()
         cell.name.stringValue = children[row].row.name
         cell.summary.stringValue = format.summary(children[row].details)
+        cell.icon.image = icon(for: children[row].details.type)
         return cell
+    }
+
+    /// One per kind, as the result list keeps them.
+    private func icon(for type: UTType) -> NSImage {
+        if let cached = icons[type.identifier] { return cached }
+        let image = rowIcon(NSWorkspace.shared.icon(for: type))
+        icons[type.identifier] = image
+        return image
     }
 
     @objc private func openChild(_ sender: Any?) {
@@ -400,25 +412,28 @@ final class DetailsPane: NSView, NSTableViewDataSource, NSTableViewDelegate {
     }
 }
 
-/// Something in the picked folder: its name, with its kind and size under it.
+/// Something in the picked folder: its icon and name, with its kind and size under it.
 final class ChildCell: NSTableCellView {
     static let id = NSUserInterfaceItemIdentifier("child")
 
+    let icon = NSImageView(frame: NSRect(x: 8, y: (Metric.child - 16) / 2, width: 16, height: 16))
     let name = NSTextField(labelWithString: "")
     let summary = NSTextField(labelWithString: "")
 
     init() {
         super.init(frame: NSRect(x: 0, y: 0, width: Metric.pane - 16, height: Metric.child))
         identifier = Self.id
-        name.frame = NSRect(x: 8, y: 14, width: Metric.pane - 32, height: 16)
-        summary.frame = NSRect(x: 8, y: 1, width: Metric.pane - 32, height: 14)
+        name.frame = NSRect(x: 30, y: 18, width: Metric.pane - 54, height: 16)
+        summary.frame = NSRect(x: 30, y: 4, width: Metric.pane - 54, height: 14)
         summary.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
         summary.textColor = .secondaryLabelColor
         for label in [name, summary] {
             label.lineBreakMode = .byTruncatingMiddle
+            label.allowsExpansionToolTips = true
             label.autoresizingMask = [.width]
             addSubview(label)
         }
+        addSubview(icon)
     }
 
     required init?(coder: NSCoder) { nil }
