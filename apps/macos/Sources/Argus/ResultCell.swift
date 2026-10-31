@@ -76,6 +76,7 @@ final class ResultCell: NSTableCellView, NSViewToolTipOwner {
         if hit == nil {
             icon.isHidden = true
             folder.frame = NSRect(x: 40, y: 5, width: 40, height: 14)
+            folder.autoresizingMask = []
             folder.alignment = .right
             folder.font = .monospacedDigitSystemFont(ofSize: NSFont.smallSystemFontSize, weight: .regular)
             name.frame = NSRect(x: 88, y: 4, width: bounds.width - 120, height: 17)
@@ -110,6 +111,7 @@ final class ResultCell: NSTableCellView, NSViewToolTipOwner {
         folder.isHidden = false
         name.frame = NSRect(x: 48, y: 24, width: bounds.width - 80, height: 17)
         folder.frame = NSRect(x: 48, y: 8, width: bounds.width - 80, height: 15)
+        folder.autoresizingMask = [.width]
         name.font = .systemFont(ofSize: NSFont.systemFontSize)
         folder.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
         folder.alignment = .natural
