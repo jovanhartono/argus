@@ -3671,6 +3671,10 @@ final class SearchPanelTests: XCTestCase {
         XCTAssertEqual(cell.folder.stringValue, "9")
         XCTAssertTrue(cell.icon.isHidden, "a line sits under its file's icon")
         XCTAssertEqual(cell.accessibilityLabel(), "line 9: q3 budget")
+        cell.show(line: TextHit(path: "/notes/plan.txt", text: "q3 budget", match: NSRange(location: 3, length: 6), line: 15_286))
+        cell.setFrameSize(NSSize(width: cell.frame.width - 34, height: cell.frame.height))
+        XCTAssertGreaterThanOrEqual(cell.folder.frame.width, cell.folder.cell!.cellSize.width, "the table's narrower column keeps every digit")
+        cell.show(line: line)
         cell.backgroundStyle = .emphasized
         let color = cell.name.attributedStringValue.attribute(.foregroundColor, at: 0, effectiveRange: nil) as? NSColor
         XCTAssertEqual(color, .alternateSelectedControlTextColor, "a picked line reads on the accent colour")
