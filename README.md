@@ -52,12 +52,12 @@ To start Argus when you log in, open System Settings → General → Login Items
 | ⌘⇧Space | Show or hide the search window |
 | ⌥⌘⇧Space | Search inside the folder the front Finder window shows |
 | ↑ ↓ | Move the selection |
-| Return | Open the selected file, folder or app |
+| Return | Open the selected file, folder or app; on a line found inside a file, open it at that line in VS Code, Cursor, Zed, Sublime Text or Xcode |
 | ⌘Return | Show it in Finder |
 | ⌥⌘C | Copy its path |
 | ⌘Y | Preview it with Quick Look |
 | ⌘I | Show or hide the details pane |
-| ⌘T | Search inside files too; choose which folders in Settings (⌘,) |
+| ⌘T | Search inside files too, anywhere in your home folder, with Spotlight naming the files |
 | Tab | Search inside the selected folder; ⌫ in an empty box steps back out |
 | → ← | Step into the selected folder in the details pane, and back out |
 | Esc | Step out of the details pane, clear the box, then leave the folder, then hide the window |

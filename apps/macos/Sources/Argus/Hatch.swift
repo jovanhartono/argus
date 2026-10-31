@@ -200,12 +200,15 @@ final class Hatch {
         return copy(out)
     }
 
-    /// Searches the text inside the files in `folders`, on threads of its own, so a search by
-    /// name never waits for it. Every older text search stops. Returns 0 when it can't start.
-    func searchText(_ query: String, in folders: [String]) -> UInt64 {
+    /// Searches the text inside the files in `scope`, a full path, or everywhere the list reaches
+    /// when nil, on threads of its own, so a search by name never waits for it. Every older text
+    /// search stops. Returns 0 when it can't start.
+    func searchText(_ query: String, in scope: String? = nil) -> UInt64 {
         var query = query
-        let bytes = Hatch.nulJoined(folders)
-        return query.withUTF8 { tl_grep_submit(core, bytes, bytes.count, $0.baseAddress, $0.count) }
+        var scope = scope ?? ""
+        return scope.withUTF8 { folder in
+            query.withUTF8 { tl_grep_submit(core, folder.baseAddress, folder.count, $0.baseAddress, $0.count) }
+        }
     }
 
     /// The lines `ticket` found since the last take, or nil when nothing waits or a newer text

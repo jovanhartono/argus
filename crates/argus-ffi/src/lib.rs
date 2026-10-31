@@ -25,6 +25,7 @@ use argus_core::{
     save_index, unix_now,
 };
 use argus_grep::{Found, Grep, Report};
+use std::collections::{HashMap, HashSet};
 use std::ffi::{CString, c_void};
 use std::io;
 use std::panic::{self, AssertUnwindSafe};
@@ -39,7 +40,7 @@ use std::time::{Duration, Instant};
 static PAGES: Pages = Pages;
 
 /// Raise this with any change below, so a window built against an older header refuses to start.
-pub const TL_ABI_VERSION: u32 = 15;
+pub const TL_ABI_VERSION: u32 = 16;
 
 pub const TL_OK: u32 = 0;
 /// No rows for that ticket: not ready yet, already taken, or a newer search replaced them.
@@ -71,6 +72,9 @@ pub const TL_EVENT_RERANKED: u32 = 8;
 const ROWS: usize = 50;
 /// Lines a text search shows, across all its folders.
 const LINES: usize = 100;
+/// Files you opened that a text search reads beside Spotlight's capped answer: each one that
+/// doesn't hold the words still costs a read before the first line.
+const OPENED_FILES: usize = 100;
 
 /// Rebuilds start at least this far apart while files keep changing, so a long download
 /// doesn't keep a core busy. A change is findable within FSEvents' 0.2 s, plus this, plus
@@ -256,7 +260,29 @@ struct Text {
     home: PathBuf,
     full_disk: AtomicBool,
     notify: Notify,
+    asker: Asker,
     started: OnceLock<TextSearch>,
+}
+
+/// Which files Spotlight is asked about, and how; tests stand in for Spotlight.
+#[derive(Clone)]
+struct Asker {
+    /// A search inside this folder asks Spotlight which files hold the words; one elsewhere,
+    /// as on a drive, reads every file. None where there is no Spotlight.
+    covers: Option<PathBuf>,
+    files: Named,
+}
+
+/// As `argus_grep::spotlight::files`: the words, the folders, and whether the search is stale.
+type Named = fn(&str, &[PathBuf], &dyn Fn() -> bool) -> Option<Vec<PathBuf>>;
+
+impl Default for Asker {
+    fn default() -> Self {
+        Self {
+            covers: cfg!(target_os = "macos").then(argus_core::home),
+            files: argus_grep::spotlight::files,
+        }
+    }
 }
 
 struct TextSearch {
@@ -268,7 +294,8 @@ struct TextSearch {
 
 struct Find {
     ticket: Ticket,
-    folders: Vec<PathBuf>,
+    /// Only what is inside this folder; the core's whole folder when none.
+    folder: Option<PathBuf>,
     query: String,
     access: Access,
     cloud: Cloud,
@@ -1358,6 +1385,7 @@ fn start(
         home,
         full_disk: AtomicBool::new(full_disk),
         notify,
+        asker: Asker::default(),
         started: OnceLock::new(),
     };
     let saved_in = resume
@@ -2557,12 +2585,12 @@ impl Text {
             let worker = {
                 let (grep, waiting, live) =
                     (Arc::clone(&grep), Arc::clone(&waiting), Arc::clone(live));
-                let (home, notify) = (self.home.clone(), self.notify);
+                let (home, asker, notify) = (self.home.clone(), self.asker.clone(), self.notify);
                 thread::Builder::new()
                     .name("text".into())
                     .spawn(move || {
                         find_loop(&grep, &inbox, &waiting, notify, |find| {
-                            find_in(&grep, find, &waiting, &home, &live, notify)
+                            find_in(&grep, find, &waiting, &home, &asker, &live, notify)
                         });
                     })
                     .expect("start the text search worker")
@@ -2622,14 +2650,18 @@ fn find_loop(
     }
 }
 
-/// Lists each folder as the name list would, at the time of the search, then searches it, until
-/// `LINES` lines in all. A folder on a drive being ejected counts as unreadable, and one ejected
-/// midway is searched no further. `None` once a newer search or a cancel took over.
+/// Searches inside the files of `find`'s folder, or of the core's whole folder, until `LINES`
+/// lines. Inside the folder Spotlight covers, only the files it names are read, and only where
+/// the name list keeps files; elsewhere,
+/// as on a drive, the folder is listed as the name list would list it, then every file is read.
+/// A drive being ejected counts as unreadable, and one ejected midway is read no further.
+/// `None` once a newer search or a cancel took over.
 fn find_in(
     grep: &Grep,
     find: &Find,
     waiting: &Mutex<Waiting>,
     home: &Path,
+    asker: &Asker,
     live: &Live,
     notify: Notify,
 ) -> Option<Report> {
@@ -2638,88 +2670,205 @@ fn find_in(
     }
     let number = find.ticket.number();
     let stale = || grep.newest() != number;
-    let home = std::fs::canonicalize(home).unwrap_or_else(|_| home.to_path_buf());
+    let real = |path: &Path| std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let home = real(home);
+    let folder = find.folder.as_deref().map_or_else(|| home.clone(), real);
     // Problems with the list are told by the name list already.
     let (ignore, _) = Ignore::load(&home, find.access);
-    let mut report = Report::default();
-    let reads = |outer: &Path, inner: &Path| {
-        argus_core::reads_inside(outer, inner, &home, &ignore, find.cloud)
-    };
-    for folder in outermost(&find.folders, reads) {
-        let limit = LINES.saturating_sub(report.lines_found);
-        if limit == 0 || stale() {
-            break;
+    let add = |file: &[Found<'_>]| add(waiting, grep, number, file, notify);
+    if asker
+        .covers
+        .as_ref()
+        .is_some_and(|covers| folder.starts_with(covers))
+    {
+        let (skip, access, cloud) = (Clutter::Skip, find.access, find.cloud);
+        let scope = Settings::new(&home, &home, skip, ignore.clone(), access, cloud).root_scope();
+        if argus_grep::spotlight::query(&find.query).is_some() {
+            let files = spotlit(grep, find, &folder, &home, &scope, asker, live)?;
+            return grep.search_files(&files, &find.query, find.ticket, LINES, &|| false, add);
         }
-        let touches = |drive: &Path| folder.starts_with(drive) || drive.starts_with(&folder);
-        let Some(drive) = live.drive_read(touches) else {
-            report.unreadable += 1;
-            continue;
-        };
-        let ejected = || drive.ejected();
-        // Listing a home folder takes all cores for about 0.1 s: on the text search threads, it
-        // leaves name searches alone, and a newer keystroke stops it.
-        let scan = grep.install(|| {
-            let stop = || stale() || ejected();
-            let (skip, access, cloud) = (Clutter::Skip, find.access, find.cloud);
-            argus_core::scan_until(&folder, &home, skip, &ignore, access, cloud, &stop)
-        });
-        if stale() {
-            return None;
+        // Spotlight can't look for text with no letter or digit, as "=>", so a folder the list
+        // keeps is read whole instead; one it only walks through or seals stays unread, and so
+        // does the whole home folder, which would take seconds and never reach 100 lines.
+        if folder == home || !scope.keeps_files_in(&folder) {
+            return Some(Report::default());
         }
-        let Some(scan) = scan.ok().filter(|_| !ejected()) else {
-            report.unreadable += 1;
-            continue;
-        };
-        let add = |found: Found<'_>| add(waiting, grep, number, &found, notify);
-        let query = &find.query;
-        report =
-            report + grep.search_until(&scan.index, query, find.ticket, limit, &ejected, add)?;
     }
-    (!stale()).then_some(report)
+    let unreadable = Report {
+        unreadable: 1,
+        ..Report::default()
+    };
+    let touches = |drive: &Path| folder.starts_with(drive) || drive.starts_with(&folder);
+    let Some(drive) = live.drive_read(touches) else {
+        return Some(unreadable);
+    };
+    let ejected = || drive.ejected();
+    // Listing a home folder takes all cores for about 0.1 s: on the text search threads, it
+    // leaves name searches alone, and a newer keystroke stops it.
+    let scan = grep.install(|| {
+        let stop = || stale() || ejected();
+        let (skip, access, cloud) = (Clutter::Skip, find.access, find.cloud);
+        argus_core::scan_until(&folder, &home, skip, &ignore, access, cloud, &stop)
+    });
+    if stale() {
+        return None;
+    }
+    let Some(scan) = scan.ok().filter(|_| !ejected()) else {
+        return Some(unreadable);
+    };
+    grep.search_until(&scan.index, &find.query, find.ticket, LINES, &ejected, add)
 }
 
-/// The folders as real paths, each once, leaving out any inside another that `reads(outer,
-/// inner)` says a search of it covers.
-fn outermost(folders: &[PathBuf], reads: impl Fn(&Path, &Path) -> bool) -> Vec<PathBuf> {
-    let mut real: Vec<PathBuf> = folders
-        .iter()
-        .map(|folder| std::fs::canonicalize(folder).unwrap_or_else(|_| folder.clone()))
+/// The files inside `folder` that Spotlight says hold the words, best first: the ones you
+/// open most, then the newest. Only files the name list would keep are named, so no file in a
+/// skipped, guarded or cloud folder is ever opened. `None` once the search is no longer wanted.
+fn spotlit(
+    grep: &Grep,
+    find: &Find,
+    folder: &Path,
+    home: &Path,
+    scope: &Scope,
+    asker: &Asker,
+    live: &Live,
+) -> Option<Vec<PathBuf>> {
+    let number = find.ticket.number();
+    let stale = || grep.newest() != number;
+    let keeps_own = scope.keeps_files_in(folder);
+    // Asked about the whole home folder, Spotlight filled its cap from ~/Library's caches; a
+    // folder the list only walks through, as ~/Library, is asked about where the list reads.
+    let (within, mut named) = if folder != home && keeps_own {
+        (vec![folder.to_path_buf()], Vec::new())
+    } else {
+        (kept_folders(scope, folder), own_files(folder, keeps_own))
+    };
+    if !within.is_empty() {
+        let answer = (asker.files)(&find.query, &within, &stale)?;
+        // Spotlight's cap holds whatever it met first, so the files you open most are read too.
+        if answer.len() >= argus_grep::spotlight::SPOTLIGHT_FILES {
+            named.extend(opened(live, folder));
+        }
+        named.extend(answer);
+    }
+    // Stats on the text search threads, below name search.
+    grep.install(|| {
+        let mut keeps: HashMap<PathBuf, bool> = HashMap::new();
+        let mut seen: HashSet<PathBuf> = HashSet::with_capacity(named.len());
+        let mut ranked = Vec::with_capacity(named.len());
+        for file in named {
+            if !seen.insert(file.clone()) {
+                continue;
+            }
+            if stale() {
+                return None;
+            }
+            let Some(parent) = file.parent().filter(|_| file.starts_with(folder)) else {
+                continue;
+            };
+            let kept = match keeps.get(parent) {
+                Some(&kept) => kept,
+                None => {
+                    let kept = scope.keeps_files_in(parent);
+                    keeps.insert(parent.to_path_buf(), kept);
+                    kept
+                }
+            };
+            let Some(metadata) = std::fs::symlink_metadata(&file)
+                .ok()
+                .filter(|metadata| kept && metadata.is_file())
+            else {
+                continue;
+            };
+            ranked.push((0.0, metadata.modified().ok(), file));
+        }
+        let now = unix_now();
+        let opens = lock(&live.opens);
+        for (score, _, file) in &mut ranked {
+            *score = opens.frecency.score(file, now);
+        }
+        drop(opens);
+        ranked.sort_unstable_by(|a, b| b.0.total_cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
+        Some(ranked.into_iter().map(|(_, _, file)| file).collect())
+    })
+}
+
+/// The files right inside `folder` when the list keeps them, as ~/todo.md: Spotlight can only
+/// be asked about a folder with everything inside it. Hidden ones, as ~/.zsh_history, are left
+/// out as Spotlight leaves them out; rewritten all the time, they'd take the top of the list.
+fn own_files(folder: &Path, keeps: bool) -> Vec<PathBuf> {
+    let Some(entries) = std::fs::read_dir(folder).ok().filter(|_| keeps) else {
+        return Vec::new();
+    };
+    let files = entries.flatten().filter(|entry| {
+        !entry.file_name().as_encoded_bytes().starts_with(b".")
+            && entry.file_type().is_ok_and(|kind| kind.is_file())
+    });
+    files.map(|entry| entry.path()).collect()
+}
+
+/// At most `OPENED_FILES` of the files you open most inside `folder`, strongest first.
+fn opened(live: &Live, folder: &Path) -> Vec<PathBuf> {
+    let now = unix_now();
+    let opens = lock(&live.opens);
+    let mut opened: Vec<(f64, &Path)> = opens
+        .frecency
+        .files()
+        .filter(|file| file.starts_with(folder))
+        .map(|file| (opens.frecency.score(file, now), file))
         .collect();
-    // A folder sorts before everything inside it.
-    real.sort();
-    let mut kept: Vec<PathBuf> = Vec::with_capacity(real.len());
-    for folder in real {
-        if !kept
-            .iter()
-            .any(|outer| folder.starts_with(outer) && reads(outer, &folder))
-        {
-            kept.push(folder);
+    opened.sort_unstable_by(|a, b| b.0.total_cmp(&a.0));
+    opened.truncate(OPENED_FILES);
+    opened
+        .into_iter()
+        .map(|(_, file)| file.to_path_buf())
+        .collect()
+}
+
+/// The folders inside `folder` whose files the name list keeps, going through those it reads
+/// only on the way to another, as ~/Library on the way to a cloud drive.
+fn kept_folders(scope: &Scope, folder: &Path) -> Vec<PathBuf> {
+    let mut kept = Vec::new();
+    let Ok(entries) = std::fs::read_dir(folder) else {
+        return kept;
+    };
+    for entry in entries.flatten() {
+        if !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+            continue;
+        }
+        let path = entry.path();
+        if scope.keeps_files_in(&path) {
+            kept.push(path);
+        } else if scope.in_scope(&path) {
+            kept.extend(kept_folders(scope, &path));
         }
     }
+    kept.sort_unstable();
     kept
 }
 
-fn add(waiting: &Mutex<Waiting>, grep: &Grep, number: u64, found: &Found<'_>, notify: Notify) {
+/// Adds one file's lines to the batch waiting for the window, together.
+fn add(waiting: &Mutex<Waiting>, grep: &Grep, number: u64, file: &[Found<'_>], notify: Notify) {
     let mut waiting = waiting.lock().unwrap();
     // Read just as a newer search or a cancel came in.
     if grep.newest() != number {
         return;
     }
-    waiting.found += 1;
+    waiting.found += file.len();
     let batch = &mut waiting.batch;
-    let path_start = batch.text.len() as u32;
-    batch.text.push_str(&found.path.to_string_lossy());
-    let text_start = batch.text.len() as u32;
-    batch.text.push_str(found.text);
-    batch.lines.push(TlLine {
-        path_start,
-        path_len: text_start - path_start,
-        text_start,
-        text_len: found.text.len() as u32,
-        match_start: found.matched.start as u32,
-        match_len: found.matched.len() as u32,
-        line: found.line,
-    });
+    for found in file {
+        let path_start = batch.text.len() as u32;
+        batch.text.push_str(&found.path.to_string_lossy());
+        let text_start = batch.text.len() as u32;
+        batch.text.push_str(found.text);
+        batch.lines.push(TlLine {
+            path_start,
+            path_len: text_start - path_start,
+            text_start,
+            text_len: found.text.len() as u32,
+            match_start: found.matched.start as u32,
+            match_len: found.matched.len() as u32,
+            line: found.line,
+        });
+    }
     tell(waiting, number, notify);
 }
 
@@ -2732,24 +2881,29 @@ fn tell(mut waiting: MutexGuard<'_, Waiting>, number: u64, notify: Notify) {
     }
 }
 
-/// Starts a search for `query` inside the files in `folders` and returns its ticket, or 0 on
-/// failure, as for a folder that isn't UTF-8, leaving the search under way alone. Otherwise
-/// every older text search gives up; name searches never wait for any. `folders` holds
-/// `folders_len` bytes: paths in UTF-8, each ending in a NUL byte. Each is listed as the name
-/// list would be, skipping clutter and the ignore list, and cloud drives as `tl_index_cloud`
-/// says, and a folder inside another is searched once; one that can't be listed counts as
-/// unreadable.
+/// Starts a search for `query` inside the files in `folder`, a full path in UTF-8 of
+/// `folder_len` bytes, or in the core's whole folder when `folder_len` is 0, and returns its
+/// ticket, or 0 on failure, as for a folder that isn't UTF-8, leaving the search under way
+/// alone. Otherwise every older text search gives up; name searches never wait for any.
+/// Inside your home folder, Spotlight names the files that hold each typed word at the start of
+/// one of their words, and only the files you open most and the newest of those are read; a
+/// query with no letter or digit, which Spotlight can't look for, reads the folder whole, except
+/// the whole home folder, which it leaves unread.
+/// Elsewhere, as on a drive, the folder is listed as the name list would be and every file is
+/// read; one that can't be listed counts as unreadable. Either way clutter, the ignore list
+/// and cloud drives, as `tl_index_cloud` says, are left out.
 /// Upper-case letters in `query` must match exactly; lower-case ones match either case. Up to
-/// 100 lines come in batches, each announced by `TL_EVENT_LINES`, the last with the end.
+/// 3 lines a file and 100 in all come in batches, each announced by `TL_EVENT_LINES`, the last
+/// with the end; a file's lines come together, one after the other.
 ///
 /// # Safety
-/// `core` came from `tl_core_new` or `tl_core_new_stand_in`, `folders` points to `folders_len`
-/// bytes (or `folders_len` is 0), and `query` to `query_len` bytes (or `query_len` is 0).
+/// `core` came from `tl_core_new` or `tl_core_new_stand_in`, `folder` points to `folder_len`
+/// bytes (or `folder_len` is 0), and `query` to `query_len` bytes (or `query_len` is 0).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn tl_grep_submit(
     core: *const TlCore,
-    folders: *const u8,
-    folders_len: usize,
+    folder: *const u8,
+    folder_len: usize,
     query: *const u8,
     query_len: usize,
 ) -> u64 {
@@ -2758,17 +2912,15 @@ pub unsafe extern "C" fn tl_grep_submit(
         let Some(text) = &core.text else {
             return 0;
         };
-        let folders = match folders_len {
-            0 => &[],
-            _ => unsafe { std::slice::from_raw_parts(folders, folders_len) },
-        };
-        let folders: Result<Vec<PathBuf>, _> = folders
-            .split(|&byte| byte == 0)
-            .filter(|path| !path.is_empty())
-            .map(|path| std::str::from_utf8(path).map(PathBuf::from))
-            .collect();
-        let Ok(folders) = folders else {
-            return 0;
+        let folder = match folder_len {
+            0 => None,
+            _ => {
+                match std::str::from_utf8(unsafe { std::slice::from_raw_parts(folder, folder_len) })
+                {
+                    Ok(folder) => Some(PathBuf::from(folder)),
+                    Err(_) => return 0,
+                }
+            }
         };
         let query = match query_len {
             0 => &[],
@@ -2789,7 +2941,7 @@ pub unsafe extern "C" fn tl_grep_submit(
         let ticket = search.grep.ticket();
         let find = Find {
             ticket,
-            folders,
+            folder,
             query,
             access,
             cloud,
@@ -4550,34 +4702,30 @@ mod tests {
     }
 
     #[test]
-    fn text_search_follows_the_cloud_switch_but_reads_a_folder_chosen_in_a_cloud_drive() {
+    fn text_search_follows_the_cloud_switch_but_reads_inside_a_cloud_drive_it_is_given() {
         let (_dir, home) = home_with(&[]);
         let dropbox = home.join("Library/CloudStorage/Dropbox");
         write(&dropbox.join("budget.txt"), "budget\n");
         let events = Events::default();
         let core = text_core(&home, 1, &events);
 
-        let whole = grep(&core, &[&home], "budget");
+        let whole = grep(&core, None, "budget");
         assert_eq!(grep_all(&core, &events, whole).1.lines_found, 0);
-        let chosen = grep(&core, &[&dropbox], "budget");
-        assert_eq!(grep_all(&core, &events, chosen).1.lines_found, 1);
-        let both = grep(&core, &[&home, &dropbox], "budget");
-        assert_eq!(grep_all(&core, &events, both).1.lines_found, 1);
+        let given = grep(&core, Some(&dropbox), "budget");
+        assert_eq!(grep_all(&core, &events, given).1.lines_found, 1);
 
-        // Brought back by the ignore list, the drive is read once with the home folder.
+        // Brought back by the ignore list, the drive is read with the home folder.
         write(
             &home.join(".config/argus/ignore"),
             "!~/Library/CloudStorage/Dropbox\n",
         );
-        let both = grep(&core, &[&home, &dropbox], "budget");
-        assert_eq!(grep_all(&core, &events, both).1.lines_found, 1);
+        let whole = grep(&core, None, "budget");
+        assert_eq!(grep_all(&core, &events, whole).1.lines_found, 1);
         std::fs::remove_file(home.join(".config/argus/ignore")).unwrap();
 
         assert_eq!(unsafe { tl_index_cloud(core.0, 1, 2) }, 1);
-        let whole = grep(&core, &[&home], "budget");
+        let whole = grep(&core, None, "budget");
         assert_eq!(grep_all(&core, &events, whole).1.lines_found, 1);
-        let both = grep(&core, &[&home, &dropbox], "budget");
-        assert_eq!(grep_all(&core, &events, both).1.lines_found, 1);
     }
 
     #[test]
@@ -4814,7 +4962,7 @@ mod tests {
     #[test]
     fn a_text_search_inside_a_drive_ejected_midway_lets_go_of_it_before_the_call_returns() {
         let events = Events::default();
-        let (core, _dir, [drive, home]) = home_beside_drive(&events);
+        let (core, _dir, [drive, _]) = home_beside_drive(&events);
         for n in 0..20_000 {
             let text = if n % 400 == 0 {
                 "budget\n".to_owned()
@@ -4823,8 +4971,7 @@ mod tests {
             };
             write(&drive.join(format!("text/{}/{n}.txt", n % 100)), text);
         }
-        write(&home.join("notes/plan.md"), "budget at home\n");
-        let ticket = grep(&core, &[&home, &drive], "budget");
+        let ticket = grep(&core, Some(&drive), "budget");
         // Lines from the drive, so its files are being read.
         events.wait_for(TL_EVENT_LINES, ticket);
         assert!(reading(&core, &drive));
@@ -4833,22 +4980,19 @@ mod tests {
         let took = started.elapsed();
         assert!(!reading(&core, &drive), "the search still reads the drive");
         assert_eq!(open_inside(&drive), Vec::<PathBuf>::new());
-        let (lines, report) = grep_all(&core, &events, ticket);
+        let (_, report) = grep_all(&core, &events, ticket);
         eprintln!(
-            "MEASURE let go of mid-search in {took:?}, {} of 20,001 files searched",
+            "MEASURE let go of mid-search in {took:?}, {} of 20,000 files searched",
             report.files_searched
         );
-        assert!(report.files_searched < 20_001, "{report:?}");
-        // The search goes on in the folders on other drives.
-        let at_home = home.join("notes/plan.md").to_string_lossy().into_owned();
-        assert!(lines.iter().any(|(path, ..)| *path == at_home), "{lines:?}");
+        assert!(report.files_searched < 20_000, "{report:?}");
 
         // Nothing reads the drive again until it is mounted again.
-        let again = grep(&core, &[&drive], "budget");
+        let again = grep(&core, Some(&drive), "budget");
         let (lines, report) = grep_all(&core, &events, again);
         assert_eq!((lines.len(), report.unreadable), (0, 1));
         assert_eq!(mounted(&core, &drive, 4), 1);
-        let again = grep(&core, &[&drive], "budget");
+        let again = grep(&core, Some(&drive), "budget");
         assert_eq!(grep_all(&core, &events, again).0.len(), 50);
     }
 
@@ -4861,13 +5005,13 @@ mod tests {
         let around = drive.parent().unwrap();
         assert_eq!(unmounted(&core, &drive, 3), 1);
         // Mounted still, as macOS takes a moment to unmount it once the eject is approved.
-        let ticket = grep(&core, &[around], "budget");
+        let ticket = grep(&core, Some(around), "budget");
         assert_eq!(grep_all(&core, &events, ticket).1.unreadable, 1);
 
         std::fs::remove_dir_all(&drive).unwrap();
         let path = drive.to_str().unwrap();
         unsafe { tl_volume_gone(core.0, path.as_ptr(), path.len()) };
-        let ticket = grep(&core, &[around], "budget");
+        let ticket = grep(&core, Some(around), "budget");
         let (lines, report) = grep_all(&core, &events, ticket);
         assert_eq!((lines.len(), report.unreadable), (1, 0), "{lines:?}");
     }
@@ -6601,14 +6745,10 @@ mod tests {
     /// the part of it that matched.
     type Line = (String, u64, String, String);
 
-    fn grep(core: &Core, folders: &[&Path], query: &str) -> u64 {
-        let mut bytes = Vec::new();
-        for folder in folders {
-            bytes.extend_from_slice(folder.to_str().unwrap().as_bytes());
-            bytes.push(0);
-        }
-        let (folders, len) = (bytes.as_ptr(), bytes.len());
-        unsafe { tl_grep_submit(core.0, folders, len, query.as_ptr(), query.len()) }
+    fn grep(core: &Core, folder: Option<&Path>, query: &str) -> u64 {
+        let folder = folder.map_or("", |folder| folder.to_str().unwrap());
+        let (path, len) = (folder.as_ptr(), folder.len());
+        unsafe { tl_grep_submit(core.0, path, len, query.as_ptr(), query.len()) }
     }
 
     /// The lines waiting for `ticket`, and the counts once the search is over.
@@ -6662,17 +6802,79 @@ mod tests {
 
     /// As `grep_all`, once `taken` batches were taken.
     fn grep_rest(core: &Core, events: &Events, ticket: u64, taken: usize) -> (Vec<Line>, Report) {
+        let (mut found, report) = grep_in_order(core, events, ticket, taken);
+        found.sort();
+        (found, report)
+    }
+
+    /// As `grep_rest`, the lines in the order they came.
+    fn grep_in_order(
+        core: &Core,
+        events: &Events,
+        ticket: u64,
+        taken: usize,
+    ) -> (Vec<Line>, Report) {
         let mut found = Vec::new();
         for batch in taken + 1.. {
             events.wait_for_times(TL_EVENT_LINES, ticket, batch);
             let (lines, report) = take_lines(core, ticket).expect("a batch for each event");
             found.extend(lines);
             if let Some(report) = report {
-                found.sort();
                 return (found, report);
             }
         }
         unreachable!()
+    }
+
+    /// What the stand-in Spotlight names, by the words asked, and the folders each was asked in.
+    /// Each test asks its own words, so tests running at once never mix.
+    static NAMED: Mutex<Vec<(String, Vec<PathBuf>)>> = Mutex::new(Vec::new());
+    static ASKED: Mutex<Vec<(String, Vec<PathBuf>)>> = Mutex::new(Vec::new());
+
+    /// Names the files planted in `NAMED` for `query`, wherever they are; "wait…" holds on
+    /// until the search is no longer wanted, as a slow Spotlight would.
+    fn stand_in_spotlight(
+        query: &str,
+        within: &[PathBuf],
+        stale: &dyn Fn() -> bool,
+    ) -> Option<Vec<PathBuf>> {
+        ASKED
+            .lock()
+            .unwrap()
+            .push((query.to_owned(), within.to_vec()));
+        if query.starts_with("wait") {
+            while !stale() {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            return None;
+        }
+        let named = NAMED.lock().unwrap();
+        let files = named.iter().filter(|(asked, _)| asked == query);
+        Some(files.flat_map(|(_, files)| files.clone()).collect())
+    }
+
+    fn name(query: &str, files: &[PathBuf]) {
+        NAMED
+            .lock()
+            .unwrap()
+            .push((query.to_owned(), files.to_vec()));
+    }
+
+    fn asked(query: &str) -> Vec<Vec<PathBuf>> {
+        let asked = ASKED.lock().unwrap();
+        let asked = asked.iter().filter(|(words, _)| words == query);
+        asked.map(|(_, within)| within.clone()).collect()
+    }
+
+    /// A core over `home` whose text searches inside `covers` ask the stand-in Spotlight.
+    fn spotlit_core(home: &Path, covers: &Path, full_disk: u32, events: &Events) -> Core {
+        let core = text_core(home, full_disk, events);
+        let text = unsafe { &mut *core.0 }.text.as_mut().unwrap();
+        text.asker = Asker {
+            covers: Some(covers.to_path_buf()),
+            files: stand_in_spotlight,
+        };
+        core
     }
 
     fn write(path: &Path, text: impl AsRef<[u8]>) {
@@ -6730,8 +6932,7 @@ mod tests {
         let events = Events::default();
         let core = text_core(&home, 1, &events);
 
-        // A folder inside another, or named twice, is searched once.
-        let ticket = grep(&core, &[&notes, &home, &notes.join("old"), &home], "budget");
+        let ticket = grep(&core, None, "budget");
         assert_ne!(ticket, 0);
         let (lines, report) = grep_all(&core, &events, ticket);
         let plan = notes.join("plan.md").to_string_lossy().into_owned();
@@ -6763,7 +6964,7 @@ mod tests {
         write(&home.join("a.txt"), "budget\n");
         let events = Events::default();
         let core = text_core(&home, 1, &events);
-        let ticket = grep(&core, &[&home], "budget");
+        let ticket = grep(&core, None, "budget");
         let (lines, _) = grep_all(&core, &events, ticket);
         let shown: Vec<&str> = lines.iter().map(|line| line.0.as_str()).collect();
         assert_eq!(shown, [home.join("a.txt").to_str().unwrap()]);
@@ -6771,14 +6972,14 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn a_folder_named_by_a_link_is_searched_once_by_its_real_path() {
+    fn a_folder_named_by_a_link_is_searched_by_its_real_path() {
         let (_dir, home) = home_with(&[]);
         let notes = home.join("notes");
         write(&notes.join("a.txt"), "budget\n");
         std::os::unix::fs::symlink(&notes, home.join("link")).unwrap();
         let events = Events::default();
         let core = text_core(&home, 1, &events);
-        let ticket = grep(&core, &[&home.join("link"), &notes], "budget");
+        let ticket = grep(&core, Some(&home.join("link")), "budget");
         let (lines, report) = grep_all(&core, &events, ticket);
         let shown: Vec<&str> = lines.iter().map(|line| line.0.as_str()).collect();
         assert_eq!(shown, [notes.join("a.txt").to_str().unwrap()]);
@@ -6794,7 +6995,7 @@ mod tests {
         let core = text_core(&home, 1, &events);
 
         events.hold_lines(true);
-        let text = grep(&core, &[&home], "budget");
+        let text = grep(&core, None, "budget");
         // The text search now waits inside `on_event`, halfway through its files.
         let halfway = events.heard(TL_EVENT_LINES, text);
         let name = submit(&core, "txt");
@@ -6819,8 +7020,8 @@ mod tests {
     #[test]
     fn a_cancelled_text_search_stops_and_keeps_nothing() {
         let (_dir, home) = home_with(&[]);
-        for file in ["a", "b", "c", "d", "e"] {
-            write(&home.join(format!("{file}.txt")), "budget\n".repeat(50));
+        for file in 0..40 {
+            write(&home.join(format!("{file}.txt")), "budget\n".repeat(5));
         }
         let events = Events::default();
         let core = text_core(&home, 1, &events);
@@ -6830,7 +7031,7 @@ mod tests {
         assert_eq!(take_lines(&core, 1), None);
 
         events.hold_lines(true);
-        let cancelled = grep(&core, &[&home], "budget");
+        let cancelled = grep(&core, None, "budget");
         let halfway = events.heard(TL_EVENT_LINES, cancelled);
         unsafe { tl_grep_cancel(core.0) };
         let kept = take_lines(&core, cancelled);
@@ -6839,7 +7040,7 @@ mod tests {
         assert_eq!(kept, None);
 
         // The worker takes one search at a time, so this one ends after the cancelled one.
-        let next = grep(&core, &[&home], "budget");
+        let next = grep(&core, None, "budget");
         let (lines, report) = grep_all(&core, &events, next);
         assert_eq!((lines.len(), report.lines_found), (LINES, LINES));
         assert_eq!(
@@ -6851,34 +7052,27 @@ mod tests {
     }
 
     #[test]
-    fn a_text_search_stops_at_its_lines_across_folders() {
+    fn a_text_search_stops_at_its_lines_three_a_file() {
         let (_dir, home) = home_with(&[]);
-        let (one, two) = (home.join("one"), home.join("two"));
-        write(&one.join("a.txt"), "budget\n".repeat(80));
-        write(&two.join("b.txt"), "budget\n".repeat(80));
+        for file in 0..40 {
+            write(
+                &home.join(format!("{}/{file}.txt", file % 2)),
+                "budget\n".repeat(80),
+            );
+        }
         let events = Events::default();
         let core = text_core(&home, 1, &events);
-        let ticket = grep(&core, &[&one, &two], "budget");
-        let (lines, report) = grep_all(&core, &events, ticket);
+        let ticket = grep(&core, None, "budget");
+        let (lines, report) = grep_in_order(&core, &events, ticket, 0);
         assert_eq!((lines.len(), report.lines_found), (LINES, LINES));
-        assert_eq!(report.files_searched, 2);
-    }
-
-    #[test]
-    fn a_folder_after_the_last_line_is_never_listed() {
-        let (_dir, home) = home_with(&[]);
-        let one = home.join("one");
-        write(&one.join("a.txt"), "budget\n".repeat(LINES));
-        let events = Events::default();
-        let core = text_core(&home, 1, &events);
-        // Listed, the missing folder would count as unreadable.
-        let ticket = grep(&core, &[&one, &home.join("two")], "budget");
-        let full = Report {
-            files_searched: 1,
-            lines_found: LINES,
-            ..Report::default()
-        };
-        assert_eq!(grep_all(&core, &events, ticket).1, full);
+        assert_eq!(report.files_searched, LINES.div_ceil(3));
+        // Each file's lines come together, the first ones of it.
+        let files: Vec<&[Line]> = lines.chunk_by(|a, b| a.0 == b.0).collect();
+        assert_eq!(files.len(), LINES.div_ceil(3));
+        for file in files {
+            let numbers: Vec<u64> = file.iter().map(|line| line.1).collect();
+            assert_eq!(numbers, [1, 2, 3][..file.len()], "{file:?}");
+        }
     }
 
     #[test]
@@ -6889,13 +7083,10 @@ mod tests {
         let core = text_core(&home, 1, &events);
         // The first search waits at its first line while the rest are typed.
         events.hold_lines(true);
-        let first = grep(&core, &[&home], "b");
+        let first = grep(&core, None, "b");
         let held = events.heard(TL_EVENT_LINES, first);
         let typed = ["bu", "bud", "budg", "budge", "budget"];
-        let tickets: Vec<u64> = typed
-            .iter()
-            .map(|query| grep(&core, &[&home], query))
-            .collect();
+        let tickets: Vec<u64> = typed.iter().map(|query| grep(&core, None, query)).collect();
         events.hold_lines(false);
         assert!(held);
 
@@ -6911,49 +7102,38 @@ mod tests {
     }
 
     #[test]
-    fn a_text_search_counts_folders_it_cannot_list_and_refuses_bad_paths() {
+    fn a_text_search_counts_a_folder_it_cannot_list_and_refuses_a_bad_path() {
         let (_dir, home) = home_with(&[]);
         let notes = home.join("notes");
         write(&notes.join("a.txt"), "budget\n");
         let events = Events::default();
         let core = text_core(&home, 1, &events);
 
-        // One bad path refuses the whole list, and leaves the search under way alone.
+        // A bad path is refused, and leaves the search under way alone.
         events.hold_lines(true);
-        let running = grep(&core, &[&notes], "budget");
+        let running = grep(&core, Some(&notes), "budget");
         let held = events.heard(TL_EVENT_LINES, running);
-        let mut folders = notes.to_str().unwrap().as_bytes().to_vec();
-        folders.extend_from_slice(&[0, 0xff, 0]);
         let query = "budget";
-        let refused =
-            unsafe { tl_grep_submit(core.0, folders.as_ptr(), folders.len(), query.as_ptr(), 6) };
+        let refused = unsafe { tl_grep_submit(core.0, [0xff].as_ptr(), 1, query.as_ptr(), 6) };
         events.hold_lines(false);
         assert!(held);
         assert_eq!(refused, 0);
         assert_eq!(grep_all(&core, &events, running).1.lines_found, 1);
 
-        let gone = home.join("gone");
-        let file = notes.join("a.txt");
-        let ticket = grep(&core, &[&gone, &file], "budget");
         let unreadable = Report {
-            unreadable: 2,
-            ..Report::default()
-        };
-        assert_eq!(grep_all(&core, &events, ticket), (Vec::new(), unreadable));
-
-        let ticket = grep(&core, &[&notes, &gone], "budget");
-        let both = Report {
-            files_searched: 1,
-            lines_found: 1,
             unreadable: 1,
             ..Report::default()
         };
-        let (lines, report) = grep_all(&core, &events, ticket);
-        assert_eq!((lines.len(), report), (1, both));
+        let gone = home.join("gone");
+        for folder in [&gone, &notes.join("a.txt")] {
+            let ticket = grep(&core, Some(folder), "budget");
+            let ended = grep_all(&core, &events, ticket);
+            assert_eq!(ended, (Vec::new(), unreadable), "{folder:?}");
+        }
 
-        // An empty box, two lines, or no folders, end at once with nothing, listing nothing.
+        // An empty box or two lines end at once with nothing, listing nothing.
         for query in ["", "budget\nbudget"] {
-            let ticket = grep(&core, &[&gone], query);
+            let ticket = grep(&core, Some(&gone), query);
             let ended = grep_all(&core, &events, ticket);
             assert_eq!(ended, (Vec::new(), Report::default()), "{query:?}");
         }
@@ -6965,7 +7145,7 @@ mod tests {
             (Vec::new(), Report::default())
         );
         // Text that isn't UTF-8 is read as Swift would show it.
-        let folder = format!("{}\0", notes.to_str().unwrap());
+        let folder = notes.to_str().unwrap();
         let broken =
             unsafe { tl_grep_submit(core.0, folder.as_ptr(), folder.len(), [0xff].as_ptr(), 1) };
         assert_ne!(broken, 0);
@@ -6981,17 +7161,19 @@ mod tests {
         let core = scan(home.to_str().unwrap(), 0, &events);
         events.wait_for(TL_EVENT_INDEXED, 1);
 
-        let limited = grep(&core, &[&home], "budget");
+        let limited = grep(&core, None, "budget");
         assert_eq!(grep_all(&core, &events, limited).1.lines_found, 0);
         // Named directly, a guarded folder still stays unread.
-        let named = grep(&core, &[&documents, &documents.join("work")], "budget");
         let unread = Report {
             unreadable: 1,
             ..Report::default()
         };
-        assert_eq!(grep_all(&core, &events, named), (Vec::new(), unread));
+        for folder in [&documents, &documents.join("work")] {
+            let named = grep(&core, Some(folder), "budget");
+            assert_eq!(grep_all(&core, &events, named), (Vec::new(), unread));
+        }
         unsafe { tl_grant_full_disk(core.0, 0, 1) };
-        let full = grep(&core, &[&home], "budget");
+        let full = grep(&core, None, "budget");
         assert_eq!(grep_all(&core, &events, full).1.lines_found, 1);
     }
 
@@ -7014,7 +7196,7 @@ mod tests {
         let events = Events::default();
         let core = text_core(&home, 1, &events);
         events.hold_lines(true);
-        let ticket = grep(&core, &[&home], "budget");
+        let ticket = grep(&core, None, "budget");
         let held = events.heard(TL_EVENT_LINES, ticket);
         let search = unsafe { &*core.0 }.text.as_ref().unwrap().started.get();
         let grep = Arc::clone(&search.unwrap().grep);
@@ -7047,15 +7229,14 @@ mod tests {
         let (grep, waiting) = (&grep, &waiting);
         let finder = |find: &Find| {
             if find.query == "broken" {
-                let line = Found {
-                    entry: 1,
+                let line = |line| Found {
                     path: Path::new("a.txt"),
-                    line: 1,
+                    line,
                     text: "broken",
                     matched: 0..6,
                 };
-                add(waiting, grep, find.ticket.number(), &line, notify);
-                add(waiting, grep, find.ticket.number(), &line, notify);
+                add(waiting, grep, find.ticket.number(), &[line(1)], notify);
+                add(waiting, grep, find.ticket.number(), &[line(2)], notify);
                 panic!("a bug in a text search");
             }
             Some(Report {
@@ -7084,11 +7265,11 @@ mod tests {
             scope.spawn(move || find_loop(grep, &inbox, waiting, notify, finder));
             let send = |query: &str| {
                 let ticket = grep.ticket();
-                let (folders, query) = (Vec::new(), query.to_owned());
+                let query = query.to_owned();
                 let (access, cloud) = (Access::Full, Cloud::Skip);
                 let find = Find {
                     ticket,
-                    folders,
+                    folder: None,
                     query,
                     access,
                     cloud,
@@ -7115,36 +7296,239 @@ mod tests {
     }
 
     #[test]
-    fn each_folder_is_searched_once() {
-        // Names that sort before "/" byte by byte must not split a folder from its insides.
-        let names = [
-            "/a", "/a/b", "/a/b/c", "/ab", "/x", "/a/b2", "/a-b", "/a.b", "/a b",
-        ];
-        // Under a root that never exists, so no name resolves to a real folder (CI on
-        // Windows has a D:\a).
-        let paths: Vec<PathBuf> = names
-            .iter()
-            .map(|name| PathBuf::from(format!("/argus-no-such-root{name}")))
-            .collect();
-        // Every set of these folders, each also named twice.
-        for set in 0..1_u32 << names.len() {
-            let chosen: Vec<PathBuf> = (0..names.len())
-                .filter(|bit| set & (1 << bit) != 0)
-                .flat_map(|bit| [paths[bit].clone(), paths[bit].clone()])
-                .rev()
-                .collect();
-            let kept = outermost(&chosen, |_, _| true);
-            for folder in &chosen {
-                let outer = kept.iter().filter(|outer| folder.starts_with(outer));
-                assert_eq!(outer.count(), 1, "{folder:?} in {kept:?}");
-            }
-            assert!(kept.iter().all(|folder| chosen.contains(folder)));
+    fn spotlight_is_asked_in_kept_folders_and_only_kept_files_are_read() {
+        let (_dir, home) = home_with(&[]);
+        let named = [
+            "notes/a.txt",
+            "notes/node_modules/b.js",
+            "notes/.git/c",
+            "secret/d.txt",
+            "notes/secret/e.txt",
+            "Documents/f.txt",
+            "Library/Caches/g.txt",
+            "Library/CloudStorage/Dropbox/h.txt",
+        ]
+        .map(|file| home.join(file));
+        for file in &named {
+            write(file, "zebra-kept\n");
         }
+        write(&home.join(".config/argus/ignore"), "secret\n");
+        std::fs::create_dir(home.join("empty")).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&named[0], home.join("notes/link.txt")).unwrap();
+        let mut answer = named.to_vec();
+        answer.extend([home.join("notes/link.txt"), home.join("notes/gone.txt")]);
+        name("zebra-kept", &answer);
+        let events = Events::default();
+        // Without Full Disk Access, so Documents is guarded.
+        let core = spotlit_core(&home, &home, 0, &events);
+        let ticket = grep(&core, None, "zebra-kept");
+        let (lines, report) = grep_all(&core, &events, ticket);
+        let shown: Vec<&str> = lines.iter().map(|line| line.0.as_str()).collect();
+        assert_eq!(shown, [named[0].to_str().unwrap()]);
+        assert_eq!(report.files_searched, 1);
+        // Never ~/Library or the home folder whole, where caches would fill Spotlight's cap.
+        let within = vec![home.join("empty"), home.join("notes")];
+        assert_eq!(asked("zebra-kept"), [within]);
+
+        // With Full Disk Access, Documents is read; with the cloud switch on too, the cloud
+        // drive is asked about and read.
+        unsafe { tl_grant_full_disk(core.0, 0, 1) };
+        let ticket = grep(&core, None, "zebra-kept");
+        assert_eq!(grep_all(&core, &events, ticket).0.len(), 2);
+        assert_eq!(unsafe { tl_index_cloud(core.0, 1, 2) }, 1);
+        let ticket = grep(&core, None, "zebra-kept");
+        let (lines, _) = grep_all(&core, &events, ticket);
+        assert_eq!(lines.len(), 3, "{lines:?}");
+        let drives = home.join("Library/CloudStorage");
+        assert!(asked("zebra-kept")[2].contains(&drives));
+    }
+
+    #[test]
+    fn files_you_open_come_first_then_the_newest() {
+        let (_dir, home) = home_with(&[]);
+        let files = ["old.txt", "newest.txt", "newer.txt", "opened.txt"].map(|file| {
+            let path = home.join("notes").join(file);
+            write(&path, "zebra-ranked\n");
+            path
+        });
+        let day = Duration::from_secs(24 * 60 * 60);
+        let now = std::time::SystemTime::now();
+        for (file, age) in files.iter().zip([30, 1, 2, 60]) {
+            let file = std::fs::File::options().write(true).open(file).unwrap();
+            file.set_modified(now - day * age).unwrap();
+        }
+        name("zebra-ranked", &files);
+        let events = Events::default();
+        let core = spotlit_core(&home, &home, 1, &events);
+        let opened = files[3].to_str().unwrap();
+        assert_eq!(
+            unsafe { tl_opened(core.0, opened.as_ptr(), opened.len()) },
+            1
+        );
+        let ticket = grep(&core, None, "zebra-ranked");
+        let (lines, _) = grep_in_order(&core, &events, ticket, 0);
+        let order: Vec<&str> = lines.iter().map(|line| line.0.as_str()).collect();
+        let expected = [&files[3], &files[1], &files[2], &files[0]].map(|f| f.to_str().unwrap());
+        assert_eq!(order, expected);
+    }
+
+    #[test]
+    fn a_folder_inside_the_home_folder_narrows_spotlight_and_one_outside_is_read_whole() {
+        let (_dir, home) = home_with(&[]);
+        let (_drive_dir, drive) = home_with(&[]);
+        let inside = home.join("work/notes");
+        write(&inside.join("a.txt"), "zebra-narrow\n");
+        write(&home.join("work/b.txt"), "zebra-narrow\n");
+        write(&drive.join("c.txt"), "zebra-narrow\n");
+        name(
+            "zebra-narrow",
+            &[inside.join("a.txt"), home.join("work/b.txt")],
+        );
+        let events = Events::default();
+        let core = spotlit_core(&home, &home, 1, &events);
+        let ticket = grep(&core, Some(&inside), "zebra-narrow");
+        let (lines, _) = grep_all(&core, &events, ticket);
+        let a = inside.join("a.txt");
+        assert_eq!(
+            lines.iter().map(|line| &line.0).collect::<Vec<_>>(),
+            [a.to_str().unwrap()]
+        );
+        assert_eq!(asked("zebra-narrow"), [vec![inside.clone()]]);
+
+        let ticket = grep(&core, Some(&drive), "zebra-narrow");
+        let (lines, report) = grep_all(&core, &events, ticket);
+        let c = drive.join("c.txt");
+        assert_eq!(
+            lines.iter().map(|line| &line.0).collect::<Vec<_>>(),
+            [c.to_str().unwrap()]
+        );
+        assert_eq!(report.files_searched, 1);
+        assert_eq!(
+            asked("zebra-narrow").len(),
+            1,
+            "Spotlight isn't asked about a drive"
+        );
+    }
+
+    /// As a Dropbox folder passed in with its switch off, or a chip on node_modules that the
+    /// ignore list walks through to bring one package back.
+    #[test]
+    fn a_folder_the_list_leaves_out_is_read_only_where_the_list_reads() {
+        let (_dir, home) = home_with(&[]);
+        let dropbox = home.join("Library/CloudStorage/Dropbox");
+        let modules = home.join("work/node_modules");
+        let files = [
+            dropbox.join("notes/a.txt"),
+            modules.join("mylib/b.js"),
+            modules.join("other/c.js"),
+        ];
+        for file in &files {
+            write(file, "zebra-left\n");
+        }
+        write(
+            &home.join(".config/argus/ignore"),
+            "!~/work/node_modules/mylib\n",
+        );
+        name("zebra-left", &files);
+        let events = Events::default();
+        let core = spotlit_core(&home, &home, 1, &events);
+        let ticket = grep(&core, Some(&dropbox), "zebra-left");
+        let (lines, report) = grep_all(&core, &events, ticket);
+        assert!(lines.is_empty(), "{lines:?}");
+        assert_eq!(report.files_searched, 0);
+        assert!(asked("zebra-left").is_empty(), "nothing in it is read");
+
+        let ticket = grep(&core, Some(&modules), "zebra-left");
+        let (lines, _) = grep_all(&core, &events, ticket);
+        let shown: Vec<&str> = lines.iter().map(|line| line.0.as_str()).collect();
+        assert_eq!(shown, [files[1].to_str().unwrap()]);
+        assert_eq!(asked("zebra-left"), [vec![modules.join("mylib")]]);
+    }
+
+    #[test]
+    fn files_right_inside_the_home_folder_are_read_too() {
+        let (_dir, home) = home_with(&[]);
+        write(&home.join("todo.md"), "call dentist about zebra-top\n");
+        write(&home.join(".zsh_history"), "grep zebra-top\n");
+        write(&home.join("notes/a.txt"), "zebra-top\n");
+        name("zebra-top", &[home.join("notes/a.txt")]);
+        let events = Events::default();
+        let core = spotlit_core(&home, &home, 1, &events);
+        let ticket = grep(&core, None, "zebra-top");
+        let (lines, _) = grep_all(&core, &events, ticket);
+        let mut shown: Vec<&str> = lines.iter().map(|line| line.0.as_str()).collect();
+        shown.sort_unstable();
+        let expected = [home.join("notes/a.txt"), home.join("todo.md")];
+        assert_eq!(shown, expected.each_ref().map(|f| f.to_str().unwrap()));
+    }
+
+    /// Spotlight can't look for "=>", so a kept folder is read as the name list keeps it; the
+    /// whole home folder is too big to read that way.
+    #[test]
+    fn text_without_a_letter_or_digit_is_read_without_spotlight() {
+        let (_dir, home) = home_with(&[]);
+        write(&home.join("work/a.rs"), "let f = |x| x =>> 1;\n");
+        write(&home.join("work/node_modules/b.js"), "=>>\n");
+        let events = Events::default();
+        let core = spotlit_core(&home, &home, 1, &events);
+        let ticket = grep(&core, Some(&home.join("work")), "=>>");
+        let (lines, _) = grep_all(&core, &events, ticket);
+        let shown: Vec<&str> = lines.iter().map(|line| line.0.as_str()).collect();
+        assert_eq!(shown, [home.join("work/a.rs").to_str().unwrap()]);
+        assert!(asked("=>>").is_empty());
+
+        let ticket = grep(&core, None, "=>>");
+        let (lines, report) = grep_all(&core, &events, ticket);
+        assert!(lines.is_empty(), "{lines:?}");
+        assert_eq!(report.files_searched, 0);
+    }
+
+    /// A common word fills Spotlight's cap with files it met first, maybe without yours.
+    #[test]
+    fn a_file_you_opened_is_read_even_when_spotlights_cap_leaves_it_out() {
+        let (_dir, home) = home_with(&[]);
+        let opened = home.join("notes/opened.txt");
+        write(&opened, "zebra-capped\n");
+        write(&home.join("notes/other.txt"), "zebra-capped\n");
+        let mut answer: Vec<PathBuf> = (0..argus_grep::spotlight::SPOTLIGHT_FILES - 1)
+            .map(|at| home.join(format!("notes/gone{at}.txt")))
+            .collect();
+        answer.push(home.join("notes/other.txt"));
+        name("zebra-capped", &answer);
+        let events = Events::default();
+        let core = spotlit_core(&home, &home, 1, &events);
+        let path = opened.to_str().unwrap();
+        assert_eq!(unsafe { tl_opened(core.0, path.as_ptr(), path.len()) }, 1);
+        let ticket = grep(&core, None, "zebra-capped");
+        let (lines, _) = grep_in_order(&core, &events, ticket, 0);
+        let order: Vec<&str> = lines.iter().map(|line| line.0.as_str()).collect();
+        assert_eq!(
+            order,
+            [path, home.join("notes/other.txt").to_str().unwrap()]
+        );
+    }
+
+    #[test]
+    fn a_newer_search_stops_a_slow_spotlight() {
+        let (_dir, home) = home_with(&[]);
+        write(&home.join("notes/a.txt"), "zebra-after\n");
+        name("zebra-after", &[home.join("notes/a.txt")]);
+        let events = Events::default();
+        let core = spotlit_core(&home, &home, 1, &events);
+        let waiting = grep(&core, None, "wait-zebra");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while asked("wait-zebra").is_empty() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let next = grep(&core, None, "zebra-after");
+        assert_eq!(grep_all(&core, &events, next).1.lines_found, 1);
+        assert_eq!(events.count(TL_EVENT_LINES, waiting), 0);
     }
 
     /// Name search times while a text search over `TL_GREP_FOLDER` (the home folder unless
-    /// set, without the guarded folders) starts again with each keystroke, 100 ms apart, as
-    /// live typing does. Run with
+    /// set, through Spotlight, without the guarded folders; read whole outside the home
+    /// folder) starts again with each keystroke, 100 ms apart, as live typing does. Run with
     /// `cargo test --release -p argus-ffi -- --ignored --nocapture name_search_times`.
     #[test]
     #[ignore = "builds a million names and lists a whole folder; slow outside --release"]
@@ -7166,7 +7550,7 @@ mod tests {
                 let pressed = Instant::now();
                 if busy {
                     // Matches nothing, so each search would list and read the whole folder.
-                    grep(&core, &[&folder], &format!("zq{key} no such text"));
+                    grep(&core, Some(&folder), &format!("zq{key} no such text"));
                 }
                 for query in queries {
                     let started = Instant::now();

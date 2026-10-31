@@ -244,10 +244,10 @@ final class DrivesTests: XCTestCase {
         let cell = ResultCell()
         cell.show(Row(name: "beach.jpg", folder: "/Volumes/Photos/trips", isFolder: false), icon: NSImage())
         XCTAssertEqual(cell.folder.stringValue, "Photos › trips")
-        cell.show(
-            TextHit(path: "/Volumes/Photos/notes/plan.txt", text: "plan", match: NSRange(location: 0, length: 4), line: 3),
-            icon: NSImage())
-        XCTAssertEqual(cell.folder.stringValue, "plan.txt, line 3 · Photos › notes")
+        let hit = TextHit(
+            path: "/Volumes/Photos/notes/plan.txt", text: "plan", match: NSRange(location: 0, length: 4), line: 3)
+        cell.show(hit.file, icon: NSImage())
+        XCTAssertEqual(cell.folder.stringValue, "Photos › notes", "a file with lines found inside")
     }
 
     func testTheWindowLeavesOutWhatTheCoreRefuses() async throws {

@@ -712,9 +712,11 @@ fn grep(folder: &Path, options: &Options, text: &str) -> ExitCode {
     let grep = Grep::default();
     let started = Instant::now();
     let first = OnceLock::new();
-    let report = grep.search(&index, text, grep.ticket(), GREP_LIMIT, |found| {
+    let report = grep.search(&index, text, grep.ticket(), GREP_LIMIT, |file| {
         first.get_or_init(|| ms(started));
-        println!("{}:{}: {}", found.path.display(), found.line, found.text);
+        for found in file {
+            println!("{}:{}: {}", found.path.display(), found.line, found.text);
+        }
     });
     let Some(report) = report else {
         return ExitCode::FAILURE;
