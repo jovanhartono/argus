@@ -950,7 +950,47 @@ fn held_in(name: &str, word: &str, app: bool) -> Held {
             result = Held::Inside;
         }
     }
+    let starts = |at: usize| {
+        name[at].is_ascii_alphanumeric()
+            && (at == 0 || !name[at - 1].is_ascii_alphanumeric() || camel(at))
+    };
+    let ends = |at: usize| at == name.len() || !name[at].is_ascii_alphanumeric() || camel(at);
+    // "vscode" is Visual Studio Code typed as V·S·Code: like a whole word, not a typo.
+    if app && on_word_starts(name, word, 0, &starts, &ends) {
+        return Held::Alone;
+    }
     result
+}
+
+/// Whether `word` spells the app's words in order from the first, each by its initial or in
+/// full, the last by at least two letters: "vscod" on the way to "vscode". Only the last may be
+/// cut short, so "desing" is not Des·In·G of Desk Insight Gallery, and "colors" is not
+/// Color·S of ColorSync.
+fn on_word_starts(
+    name: &[u8],
+    word: &[u8],
+    from: usize,
+    starts: &impl Fn(usize) -> bool,
+    ends: &impl Fn(usize) -> bool,
+) -> bool {
+    let Some(at) = (from..name.len()).find(|&at| starts(at)) else {
+        return false;
+    };
+    let end = (at + 1..=name.len())
+        .find(|&end| ends(end))
+        .unwrap_or(name.len());
+    let whole = &name[at..end];
+    let opens = |piece: &[u8]| {
+        piece.len() <= whole.len() && whole[..piece.len()].eq_ignore_ascii_case(piece)
+    };
+    (from > 0 && word.len() >= 2 && opens(word))
+        || (word.len() > 1
+            && opens(&word[..1])
+            && on_word_starts(name, &word[1..], end, starts, ends))
+        || (whole.len() > 1
+            && word.len() > whole.len()
+            && opens(&word[..whole.len()])
+            && on_word_starts(name, &word[whole.len()..], end, starts, ends))
 }
 
 /// Below this score a name cannot hold the word letter for letter, as frizbee gives each letter
@@ -2886,6 +2926,76 @@ mod tests {
         );
         // No app matches "plan", so none takes a typo for "safarri".
         assert!(ranked(&index, &apps, "safarri plan").is_empty());
+    }
+
+    #[test]
+    fn an_app_holds_a_word_typed_on_its_word_starts() {
+        let mut builder = IndexBuilder::new();
+        let root = builder.push("/home", NO_PARENT, true);
+        for name in [
+            "SATU.xcodeproj",
+            "visionmodel",
+            "synergy-core.code-workspace",
+            "design.pdf",
+        ] {
+            builder.push(name, root, false);
+        }
+        let index = builder.finish();
+        let apps = applications(&["Visual Studio Code"]);
+        // V·S·Code is how people type it, so files one typo from "vscode" stay out.
+        assert_eq!(
+            ranked(&index, &apps, "vscode"),
+            ["/Applications/Visual Studio Code.app"]
+        );
+        assert_eq!(ranked(&index, &apps, "desing"), ["/home/design.pdf"]);
+    }
+
+    #[test]
+    fn an_app_holds_a_word_still_being_typed_on_its_word_starts() {
+        let mut builder = IndexBuilder::new();
+        let root = builder.push("/home", NO_PARENT, true);
+        for name in ["SATU.xcodeproj", "Discord.app", "visionmodel"] {
+            builder.push(name, root, false);
+        }
+        let index = builder.finish();
+        let apps = applications(&["Visual Studio Code"]);
+        // Each keystroke on the way to "vscode" keeps the list clean, not just the last.
+        for query in ["vsco", "vscod"] {
+            assert_eq!(
+                ranked(&index, &apps, query),
+                ["/Applications/Visual Studio Code.app"],
+                "{query}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_plural_is_not_an_app_typed_on_its_word_starts() {
+        let mut builder = IndexBuilder::new();
+        let root = builder.push("/home", NO_PARENT, true);
+        let configurations = builder.push("configurations", root, true);
+        builder.push("colors.json", configurations, false);
+        builder.push("Assignment Embedded Systems.docx", root, false);
+        builder.push("curl", root, false);
+        let index = builder.finish();
+        let apps = applications(&[
+            "ColorSync Utility",
+            "System Settings",
+            "Claude Code URL Handler",
+        ]);
+        // "colors" is Color + S of Sync, but someone typing it wants the file named colors.
+        let tops: Vec<String> = ["colors", "systems", "curl"]
+            .iter()
+            .map(|query| ranked(&index, &apps, query).swap_remove(0))
+            .collect();
+        assert_eq!(
+            tops,
+            [
+                "/home/configurations/colors.json",
+                "/home/Assignment Embedded Systems.docx",
+                "/home/curl",
+            ]
+        );
     }
 
     #[test]
