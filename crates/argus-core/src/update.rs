@@ -1111,6 +1111,8 @@ mod tests {
         "node_modules",
         "vendor",
         "composer.json",
+        "dist",
+        "package.json",
         "CACHEDIR.TAG",
         "Notes.app",
         "Contents",
@@ -1625,6 +1627,39 @@ mod tests {
         assert!(!settings.update(&mut index, &[root.join("site")]).compacted);
         assert_eq!(vendor(&index), Some(Kind::Folder));
         assert_current(&settings, &index, &root, "without composer.json");
+    }
+
+    #[test]
+    fn a_project_file_drops_its_build_output_and_brings_it_back() {
+        let (_dir, root) = temp_root();
+        pad(&root);
+        write(&root, &["app/target/debug/tl", "app/dist/index.js"]);
+        let (ignore, _) = Ignore::parse("!~/app/dist", &root, Access::Full);
+        let settings = Settings::new(
+            &root,
+            &root,
+            Clutter::Skip,
+            ignore,
+            Access::Full,
+            Cloud::Keep,
+        );
+        let mut index = settings.scan().unwrap().index;
+        let listed = |index: &Index, path: &str| {
+            let found = findable(index, &root);
+            found.iter().any(|(found, _)| found == Path::new(path))
+        };
+        assert!(listed(&index, "app/target/debug/tl"));
+
+        write(&root, &["app/Cargo.toml", "app/package.json"]);
+        settings.update(&mut index, &[root.join("app")]);
+        assert!(!listed(&index, "app/target"));
+        assert!(listed(&index, "app/dist/index.js"));
+        assert_current(&settings, &index, &root, "with Cargo.toml");
+
+        fs::remove_file(root.join("app/Cargo.toml")).unwrap();
+        settings.update(&mut index, &[root.join("app")]);
+        assert!(listed(&index, "app/target/debug/tl"));
+        assert_current(&settings, &index, &root, "without Cargo.toml");
     }
 
     #[test]
