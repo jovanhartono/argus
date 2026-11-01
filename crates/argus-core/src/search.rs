@@ -950,7 +950,42 @@ fn held_in(name: &str, word: &str, app: bool) -> Held {
             result = Held::Inside;
         }
     }
+    let starts = |at: usize| {
+        name[at].is_ascii_alphanumeric()
+            && (at == 0 || !name[at - 1].is_ascii_alphanumeric() || camel(at))
+    };
+    let ends = |at: usize| at == name.len() || !name[at].is_ascii_alphanumeric() || camel(at);
+    // "vscode" is Visual Studio Code typed as V·S·Code: like a whole word, not a typo.
+    if app && on_word_starts(name, word, 0, &starts, &ends) {
+        return Held::Alone;
+    }
     result
+}
+
+/// Whether `word` splits into an initial or a whole word of `name`, one after another from
+/// `from`. Not any part of a word, so "desing" is not held by Desk Insight Gallery.
+fn on_word_starts(
+    name: &[u8],
+    word: &[u8],
+    from: usize,
+    starts: &impl Fn(usize) -> bool,
+    ends: &impl Fn(usize) -> bool,
+) -> bool {
+    let Some(&first) = word.first() else {
+        return true;
+    };
+    (from..name.len()).filter(|&at| starts(at)).any(|at| {
+        let end = (at + 1..=name.len())
+            .find(|&end| ends(end))
+            .unwrap_or(name.len());
+        let whole = &name[at..end];
+        (name[at].eq_ignore_ascii_case(&first)
+            && on_word_starts(name, &word[1..], at + 1, starts, ends))
+            || (whole.len() > 1
+                && word.len() >= whole.len()
+                && whole.eq_ignore_ascii_case(&word[..whole.len()])
+                && on_word_starts(name, &word[whole.len()..], end, starts, ends))
+    })
 }
 
 /// Below this score a name cannot hold the word letter for letter, as frizbee gives each letter
@@ -2886,6 +2921,28 @@ mod tests {
         );
         // No app matches "plan", so none takes a typo for "safarri".
         assert!(ranked(&index, &apps, "safarri plan").is_empty());
+    }
+
+    #[test]
+    fn an_app_holds_a_word_typed_on_its_word_starts() {
+        let mut builder = IndexBuilder::new();
+        let root = builder.push("/home", NO_PARENT, true);
+        for name in [
+            "SATU.xcodeproj",
+            "visionmodel",
+            "synergy-core.code-workspace",
+            "design.pdf",
+        ] {
+            builder.push(name, root, false);
+        }
+        let index = builder.finish();
+        let apps = applications(&["Visual Studio Code"]);
+        // V·S·Code is how people type it, so files one typo from "vscode" stay out.
+        assert_eq!(
+            ranked(&index, &apps, "vscode"),
+            ["/Applications/Visual Studio Code.app"]
+        );
+        assert_eq!(ranked(&index, &apps, "desing"), ["/home/design.pdf"]);
     }
 
     #[test]
