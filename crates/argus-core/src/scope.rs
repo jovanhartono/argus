@@ -212,6 +212,10 @@ mod tests {
         "work/py/lib/site",
         "work/py/bin",
         "work/rust/target/debug",
+        "work/crate/target/debug",
+        "work/web/dist/assets",
+        "work/web/coverage/keep",
+        "work/talk/dist",
         "work/Notes.app/Contents",
         "work/satudental.app/src",
         "work/Trip.photoslibrary/originals",
@@ -240,7 +244,7 @@ mod tests {
     ];
 
     const RULES: &str = "old projects\n~/Movies/Exports\n!~/.config/nvim\n!~/.cache/keep\n\
-                         !~/Library/Application Support/Foo\n";
+                         !~/Library/Application Support/Foo\n!~/work/web/coverage/keep\n";
 
     fn home() -> (tempfile::TempDir, PathBuf) {
         let dir = tempfile::tempdir().unwrap();
@@ -259,6 +263,8 @@ mod tests {
         for (file, text) in [
             ("work/site/composer.json", ""),
             ("work/py/pyvenv.cfg", ""),
+            ("work/crate/Cargo.toml", ""),
+            ("work/web/package.json", ""),
             ("work/notes/CACHEDIR.TAG", "not a tag"),
             (
                 "work/rust/target/CACHEDIR.TAG",
@@ -316,9 +322,11 @@ mod tests {
                 let scope = settings.scope(&index);
                 let listed: Vec<PathBuf> = (0..index.len() as u32).map(|e| index.path(e)).collect();
                 for folder in every_folder(&home) {
-                    let passage = *root == home
-                        && clutter == Clutter::Skip
-                        && passages.iter().any(|passage| folder == home.join(passage));
+                    let coverage = folder == home.join("work/web/coverage");
+                    let passage = clutter == Clutter::Skip
+                        && ((*root == home
+                            && passages.iter().any(|passage| folder == home.join(passage)))
+                            || (coverage && folder.starts_with(root)));
                     let read = listed.contains(&folder.join("probe.txt")) || passage;
                     assert_eq!(
                         scope.in_scope(&folder),
@@ -424,6 +432,11 @@ mod tests {
             assert!(scope.in_scope(&home.join("work/gone/deeper")));
             assert!(!scope.in_scope(&home.join("work/gone/node_modules/x")));
             assert!(!scope.in_scope(&home.join("work/rust/target/debug/deps")));
+            assert!(!scope.in_scope(&home.join("work/crate/target/debug")));
+            assert!(!scope.in_scope(&home.join("work/web/dist/assets")));
+            assert!(scope.in_scope(&home.join("work/web/coverage/keep")));
+            assert!(!scope.keeps_files_in(&home.join("work/web/coverage")));
+            assert!(scope.in_scope(&home.join("work/talk/dist")));
             assert!(!scope.in_scope(&home.join("Library/Caches/com.apple.x")));
             assert!(!scope.in_scope(Path::new("/elsewhere")));
             assert!(!scope.in_scope(home.parent().unwrap()));

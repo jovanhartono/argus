@@ -24,7 +24,7 @@ const USAGE: &str = "usage:
   tl open-record <path> --frecency <file>      count one open of a file or folder in a list
 on a Mac, searches also find the apps in /Applications, /System/Applications and ~/Applications
 add --all to include hidden folders, ~/Library, the insides of packages like Photos Library,
-and tool downloads and caches like node_modules
+and tool downloads, caches and build output like node_modules, or target beside Cargo.toml
 add --cloud to include iCloud Drive and cloud drives like Dropbox, which the app leaves out at first
 add --load <file> to open a saved index instead of scanning (it scans when the file is missing,
 damaged or built with other settings, and does not catch up on changes made since it was saved),

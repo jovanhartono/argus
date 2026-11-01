@@ -243,7 +243,7 @@ impl Rules {
         let wanted = self.ignore.keeps(child, name) || (cloud && !self.ignore.skips(child, name));
         let dropped = inside.passage
             || is_clutter(parent, name, &self.home)
-            || is_tool_download(name, beside)
+            || is_tool_folder(name, beside)
             || self.ignore.skips(child, name);
         if !wanted && dropped {
             // A skipped folder on the way to one you brought back is walked through, keeping
@@ -415,9 +415,10 @@ fn is_clutter(folder: &Path, name: &OsStr, home: &Path) -> bool {
         || (name == "mod" && folder.strip_prefix(home) == Ok(Path::new("go/pkg")))
 }
 
-/// Downloads a tool keeps beside its project, known by the project file next to them.
-/// A folder that happens to be called "vendor" is kept.
-fn is_tool_download(name: &OsStr, beside: impl Fn(&str) -> bool) -> bool {
+/// Downloads and build output a tool keeps beside its project, known by the project file
+/// next to them. A folder that happens to be called "vendor" or "dist" is kept.
+fn is_tool_folder(name: &OsStr, beside: impl Fn(&str) -> bool) -> bool {
+    let python = || beside("pyproject.toml") || beside("setup.py");
     match name.to_str() {
         Some("vendor") => beside("composer.json") || beside("go.mod"),
         Some("Pods") => beside("Podfile"),
@@ -425,6 +426,21 @@ fn is_tool_download(name: &OsStr, beside: impl Fn(&str) -> bool) -> bool {
         Some("bin" | "include" | "Include" | "lib" | "Lib" | "lib64" | "Scripts") => {
             beside("pyvenv.cfg")
         }
+        Some("target") => beside("Cargo.toml") || beside("pom.xml"),
+        Some("dist") => beside("package.json") || python(),
+        Some("out" | "coverage") => beside("package.json"),
+        // Not beside package.json: Electron apps keep their icons in build/.
+        Some("build") => {
+            beside("build.gradle")
+                || beside("build.gradle.kts")
+                || beside("pubspec.yaml")
+                || beside("CMakeLists.txt")
+                || python()
+        }
+        Some("_build" | "deps") => beside("mix.exs"),
+        Some("zig-out") => beside("build.zig"),
+        Some("Carthage") => beside("Cartfile"),
+        Some(name) if name.ends_with(".egg-info") => python(),
         _ => false,
     }
 }
@@ -837,6 +853,59 @@ mod tests {
         assert_eq!(found, expected);
         let everything = scan_from(root, Clutter::Keep, PathBuf::new()).unwrap();
         assert_eq!(everything.index.len(), 33);
+    }
+
+    #[test]
+    fn skips_build_output_only_beside_its_project_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = &fs::canonicalize(dir.path()).unwrap();
+        let kept = [
+            "crate/Cargo.toml",
+            "web/package.json",
+            "web/build/icon.png",
+            "web/coverage/keep/lcov.info",
+            "lib/pyproject.toml",
+            "ex/mix.exs",
+            "zig/build.zig",
+            "ios/Cartfile",
+            "android/build.gradle.kts",
+            "talk/dist/slides.pdf",
+            "talk/target/goals.md",
+            "talk/thing.egg-info/notes.txt",
+        ];
+        let skipped = [
+            "crate/target/debug/tl",
+            "web/dist/index.js",
+            "web/out/index.html",
+            "web/coverage/lcov.info",
+            "lib/dist/lib.whl",
+            "lib/build/lib/a.py",
+            "lib/lib.egg-info/PKG-INFO",
+            "ex/_build/dev/a.beam",
+            "ex/deps/plug/mix.exs",
+            "zig/zig-out/bin/app",
+            "ios/Carthage/Build/a.framework",
+            "android/build/app.apk",
+        ];
+        for file in kept.iter().chain(&skipped) {
+            fs::create_dir_all(root.join(file).parent().unwrap()).unwrap();
+            fs::write(root.join(file), "").unwrap();
+        }
+        let (ignore, problems) = Ignore::parse("!~/web/coverage/keep", root, Access::Full);
+        assert!(problems.is_empty());
+        let (skip, full) = (Clutter::Skip, Access::Full);
+        let scan = super::scan(root, Path::new(""), skip, &ignore, full, Cloud::Keep);
+        let found = paths_below(root, &scan.unwrap().index);
+
+        for file in kept {
+            assert!(found.contains(Path::new(file)), "{file}");
+        }
+        for file in skipped {
+            assert!(!found.contains(Path::new(file)), "{file}");
+        }
+        // Brought back by the ! line: coverage is only the way to it.
+        assert!(found.contains(Path::new("web/coverage")));
+        assert!(!found.contains(Path::new("web/out")));
     }
 
     #[test]
