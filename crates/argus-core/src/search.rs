@@ -5,7 +5,7 @@ use crate::frecency::{Boosts, Frecency};
 use crate::index::{ALL_LETTERS, EntryId, Index, NameId, letter, letters, symbols};
 use crate::siblings::NO_FOLDER;
 use crate::within::Within;
-use frizbee::{Config, Match, Matcher, Matching, Pattern, Scoring, SortStrategy};
+use frizbee::{CaseMatching, Config, Match, Matcher, Matching, Pattern, Scoring, SortStrategy};
 use rayon::prelude::*;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -921,21 +921,34 @@ fn splits_at_dot(word: &Pattern) -> bool {
     word.config.matching.is_none() && !word.needle.contains('.')
 }
 
-/// A name's text before and after the dot of its extension, when it has one.
+/// A name's text before and after the dot of its extension, when it has one. Only letters and
+/// digits make an extension, so "Mr. Robot" and "node-v20.11.1-darwin-arm64" have none.
 fn extension(text: &str) -> Option<(&str, &str)> {
     let dot = text.rfind('.')?;
-    (dot > 0 && dot + 1 < text.len()).then(|| (&text[..dot], &text[dot + 1..]))
+    let tail = &text[dot + 1..];
+    (dot > 0 && !tail.is_empty() && tail.bytes().all(|b| b.is_ascii_alphanumeric()))
+        .then(|| (&text[..dot], tail))
 }
 
-/// One word's matchers for each way of ending it on the first letters of an extension,
-/// made the first time a name needs them.
+/// One word's matchers for each way of ending it inside an extension, made the first time a
+/// name needs them.
 #[derive(Default)]
-struct Sides(Option<Vec<(Matcher, Matcher)>>);
+struct Sides(Option<Vec<Cut>>);
 
-/// Whether a name frizbee matched still fits the word with no letter of it taken from the
-/// middle of the extension: "cmux" is not credit-mutation.tsx, whose x only ".tsx" holds. The
-/// word may end on the extension's first letters in a row, so "reportpdf" still finds
-/// report.pdf and "applesafari" com.apple.Safari.
+/// The word cut in two: the head before the dot, the end in the extension.
+struct Cut {
+    head: Matcher,
+    /// The end letter for letter: the extension's first letters, or a run of three or more.
+    end: Matcher,
+    /// With a typo allowed, the end from the extension's first letter, fuzzy.
+    loose: Option<(char, Matcher)>,
+}
+
+/// Whether a name frizbee matched still fits the word with no stray letter of it taken from
+/// the extension: "cmux" is not credit-mutation.tsx, whose x only ".tsx" holds. The word may
+/// end on the extension's first letters, or on three or more of its letters in a row, so
+/// "reportpdf" still finds report.pdf and "shopworkspace" Shop.xcworkspace. A word allowed a
+/// typo may take it in either part: "designpfd" still finds design.pdf.
 fn beside_extension(
     text: &str,
     word: &Pattern,
@@ -948,32 +961,62 @@ fn beside_extension(
     };
     let needle = word.needle.as_str();
     // Most extensions share no letter with the word, like ".pdf" for "notes", so no match
-    // can reach into them.
-    if needle.is_ascii()
-        && tail.is_ascii()
-        && letters(needle) & letters(tail) == 0
-        && symbols(needle) & symbols(tail) == 0
-    {
+    // can reach into them. A typo there only stands for a letter the word lacks.
+    if needle.is_ascii() && letters(needle) & letters(tail) == 0 {
         return true;
     }
     if matcher.match_one(stem, 0).is_some() || matcher.match_one(tail, 0).is_some() {
         return true;
     }
-    let ends = sides.0.get_or_insert_with(|| {
+    // The pieces keep the whole word's case: "abC" minds case in both.
+    let respect = needle.chars().any(char::is_uppercase);
+    let cuts = sides.0.get_or_insert_with(|| {
         let config = matcher_config();
+        let casing = if respect {
+            CaseMatching::Respect
+        } else {
+            CaseMatching::Ignore
+        };
+        let piece = |text: &str| Pattern::new(text, word.config.clone()).casing(Some(casing));
         needle
             .char_indices()
             .skip(1)
-            .map(|(cut, _)| {
-                let head = Pattern::new(&needle[..cut], word.config.clone()).max_typos(Some(typos));
-                let end = Pattern::new(&needle[cut..], word.config.clone())
-                    .matching(Some(Matching::Prefix));
-                (Matcher::new(head, &config), Matcher::new(end, &config))
+            .map(|(cut, first)| {
+                let end = &needle[cut..];
+                let run = if end.chars().count() >= 3 {
+                    Matching::Substring
+                } else {
+                    Matching::Prefix
+                };
+                let loose = (typos > 0).then(|| {
+                    let fuzzy = piece(end).max_typos(Some(typos));
+                    (first, Matcher::new(fuzzy, &config))
+                });
+                Cut {
+                    head: Matcher::new(piece(&needle[..cut]).max_typos(Some(typos)), &config),
+                    end: Matcher::new(piece(end).matching(Some(run)), &config),
+                    loose,
+                }
             })
             .collect()
     });
-    ends.iter_mut()
-        .any(|(head, end)| end.match_one(tail, 0).is_some() && head.match_one(stem, 0).is_some())
+    let opens = |first: char| {
+        tail.chars().next().is_some_and(|t| {
+            if respect {
+                t == first
+            } else {
+                t.eq_ignore_ascii_case(&first)
+            }
+        })
+    };
+    cuts.iter_mut().any(|cut| {
+        let end = cut.end.match_one(tail, 0).is_some()
+            || cut
+                .loose
+                .as_mut()
+                .is_some_and(|(first, loose)| opens(*first) && loose.match_one(tail, 0).is_some());
+        end && cut.head.match_one(stem, 0).is_some()
+    })
 }
 
 /// How a name holds a typed word, letter for letter: "nib" is the whole of "NIB.pdf" bar its
@@ -3311,6 +3354,13 @@ mod tests {
             "résumé.pdf",
             "photo.JPG",
             "budget 2024.numbers",
+            "Mr. Robot",
+            "St. Louis trip",
+            "node-v20.11.1-darwin-arm64",
+            "Info.plist",
+            "com.microsoft.VSCode",
+            "design.pdf",
+            "aB.CbC",
         ];
         let mut builder = IndexBuilder::new();
         let root = builder.push("/home", NO_PARENT, true);
@@ -3388,6 +3438,18 @@ mod tests {
             // A name with no extension, or a lone dot at its end, is matched as before.
             ("mkfl", &["Makefile"], &[]),
             ("notes", &["notes."], &[]),
+            // Text after an abbreviation's dot, with a space or dash in it, is no extension.
+            ("mrrobot", &["Mr. Robot"], &[]),
+            ("stlouis", &["St. Louis trip"], &[]),
+            ("nodearm64", &["node-v20.11.1-darwin-arm64"], &[]),
+            // Three or more letters in a row may come from anywhere in the extension.
+            ("shopworkspace", &["Shop.xcworkspace"], &[]),
+            ("infolist", &["Info.plist"], &[]),
+            ("microsoftcode", &["com.microsoft.VSCode"], &[]),
+            // A word that takes a typo is not held to the rule.
+            ("designpfd", &["design.pdf"], &[]),
+            // A capital typed minds case in every piece: the b of "abC" is only inside "CbC".
+            ("abC", &[], &["aB.CbC"]),
             // Each word of several may sit on its own side of the dot.
             ("nib pdf", &["NIB.pdf"], &[]),
             ("credit tsx", &["credit-mutation.tsx"], &[]),
@@ -3427,35 +3489,50 @@ mod tests {
         );
     }
 
-    /// Lower-case ASCII with no typo: frizbee's fuzzy match is then "the word's letters appear
-    /// in order", so the rule can be checked against every way of splitting the word.
+    /// ASCII with no typo: frizbee's fuzzy match is then "the word's letters appear in order",
+    /// minding case once the word has a capital, so the rule can be checked against every way
+    /// of splitting the word. Written apart from `extension` on purpose.
     fn fits_by_hand(name: &str, word: &str) -> bool {
-        fn in_order(word: &str, text: &str) -> bool {
-            let mut text = text.chars().map(|c| c.to_ascii_lowercase());
+        let fold = |text: &str| {
+            if word.bytes().any(|b| b.is_ascii_uppercase()) {
+                text.to_owned()
+            } else {
+                text.to_ascii_lowercase()
+            }
+        };
+        let in_order = |word: &str, text: &str| {
+            let text = fold(text);
+            let mut text = text.chars();
             word.chars().all(|c| text.any(|t| t == c))
-        }
-        if word.contains('.') {
-            return in_order(word, name);
-        }
-        let Some((stem, tail)) = extension(name) else {
+        };
+        let dot = name.rfind('.').filter(|&dot| {
+            let tail = &name[dot + 1..];
+            dot > 0 && !tail.is_empty() && tail.bytes().all(|b| b.is_ascii_alphanumeric())
+        });
+        let Some(dot) = dot.filter(|_| !word.contains('.')) else {
             return in_order(word, name);
         };
-        let tail = tail.to_ascii_lowercase();
+        let (stem, tail) = (&name[..dot], fold(&name[dot + 1..]));
         in_order(word, stem)
             || in_order(word, &tail)
-            || (1..word.len())
-                .any(|cut| tail.starts_with(&word[cut..]) && in_order(&word[..cut], stem))
+            || (1..word.len()).any(|cut| {
+                let end = &word[cut..];
+                let fits = tail.starts_with(end) || (end.len() >= 3 && tail.contains(end));
+                fits && in_order(&word[..cut], stem)
+            })
     }
 
     #[test]
     fn the_extension_rule_matches_every_way_of_splitting_the_word() {
         let mut rng = Rng(0xd07);
-        let parts = ["a", "b", "c", "A", "B", ".", ".", "-", " ", "ab", "é"];
-        let typed = ["a", "b", "c", "a", "b", "."];
+        let parts = [
+            "a", "b", "c", "A", "B", ".", ".", "-", " ", "ab", "abc", "é", "1",
+        ];
+        let typed = ["a", "b", "c", "a", "b", "c", ".", "A", "1"];
         let config = matcher_config();
         let (mut kept, mut dropped) = (0, 0);
-        for _ in 0..4_000 {
-            let needle = rng.text(&typed, 5);
+        for _ in 0..6_000 {
+            let needle = rng.text(&typed, 6);
             let Some(word) = Pattern::parse_query(&needle).pop() else {
                 continue;
             };
@@ -3486,12 +3563,14 @@ mod tests {
     }
 
     /// A word that fits before the dot, or in the extension alone, is never dropped, however it
-    /// is cased and whatever typo it may take.
+    /// is cased, whatever typo it may take, with letters from beyond ASCII too.
     #[test]
     fn the_extension_rule_never_drops_a_word_one_side_holds() {
         let mut rng = Rng(0xe47);
-        let parts = ["a", "b", "x", "A", "X", ".", "-", "_", " ", "é", "日", "1"];
-        let typed = ["a", "b", "x", "A", "X", "1", "é"];
+        let parts = [
+            "a", "b", "x", "A", "X", ".", "-", "_", " ", "é", "É", "日", "1",
+        ];
+        let typed = ["a", "b", "x", "A", "X", "1", "é", "É"];
         let config = matcher_config();
         let mut checked = 0;
         for _ in 0..3_000 {
