@@ -785,6 +785,7 @@ fn match_names(
     let typos = |w: usize| u16::from(typo_words >> w & 1);
     let needed: Vec<u64> = words.iter().map(|word| letters(&word.needle)).collect();
     let needed_symbols: Vec<u8> = words.iter().map(|word| symbols(&word.needle)).collect();
+    let dot = symbols(".");
     let shortcuts = scratch.shortcuts();
     let floors: Vec<u16> = (0..words.len())
         .map(|w| held_floor(&words[w], typos(w), &config.scoring))
@@ -895,10 +896,12 @@ fn match_names(
                         for found in matcher.match_list(texts) {
                             let text = texts[found.index as usize];
                             let word = &words[w];
-                            if one_side && !beside_extension(text, word, matcher, sides) {
+                            let n = ids[found.index as usize];
+                            // A name with no dot has no extension, known without reading it.
+                            let dotted = index.name_symbols[first + n] & dot != 0;
+                            if one_side && dotted && !beside_extension(text, word, matcher, sides) {
                                 continue;
                             }
-                            let n = ids[found.index as usize];
                             bits[n] |= 1 << w;
                             matched |= 1 << w;
                             if wanted >> w & 1 == 1 {
@@ -967,7 +970,8 @@ struct Cut {
     head: Matcher,
     /// The end letter for letter: the extension's first letters, or a run of three or more.
     end: Matcher,
-    /// With a typo allowed, the end from the extension's first letter, fuzzy.
+    /// With a typo allowed, the end from the extension's first letter, fuzzy. The head may
+    /// take its own typo too, so a rare name gets through with two, never one too few.
     loose: Option<(char, Matcher)>,
 }
 
@@ -978,11 +982,11 @@ struct Cut {
 /// typo may take it in either part: "designpfd" still finds design.pdf.
 fn beside_extension(text: &str, word: &Pattern, matcher: &mut Matcher, sides: &mut Sides) -> bool {
     let needle = word.needle.as_str();
-    // "te" fits hundreds of thousands of names, nearly all of them before a dot; this one
-    // pass over the letters keeps the rule from costing a sixth more per keystroke.
+    // "te" fits hundreds of thousands of names, nearly all of them before the dot, so one
+    // pass over the letters settles most names.
     if sides.plain
-        && let Some(end) = letters_end(needle, text, sides.respect)
-        && text.as_bytes()[end..].contains(&b'.')
+        && let Some(dot) = text.bytes().rposition(|b| b == b'.')
+        && letters_end(needle, &text[..dot], sides.respect).is_some()
     {
         return true;
     }
@@ -1002,19 +1006,20 @@ fn beside_extension(text: &str, word: &Pattern, matcher: &mut Matcher, sides: &m
 
 /// Where the ASCII word's letters, found in order as early as they come, end in `text`.
 fn letters_end(word: &str, text: &str, respect: bool) -> Option<usize> {
-    let text = text.as_bytes();
-    let mut at = 0;
-    for &w in word.as_bytes() {
-        let found = text[at..].iter().position(|&t| {
-            if respect {
-                t == w
-            } else {
-                t.eq_ignore_ascii_case(&w)
-            }
-        })?;
-        at += found + 1;
+    fn end(word: &[u8], text: &[u8], same: impl Fn(u8, u8) -> bool) -> Option<usize> {
+        let mut at = 0;
+        for &w in word {
+            at += text[at..].iter().position(|&t| same(t, w))? + 1;
+        }
+        Some(at)
     }
-    Some(at)
+    let (word, text) = (word.as_bytes(), text.as_bytes());
+    // A word with no capital is all lower case already.
+    if respect {
+        end(word, text, |t, w| t == w)
+    } else {
+        end(word, text, |t, w| t.to_ascii_lowercase() == w)
+    }
 }
 
 /// `beside_extension` for an ASCII word with no typo, where frizbee's fuzzy match is the
@@ -1103,16 +1108,7 @@ fn fits_by_frizbee(
 /// Whether `text` holds the ASCII word's letters in order, which is a match for frizbee when
 /// the word allows no typo.
 fn in_order(word: &str, text: &str, respect: bool) -> bool {
-    let mut text = text.bytes();
-    word.bytes().all(|w| {
-        text.any(|t| {
-            if respect {
-                t == w
-            } else {
-                t.eq_ignore_ascii_case(&w)
-            }
-        })
-    })
+    letters_end(word, text, respect).is_some()
 }
 
 /// How a name holds a typed word, letter for letter: "nib" is the whole of "NIB.pdf" bar its
