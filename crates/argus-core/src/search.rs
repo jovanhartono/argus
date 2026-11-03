@@ -969,6 +969,20 @@ fn beside_extension(text: &str, word: &Pattern, matcher: &mut Matcher, sides: &m
     let Some(dot) = text.bytes().rposition(|b| b == b'.') else {
         return true;
     };
+    // The name holds the word, so a last letter the extension lacks sits before the dot, and so
+    // does the rest.
+    if sides.plain {
+        let last = needle.as_bytes()[needle.len() - 1];
+        let tail = &text.as_bytes()[dot + 1..];
+        let ends = if sides.respect {
+            tail.contains(&last)
+        } else {
+            tail.iter().any(|t| t.to_ascii_lowercase() == last)
+        };
+        if !ends {
+            return true;
+        }
+    }
     // "te" fits hundreds of thousands of names, nearly all of them before the dot.
     if sides.plain && in_order(needle, &text[..dot], sides.respect) {
         return true;
