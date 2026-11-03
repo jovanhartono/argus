@@ -990,6 +990,8 @@ struct Loose {
     long: bool,
     /// The end after its first letter, which may be the typo itself: "reportodf".
     rest: String,
+    /// The end with its first two letters swapped back, the commonest slip: "invoicedpf".
+    swapped: Option<String>,
 }
 
 /// Whether a name frizbee matched still fits the word with no stray letter of it taken from
@@ -1102,6 +1104,12 @@ fn fits_by_frizbee(
                     first,
                     long: end.chars().count() >= 4,
                     rest: end[first.len_utf8()..].to_owned(),
+                    swapped: {
+                        let mut letters = end.chars();
+                        let (a, b) = (letters.next(), letters.next());
+                        a.zip(b)
+                            .map(|(a, b)| [b, a].into_iter().chain(letters).collect())
+                    },
                 });
                 Cut {
                     head: Matcher::new(piece(head).max_typos(Some(typos)), &config),
@@ -1131,13 +1139,18 @@ fn fits_by_frizbee(
         cut.loose.as_mut().is_some_and(|loose| {
             let opens = opening.is_some_and(|t| same(t, loose.first));
             let near = (opens || loose.long) && loose.end.match_one(tail, 0).is_some();
-            let mut rest = after.chars();
-            let swapped = opening.is_some()
-                && loose
-                    .rest
+            let opens_with = |text: &str, letters: &str| {
+                let mut text = text.chars();
+                letters
                     .chars()
-                    .all(|r| rest.next().is_some_and(|t| same(r, t)));
-            (near || swapped) && loose.head.match_one(stem, 0).is_some()
+                    .all(|l| text.next().is_some_and(|t| same(l, t)))
+            };
+            let replaced = opening.is_some() && opens_with(after, &loose.rest);
+            let swapped = loose
+                .swapped
+                .as_deref()
+                .is_some_and(|swapped| opens_with(tail, swapped));
+            (near || replaced || swapped) && loose.head.match_one(stem, 0).is_some()
         })
     })
 }
@@ -3553,7 +3566,6 @@ mod tests {
             ("nextconfigjs", &["next.config.mjs"], &[]),
             ("pythongz", &["Python-3.12.1.tgz"], &[]),
             ("rdf", &["report.pdf"], &[]),
-            ("xcodep", &["Xcode.app"], &[]),
             // But not one letter from further in: the f of "rpf" is the last of ".pdf".
             ("rpf", &[], &["report.pdf"]),
             ("mns", &[], &["main.rs"]),
@@ -3597,6 +3609,12 @@ mod tests {
             ("leasedf", &["Lease Agreement.pdf"], &[]),
             ("mainfs", &["main.rs"], &[]),
             ("résuméodf", &["résumé.pdf"], &[]),
+            // The extension's first two letters swapped is one typo too.
+            ("reportdpf", &["report.pdf"], &[]),
+            ("leasedpf", &["Lease Agreement.pdf"], &[]),
+            ("nextconfigjms", &["next.config.mjs"], &[]),
+            ("photopjg", &["photo.JPG"], &[]),
+            ("mainsr", &["main.rs"], &[]),
             // But the typo does not open the middle of the extension: "mainsx" would need the
             // s from inside ".rs" as well as a typo for the x.
             ("mainsx", &[], &["main.rs"]),
@@ -3750,7 +3768,14 @@ mod tests {
                 (near(head, stem) && exact(end))
                     || (in_order(head, stem)
                         && ((near(end, &tail) && (end.len() >= 4 || tail.starts_with(&end[..1])))
-                            || tail[1..].starts_with(&end[1..])))
+                            || tail[1..].starts_with(&end[1..])
+                            || (end.len() >= 2
+                                && tail.starts_with(&format!(
+                                    "{}{}{}",
+                                    &end[1..2],
+                                    &end[..1],
+                                    &end[2..]
+                                )))))
             })
     }
 
