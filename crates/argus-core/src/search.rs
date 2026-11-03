@@ -973,6 +973,9 @@ struct Cut {
     head: Matcher,
     /// The end letter for letter: the extension's first letters, or a run of three or more.
     end: Matcher,
+    /// Two letters or more, so the end may also open the extension at its second letter,
+    /// the first left out: "nextconfigjs" for next.config.mjs.
+    second: bool,
     /// For a word allowed a typo: the head letter for letter, and the end with the typo.
     loose: Option<Loose>,
 }
@@ -991,8 +994,9 @@ struct Loose {
 
 /// Whether a name frizbee matched still fits the word with no stray letter of it taken from
 /// the extension: "cmux" is not credit-mutation.tsx, whose x only ".tsx" holds. The word may
-/// end on the extension's first letters, or on three or more of its letters in a row, so
-/// "reportpdf" still finds report.pdf and "shopworkspace" Shop.xcworkspace. A word allowed a
+/// end on the extension's first letters, on two or more after its first ("nextconfigjs" for
+/// next.config.mjs), or on three or more of its letters in a row, so "reportpdf" still finds
+/// report.pdf and "shopworkspace" Shop.xcworkspace. A word allowed a
 /// typo may take it in either part: "designpfd" still finds design.pdf, "mainfs" main.rs.
 fn beside_extension(text: &str, word: &Pattern, matcher: &mut Matcher, sides: &mut Sides) -> bool {
     let needle = word.needle.as_str();
@@ -1047,11 +1051,14 @@ fn fits_by_letters(stem: &str, tail: &str, needle: &str, respect: bool) -> bool 
         }
     };
     let tail_bytes = tail.as_bytes();
+    let opens_at = |at: usize, end: &[u8]| {
+        tail_bytes.len() >= at + end.len() && same(&tail_bytes[at..at + end.len()], end)
+    };
     in_order(needle, stem, respect)
         || in_order(needle, tail, respect)
         || (1..needle.len()).any(|cut| {
             let end = &needle.as_bytes()[cut..];
-            let opens = tail_bytes.len() >= end.len() && same(&tail_bytes[..end.len()], end);
+            let opens = opens_at(0, end) || (end.len() >= 2 && opens_at(1, end));
             let run = end.len() >= 3 && tail_bytes.windows(end.len()).any(|w| same(w, end));
             (opens || run) && in_order(&needle[..cut], stem, respect)
         })
@@ -1099,6 +1106,7 @@ fn fits_by_frizbee(
                 Cut {
                     head: Matcher::new(piece(head).max_typos(Some(typos)), &config),
                     end: Matcher::new(piece(end).matching(Some(run)), &config),
+                    second: end.chars().count() >= 2,
                     loose,
                 }
             })
@@ -1115,7 +1123,9 @@ fn fits_by_frizbee(
     let opening = after.next();
     let after = after.as_str();
     cuts.iter_mut().any(|cut| {
-        if cut.end.match_one(tail, 0).is_some() && cut.head.match_one(stem, 0).is_some() {
+        let end = cut.end.match_one(tail, 0).is_some()
+            || (cut.second && cut.end.match_one(after, 0).is_some());
+        if end && cut.head.match_one(stem, 0).is_some() {
             return true;
         }
         cut.loose.as_mut().is_some_and(|loose| {
@@ -3479,7 +3489,11 @@ mod tests {
             "Info.plist",
             "com.microsoft.VSCode",
             "design.pdf",
-            "aB.CbC",
+            "aB.CCbC",
+            "next.config.mjs",
+            "Python-3.12.1.tgz",
+            "Xcode.app",
+            "Lease Agreement.pdf",
         ];
         let mut builder = IndexBuilder::new();
         let root = builder.push("/home", NO_PARENT, true);
@@ -3535,10 +3549,15 @@ mod tests {
             ("minjs", &["jquery-3.6.0.min.js"], &[]),
             ("envlocal", &[".env.local"], &[]),
             ("photojpg", &["photo.JPG"], &[]),
-            // But not the extension's later letters: "rdf" skips the p of ".pdf".
-            ("rdf", &[], &["report.pdf"]),
+            // Or from its second letter, the first left out, two letters or more.
+            ("nextconfigjs", &["next.config.mjs"], &[]),
+            ("pythongz", &["Python-3.12.1.tgz"], &[]),
+            ("rdf", &["report.pdf"], &[]),
+            ("xcodep", &["Xcode.app"], &[]),
+            // But not one letter from further in: the f of "rpf" is the last of ".pdf".
+            ("rpf", &[], &["report.pdf"]),
             ("mns", &[], &["main.rs"]),
-            ("ndf", &[], &["NIB.pdf"]),
+            ("nbf", &[], &["NIB.pdf"]),
             // From four letters on, a word no name holds may take a typo: "mains" is "main"
             // with an s missing, the way "desing" finds design.pdf, and "reportdf" is
             // "reportpdf" with the p missing.
@@ -3574,13 +3593,17 @@ mod tests {
             ("infolsit", &["Info.plist"], &[]),
             ("microsoftcdoe", &["com.microsoft.VSCode"], &[]),
             ("reportodf", &["report.pdf"], &[]),
+            ("leaseodf", &["Lease Agreement.pdf"], &[]),
+            ("leasedf", &["Lease Agreement.pdf"], &[]),
             ("mainfs", &["main.rs"], &[]),
             ("résuméodf", &["résumé.pdf"], &[]),
             // But the typo does not open the middle of the extension: "mainsx" would need the
             // s from inside ".rs" as well as a typo for the x.
             ("mainsx", &[], &["main.rs"]),
-            // A capital typed minds case in every piece: the b of "abC" is only inside "CbC".
-            ("abC", &[], &["aB.CbC"]),
+            // A capital typed minds case in every piece: the b of "abC" is only deep inside
+            // "CCbC", while "abc" fits "aB" and the C opening it.
+            ("abC", &[], &["aB.CCbC"]),
+            ("abc", &["aB.CCbC"], &[]),
             // Each word of several may sit on its own side of the dot.
             ("nib pdf", &["NIB.pdf"], &[]),
             ("credit tsx", &["credit-mutation.tsx"], &[]),
@@ -3648,7 +3671,9 @@ mod tests {
             || in_order(word, &tail)
             || (1..word.len()).any(|cut| {
                 let end = &word[cut..];
-                let fits = tail.starts_with(end) || (end.len() >= 3 && tail.contains(end));
+                let fits = tail.starts_with(end)
+                    || (end.len() >= 2 && tail[1..].starts_with(end))
+                    || (end.len() >= 3 && tail.contains(end));
                 fits && in_order(&word[..cut], stem)
             })
     }
@@ -3688,7 +3713,7 @@ mod tests {
             }
         }
         assert!(
-            kept > 5_000 && dropped > 500,
+            kept > 5_000 && dropped > 300,
             "{kept} kept, {dropped} dropped"
         );
     }
@@ -3713,7 +3738,11 @@ mod tests {
             return true;
         };
         let (stem, tail) = (&name[..dot], name[dot + 1..].to_ascii_lowercase());
-        let exact = |end: &str| tail.starts_with(end) || (end.len() >= 3 && tail.contains(end));
+        let exact = |end: &str| {
+            tail.starts_with(end)
+                || (end.len() >= 2 && tail[1..].starts_with(end))
+                || (end.len() >= 3 && tail.contains(end))
+        };
         near(word, stem)
             || near(word, &tail)
             || (1..word.len()).any(|cut| {
