@@ -820,20 +820,22 @@ fn match_names(
                     .enumerate()
                     .map(|(w, word)| Matcher::new(word.clone().max_typos(Some(typos(w))), &config))
                     .collect();
-                (matchers, Vec::new(), Vec::new())
+                let sides: Vec<Sides> = words.iter().map(|_| Sides::default()).collect();
+                (matchers, sides, Vec::new(), Vec::new())
             },
-            |(matchers, ids, texts), (chunk, (bits, scores))| {
+            |(matchers, sides, ids, texts), (chunk, (bits, scores))| {
                 if stale() {
                     return None;
                 }
                 let first = chunk * NAME_CHUNK;
                 let (mut matched, mut held) = (0u8, 0u8);
-                for (w, matcher) in matchers.iter_mut().enumerate() {
+                for (w, (matcher, sides)) in matchers.iter_mut().zip(sides.iter_mut()).enumerate() {
                     if active >> w & 1 == 0 {
                         continue;
                     }
                     // "zshrc" should find .zshrc as readily as zshrc.bak; typing ".zsh" keeps the dot.
                     let keep_dot = words[w].needle.starts_with('.');
+                    let one_side = splits_at_dot(&words[w]);
                     let end = first + bits.len();
                     for batch in (first..end).step_by(MATCH_BATCH) {
                         ids.clear();
@@ -889,12 +891,16 @@ fn match_names(
                             });
                         }
                         for found in matcher.match_list(texts) {
+                            let text = texts[found.index as usize];
+                            let word = &words[w];
+                            if one_side && !beside_extension(text, word, typos(w), matcher, sides) {
+                                continue;
+                            }
                             let n = ids[found.index as usize];
                             bits[n] |= 1 << w;
                             matched |= 1 << w;
                             if wanted >> w & 1 == 1 {
-                                let text = texts[found.index as usize];
-                                let needle = &words[w].needle;
+                                let needle = &word.needle;
                                 let (score, holds) =
                                     points(found, text, needle, floors[w], false, &config.scoring);
                                 held |= u8::from(holds) << w;
@@ -907,6 +913,67 @@ fn match_names(
             },
         )
         .try_reduce(|| (0, 0), |a, b| Some((a.0 | b.0, a.1 | b.1)))
+}
+
+/// Whether a word's letters must stay on one side of a name's extension. A word with a dot in
+/// it, or one matched letter for letter by `^`, `$` or `'`, already says where it goes.
+fn splits_at_dot(word: &Pattern) -> bool {
+    word.config.matching.is_none() && !word.needle.contains('.')
+}
+
+/// A name's text before and after the dot of its extension, when it has one.
+fn extension(text: &str) -> Option<(&str, &str)> {
+    let dot = text.rfind('.')?;
+    (dot > 0 && dot + 1 < text.len()).then(|| (&text[..dot], &text[dot + 1..]))
+}
+
+/// One word's matchers for each way of ending it on the first letters of an extension,
+/// made the first time a name needs them.
+#[derive(Default)]
+struct Sides(Option<Vec<(Matcher, Matcher)>>);
+
+/// Whether a name frizbee matched still fits the word with no letter of it taken from the
+/// middle of the extension: "cmux" is not credit-mutation.tsx, whose x only ".tsx" holds. The
+/// word may end on the extension's first letters in a row, so "reportpdf" still finds
+/// report.pdf and "applesafari" com.apple.Safari.
+fn beside_extension(
+    text: &str,
+    word: &Pattern,
+    typos: u16,
+    matcher: &mut Matcher,
+    sides: &mut Sides,
+) -> bool {
+    let Some((stem, tail)) = extension(text) else {
+        return true;
+    };
+    let needle = word.needle.as_str();
+    // Most extensions share no letter with the word, like ".pdf" for "notes", so no match
+    // can reach into them.
+    if needle.is_ascii()
+        && tail.is_ascii()
+        && letters(needle) & letters(tail) == 0
+        && symbols(needle) & symbols(tail) == 0
+    {
+        return true;
+    }
+    if matcher.match_one(stem, 0).is_some() || matcher.match_one(tail, 0).is_some() {
+        return true;
+    }
+    let ends = sides.0.get_or_insert_with(|| {
+        let config = matcher_config();
+        needle
+            .char_indices()
+            .skip(1)
+            .map(|(cut, _)| {
+                let head = Pattern::new(&needle[..cut], word.config.clone()).max_typos(Some(typos));
+                let end = Pattern::new(&needle[cut..], word.config.clone())
+                    .matching(Some(Matching::Prefix));
+                (Matcher::new(head, &config), Matcher::new(end, &config))
+            })
+            .collect()
+    });
+    ends.iter_mut()
+        .any(|(head, end)| end.match_one(tail, 0).is_some() && head.match_one(stem, 0).is_some())
 }
 
 /// How a name holds a typed word, letter for letter: "nib" is the whole of "NIB.pdf" bar its
@@ -3215,6 +3282,306 @@ mod tests {
             assert_eq!(hits.len(), 1, "{query}");
             assert!(matches!(hits[0].item, Item::App(_)), "{query}");
         }
+    }
+
+    use std::collections::BTreeSet;
+
+    /// Every file name below sits in one folder, and each query lists what it must find and
+    /// what it must leave out.
+    #[test]
+    fn a_word_never_takes_letters_from_inside_an_extension() {
+        let names = [
+            "credit-mutation.tsx",
+            "credit-mutation.xlsx",
+            "cmux",
+            "cmux.app",
+            "NIB.pdf",
+            "report.pdf",
+            "main.rs",
+            "com.apple.Safari",
+            "com.apple.Safari.plist",
+            "v1.2.3",
+            "archive.tar.gz",
+            "jquery-3.6.0.min.js",
+            "Shop.xcworkspace",
+            ".zshrc",
+            ".env.local",
+            "Makefile",
+            "notes.",
+            "résumé.pdf",
+            "photo.JPG",
+            "budget 2024.numbers",
+        ];
+        let mut builder = IndexBuilder::new();
+        let root = builder.push("/home", NO_PARENT, true);
+        for name in names {
+            builder.push(name, root, false);
+        }
+        let index = builder.finish();
+        let found = |query: &str| -> Vec<String> {
+            paths(&index, query)
+                .into_iter()
+                .map(|path| path.trim_start_matches("/home/").to_owned())
+                .collect()
+        };
+        let cases: &[(&str, &[&str], &[&str])] = &[
+            // The x of "cmux" is only in the middle of ".tsx".
+            (
+                "cmux",
+                &["cmux", "cmux.app", "credit-mutation.xlsx"],
+                &["credit-mutation.tsx"],
+            ),
+            ("cmx", &["cmux", "cmux.app"], &["credit-mutation.tsx"]),
+            ("crdtsx", &["credit-mutation.tsx"], &[]),
+            ("crdsx", &[], &["credit-mutation.tsx"]),
+            // A word wholly in the extension, or wholly before it, still finds the file.
+            ("pdf", &["NIB.pdf", "report.pdf", "résumé.pdf"], &[]),
+            ("tsx", &["credit-mutation.tsx"], &[]),
+            (
+                "mutation",
+                &["credit-mutation.tsx", "credit-mutation.xlsx"],
+                &[],
+            ),
+            (
+                "credmut",
+                &["credit-mutation.tsx", "credit-mutation.xlsx"],
+                &[],
+            ),
+            ("nib", &["NIB.pdf"], &[]),
+            ("jpg", &["photo.JPG"], &[]),
+            ("numbers", &["budget 2024.numbers"], &[]),
+            ("workspace", &["Shop.xcworkspace"], &[]),
+            // Typing on into the first letters of the extension still finds it.
+            ("reportpdf", &["report.pdf"], &[]),
+            ("reportp", &["report.pdf"], &[]),
+            ("mainrs", &["main.rs"], &[]),
+            (
+                "applesafari",
+                &["com.apple.Safari", "com.apple.Safari.plist"],
+                &[],
+            ),
+            ("safariplist", &["com.apple.Safari.plist"], &[]),
+            ("v123", &["v1.2.3"], &[]),
+            ("targz", &["archive.tar.gz"], &[]),
+            ("minjs", &["jquery-3.6.0.min.js"], &[]),
+            ("envlocal", &[".env.local"], &[]),
+            ("photojpg", &["photo.JPG"], &[]),
+            // But not the extension's later letters: "reportdf" skips the p of ".pdf".
+            ("reportdf", &[], &["report.pdf"]),
+            ("mns", &[], &["main.rs"]),
+            // From four letters on, a word no name holds may take a typo: "mains" is "main"
+            // with an s missing, the way "desing" finds design.pdf.
+            ("mains", &["main.rs"], &[]),
+            ("nibdf", &[], &["NIB.pdf"]),
+            // A dot typed, or a literal word, goes wherever it says.
+            ("mutation.tsx", &["credit-mutation.tsx"], &[]),
+            ("n.tsx", &["credit-mutation.tsx"], &[]),
+            (
+                "cmu.x",
+                &["credit-mutation.tsx", "credit-mutation.xlsx"],
+                &[],
+            ),
+            ("tsx$", &["credit-mutation.tsx"], &[]),
+            ("'n.tsx", &["credit-mutation.tsx"], &[]),
+            (".zsh", &[".zshrc"], &[]),
+            ("zshrc", &[".zshrc"], &[]),
+            // A name with no extension, or a lone dot at its end, is matched as before.
+            ("mkfl", &["Makefile"], &[]),
+            ("notes", &["notes."], &[]),
+            // Each word of several may sit on its own side of the dot.
+            ("nib pdf", &["NIB.pdf"], &[]),
+            ("credit tsx", &["credit-mutation.tsx"], &[]),
+            (
+                "cmux !tsx",
+                &["cmux", "cmux.app", "credit-mutation.xlsx"],
+                &[],
+            ),
+        ];
+        for &(query, kept, dropped) in cases {
+            let found = found(query);
+            for name in kept {
+                assert!(
+                    found.iter().any(|f| f == name),
+                    "{query:?} lost {name:?}: {found:?}"
+                );
+            }
+            for name in dropped {
+                assert!(!found.iter().any(|f| f == name), "{query:?} found {name:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_cmux_app_comes_without_credit_mutation() {
+        let mut builder = IndexBuilder::new();
+        let root = builder.push("/home", NO_PARENT, true);
+        let src = builder.push("src", root, true);
+        builder.push("credit-mutation.tsx", src, false);
+        let index = builder.finish();
+        let apps = applications(&["cmux"]);
+        assert_eq!(ranked(&index, &apps, "cmux"), ["/Applications/cmux.app"]);
+        // With no name holding "cmux" it may be a typo, and "cmu" fits before the dot.
+        assert_eq!(
+            ranked(&index, &Apps::default(), "cmux"),
+            ["/home/src/credit-mutation.tsx"]
+        );
+    }
+
+    /// Lower-case ASCII with no typo: frizbee's fuzzy match is then "the word's letters appear
+    /// in order", so the rule can be checked against every way of splitting the word.
+    fn fits_by_hand(name: &str, word: &str) -> bool {
+        fn in_order(word: &str, text: &str) -> bool {
+            let mut text = text.chars().map(|c| c.to_ascii_lowercase());
+            word.chars().all(|c| text.any(|t| t == c))
+        }
+        if word.contains('.') {
+            return in_order(word, name);
+        }
+        let Some((stem, tail)) = extension(name) else {
+            return in_order(word, name);
+        };
+        let tail = tail.to_ascii_lowercase();
+        in_order(word, stem)
+            || in_order(word, &tail)
+            || (1..word.len())
+                .any(|cut| tail.starts_with(&word[cut..]) && in_order(&word[..cut], stem))
+    }
+
+    #[test]
+    fn the_extension_rule_matches_every_way_of_splitting_the_word() {
+        let mut rng = Rng(0xd07);
+        let parts = ["a", "b", "c", "A", "B", ".", ".", "-", " ", "ab", "é"];
+        let typed = ["a", "b", "c", "a", "b", "."];
+        let config = matcher_config();
+        let (mut kept, mut dropped) = (0, 0);
+        for _ in 0..4_000 {
+            let needle = rng.text(&typed, 5);
+            let Some(word) = Pattern::parse_query(&needle).pop() else {
+                continue;
+            };
+            let word = positive(word).max_typos(Some(0));
+            let names: Vec<String> = (0..40).map(|_| rng.name(&parts, 10)).collect();
+            let mut matcher = Matcher::new(word.clone(), &config);
+            let mut sides = Sides::default();
+            for found in Matcher::new(word.clone(), &config).match_list(&names) {
+                let name = &names[found.index as usize];
+                let ours = !splits_at_dot(&word)
+                    || beside_extension(name, &word, 0, &mut matcher, &mut sides);
+                assert_eq!(
+                    ours,
+                    fits_by_hand(name, &word.needle),
+                    "{needle:?} in {name:?}"
+                );
+                if ours {
+                    kept += 1;
+                } else {
+                    dropped += 1;
+                }
+            }
+        }
+        assert!(
+            kept > 5_000 && dropped > 500,
+            "{kept} kept, {dropped} dropped"
+        );
+    }
+
+    /// A word that fits before the dot, or in the extension alone, is never dropped, however it
+    /// is cased and whatever typo it may take.
+    #[test]
+    fn the_extension_rule_never_drops_a_word_one_side_holds() {
+        let mut rng = Rng(0xe47);
+        let parts = ["a", "b", "x", "A", "X", ".", "-", "_", " ", "é", "日", "1"];
+        let typed = ["a", "b", "x", "A", "X", "1", "é"];
+        let config = matcher_config();
+        let mut checked = 0;
+        for _ in 0..3_000 {
+            let needle = rng.text(&typed, 6);
+            let typos = rng.below(2) as u16;
+            let word = Pattern::parse_query(&needle)
+                .remove(0)
+                .max_typos(Some(typos));
+            let names: Vec<String> = (0..40).map(|_| rng.name(&parts, 12)).collect();
+            let mut matcher = Matcher::new(word.clone(), &config);
+            let mut sides = Sides::default();
+            let mut one_side = Matcher::new(word.clone(), &config);
+            for found in Matcher::new(word.clone(), &config).match_list(&names) {
+                let name = &names[found.index as usize];
+                let holds = extension(name).is_none_or(|(stem, tail)| {
+                    one_side.match_one(stem, 0).is_some() || one_side.match_one(tail, 0).is_some()
+                });
+                if holds {
+                    checked += 1;
+                    assert!(
+                        beside_extension(name, &word, typos, &mut matcher, &mut sides),
+                        "{needle:?} with {typos} typos in {name:?}"
+                    );
+                }
+            }
+        }
+        assert!(checked > 5_000, "{checked}");
+    }
+
+    /// The whole search, every shortcut and pass included, finds exactly the names frizbee
+    /// matches and the rule keeps, for words too short to take a typo.
+    #[test]
+    fn a_search_finds_exactly_the_names_the_extension_rule_keeps() {
+        let mut rng = Rng(0x5eac);
+        let parts = ["a", "b", "c", "x", ".", ".", "-", "ab", "cx", "tsx"];
+        let mut builder = IndexBuilder::new();
+        let root = builder.push("/home", NO_PARENT, true);
+        let mut names = Vec::new();
+        for i in 0..600 {
+            let name = format!(
+                "{}{}",
+                rng.name(&parts, 8),
+                ["", ".tsx", ".ab", ".x"][i % 4]
+            );
+            builder.push(&name, root, false);
+            names.push(name);
+        }
+        let index = builder.finish();
+        let config = matcher_config();
+        let never = &|| false;
+        let mut checked = 0;
+        for _ in 0..200 {
+            let query = rng.text(&["a", "b", "c", "x", "t"], 3);
+            let word = Pattern::parse_query(&query).remove(0);
+            let texts: Vec<&str> = names
+                .iter()
+                .map(|name| name.strip_prefix('.').unwrap_or(name))
+                .collect();
+            let expected: BTreeSet<&str> = Matcher::new(positive(word), &config)
+                .match_list(&texts)
+                .iter()
+                .map(|found| found.index as usize)
+                .filter(|&n| fits_by_hand(texts[n], &query))
+                .map(|n| names[n].as_str())
+                .collect();
+            for no_shortcuts in [false, true] {
+                let mut scratch = Scratch {
+                    no_shortcuts,
+                    ..Scratch::default()
+                };
+                let hits = run(
+                    &index,
+                    &Apps::default(),
+                    &query,
+                    index.len(),
+                    None,
+                    &Boosts::default(),
+                    &mut scratch,
+                    never,
+                )
+                .unwrap();
+                let found: BTreeSet<&str> = hits
+                    .iter()
+                    .map(|hit| index.name(hit.entry().unwrap()))
+                    .collect();
+                assert_eq!(found, expected, "{query:?}");
+            }
+            checked += expected.len();
+        }
+        assert!(checked > 2_000, "{checked}");
     }
 
     #[test]
