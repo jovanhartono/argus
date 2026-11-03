@@ -920,32 +920,29 @@ fn match_names(
         .try_reduce(|| (0, 0), |a, b| Some((a.0 | b.0, a.1 | b.1)))
 }
 
-/// Whether a word's letters must stay on one side of a name's extension. A word with a dot in
-/// it, or one matched letter for letter by `^`, `$` or `'`, already says where it goes.
+/// A word with a dot in it, or typed with `^`, `$` or `'`, already says where it goes.
 fn splits_at_dot(word: &Pattern) -> bool {
     word.config.matching.is_none() && !word.needle.contains('.')
 }
 
-/// A name's text before and after the dot of its extension, when it has one. Only letters and
-/// digits make an extension, so "Mr. Robot" and "node-v20.11.1-darwin-arm64" have none.
-fn extension(text: &str) -> Option<(&str, &str)> {
-    let dot = text.rfind('.')?;
+/// The text before and after the last dot, when only letters and digits follow it: "Mr. Robot"
+/// and "node-v20.11.1-darwin-arm64" have no extension.
+fn extension_at(text: &str, dot: usize) -> Option<(&str, &str)> {
     let tail = &text[dot + 1..];
     (dot > 0 && !tail.is_empty() && tail.bytes().all(|b| b.is_ascii_alphanumeric()))
         .then(|| (&text[..dot], tail))
 }
 
-/// What one word needs to check names against its extension rule.
 struct Sides {
     typos: u16,
     /// An ASCII word with no typo, checked by its letters alone.
     plain: bool,
-    /// A capital typed, so every piece minds case as the whole word does.
+    /// A capital typed, so every part minds case as the whole word does.
     respect: bool,
     letters: u64,
-    /// The matchers for each way of ending the word inside an extension, made the first
+    /// For each cut of the word, the head letter for letter and with the typo; made the first
     /// time a name needs them.
-    cuts: Option<Vec<Cut>>,
+    heads: Option<Vec<(Matcher, Option<Matcher>)>>,
 }
 
 impl Sides {
@@ -960,113 +957,85 @@ impl Sides {
             } else {
                 ALL_LETTERS
             },
-            cuts: None,
+            heads: None,
         }
     }
 }
 
-/// The word cut in two: the head before the dot, the end in the extension. A word allowed a
-/// typo spends it in one part: the head with the typo and the end letter for letter, or
-/// the other way round.
-struct Cut {
-    /// The head, with the word's typo.
-    head: Matcher,
-    /// The end letter for letter: the extension's first letters, or a run of three or more.
-    end: Matcher,
-    /// Two letters or more, so the end may also open the extension at its second letter,
-    /// the first left out: "nextconfigjs" for next.config.mjs.
-    second: bool,
-    /// For a word allowed a typo: the head letter for letter, and the end with the typo.
-    loose: Option<Loose>,
-}
-
-struct Loose {
-    head: Matcher,
-    end: Matcher,
-    /// The end's first letter, which must open the extension unless the end is long.
-    first: char,
-    /// Four letters or more, enough to stand out wherever they sit in the extension:
-    /// "shopworkspcae" for Shop.xcworkspace.
-    long: bool,
-    /// The end after its first letter, which may be the typo itself: "reportodf".
-    rest: String,
-    /// The end with its first two letters swapped back, the commonest slip: "invoicedpf".
-    swapped: Option<String>,
-}
-
-/// Whether a name frizbee matched still fits the word with no stray letter of it taken from
-/// the extension: "cmux" is not credit-mutation.tsx, whose x only ".tsx" holds. The word may
-/// end on the extension's first letters, on two or more after its first ("nextconfigjs" for
-/// next.config.mjs), or on three or more of its letters in a row, so "reportpdf" still finds
-/// report.pdf and "shopworkspace" Shop.xcworkspace. A word allowed a
-/// typo may take it in either part: "designpfd" still finds design.pdf, "mainfs" main.rs.
+/// Whether a name frizbee matched fits the word with no stray letter taken from its
+/// extension: "cmux" is not credit-mutation.tsx, whose x only ".tsx" holds.
 fn beside_extension(text: &str, word: &Pattern, matcher: &mut Matcher, sides: &mut Sides) -> bool {
     let needle = word.needle.as_str();
-    // "te" fits hundreds of thousands of names, nearly all of them before the dot, so one
-    // pass over the letters settles most names.
-    if sides.plain
-        && let Some(dot) = text.bytes().rposition(|b| b == b'.')
-        && letters_end(needle, &text[..dot], sides.respect).is_some()
-    {
-        return true;
-    }
-    let Some((stem, tail)) = extension(text) else {
+    let Some(dot) = text.bytes().rposition(|b| b == b'.') else {
         return true;
     };
-    // Most extensions share no letter with the word, like ".pdf" for "notes", so no match
-    // can reach into them. A typo there only stands for a letter the word lacks.
+    // "te" fits hundreds of thousands of names, nearly all of them before the dot.
+    if sides.plain && in_order(needle, &text[..dot], sides.respect) {
+        return true;
+    }
+    let Some((stem, tail)) = extension_at(text, dot) else {
+        return true;
+    };
+    // A typo only stands for a letter the word lacks, so it cannot reach in either.
     if sides.letters & letters(tail) == 0 {
         return true;
     }
     if sides.plain && stem.is_ascii() {
-        return fits_by_letters(stem, tail, needle, sides.respect);
+        return ends_in(stem, tail, needle, sides.respect);
     }
     fits_by_frizbee(stem, tail, word, matcher, sides)
 }
 
-/// Where the ASCII word's letters, found in order as early as they come, end in `text`.
-fn letters_end(word: &str, text: &str, respect: bool) -> Option<usize> {
-    fn end(word: &[u8], text: &[u8], same: impl Fn(u8, u8) -> bool) -> Option<usize> {
-        let mut at = 0;
-        for &w in word {
-            at += text[at..].iter().position(|&t| same(t, w))? + 1;
-        }
-        Some(at)
+/// Whether `text` holds the ASCII word's letters in order: frizbee's match with no typo.
+fn in_order(word: &str, text: &str, respect: bool) -> bool {
+    fitting(word, text, respect) == word.len()
+}
+
+/// How many of the ASCII word's first letters `text` holds in order.
+fn fitting(word: &str, text: &str, respect: bool) -> usize {
+    fn count(word: &[u8], text: &[u8], same: impl Fn(u8, u8) -> bool) -> usize {
+        let mut text = text.iter();
+        word.iter()
+            .take_while(|&&w| text.any(|&t| same(t, w)))
+            .count()
     }
     let (word, text) = (word.as_bytes(), text.as_bytes());
     // A word with no capital is all lower case already.
     if respect {
-        end(word, text, |t, w| t == w)
+        count(word, text, |t, w| t == w)
     } else {
-        end(word, text, |t, w| t.to_ascii_lowercase() == w)
+        count(word, text, |t, w| t.to_ascii_lowercase() == w)
     }
 }
 
-/// `beside_extension` for an ASCII word with no typo, where frizbee's fuzzy match is the
-/// word's letters in order.
-fn fits_by_letters(stem: &str, tail: &str, needle: &str, respect: bool) -> bool {
-    let same = |a: &[u8], b: &[u8]| {
+/// Where the end of a word may sit in an extension: on its first letters, on two or more after
+/// its first ("nextconfigjs" for next.config.mjs), or on a run of three or more anywhere
+/// ("shopworkspace" for Shop.xcworkspace).
+fn ends_on<T: Copy>(end: &[T], tail: &[T], same: impl Fn(T, T) -> bool) -> bool {
+    let at = |start: usize| {
+        tail.len() >= start + end.len() && end.iter().zip(&tail[start..]).all(|(&e, &t)| same(e, t))
+    };
+    !end.is_empty()
+        && (at(0) || (end.len() >= 2 && at(1)) || (end.len() >= 3 && (2..tail.len()).any(at)))
+}
+
+/// `beside_extension` for an ASCII word with no typo that the stem does not hold.
+fn ends_in(stem: &str, tail: &str, needle: &str, respect: bool) -> bool {
+    let same = |a: u8, b: u8| {
         if respect {
             a == b
         } else {
-            a.eq_ignore_ascii_case(b)
+            a.eq_ignore_ascii_case(&b)
         }
     };
-    let tail_bytes = tail.as_bytes();
-    let opens_at = |at: usize, end: &[u8]| {
-        tail_bytes.len() >= at + end.len() && same(&tail_bytes[at..at + end.len()], end)
-    };
-    in_order(needle, stem, respect)
-        || in_order(needle, tail, respect)
-        || (1..needle.len()).any(|cut| {
-            let end = &needle.as_bytes()[cut..];
-            let opens = opens_at(0, end) || (end.len() >= 2 && opens_at(1, end));
-            let run = end.len() >= 3 && tail_bytes.windows(end.len()).any(|w| same(w, end));
-            (opens || run) && in_order(&needle[..cut], stem, respect)
-        })
+    let fits = fitting(needle, stem, respect).min(needle.len() - 1);
+    in_order(needle, tail, respect)
+        || (1..=fits).any(|cut| ends_on(&needle.as_bytes()[cut..], tail.as_bytes(), same))
 }
 
-/// `beside_extension` for any word, asking frizbee about each part.
+/// `beside_extension` for any word, asking frizbee about the part before the dot. A word
+/// allowed a typo spends it on one side: in the head, or in the end, which may then be one
+/// letter extra, missing, wrong or swapped from a place `ends_on` allows ("reportodf").
 fn fits_by_frizbee(
     stem: &str,
     tail: &str,
@@ -1079,47 +1048,6 @@ fn fits_by_frizbee(
         return true;
     }
     let (typos, respect) = (sides.typos, sides.respect);
-    let cuts = sides.cuts.get_or_insert_with(|| {
-        let config = matcher_config();
-        let casing = if respect {
-            CaseMatching::Respect
-        } else {
-            CaseMatching::Ignore
-        };
-        let piece = |text: &str| Pattern::new(text, word.config.clone()).casing(Some(casing));
-        needle
-            .char_indices()
-            .skip(1)
-            .map(|(cut, first)| {
-                let end = &needle[cut..];
-                let run = if end.chars().count() >= 3 {
-                    Matching::Substring
-                } else {
-                    Matching::Prefix
-                };
-                let head = &needle[..cut];
-                let loose = (typos > 0).then(|| Loose {
-                    head: Matcher::new(piece(head).max_typos(Some(0)), &config),
-                    end: Matcher::new(piece(end).max_typos(Some(typos)), &config),
-                    first,
-                    long: end.chars().count() >= 4,
-                    rest: end[first.len_utf8()..].to_owned(),
-                    swapped: {
-                        let mut letters = end.chars();
-                        let (a, b) = (letters.next(), letters.next());
-                        a.zip(b)
-                            .map(|(a, b)| [b, a].into_iter().chain(letters).collect())
-                    },
-                });
-                Cut {
-                    head: Matcher::new(piece(head).max_typos(Some(typos)), &config),
-                    end: Matcher::new(piece(end).matching(Some(run)), &config),
-                    second: end.chars().count() >= 2,
-                    loose,
-                }
-            })
-            .collect()
-    });
     let same = |a: char, b: char| {
         if respect {
             a == b
@@ -1127,38 +1055,71 @@ fn fits_by_frizbee(
             a.eq_ignore_ascii_case(&b)
         }
     };
-    let mut after = tail.chars();
-    let opening = after.next();
-    let after = after.as_str();
-    cuts.iter_mut().any(|cut| {
-        let end = cut.end.match_one(tail, 0).is_some()
-            || (cut.second && cut.end.match_one(after, 0).is_some());
-        if end && cut.head.match_one(stem, 0).is_some() {
-            return true;
+    let heads = sides.heads.get_or_insert_with(|| {
+        let config = matcher_config();
+        let casing = if respect {
+            CaseMatching::Respect
+        } else {
+            CaseMatching::Ignore
+        };
+        let head = |text: &str, typos: u16| {
+            let pattern = Pattern::new(text, word.config.clone()).casing(Some(casing));
+            Matcher::new(pattern.max_typos(Some(typos)), &config)
+        };
+        needle
+            .char_indices()
+            .skip(1)
+            .map(|(cut, _)| {
+                let loose = (typos > 0).then(|| head(&needle[..cut], typos));
+                (head(&needle[..cut], 0), loose)
+            })
+            .collect()
+    });
+    let letters: Vec<char> = needle.chars().collect();
+    let tail: Vec<char> = tail.chars().collect();
+    heads.iter_mut().enumerate().any(|(i, (exact, loose))| {
+        let end = &letters[i + 1..];
+        if ends_on(end, &tail, same) {
+            let head = loose.as_mut().unwrap_or(&mut *exact);
+            if head.match_one(stem, 0).is_some() {
+                return true;
+            }
         }
-        cut.loose.as_mut().is_some_and(|loose| {
-            let opens = opening.is_some_and(|t| same(t, loose.first));
-            let near = (opens || loose.long) && loose.end.match_one(tail, 0).is_some();
-            let opens_with = |text: &str, letters: &str| {
-                let mut text = text.chars();
-                letters
-                    .chars()
-                    .all(|l| text.next().is_some_and(|t| same(l, t)))
-            };
-            let replaced = opening.is_some() && opens_with(after, &loose.rest);
-            let swapped = loose
-                .swapped
-                .as_deref()
-                .is_some_and(|swapped| opens_with(tail, swapped));
-            (near || replaced || swapped) && loose.head.match_one(stem, 0).is_some()
+        typos > 0 && one_typo_from_an_end(end, &tail, same) && exact.match_one(stem, 0).is_some()
+    })
+}
+
+/// Whether some place `ends_on` allows in `tail` is one typo away from `end`.
+fn one_typo_from_an_end(
+    end: &[char],
+    tail: &[char],
+    same: impl Fn(char, char) -> bool + Copy,
+) -> bool {
+    (0..tail.len()).any(|start| {
+        (end.len().saturating_sub(1).max(1)..=end.len() + 1).any(|len| {
+            let place =
+                start + len <= tail.len() && (start == 0 || (start == 1 && len >= 2) || len >= 3);
+            place && one_typo_apart(end, &tail[start..start + len], same)
         })
     })
 }
 
-/// Whether `text` holds the ASCII word's letters in order, which is a match for frizbee when
-/// the word allows no typo.
-fn in_order(word: &str, text: &str, respect: bool) -> bool {
-    letters_end(word, text, respect).is_some()
+/// One letter extra, missing or wrong, or two neighbours swapped.
+fn one_typo_apart(a: &[char], b: &[char], same: impl Fn(char, char) -> bool + Copy) -> bool {
+    let eq =
+        |a: &[char], b: &[char]| a.len() == b.len() && a.iter().zip(b).all(|(&x, &y)| same(x, y));
+    let common = a.iter().zip(b).take_while(|&(&x, &y)| same(x, y)).count();
+    let (a, b) = (&a[common..], &b[common..]);
+    match (a.len(), b.len()) {
+        (0, 0) => true,
+        (x, y) if x == y => {
+            eq(&a[1..], &b[1..])
+                || (x >= 2 && same(a[0], b[1]) && same(a[1], b[0]) && eq(&a[2..], &b[2..]))
+        }
+        (x, y) if x == y + 1 => eq(&a[1..], b),
+        (x, y) if y == x + 1 => eq(a, &b[1..]),
+        _ => false,
+    }
 }
 
 /// How a name holds a typed word, letter for letter: "nib" is the whole of "NIB.pdf" bar its
@@ -3471,6 +3432,10 @@ mod tests {
 
     use std::collections::BTreeSet;
 
+    fn extension(text: &str) -> Option<(&str, &str)> {
+        extension_at(text, text.rfind('.')?)
+    }
+
     /// Every file name below sits in one folder, and each query lists what it must find and
     /// what it must leave out.
     #[test]
@@ -3618,6 +3583,10 @@ mod tests {
             // But the typo does not open the middle of the extension: "mainsx" would need the
             // s from inside ".rs" as well as a typo for the x.
             ("mainsx", &[], &["main.rs"]),
+            // Nor scatter the end across it: x, w, s and e are not one typo from "xcworkspace"
+            // anywhere, while "reportpf" is "reportpdf" with the d missing.
+            ("shopxwse", &[], &["Shop.xcworkspace"]),
+            ("reportpf", &["report.pdf"], &[]),
             // A capital typed minds case in every piece: the b of "abC" is only deep inside
             // "CCbC", while "abc" fits "aB" and the C opening it.
             ("abC", &[], &["aB.CCbC"]),
@@ -3761,21 +3730,35 @@ mod tests {
                 || (end.len() >= 2 && tail[1..].starts_with(end))
                 || (end.len() >= 3 && tail.contains(end))
         };
+        // Every way to make one typo in the end: a letter dropped, added, changed, or two
+        // neighbours swapped, using the extension's own letters.
+        let edits = |end: &str| {
+            let end: Vec<char> = end.chars().collect();
+            let mut all = Vec::new();
+            for i in 0..=end.len() {
+                if i < end.len() {
+                    all.push([&end[..i], &end[i + 1..]].concat());
+                }
+                for t in tail.chars() {
+                    all.push([&end[..i], &[t], &end[i..]].concat());
+                    if i < end.len() {
+                        all.push([&end[..i], &[t], &end[i + 1..]].concat());
+                    }
+                }
+                if i + 1 < end.len() {
+                    let mut swapped = end.clone();
+                    swapped.swap(i, i + 1);
+                    all.push(swapped);
+                }
+            }
+            all.into_iter().map(|e| e.into_iter().collect::<String>())
+        };
         near(word, stem)
             || near(word, &tail)
             || (1..word.len()).any(|cut| {
                 let (head, end) = word.split_at(cut);
                 (near(head, stem) && exact(end))
-                    || (in_order(head, stem)
-                        && ((near(end, &tail) && (end.len() >= 4 || tail.starts_with(&end[..1])))
-                            || tail[1..].starts_with(&end[1..])
-                            || (end.len() >= 2
-                                && tail.starts_with(&format!(
-                                    "{}{}{}",
-                                    &end[1..2],
-                                    &end[..1],
-                                    &end[2..]
-                                )))))
+                    || (in_order(head, stem) && edits(end).any(|e| !e.is_empty() && exact(&e)))
             })
     }
 
@@ -3862,7 +3845,8 @@ mod tests {
                 let Some((stem, tail)) = extension(&name) else {
                     continue;
                 };
-                let ours = fits_by_letters(stem, tail, &needle, respect);
+                let ours =
+                    in_order(&needle, stem, respect) || ends_in(stem, tail, &needle, respect);
                 let frizbee = fits_by_frizbee(stem, tail, &word, &mut matcher, &mut sides);
                 assert_eq!(ours, frizbee, "{needle:?} in {name:?}");
                 if ours {
