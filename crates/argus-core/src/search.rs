@@ -965,21 +965,35 @@ impl Sides {
     }
 }
 
-/// The word cut in two: the head before the dot, the end in the extension.
+/// The word cut in two: the head before the dot, the end in the extension. A word allowed a
+/// typo spends it in one part: the head with the typo and the end letter for letter, or
+/// the other way round.
 struct Cut {
+    /// The head, with the word's typo.
     head: Matcher,
     /// The end letter for letter: the extension's first letters, or a run of three or more.
     end: Matcher,
-    /// With a typo allowed, the end from the extension's first letter, fuzzy. The head may
-    /// take its own typo too, so a rare name gets through with two, never one too few.
-    loose: Option<(char, Matcher)>,
+    /// For a word allowed a typo: the head letter for letter, and the end with the typo.
+    loose: Option<Loose>,
+}
+
+struct Loose {
+    head: Matcher,
+    end: Matcher,
+    /// The end's first letter, which must open the extension unless the end is long.
+    first: char,
+    /// Four letters or more, enough to stand out wherever they sit in the extension:
+    /// "shopworkspcae" for Shop.xcworkspace.
+    long: bool,
+    /// The end after its first letter, which may be the typo itself: "reportodf".
+    rest: String,
 }
 
 /// Whether a name frizbee matched still fits the word with no stray letter of it taken from
 /// the extension: "cmux" is not credit-mutation.tsx, whose x only ".tsx" holds. The word may
 /// end on the extension's first letters, or on three or more of its letters in a row, so
 /// "reportpdf" still finds report.pdf and "shopworkspace" Shop.xcworkspace. A word allowed a
-/// typo may take it in either part: "designpfd" still finds design.pdf.
+/// typo may take it in either part: "designpfd" still finds design.pdf, "mainfs" main.rs.
 fn beside_extension(text: &str, word: &Pattern, matcher: &mut Matcher, sides: &mut Sides) -> bool {
     let needle = word.needle.as_str();
     // "te" fits hundreds of thousands of names, nearly all of them before the dot, so one
@@ -1074,34 +1088,47 @@ fn fits_by_frizbee(
                 } else {
                     Matching::Prefix
                 };
-                let loose = (typos > 0).then(|| {
-                    let fuzzy = piece(end).max_typos(Some(typos));
-                    (first, Matcher::new(fuzzy, &config))
+                let head = &needle[..cut];
+                let loose = (typos > 0).then(|| Loose {
+                    head: Matcher::new(piece(head).max_typos(Some(0)), &config),
+                    end: Matcher::new(piece(end).max_typos(Some(typos)), &config),
+                    first,
+                    long: end.chars().count() >= 4,
+                    rest: end[first.len_utf8()..].to_owned(),
                 });
                 Cut {
-                    head: Matcher::new(piece(&needle[..cut]).max_typos(Some(typos)), &config),
+                    head: Matcher::new(piece(head).max_typos(Some(typos)), &config),
                     end: Matcher::new(piece(end).matching(Some(run)), &config),
                     loose,
                 }
             })
             .collect()
     });
-    let opens = |first: char| {
-        tail.chars().next().is_some_and(|t| {
-            if respect {
-                t == first
-            } else {
-                t.eq_ignore_ascii_case(&first)
-            }
-        })
+    let same = |a: char, b: char| {
+        if respect {
+            a == b
+        } else {
+            a.eq_ignore_ascii_case(&b)
+        }
     };
+    let mut after = tail.chars();
+    let opening = after.next();
+    let after = after.as_str();
     cuts.iter_mut().any(|cut| {
-        let end = cut.end.match_one(tail, 0).is_some()
-            || cut
-                .loose
-                .as_mut()
-                .is_some_and(|(first, loose)| opens(*first) && loose.match_one(tail, 0).is_some());
-        end && cut.head.match_one(stem, 0).is_some()
+        if cut.end.match_one(tail, 0).is_some() && cut.head.match_one(stem, 0).is_some() {
+            return true;
+        }
+        cut.loose.as_mut().is_some_and(|loose| {
+            let opens = opening.is_some_and(|t| same(t, loose.first));
+            let near = (opens || loose.long) && loose.end.match_one(tail, 0).is_some();
+            let mut rest = after.chars();
+            let swapped = opening.is_some()
+                && loose
+                    .rest
+                    .chars()
+                    .all(|r| rest.next().is_some_and(|t| same(r, t)));
+            (near || swapped) && loose.head.match_one(stem, 0).is_some()
+        })
     })
 }
 
@@ -3475,7 +3502,7 @@ mod tests {
             ),
             ("cmx", &["cmux", "cmux.app"], &["credit-mutation.tsx"]),
             ("crdtsx", &["credit-mutation.tsx"], &[]),
-            ("crdsx", &[], &["credit-mutation.tsx"]),
+            ("crs", &[], &["credit-mutation.tsx"]),
             // A word wholly in the extension, or wholly before it, still finds the file.
             ("pdf", &["NIB.pdf", "report.pdf", "résumé.pdf"], &[]),
             ("tsx", &["credit-mutation.tsx"], &[]),
@@ -3508,13 +3535,15 @@ mod tests {
             ("minjs", &["jquery-3.6.0.min.js"], &[]),
             ("envlocal", &[".env.local"], &[]),
             ("photojpg", &["photo.JPG"], &[]),
-            // But not the extension's later letters: "reportdf" skips the p of ".pdf".
-            ("reportdf", &[], &["report.pdf"]),
+            // But not the extension's later letters: "rdf" skips the p of ".pdf".
+            ("rdf", &[], &["report.pdf"]),
             ("mns", &[], &["main.rs"]),
+            ("ndf", &[], &["NIB.pdf"]),
             // From four letters on, a word no name holds may take a typo: "mains" is "main"
-            // with an s missing, the way "desing" finds design.pdf.
+            // with an s missing, the way "desing" finds design.pdf, and "reportdf" is
+            // "reportpdf" with the p missing.
             ("mains", &["main.rs"], &[]),
-            ("nibdf", &[], &["NIB.pdf"]),
+            ("reportdf", &["report.pdf"], &[]),
             // A dot typed, or a literal word, goes wherever it says.
             ("mutation.tsx", &["credit-mutation.tsx"], &[]),
             ("n.tsx", &["credit-mutation.tsx"], &[]),
@@ -3538,8 +3567,18 @@ mod tests {
             ("shopworkspace", &["Shop.xcworkspace"], &[]),
             ("infolist", &["Info.plist"], &[]),
             ("microsoftcode", &["com.microsoft.VSCode"], &[]),
-            // A word that takes a typo is not held to the rule.
+            // A word no name holds may spend its one typo before the dot or after it.
             ("designpfd", &["design.pdf"], &[]),
+            ("shopworkspcae", &["Shop.xcworkspace"], &[]),
+            ("shopwrokspace", &["Shop.xcworkspace"], &[]),
+            ("infolsit", &["Info.plist"], &[]),
+            ("microsoftcdoe", &["com.microsoft.VSCode"], &[]),
+            ("reportodf", &["report.pdf"], &[]),
+            ("mainfs", &["main.rs"], &[]),
+            ("résuméodf", &["résumé.pdf"], &[]),
+            // But the typo does not open the middle of the extension: "mainsx" would need the
+            // s from inside ".rs" as well as a typo for the x.
+            ("mainsx", &[], &["main.rs"]),
             // A capital typed minds case in every piece: the b of "abC" is only inside "CbC".
             ("abC", &[], &["aB.CbC"]),
             // Each word of several may sit on its own side of the dot.
@@ -3639,6 +3678,74 @@ mod tests {
                 assert_eq!(
                     ours,
                     fits_by_hand(name, &word.needle),
+                    "{needle:?} in {name:?}"
+                );
+                if ours {
+                    kept += 1;
+                } else {
+                    dropped += 1;
+                }
+            }
+        }
+        assert!(
+            kept > 5_000 && dropped > 500,
+            "{kept} kept, {dropped} dropped"
+        );
+    }
+
+    /// `fits_by_hand` for a lower-case ASCII word allowed one typo, which to frizbee is one
+    /// letter of the word that the name may lack.
+    fn fits_by_hand_with_a_typo(name: &str, word: &str) -> bool {
+        let in_order = |word: &str, text: &str| {
+            let mut text = text.bytes().map(|b| b.to_ascii_lowercase());
+            word.bytes().all(|w| text.any(|t| t == w))
+        };
+        let near = |word: &str, text: &str| {
+            in_order(word, text)
+                || (0..word.len())
+                    .any(|i| in_order(&format!("{}{}", &word[..i], &word[i + 1..]), text))
+        };
+        let dot = name.rfind('.').filter(|&dot| {
+            let tail = &name[dot + 1..];
+            dot > 0 && !tail.is_empty() && tail.bytes().all(|b| b.is_ascii_alphanumeric())
+        });
+        let Some(dot) = dot else {
+            return true;
+        };
+        let (stem, tail) = (&name[..dot], name[dot + 1..].to_ascii_lowercase());
+        let exact = |end: &str| tail.starts_with(end) || (end.len() >= 3 && tail.contains(end));
+        near(word, stem)
+            || near(word, &tail)
+            || (1..word.len()).any(|cut| {
+                let (head, end) = word.split_at(cut);
+                (near(head, stem) && exact(end))
+                    || (in_order(head, stem)
+                        && ((near(end, &tail) && (end.len() >= 4 || tail.starts_with(&end[..1])))
+                            || tail[1..].starts_with(&end[1..])))
+            })
+    }
+
+    #[test]
+    fn the_extension_rule_with_a_typo_matches_every_way_of_spending_it() {
+        let mut rng = Rng(0x7790);
+        let parts = [
+            "a", "b", "c", "d", ".", ".", "-", " ", "ab", "abc", "cd", "1",
+        ];
+        let typed = ["a", "b", "c", "d", "a", "b"];
+        let config = matcher_config();
+        let (mut kept, mut dropped) = (0, 0);
+        for _ in 0..6_000 {
+            let needle = rng.text(&typed, 7);
+            let word = Pattern::parse_query(&needle).remove(0).max_typos(Some(1));
+            let names: Vec<String> = (0..40).map(|_| rng.name(&parts, 12)).collect();
+            let mut matcher = Matcher::new(word.clone(), &config);
+            let mut sides = Sides::new(&word, 1);
+            for found in Matcher::new(word.clone(), &config).match_list(&names) {
+                let name = &names[found.index as usize];
+                let ours = beside_extension(name, &word, &mut matcher, &mut sides);
+                assert_eq!(
+                    ours,
+                    fits_by_hand_with_a_typo(name, &needle),
                     "{needle:?} in {name:?}"
                 );
                 if ours {
