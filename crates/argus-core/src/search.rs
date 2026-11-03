@@ -897,7 +897,6 @@ fn match_names(
                             let text = texts[found.index as usize];
                             let word = &words[w];
                             let n = ids[found.index as usize];
-                            // A name with no dot has no extension, known without reading it.
                             let dotted = index.name_symbols[first + n] & dot != 0;
                             if one_side && dotted && !beside_extension(text, word, matcher, sides) {
                                 continue;
@@ -925,11 +924,11 @@ fn splits_at_dot(word: &Pattern) -> bool {
     word.config.matching.is_none() && !word.needle.contains('.')
 }
 
-/// The text before and after the last dot, when only letters and digits follow it: "Mr. Robot"
-/// and "node-v20.11.1-darwin-arm64" have no extension.
+/// The text before and after the last dot, when one to four letters and digits follow it:
+/// "Mr. Robot", com.apple.Safari and "node-v20.11.1-darwin-arm64" have no extension.
 fn extension_at(text: &str, dot: usize) -> Option<(&str, &str)> {
     let tail = &text[dot + 1..];
-    (dot > 0 && !tail.is_empty() && tail.bytes().all(|b| b.is_ascii_alphanumeric()))
+    (dot > 0 && (1..=4).contains(&tail.len()) && tail.bytes().all(|b| b.is_ascii_alphanumeric()))
         .then(|| (&text[..dot], tail))
 }
 
@@ -969,33 +968,34 @@ fn beside_extension(text: &str, word: &Pattern, matcher: &mut Matcher, sides: &m
     let Some(dot) = text.bytes().rposition(|b| b == b'.') else {
         return true;
     };
-    // The name holds the word, so a last letter the extension lacks sits before the dot, and so
-    // does the rest.
+    let Some((stem, tail)) = extension_at(text, dot) else {
+        return true;
+    };
+    let mut fits = 0;
     if sides.plain {
+        // The name holds the word, so a last letter the extension lacks sits before the dot, and
+        // so does the rest.
         let last = needle.as_bytes()[needle.len() - 1];
-        let tail = &text.as_bytes()[dot + 1..];
         let ends = if sides.respect {
-            tail.contains(&last)
+            tail.as_bytes().contains(&last)
         } else {
-            tail.iter().any(|t| t.to_ascii_lowercase() == last)
+            tail.bytes().any(|t| t.to_ascii_lowercase() == last)
         };
         if !ends {
             return true;
         }
+        // "te" fits hundreds of thousands of names, nearly all of them before the dot.
+        fits = fitting(needle, stem, sides.respect);
+        if fits == needle.len() {
+            return true;
+        }
     }
-    // "te" fits hundreds of thousands of names, nearly all of them before the dot.
-    if sides.plain && in_order(needle, &text[..dot], sides.respect) {
-        return true;
-    }
-    let Some((stem, tail)) = extension_at(text, dot) else {
-        return true;
-    };
     // A typo only stands for a letter the word lacks, so it cannot reach in either.
     if sides.letters & letters(tail) == 0 {
         return true;
     }
     if sides.plain && stem.is_ascii() {
-        return ends_in(stem, tail, needle, sides.respect);
+        return ends_in(tail, needle, sides.respect, fits);
     }
     fits_by_frizbee(stem, tail, word, matcher, sides)
 }
@@ -1014,7 +1014,6 @@ fn fitting(word: &str, text: &str, respect: bool) -> usize {
             .count()
     }
     let (word, text) = (word.as_bytes(), text.as_bytes());
-    // A word with no capital is all lower case already.
     if respect {
         count(word, text, |t, w| t == w)
     } else {
@@ -1022,19 +1021,18 @@ fn fitting(word: &str, text: &str, respect: bool) -> usize {
     }
 }
 
-/// Where the end of a word may sit in an extension: on its first letters, on two or more after
-/// its first ("nextconfigjs" for next.config.mjs), or on a run of three or more anywhere
-/// ("shopworkspace" for Shop.xcworkspace).
+/// Where the end of a word may sit in an extension: on its first letters, or on two or more
+/// after its first ("nextconfigjs" for next.config.mjs).
 fn ends_on<T: Copy>(end: &[T], tail: &[T], same: impl Fn(T, T) -> bool) -> bool {
     let at = |start: usize| {
         tail.len() >= start + end.len() && end.iter().zip(&tail[start..]).all(|(&e, &t)| same(e, t))
     };
-    !end.is_empty()
-        && (at(0) || (end.len() >= 2 && at(1)) || (end.len() >= 3 && (2..tail.len()).any(at)))
+    !end.is_empty() && (at(0) || (end.len() >= 2 && at(1)))
 }
 
-/// `beside_extension` for an ASCII word with no typo that the stem does not hold.
-fn ends_in(stem: &str, tail: &str, needle: &str, respect: bool) -> bool {
+/// `beside_extension` for an ASCII word with no typo whose first `fits` letters, not all of
+/// them, the stem holds.
+fn ends_in(tail: &str, needle: &str, respect: bool, fits: usize) -> bool {
     let same = |a: u8, b: u8| {
         if respect {
             a == b
@@ -1042,7 +1040,6 @@ fn ends_in(stem: &str, tail: &str, needle: &str, respect: bool) -> bool {
             a.eq_ignore_ascii_case(&b)
         }
     };
-    let fits = fitting(needle, stem, respect).min(needle.len() - 1);
     in_order(needle, tail, respect)
         || (1..=fits).any(|cut| ends_on(&needle.as_bytes()[cut..], tail.as_bytes(), same))
 }
@@ -1109,10 +1106,9 @@ fn one_typo_from_an_end(
     tail: &[char],
     same: impl Fn(char, char) -> bool + Copy,
 ) -> bool {
-    (0..tail.len()).any(|start| {
+    (0..2).any(|start| {
         (end.len().saturating_sub(1).max(1)..=end.len() + 1).any(|len| {
-            let place =
-                start + len <= tail.len() && (start == 0 || (start == 1 && len >= 2) || len >= 3);
+            let place = start + len <= tail.len() && (start == 0 || len >= 2);
             place && one_typo_apart(end, &tail[start..start + len], same)
         })
     })
@@ -3486,6 +3482,8 @@ mod tests {
             "Python-3.12.1.tgz",
             "Xcode.app",
             "Lease Agreement.pdf",
+            "john.smith",
+            "README.markdown",
         ];
         let mut builder = IndexBuilder::new();
         let root = builder.push("/home", NO_PARENT, true);
@@ -3573,10 +3571,15 @@ mod tests {
             ("mrrobot", &["Mr. Robot"], &[]),
             ("stlouis", &["St. Louis trip"], &[]),
             ("nodearm64", &["node-v20.11.1-darwin-arm64"], &[]),
-            // Three or more letters in a row may come from anywhere in the extension.
+            // More than four letters after the dot are part of the name, free to abbreviate.
             ("shopworkspace", &["Shop.xcworkspace"], &[]),
+            ("shopxwse", &["Shop.xcworkspace"], &[]),
             ("infolist", &["Info.plist"], &[]),
             ("microsoftcode", &["com.microsoft.VSCode"], &[]),
+            ("msvscd", &["com.microsoft.VSCode"], &[]),
+            ("applesfr", &["com.apple.Safari"], &[]),
+            ("jhnsmth", &["john.smith"], &[]),
+            ("readmemd", &["README.markdown"], &[]),
             // A word no name holds may spend its one typo before the dot or after it.
             ("designpfd", &["design.pdf"], &[]),
             ("shopworkspcae", &["Shop.xcworkspace"], &[]),
@@ -3597,9 +3600,7 @@ mod tests {
             // But the typo does not open the middle of the extension: "mainsx" would need the
             // s from inside ".rs" as well as a typo for the x.
             ("mainsx", &[], &["main.rs"]),
-            // Nor scatter the end across it: x, w, s and e are not one typo from "xcworkspace"
-            // anywhere, while "reportpf" is "reportpdf" with the d missing.
-            ("shopxwse", &[], &["Shop.xcworkspace"]),
+            // "reportpf" is "reportpdf" with the d missing.
             ("reportpf", &["report.pdf"], &[]),
             // A capital typed minds case in every piece: the b of "abC" is only deep inside
             // "CCbC", while "abc" fits "aB" and the C opening it.
@@ -3662,7 +3663,10 @@ mod tests {
         };
         let dot = name.rfind('.').filter(|&dot| {
             let tail = &name[dot + 1..];
-            dot > 0 && !tail.is_empty() && tail.bytes().all(|b| b.is_ascii_alphanumeric())
+            dot > 0
+                && tail.len() <= 4
+                && !tail.is_empty()
+                && tail.bytes().all(|b| b.is_ascii_alphanumeric())
         });
         let Some(dot) = dot.filter(|_| !word.contains('.')) else {
             return in_order(word, name);
@@ -3672,9 +3676,7 @@ mod tests {
             || in_order(word, &tail)
             || (1..word.len()).any(|cut| {
                 let end = &word[cut..];
-                let fits = tail.starts_with(end)
-                    || (end.len() >= 2 && tail[1..].starts_with(end))
-                    || (end.len() >= 3 && tail.contains(end));
+                let fits = tail.starts_with(end) || (end.len() >= 2 && tail[1..].starts_with(end));
                 fits && in_order(&word[..cut], stem)
             })
     }
@@ -3683,12 +3685,12 @@ mod tests {
     fn the_extension_rule_matches_every_way_of_splitting_the_word() {
         let mut rng = Rng(0xd07);
         let parts = [
-            "a", "b", "c", "A", "B", ".", ".", "-", " ", "ab", "abc", "é", "1",
+            "a", "b", "c", "A", "B", ".", ".", ".", "-", " ", "ab", "abc", "é", "1",
         ];
         let typed = ["a", "b", "c", "a", "b", "c", ".", "A", "1"];
         let config = matcher_config();
         let (mut kept, mut dropped) = (0, 0);
-        for _ in 0..6_000 {
+        for _ in 0..12_000 {
             let needle = rng.text(&typed, 6);
             let Some(word) = Pattern::parse_query(&needle).pop() else {
                 continue;
@@ -3733,17 +3735,17 @@ mod tests {
         };
         let dot = name.rfind('.').filter(|&dot| {
             let tail = &name[dot + 1..];
-            dot > 0 && !tail.is_empty() && tail.bytes().all(|b| b.is_ascii_alphanumeric())
+            dot > 0
+                && tail.len() <= 4
+                && !tail.is_empty()
+                && tail.bytes().all(|b| b.is_ascii_alphanumeric())
         });
         let Some(dot) = dot else {
             return true;
         };
         let (stem, tail) = (&name[..dot], name[dot + 1..].to_ascii_lowercase());
-        let exact = |end: &str| {
-            tail.starts_with(end)
-                || (end.len() >= 2 && tail[1..].starts_with(end))
-                || (end.len() >= 3 && tail.contains(end))
-        };
+        let exact =
+            |end: &str| tail.starts_with(end) || (end.len() >= 2 && tail[1..].starts_with(end));
         // Every way to make one typo in the end: a letter dropped, added, changed, or two
         // neighbours swapped, using the extension's own letters.
         let edits = |end: &str| {
@@ -3780,12 +3782,12 @@ mod tests {
     fn the_extension_rule_with_a_typo_matches_every_way_of_spending_it() {
         let mut rng = Rng(0x7790);
         let parts = [
-            "a", "b", "c", "d", ".", ".", "-", " ", "ab", "abc", "cd", "1",
+            "a", "b", "c", "d", ".", ".", ".", "-", " ", "ab", "abc", "cd", "1",
         ];
         let typed = ["a", "b", "c", "d", "a", "b"];
         let config = matcher_config();
         let (mut kept, mut dropped) = (0, 0);
-        for _ in 0..6_000 {
+        for _ in 0..12_000 {
             let needle = rng.text(&typed, 7);
             let word = Pattern::parse_query(&needle).remove(0).max_typos(Some(1));
             let names: Vec<String> = (0..40).map(|_| rng.name(&parts, 12)).collect();
@@ -3859,8 +3861,8 @@ mod tests {
                 let Some((stem, tail)) = extension(&name) else {
                     continue;
                 };
-                let ours =
-                    in_order(&needle, stem, respect) || ends_in(stem, tail, &needle, respect);
+                let fits = fitting(&needle, stem, respect);
+                let ours = fits == needle.len() || ends_in(tail, &needle, respect, fits);
                 let frizbee = fits_by_frizbee(stem, tail, &word, &mut matcher, &mut sides);
                 assert_eq!(ours, frizbee, "{needle:?} in {name:?}");
                 if ours {
