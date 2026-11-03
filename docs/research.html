@@ -775,6 +775,7 @@ footer { border-top: 1px solid var(--line); margin-top: 32px; padding-top: 20px;
     <div><dt>Search inside files</dt><dd>v1 text, code, markdown; v2 PDF and Office</dd></div>
     <div><dt>Fuzzy matching</dt><dd>Letters in order, several words, typo tolerance, fzf-style operators such as ^ for "starts with" and ! to exclude</dd></div>
     <div><dt>Typo tolerance</dt><dd>One typo, only for a word of 4 or more letters that no name holds letter for letter</dd></div>
+    <div><dt>Extensions</dt><dd>A word may not pick single letters out of an extension. Its letters stay before the last dot, or inside the extension, or the word ends on the extension's first letters, or on two or more of its letters after the first: "pdf" and "reportpdf" find report.pdf and "nextconfigjs" finds next.config.mjs, but "cmux" no longer finds credit-mutation.tsx through the x of ".tsx". Only one to four letters and digits after the last dot count as an extension, so "mrrobot" still finds "Mr. Robot" and "applesfr" still finds com.apple.Safari. A word allowed a typo may spend it on either side of the dot</dd></div>
     <div><dt>Window shape</dt><dd>Popup, Tab into a folder, Cmd+I details pane</dd></div>
     <div><dt>v1 extras</dt><dd>Index health and rebuild, search in the current Finder folder, web search as the last row</dd></div>
     <div><dt>Network</dt><dd>None by default; update check is opt-in</dd></div>
