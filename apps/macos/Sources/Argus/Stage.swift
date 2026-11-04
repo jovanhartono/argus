@@ -51,21 +51,43 @@ final class Screen: Stage {
     }
 
     var previewShows: Bool {
-        QLPreviewPanel.sharedPreviewPanelExists() && QLPreviewPanel.shared().isVisible
+        reopening || QLPreviewPanel.sharedPreviewPanelExists() && QLPreviewPanel.shared().isVisible
     }
 
     var previewIsKey: Bool {
         QLPreviewPanel.sharedPreviewPanelExists() && QLPreviewPanel.shared().isKeyWindow
     }
 
+    /// A ⌘Y while the last one fades out waits for the fade, which would otherwise close it again.
+    private var reopening = false
+
     func openPreview() {
+        openPreview(tries: 10)
+    }
+
+    /// Gives up waiting after 0.5 s, so a preview that never fades can't keep it waiting.
+    private func openPreview(tries: Int) {
         let preview = QLPreviewPanel.shared()!
+        // Not done until Quick Look lets go of the window, or it lets go of the reopened one.
+        reopening = tries > 0 && (preview.isVisible || preview.currentController != nil)
+        guard !reopening else {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self] in
+                guard let self, reopening else { return }
+                openPreview(tries: tries - 1)
+            }
+            return
+        }
+        // Handed the keys back to the search window, it still thinks it has them once closed, and
+        // reopened it drops them on the floor, which reads as a click in another app and hides all.
+        if preview.isKeyWindow { preview.resignKey() }
         // With no change of key window to notice, it is told to look for the window that feeds it.
         preview.updateController()
         preview.orderFront(nil)
     }
 
     func closePreview() {
+        // Still fading out: a second close would keep it open.
+        guard !reopening else { return reopening = false }
         QLPreviewPanel.shared().orderOut(nil)
     }
 
