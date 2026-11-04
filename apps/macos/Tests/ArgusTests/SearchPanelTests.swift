@@ -2128,6 +2128,58 @@ final class SearchPanelTests: XCTestCase {
         XCTAssertTrue(window.shown)
     }
 
+    func testOnScreenCommandYAfterClosingOpensThePreviewAgainAndKeepsIt() async throws {
+        try onScreenOnly()
+        try Data("budget\n".utf8).write(to: root.appendingPathComponent("budget.txt"))
+        let window = try await opened(access: true, on: Screen())
+        window.show()
+        defer { window.hide() }
+        let unlocked = await soon { window.panel.isKeyWindow }
+        try XCTSkipUnless(unlocked, "needs an unlocked screen")
+        try await type("budget", in: window)
+        try await until { window.rows.count == 1 }
+        let preview = QLPreviewPanel.shared()!
+        let menu = NSApp.mainMenu
+        NSApp.mainMenu = keyMenu()
+        defer { NSApp.mainMenu = menu }
+        func commandY() {
+            let event = NSEvent.keyEvent(
+                with: .keyDown, location: .zero, modifierFlags: .command, timestamp: ProcessInfo.processInfo.systemUptime,
+                windowNumber: window.panel.windowNumber, context: nil, characters: "y",
+                charactersIgnoringModifiers: "y", isARepeat: false, keyCode: 16)!
+            NSApp.sendEvent(event)
+        }
+
+        // Reopened while it still fades out, and after.
+        for gap in [0, 150, 800] {
+            commandY()
+            try await until { preview.isVisible }
+            try await Task.sleep(for: .milliseconds(300))
+            commandY()
+            try await Task.sleep(for: .milliseconds(gap))
+            commandY()
+            try await Task.sleep(for: .seconds(1))
+            XCTAssertTrue(preview.isVisible, "stays open after a \(gap) ms gap")
+            XCTAssertTrue(window.previewing, "\(gap) ms")
+            XCTAssertTrue(window.shown, "\(gap) ms")
+            window.closePreview()
+            try await until { !preview.isVisible }
+            try await Task.sleep(for: .milliseconds(300))
+        }
+
+        // Esc right after that ⌘Y keeps it closed.
+        commandY()
+        try await until { preview.isVisible }
+        try await Task.sleep(for: .milliseconds(300))
+        commandY()
+        commandY()
+        window.closePreview()
+        try await Task.sleep(for: .seconds(1))
+        XCTAssertFalse(preview.isVisible, "stays closed")
+        XCTAssertFalse(window.previewing)
+        XCTAssertTrue(window.shown)
+    }
+
     func testCommandYWhileThePreviewFadesOutOpensItAgain() async throws {
         try Data("budget\n".utf8).write(to: root.appendingPathComponent("budget.txt"))
         let window = try await opened(access: true)
