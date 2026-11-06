@@ -1,0 +1,42 @@
+name: Homebrew tap
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to put in the cask, e.g. v0.4.0
+        required: true
+
+jobs:
+  bump:
+    if: ${{ !github.event.release.prerelease }}
+    runs-on: ubuntu-latest
+    env:
+      TAG: ${{ inputs.tag || github.event.release.tag_name }}
+    steps:
+      - name: Hash the release's dmg
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download "$TAG" -R "$GITHUB_REPOSITORY" -p Argus.dmg
+          echo "VERSION=${TAG#v}" >> "$GITHUB_ENV"
+          echo "SHA256=$(sha256sum Argus.dmg | cut -d' ' -f1)" >> "$GITHUB_ENV"
+      - uses: actions/checkout@v7
+        with:
+          repository: jovanhartono/homebrew-tap
+          ssh-key: ${{ secrets.TAP_DEPLOY_KEY }}
+          path: tap
+      - name: Bump the cask
+        working-directory: tap
+        run: |
+          sed -i -E "s/^  version \".*\"$/  version \"$VERSION\"/; s/^  sha256 \".*\"$/  sha256 \"$SHA256\"/" Casks/argus.rb
+          if git diff --quiet; then
+            echo "Casks/argus.rb already has $VERSION"
+            exit 0
+          fi
+          git config user.name jovanhartono
+          git config user.email 61858840+jovanhartono@users.noreply.github.com
+          git commit -am "chore(argus): bump to $VERSION"
+          git push
