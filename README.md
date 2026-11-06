@@ -2,7 +2,7 @@
 
 A fast, light file and app launcher for macOS, written in Rust and Swift. Press ⌘⇧Space, type a few letters, and open any file, folder or app on your Mac. It forgives typos and finds text inside files too.
 
-Argus is early software: releases are marked pre-release, and the Mac app is the only one so far. A Windows version is planned.
+The Mac app is the only one so far. A Windows version is planned.
 
 ## Features
 
@@ -40,7 +40,7 @@ However you installed it:
 
 Opening Argus again from Applications while it's running also brings up the search window. Settings (⌘, in the search window) lets you change both hotkeys, opens your list of skipped folders (`~/.config/argus/ignore`; Edit… makes one with examples if you don't have one yet) and has a Quit Argus button.
 
-The first time you open it, Argus adds itself to Login Items, so the hotkey still works after a restart. When it starts at login, Argus stays out of sight until you press the hotkey. To stop that, turn off Open Argus when you log in in Settings, or remove Argus in System Settings → General → Login Items & Extensions; either way it stays off.
+The first time you open it, Argus adds itself to Login Items, so the hotkey still works after a restart, and macOS shows a Login Item Added notice once. When it starts at login, Argus stays out of sight until you press the hotkey. To stop that, turn off Open Argus when you log in in Settings, or remove Argus in System Settings → General → Login Items & Extensions; either way it stays off.
 
 ### Update to a new release
 
