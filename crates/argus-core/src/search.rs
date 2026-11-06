@@ -2652,13 +2652,7 @@ mod tests {
             found.sort();
             found
         };
-        for query in [
-            "readme",
-            "willow readme",
-            "readme !willow",
-            "plna",
-            "home",
-        ] {
+        for query in ["readme", "willow readme", "readme !willow", "plna", "home"] {
             assert_eq!(found(query), paths(&index, query), "{query}");
         }
     }
