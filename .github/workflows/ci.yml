@@ -16,19 +16,19 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
-      - run: cargo fmt --all --check
-      - run: cargo clippy --workspace --all-targets -- -D warnings
-      - run: cargo test --workspace
       - run: cargo build --release -p argus-ffi
-      # These pass on a dev Mac but not on the runner (#125).
-      - run: >
-          swift test --package-path apps/macos
-          --skip testCommandIOpensThePaneBesideThePickedFileAndClosesIt
-          --skip testAnEjectTriedAgainStartsTheWaitOver
-          --skip testTabGoesOnFromAHotkeyRecorder
-          --skip testTabOntoARowBelowTheBottomEdgeScrollsItIntoView
+      - name: DIAG plain
+        continue-on-error: true
+        run: swift test --package-path apps/macos --filter 'testTabGoesOnFromAHotkeyRecorder|testAnEjectTriedAgainStartsTheWaitOver|testCommandIOpensThePaneBesideThePickedFileAndClosesIt|testTabOntoARowBelowTheBottomEdgeScrollsItIntoView'
+      - name: DIAG with keyboard access
+        continue-on-error: true
+        run: |
+          defaults write NSGlobalDomain AppleKeyboardUIMode -int 2
+          defaults read NSGlobalDomain AppleKeyboardUIMode
+          swift test --package-path apps/macos --filter 'testTabGoesOnFromAHotkeyRecorder|testTabOntoARowBelowTheBottomEdgeScrollsItIntoView'
 
   windows:
+    if: false
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v7

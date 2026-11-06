@@ -525,8 +525,11 @@ final class HealthWindowTests: XCTestCase {
         }
         for (shift, expected) in [(false, window.windowKeys.nextValidKeyView), (true, window.windowKeys.previousValidKeyView)] {
             XCTAssertTrue(window.panel.makeFirstResponder(window.windowKeys))
+            let editor = window.panel.firstResponder
             XCTAssertTrue(window.panel.makeFirstResponder(nil), "what the recorder does with Tab")
+            print("DIAG125 shift=\(shift) editor=\(String(describing: editor)) delegate=\(String(describing: (editor as? NSText)?.delegate)) fka=\(NSApp.isFullKeyboardAccessEnabled) mode=\(UserDefaults.standard.integer(forKey: "AppleKeyboardUIMode")) key=\(window.panel.isKeyWindow) visible=\(window.panel.isVisible) expected=\(String(describing: expected)) finderCan=\(window.finderKeys.canBecomeKeyView) windowCan=\(window.windowKeys.canBecomeKeyView)")
             window.panel.keyDown(with: tab(shift))
+            print("DIAG125 after=\(String(describing: window.panel.firstResponder))")
             let reached = (window.panel.firstResponder as? NSText)?.delegate as? NSView ?? window.panel.firstResponder
             XCTAssertTrue(reached === expected, "\(String(describing: reached)) after \(shift ? "⇧Tab" : "Tab")")
         }
