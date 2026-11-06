@@ -40,7 +40,7 @@ However you installed it:
 
 Opening Argus again from Applications while it's running also brings up the search window. Settings (⌘, in the search window) lets you change both hotkeys, opens your list of skipped folders (`~/.config/argus/ignore`; Edit… makes one with examples if you don't have one yet) and has a Quit Argus button.
 
-To start Argus when you log in, open System Settings → General → Login Items & Extensions (Open Login Items… in Argus's Settings goes straight there), click + under Open at Login and choose Argus in Applications. When it starts at login, Argus stays out of sight until you press the hotkey.
+The first time you open it, Argus adds itself to Login Items, so the hotkey still works after a restart. When it starts at login, Argus stays out of sight until you press the hotkey. To stop that, turn off Open Argus when you log in in Settings, or remove Argus in System Settings → General → Login Items & Extensions; either way it stays off.
 
 ### Update to a new release
 

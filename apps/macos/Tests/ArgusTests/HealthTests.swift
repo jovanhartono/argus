@@ -93,12 +93,16 @@ final class HealthWindowTests: XCTestCase {
     private var everything = false
     private var cloudSwitched: [Bool] = []
     private var cloud = false
+    private var loginItems = MemoryLoginItems()
+    private var listedAtLogin = false
     private var area = NSRect(x: 0, y: 0, width: 1920, height: 1200)
 
     override func setUp() async throws {
         _ = NSApplication.shared
         UserDefaults.keepHotkeysInMemory()
         stage = OffStage()
+        loginItems = MemoryLoginItems()
+        listedAtLogin = false
     }
 
     override func tearDown() async throws {
@@ -141,7 +145,7 @@ final class HealthWindowTests: XCTestCase {
                 cloud = on
                 (health.busy, health.building) = (on != cloudListed, on != cloudListed)
             },
-            ignoreList: ignoreList, quit: quit, format: HealthFormat(locale: Locale(identifier: "en_US")), tick: tick,
+            loginItems: loginItems, listedAtLogin: { [unowned self] in listedAtLogin }, ignoreList: ignoreList, quit: quit, format: HealthFormat(locale: Locale(identifier: "en_US")), tick: tick,
             usableArea: { [unowned self] _ in self.area })
     }
 
@@ -280,7 +284,7 @@ final class HealthWindowTests: XCTestCase {
     func testTabGoesTopToBottomAndRoundAgain() {
         let window = window()
         let order: [NSView] = [
-            window.settings, window.rebuild, window.everything, window.cloud, window.editIgnore, window.windowKeys, window.finderKeys, window.openLoginItems, window.quit,
+            window.settings, window.rebuild, window.everything, window.cloud, window.editIgnore, window.windowKeys, window.finderKeys, window.startAtLogin, window.quit,
             window.settings,
         ]
         for (view, next) in zip(order, order.dropFirst()) {
@@ -450,13 +454,92 @@ final class HealthWindowTests: XCTestCase {
         XCTAssertEqual(HealthWindow.ignoreList.path, NSHomeDirectory() + "/.config/argus/ignore")
     }
 
-    func testOpenLoginItemsOpensThatPageOfSystemSettings() {
+    func testTheLoginSwitchShowsAndChangesWhatMacOSHas() {
+        loginItems.status = .enabled
         let window = window()
         window.show()
-        window.openLoginItems.performClick(nil)
+        defer { window.hide() }
+        XCTAssertEqual(window.startAtLogin.state, .on)
+        XCTAssertEqual(window.loginHint.stringValue, "At login Argus stays out of sight until you press the hotkey.")
+        window.startAtLogin.performClick(nil)
+        XCTAssertEqual(loginItems.status, .notRegistered)
+        XCTAssertEqual(window.startAtLogin.state, .off)
+        window.startAtLogin.performClick(nil)
+        XCTAssertEqual(loginItems.status, .enabled)
+        XCTAssertEqual(window.startAtLogin.state, .on)
+        XCTAssertTrue(window.shown)
+        XCTAssertEqual(stage.opened, [])
+    }
+
+    func testTheLoginSwitchGoesBackWhenMacOSRefuses() {
+        loginItems.failing = true
+        let window = window()
+        window.show()
+        defer { window.hide() }
+        window.startAtLogin.performClick(nil)
+        XCTAssertEqual(window.startAtLogin.state, .off)
+    }
+
+    func testTurnedOffInSystemSettingsTheLoginSwitchOpensLoginItems() {
+        loginItems.status = .requiresApproval
+        let window = window()
+        window.show()
+        XCTAssertEqual(window.startAtLogin.state, .off)
+        XCTAssertEqual(
+            window.loginHint.stringValue, "Turned off in System Settings. Click to open Login Items and turn it back on.")
+        window.startAtLogin.performClick(nil)
+        XCTAssertFalse(window.shown)
+        XCTAssertEqual(loginItems.status, .requiresApproval, "only System Settings can turn it back on")
+        XCTAssertEqual(
+            stage.opened.map(\.absoluteString), ["x-apple.systempreferences:com.apple.LoginItems-Settings.extension"])
+    }
+
+    func testAddedByHandTheLoginSwitchShowsOnAndOpensLoginItemsInsteadOfAddingASecond() {
+        listedAtLogin = true
+        let window = window()
+        window.show()
+        XCTAssertEqual(window.startAtLogin.state, .on)
+        XCTAssertEqual(
+            window.loginHint.stringValue, "Added in System Settings. Click to open Login Items and change it there.")
+        window.startAtLogin.performClick(nil)
+        XCTAssertEqual(loginItems.status, .notRegistered, "no second entry")
         XCTAssertFalse(window.shown)
         XCTAssertEqual(
             stage.opened.map(\.absoluteString), ["x-apple.systempreferences:com.apple.LoginItems-Settings.extension"])
+        listedAtLogin = false
+        window.show()
+        defer { window.hide() }
+        XCTAssertEqual(window.startAtLogin.state, .off, "taken out there, read again on the next show")
+    }
+
+    func testArgusAddsItselfToLoginItemsOnlyOnItsFirstLaunch() {
+        let defaults = MemoryDefaults()
+        loginItems.addOnFirstLaunch(defaults: defaults, translocated: false, listed: { false })
+        XCTAssertEqual(loginItems.status, .enabled)
+        try? loginItems.unregister()
+        loginItems.addOnFirstLaunch(defaults: defaults, translocated: false, listed: { false })
+        XCTAssertEqual(loginItems.status, .notRegistered, "taken out by hand, it stays out")
+    }
+
+    func testArgusAlreadyAddedByHandIsNotAddedTwice() {
+        let defaults = MemoryDefaults()
+        loginItems.addOnFirstLaunch(defaults: defaults, translocated: false, listed: { true })
+        XCTAssertEqual(loginItems.status, .notRegistered)
+        loginItems.addOnFirstLaunch(defaults: defaults, translocated: false, listed: { false })
+        XCTAssertEqual(loginItems.status, .notRegistered, "taken out later, it stays out")
+    }
+
+    /// Reads the real list, never changes it.
+    func testTheOpenAtLoginListIsReadByBundleID() {
+        XCTAssertFalse(openAtLoginHas(bundleID: "io.github.jovanhartono.argus.no-such-app"))
+    }
+
+    func testARunFromTheQuarantineFolderWaitsForTheRealCopy() {
+        let defaults = MemoryDefaults()
+        loginItems.addOnFirstLaunch(defaults: defaults, translocated: true, listed: { false })
+        XCTAssertEqual(loginItems.status, .notRegistered)
+        loginItems.addOnFirstLaunch(defaults: defaults, translocated: false, listed: { false })
+        XCTAssertEqual(loginItems.status, .enabled, "moved to Applications, it's added")
     }
 
     func testQuitArgusQuits() {
