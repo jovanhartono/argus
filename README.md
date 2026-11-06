@@ -20,9 +20,9 @@ The Mac app is the only one so far. A Windows version is planned.
 Argus runs on Apple and Intel Macs with macOS 13 or later. Install it with [Homebrew](https://brew.sh):
 
 ```sh
-brew tap jovanhartono/argus https://github.com/jovanhartono/argus
-brew trust jovanhartono/argus
-brew install --cask jovanhartono/argus/argus
+brew tap jovanhartono/tap
+brew trust jovanhartono/tap
+brew install --cask jovanhartono/tap/argus
 ```
 
 Then open Argus from Applications.
@@ -122,7 +122,6 @@ cargo run --release -p argus-cli                         # lists every command
 | `crates/argus-cli` | `tl`, the command-line front end |
 | `apps/macos` | The Mac app, in Swift and AppKit |
 | `scripts` | Build, signing and `.dmg` scripts |
-| `Casks` | The Homebrew cask, so this repo doubles as its tap |
 | `docs` | Design notes: the research behind Argus and the plan for each milestone |
 
 ## Contributing
