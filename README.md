@@ -63,7 +63,7 @@ Right-click a result for the same actions, or drag it into another app, such as 
 
 ## Build from source
 
-You need [Rust](https://rustup.rs) (stable) and, for the Mac app, Xcode 16 or later.
+You need [Rust](https://rustup.rs) (stable) and, for the Mac app, Xcode 27 or later.
 
 ```sh
 git clone https://github.com/jovanhartono/argus.git
