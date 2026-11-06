@@ -516,20 +516,11 @@ final class HealthWindowTests: XCTestCase {
         defer { window.hide() }
         // A recorder takes Tab only a moment after it joins a window, so it never starts with the focus.
         try await Task.sleep(for: .milliseconds(50))
-        let tab = { (shift: Bool) in
-            let character = shift ? "\u{19}" : "\t"
-            return NSEvent.keyEvent(
-                with: .keyDown, location: .zero, modifierFlags: shift ? [.shift] : [], timestamp: 0, windowNumber: 0,
-                context: nil, characters: character, charactersIgnoringModifiers: character, isARepeat: false,
-                keyCode: 48)!
-        }
         for (shift, expected) in [(false, window.windowKeys.nextValidKeyView), (true, window.windowKeys.previousValidKeyView)] {
             XCTAssertTrue(window.panel.makeFirstResponder(window.windowKeys))
-            let editor = window.panel.firstResponder
             XCTAssertTrue(window.panel.makeFirstResponder(nil), "what the recorder does with Tab")
-            print("DIAG125 shift=\(shift) editor=\(String(describing: editor)) delegate=\(String(describing: (editor as? NSText)?.delegate)) fka=\(NSApp.isFullKeyboardAccessEnabled) mode=\(UserDefaults.standard.integer(forKey: "AppleKeyboardUIMode")) key=\(window.panel.isKeyWindow) visible=\(window.panel.isVisible) expected=\(String(describing: expected)) finderCan=\(window.finderKeys.canBecomeKeyView) windowCan=\(window.windowKeys.canBecomeKeyView)")
-            window.panel.keyDown(with: tab(shift))
-            print("DIAG125 after=\(String(describing: window.panel.firstResponder))")
+            // What Tab and ⇧Tab call. A made-up Tab event moves nothing on a CI runner (#125).
+            if shift { window.panel.selectPreviousKeyView(nil) } else { window.panel.selectNextKeyView(nil) }
             let reached = (window.panel.firstResponder as? NSText)?.delegate as? NSView ?? window.panel.firstResponder
             XCTAssertTrue(reached === expected, "\(String(describing: reached)) after \(shift ? "⇧Tab" : "Tab")")
         }
@@ -613,10 +604,7 @@ final class HealthWindowTests: XCTestCase {
         window.page.scroll(.zero)
         let finder = { window.finderKeys.convert(window.finderKeys.bounds, to: clip) }
         XCTAssertFalse(clip.bounds.contains(finder()))
-        window.panel.keyDown(
-            with: NSEvent.keyEvent(
-                with: .keyDown, location: .zero, modifierFlags: [], timestamp: 0, windowNumber: 0, context: nil,
-                characters: "\t", charactersIgnoringModifiers: "\t", isARepeat: false, keyCode: 48)!)
+        window.panel.selectNextKeyView(nil)
         XCTAssertTrue((window.panel.firstResponder as? NSText)?.delegate === window.finderKeys)
         XCTAssertTrue(clip.bounds.contains(finder()), "the row Tab reached is in view")
         window.panel.makeFirstResponder(nil)
