@@ -17,16 +17,26 @@ Argus is early software: releases are marked pre-release, and the Mac app is the
 
 ## Install
 
-Download `Argus.dmg` from the [latest release](https://github.com/jovanhartono/argus/releases). It runs on Apple and Intel Macs with macOS 13 or later.
+Argus runs on Apple and Intel Macs with macOS 13 or later. Install it with [Homebrew](https://brew.sh):
 
-Argus isn't notarized by Apple, so macOS asks you once before it opens:
+```sh
+brew tap jovanhartono/argus https://github.com/jovanhartono/argus
+brew trust jovanhartono/argus
+brew install --cask jovanhartono/argus/argus
+```
 
-1. Open `Argus.dmg` and drag Argus to Applications.
-2. Open Argus. macOS says it can't check it for malware; click Done.
-3. Open System Settings → Privacy & Security, scroll down and click Open Anyway.
-4. Click Open Anyway again and enter your Mac password.
-5. The search window opens, and from then on ⌘⇧Space brings it up. Until Argus has Full Disk Access, it leaves out Desktop, Documents, Downloads and external drives, and the window says so. Click Open System Settings, switch Argus on under Full Disk Access, and click Quit & Reopen when macOS asks.
-6. iCloud Drive, Dropbox and other cloud drives stay out of search until you press ⌘, to open Settings and turn on Include iCloud Drive and cloud storage. This switch needs Full Disk Access first.
+Then open Argus from Applications.
+
+Or download `Argus.dmg` from the [latest release](https://github.com/jovanhartono/argus/releases), open it and drag Argus to Applications. Argus isn't notarized by Apple, so macOS asks you once before it opens. The Homebrew install skips this step, as it removes the "downloaded from the internet" mark that triggers it.
+
+1. Open Argus. macOS says it can't check it for malware; click Done.
+2. Open System Settings → Privacy & Security, scroll down and click Open Anyway.
+3. Click Open Anyway again and enter your Mac password.
+
+However you installed it:
+
+1. The search window opens, and from then on ⌘⇧Space brings it up. Until Argus has Full Disk Access, it leaves out Desktop, Documents, Downloads and external drives, and the window says so. Click Open System Settings, switch Argus on under Full Disk Access, and click Quit & Reopen when macOS asks.
+2. iCloud Drive, Dropbox and other cloud drives stay out of search until you press ⌘, to open Settings and turn on Include iCloud Drive and cloud storage. This switch needs Full Disk Access first.
 
 Opening Argus again from Applications while it's running also brings up the search window. Settings (⌘, in the search window) lets you change both hotkeys, opens your list of skipped folders (`~/.config/argus/ignore`; Edit… makes one with examples if you don't have one yet) and has a Quit Argus button.
 
@@ -34,11 +44,15 @@ To start Argus when you log in, open System Settings → General → Login Items
 
 ### Update to a new release
 
+With Homebrew, run `brew upgrade --cask argus`. It quits Argus, replaces it, and you open it again.
+
+With the `.dmg`:
+
 1. Press ⌘⇧Space, then ⌘Q to quit Argus.
 2. Open the new `Argus.dmg`, drag Argus to Applications and click Replace.
 3. Open Argus. macOS blocks it once more, so repeat Open Anyway from the install steps.
 
-Open Anyway comes back with every update, because macOS approves each build separately. Full Disk Access carries over, because every release from 0.2.1 on is signed with the same certificate. If the window ever says it needs Full Disk Access again, remove Argus from the Full Disk Access list with −, add it back with +, then quit and reopen Argus.
+With the `.dmg`, Open Anyway comes back with every update, because macOS approves each build separately. Full Disk Access carries over, because every release from 0.2.1 on is signed with the same certificate. If the window ever says it needs Full Disk Access again, remove Argus from the Full Disk Access list with −, add it back with +, then quit and reopen Argus.
 
 ## Keys
 
@@ -108,6 +122,7 @@ cargo run --release -p argus-cli                         # lists every command
 | `crates/argus-cli` | `tl`, the command-line front end |
 | `apps/macos` | The Mac app, in Swift and AppKit |
 | `scripts` | Build, signing and `.dmg` scripts |
+| `Casks` | The Homebrew cask, so this repo doubles as its tap |
 | `docs` | Design notes: the research behind Argus and the plan for each milestone |
 
 ## Contributing
