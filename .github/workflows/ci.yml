@@ -6,8 +6,21 @@ on:
   pull_request:
 
 jobs:
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
+      - run: cargo build --release -p argus-ffi
+      - run: swift test --package-path apps/macos
+
   windows:
-    # macOS tests run on the dev Mac; add a macOS job once the repo is public and its minutes are free.
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v7
