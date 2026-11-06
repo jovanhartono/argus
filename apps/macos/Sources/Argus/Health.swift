@@ -1,5 +1,6 @@
 import AppKit
 import KeyboardShortcuts
+import ServiceManagement
 
 /// How the list in use is doing, as `tl_health` tells it.
 struct Health: Equatable {
@@ -61,6 +62,13 @@ struct HealthFormat {
     func cloud(_ fullDisk: Bool) -> String {
         let what = "iCloud Drive, Dropbox, Google Drive, OneDrive and others. Finding a file by name never downloads it."
         return fullDisk ? what : what + " Needs Full Disk Access."
+    }
+
+    func login(_ status: SMAppService.Status, byHand: Bool) -> String {
+        if byHand { return "Added in System Settings. Click to open Login Items and change it there." }
+        return status == .requiresApproval
+            ? "Turned off in System Settings. Click to open Login Items and turn it back on."
+            : "At login Argus stays out of sight until you press the hotkey."
     }
 
     /// Under a minute, or a clock set back, reads "Just now".
@@ -173,7 +181,8 @@ final class HealthWindow: NSObject, NSWindowDelegate {
     let editIgnore = KeyButton(title: "Edit…", target: nil, action: nil)
     let windowKeys = KeyboardShortcuts.RecorderCocoa(for: .toggleWindow)
     let finderKeys = KeyboardShortcuts.RecorderCocoa(for: .searchFinderFolder)
-    let openLoginItems = KeyButton(title: "Open Login Items…", target: nil, action: nil)
+    let startAtLogin = NSButton(checkboxWithTitle: "Open Argus when you log in", target: nil, action: nil)
+    let loginHint = NSTextField(wrappingLabelWithString: "")
     let quit = KeyButton(title: "Quit Argus", target: nil, action: nil)
     private var sheetUp = false
     private let read: () -> Health
@@ -184,6 +193,10 @@ final class HealthWindow: NSObject, NSWindowDelegate {
     private let isCloud: () -> Bool
     private let onCloud: (Bool) -> Void
     private let stage: any Stage
+    private let loginItems: any LoginItems
+    /// Whether System Settings' Open at Login list has Argus, added by hand or not.
+    private let listedAtLogin: () -> Bool
+    private var byHand = false
     private let ignoreList: URL
     private let onQuit: () -> Void
     private let format: HealthFormat
@@ -200,7 +213,8 @@ final class HealthWindow: NSObject, NSWindowDelegate {
         read: @escaping () -> Health, hasAccess: @escaping () -> Bool, rebuild: @escaping () -> Void,
         stage: any Stage, everything: @escaping () -> Bool = { false },
         indexEverything: @escaping (Bool) -> Void = { _ in }, cloud: @escaping () -> Bool = { false },
-        indexCloud: @escaping (Bool) -> Void = { _ in }, ignoreList: URL = HealthWindow.ignoreList,
+        indexCloud: @escaping (Bool) -> Void = { _ in }, loginItems: any LoginItems = MemoryLoginItems(),
+        listedAtLogin: @escaping () -> Bool = { false }, ignoreList: URL = HealthWindow.ignoreList,
         quit: @escaping () -> Void = { NSApp.terminate(nil) }, format: HealthFormat = HealthFormat(),
         tick: TimeInterval = 1,
         usableArea: @escaping @MainActor (NSWindow) -> NSRect? = { ($0.screen ?? NSScreen.main)?.visibleFrame }
@@ -214,6 +228,8 @@ final class HealthWindow: NSObject, NSWindowDelegate {
         isCloud = cloud
         onCloud = indexCloud
         self.stage = stage
+        self.loginItems = loginItems
+        self.listedAtLogin = listedAtLogin
         self.ignoreList = ignoreList
         onQuit = quit
         self.format = format
@@ -243,7 +259,7 @@ final class HealthWindow: NSObject, NSWindowDelegate {
             [label("Skipped folders:"), ignoreLine],
             [label("Open Argus:"), windowKeys],
             [label("Search Finder’s folder:"), finderKeys],
-            [label("Start at login:"), openLoginItems],
+            [label("Start at login:"), loginBox()],
             [NSGridCell.emptyContentView, quit],
         ]
         for row in rows { grid.addRow(with: row) }
@@ -255,14 +271,13 @@ final class HealthWindow: NSObject, NSWindowDelegate {
         panel.isReleasedWhenClosed = false
         panel.delegate = self
         access.preferredMaxLayoutWidth = 260
-        for button in [settings, rebuild, editIgnore, openLoginItems, quit] {
+        for button in [settings, rebuild, editIgnore, quit] {
             button.target = self
             button.bezelStyle = .push
         }
         settings.action = #selector(openSettings(_:))
         rebuild.action = #selector(rebuildIndex(_:))
         editIgnore.action = #selector(editIgnoreList(_:))
-        openLoginItems.action = #selector(openLoginItems(_:))
         quit.action = #selector(quitArgus(_:))
         grid.column(at: 0).xPlacement = .trailing
         grid.rowAlignment = .firstBaseline
@@ -287,7 +302,7 @@ final class HealthWindow: NSObject, NSWindowDelegate {
         ])
         panel.contentView = scroll
         let order: [NSView] = [
-            settings, rebuild, everything, cloud, editIgnore, windowKeys, finderKeys, openLoginItems, quit,
+            settings, rebuild, everything, cloud, editIgnore, windowKeys, finderKeys, startAtLogin, quit,
         ]
         for (at, view) in order.enumerated() { view.nextKeyView = order[(at + 1) % order.count] }
         // One press would run both, and the search window would flash up and straight away.
@@ -344,8 +359,36 @@ final class HealthWindow: NSObject, NSWindowDelegate {
         refresh()
     }
 
+    private func loginBox() -> NSView {
+        startAtLogin.target = self
+        startAtLogin.action = #selector(switchLogin(_:))
+        loginHint.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
+        loginHint.textColor = .secondaryLabelColor
+        loginHint.preferredMaxLayoutWidth = 260
+        let box = NSStackView(views: [startAtLogin, loginHint])
+        box.orientation = .vertical
+        box.alignment = .leading
+        box.spacing = 2
+        return box
+    }
+
+    /// Once turned off in System Settings, only System Settings can turn it back on, and an
+    /// entry added there by hand is out of Argus's reach.
+    @objc func switchLogin(_ sender: Any?) {
+        if loginItems.status == .requiresApproval || byHand {
+            hide()
+            stage.open(Self.loginItems)
+            return
+        }
+        // A refusal from macOS shows as the switch going back to what it was.
+        try? startAtLogin.state == .on ? loginItems.register() : loginItems.unregister()
+        refresh()
+    }
+
     func show() {
         shown = true
+        // Read once per show, not every tick: the old list takes about 44 ms.
+        byHand = loginItems.status != .enabled && listedAtLogin()
         refresh()
         // A new display resolution or another screen since the last show would leave Quit Argus
         // below the edge; measuring the rows takes about 6 ms, so only then.
@@ -395,6 +438,9 @@ final class HealthWindow: NSObject, NSWindowDelegate {
         // Without access cloud drives stay unread, so it can be turned off but not on.
         cloud.isEnabled = (fullDisk || cloudOn) && !health.stopped
         cloudHint.stringValue = format.cloud(fullDisk)
+        let login = loginItems.status
+        startAtLogin.state = login == .enabled || byHand ? .on : .off
+        loginHint.stringValue = format.login(login, byHand: byHand)
         if building == progress.isHidden {
             progress.isHidden = !building
             building ? progress.startAnimation(nil) : progress.stopAnimation(nil)
@@ -452,12 +498,6 @@ final class HealthWindow: NSObject, NSWindowDelegate {
         }
         hide()
         stage.openAsText(ignoreList)
-    }
-
-    /// Adding Argus there stays by hand (M2 decision 8); this only saves finding the page.
-    @objc func openLoginItems(_ sender: Any?) {
-        hide()
-        stage.open(Self.loginItems)
     }
 
     /// With no Dock icon or menu bar icon, this and ⌘Q are the only ways to quit.

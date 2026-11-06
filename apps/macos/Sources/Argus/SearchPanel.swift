@@ -194,6 +194,8 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
     private var listHeight: CGFloat = 0
     let everything: IndexEverything
     let cloud: CloudDrives
+    private let loginItems: any LoginItems
+    private let listedAtLogin: () -> Bool
     /// ⌘T's switch. Off at each show, so a plain search never reads a file's text.
     private(set) var textOn = false
     private(set) var hits: [TextHit] = [] {
@@ -250,10 +252,13 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
         root: String = NSHomeDirectory(), standIn: UInt64? = nil, saved: String? = nil, opens: String? = nil,
         apps: [String] = [], everything: IndexEverything = IndexEverything(), cloud: CloudDrives = CloudDrives(),
         hasAccess: @escaping () -> Bool = { Hatch.hasFullDiskAccess() }, stage: any Stage = Screen(),
-        finder: @escaping @Sendable () -> FinderFolder = FinderFolder.ask
+        finder: @escaping @Sendable () -> FinderFolder = FinderFolder.ask, loginItems: any LoginItems = MemoryLoginItems(),
+        listedAtLogin: @escaping () -> Bool = { false }
     ) {
         self.everything = everything
         self.cloud = cloud
+        self.loginItems = loginItems
+        self.listedAtLogin = listedAtLogin
         self.hasAccess = hasAccess
         self.stage = stage
         self.finder = finder
@@ -421,7 +426,7 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
                     cloud.isOn = on
                     // Cloud drives stay unread without access anyway, so the core can hear it now.
                     hatch?.indexCloud(on)
-                })
+                }, loginItems: loginItems, listedAtLogin: listedAtLogin)
         }
         health?.show()
     }

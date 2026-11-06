@@ -1,5 +1,6 @@
 import AppKit
 import KeyboardShortcuts
+import ServiceManagement
 
 extension KeyboardShortcuts.Name {
     static let toggleWindow = Self("toggleWindow", initial: .init(.space, modifiers: [.command, .shift]))
@@ -26,10 +27,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ note: Notification) {
         // ARGUS_STAND_IN=1000000 searches made-up names instead of your files, and 0 measures
         // the window's own memory without any list.
+        let listed = { openAtLoginHas(bundleID: Bundle.main.bundleIdentifier ?? "") }
         let window = SearchPanel(
             standIn: ProcessInfo.processInfo.environment["ARGUS_STAND_IN"].flatMap(UInt64.init),
             saved: Hatch.savedList, opens: Hatch.openedList, apps: Hatch.appFolders,
-            everything: IndexEverything(defaults: .standard), cloud: CloudDrives(defaults: .standard))
+            everything: IndexEverything(defaults: .standard), cloud: CloudDrives(defaults: .standard),
+            loginItems: SMAppService.mainApp, listedAtLogin: listed)
+        SMAppService.mainApp.addOnFirstLaunch(
+            defaults: .standard, translocated: Bundle.main.bundlePath.contains("/AppTranslocation/"), listed: listed)
         window.warmUp()
         drives = Drives(
             letGo: window.letGoOfDrive, added: window.driveMounted, removing: window.driveUnmounting,
