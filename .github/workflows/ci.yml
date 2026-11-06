@@ -20,13 +20,7 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
       - run: cargo build --release -p argus-ffi
-      # These pass on a dev Mac but not on the runner (#125).
-      - run: >
-          swift test --package-path apps/macos
-          --skip testCommandIOpensThePaneBesideThePickedFileAndClosesIt
-          --skip testAnEjectTriedAgainStartsTheWaitOver
-          --skip testTabGoesOnFromAHotkeyRecorder
-          --skip testTabOntoARowBelowTheBottomEdgeScrollsItIntoView
+      - run: swift test --package-path apps/macos
 
   windows:
     runs-on: windows-latest

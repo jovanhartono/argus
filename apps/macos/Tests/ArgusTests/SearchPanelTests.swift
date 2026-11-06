@@ -2396,7 +2396,9 @@ final class SearchPanelTests: XCTestCase {
         XCTAssertFalse(window.pane.isHidden)
         try await until { window.panel.frame.width == Metric.width + 1 + Metric.pane }
         try await until { window.panel.frame.height == Metric.field + 1 + Metric.details }
-        XCTAssertEqual(window.panel.frame.minX, left, "grows to the right")
+        // A screen too narrow to grow right on, like a CI runner's, pushes the window back from the edge.
+        let room = try XCTUnwrap(window.panel.screen?.visibleFrame).maxX - window.panel.frame.width
+        XCTAssertEqual(window.panel.frame.minX, min(left, room), "grows to the right")
         XCTAssertEqual(window.panel.frame.maxY, top, "the box stays put")
         XCTAssertEqual(window.pane.frame.maxX, window.panel.contentView!.bounds.width)
         XCTAssertEqual(window.pane.name.stringValue, "budget.txt")

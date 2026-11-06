@@ -137,20 +137,28 @@ final class DrivesTests: XCTestCase {
     }
 
     func testAnEjectTriedAgainStartsTheWaitOver() async throws {
+        var asked = 0
+        // A settle far longer than the gap between the ejects, so a slow CI machine still hears
+        // the second one before the first one's check.
         let drives = Drives(
-            center: center, mounted: [], isMounted: { [unowned self] in stillMounted.contains($0) },
-            settle: .milliseconds(150), added: { [unowned self] in heard.append("+" + $0) },
+            center: center, mounted: [],
+            isMounted: { [unowned self] in
+                asked += 1
+                return stillMounted.contains($0)
+            },
+            settle: .seconds(1), added: { [unowned self] in heard.append("+" + $0) },
             removing: { [unowned self] in heard.append("-" + $0) })
         stillMounted = ["/Volumes/Photos"]
         post(NSWorkspace.willUnmountNotification, "/Volumes/Photos")
-        try await Task.sleep(for: .milliseconds(100))
+        try await Task.sleep(for: .milliseconds(50))
         // Refused, then ejected again: macOS asks once more, and that unmount may still be on its way.
         DispatchQueue.global().sync { drives.unmountAsked("/Volumes/Photos") }
-        try await Task.sleep(for: .milliseconds(100))
-        XCTAssertEqual(heard, ["-/Volumes/Photos"], "not listed again at the first eject's check")
-        XCTAssertEqual(drives.leaving, ["/Volumes/Photos"])
-        try await Task.sleep(for: .milliseconds(250))
+        let deadline = ContinuousClock.now + .seconds(10)
+        while heard.count < 2, ContinuousClock.now < deadline { try await Task.sleep(for: .milliseconds(10)) }
+        // Past the second eject's check too, which comes 50 ms after the first one's.
+        try await Task.sleep(for: .milliseconds(300))
         XCTAssertEqual(heard, ["-/Volumes/Photos", "+/Volumes/Photos"], "refused for good, so listed again once")
+        XCTAssertEqual(asked, 1, "only the second eject's check looks at the drive")
         XCTAssertEqual(drives.leaving, [])
     }
 
