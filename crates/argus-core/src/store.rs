@@ -716,6 +716,7 @@ mod tests {
             name_letters: Vec::new(),
             name_digit_starts: Vec::new(),
             name_symbols: Vec::new(),
+            folds: crate::index::Folds::default(),
             entry_name: name.to_vec(),
             siblings: Siblings {
                 starts: runs.iter().map(|&(start, _)| start).collect(),
@@ -751,6 +752,28 @@ mod tests {
             .map(|entry| index.name(entry))
             .collect();
         assert!(names.contains(&"naïve résumé.pdf"));
+    }
+
+    /// One résumé typed on a Mac, one saved by a browser as e and an accent.
+    #[test]
+    fn a_reopened_index_still_folds() {
+        let dir = tempfile::tempdir().unwrap();
+        for file in ["a/R\u{e9}sum\u{e9}.pdf", "b/Re\u{301}sume\u{301}.pdf"] {
+            let file = dir.path().join(file);
+            fs::create_dir_all(file.parent().unwrap()).unwrap();
+            fs::write(file, "").unwrap();
+        }
+        let file = dir.path().join("index");
+        let settings = keep(dir.path());
+        let scanned = settings.scan().unwrap();
+        save_index(&file, &scanned.index, 0, &settings, 0).unwrap();
+
+        let index = open_index(&file, &settings).unwrap().scan.index;
+        assert_eq!(index, scanned.index);
+        let searcher = Searcher::with_threads(1);
+        let apps = crate::Apps::default();
+        let hits = searcher.search(&index, &apps, "resume", searcher.ticket(), 10);
+        assert_eq!(hits.unwrap().len(), 2);
     }
 
     #[test]

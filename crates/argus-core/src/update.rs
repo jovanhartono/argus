@@ -1,12 +1,13 @@
 //! Keeping the index current: each changed folder is read again and the lists are patched in
 //! place, so a change costs a few folder reads instead of a rescan.
 
-use crate::index::{EntryId, Index, IndexBuilder, NO_PARENT, NameId, name_fingerprint};
+use crate::index::{EntryId, FOLDED, Index, IndexBuilder, NO_PARENT, NameId, folded_fingerprint};
 use crate::name_starts::NameStarts;
 use crate::siblings::{NO_FOLDER, Siblings};
 use crate::walk::{Kind, Listing, Rules, walk};
 use hashbrown::{DefaultHashBuilder, HashSet, HashTable};
 use rayon::prelude::*;
+use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::ffi::OsStr;
 use std::fs;
@@ -395,10 +396,13 @@ impl Index {
             self.name_starts.push(self.names.len() as u32),
             "a volume's path fits a group"
         );
-        let (letters, starts, symbols) = name_fingerprint(name);
+        let ((letters, starts, symbols), folded) = folded_fingerprint(name);
         self.name_letters.push(letters);
         self.name_digit_starts.push(starts);
         self.name_symbols.push(symbols);
+        if let Cow::Owned(folded) = folded {
+            self.folds.push(name_id, &folded);
+        }
         self.entry_name.push(name_id);
         self.folders.push(root);
         self.folder_inodes.push(0);
@@ -630,10 +634,14 @@ impl Index {
                 self.name_starts.push(end),
                 "a file name is at most 765 bytes"
             );
-            let (letters, starts, symbols) = name_fingerprint(new.name_text(name as NameId));
+            let ((letters, starts, symbols), folded) =
+                folded_fingerprint(new.name_text(name as NameId));
             self.name_letters.push(letters);
             self.name_digit_starts.push(starts);
             self.name_symbols.push(symbols);
+            if let Cow::Owned(folded) = folded {
+                self.folds.push(name_base + name as NameId, &folded);
+            }
         }
 
         let entries = new.len() - anchors.len();
@@ -754,6 +762,8 @@ impl Index {
         starts.reserve_exact(in_use().count() + 1);
         assert!(starts.push(0));
         let mut lookup = HashTable::new();
+        let folds = std::mem::take(&mut self.folds);
+        self.folds = folds.emptied();
         let mut kept = 0;
         for name in in_use() {
             let (from, to) = (self.name_starts.get(name), self.name_starts.get(name + 1));
@@ -773,6 +783,9 @@ impl Index {
             self.name_letters[kept as usize] = self.name_letters[name];
             self.name_digit_starts[kept as usize] = self.name_digit_starts[name];
             self.name_symbols[kept as usize] = self.name_symbols[name];
+            if self.name_symbols[name] & FOLDED != 0 {
+                self.folds.push(kept, folds.get(name as NameId));
+            }
             if shares {
                 lookup.insert_unique(hash, kept, |&other| {
                     hasher.hash_one(text_of(&text, &starts, other))
@@ -789,6 +802,7 @@ impl Index {
         trim(&mut self.name_letters, kept);
         trim(&mut self.name_digit_starts, kept);
         trim(&mut self.name_symbols, kept);
+        self.folds.shrink_to_fit();
         renamed
     }
 
@@ -907,6 +921,7 @@ struct Added {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::index::name_fingerprint;
     use crate::store::{is_sound, open_index, save_index};
     use crate::{
         Access, Boosts, Cloud, Clutter, Frecency, Ignore, Scan, Searcher, Settings, Within,
@@ -961,6 +976,9 @@ mod tests {
             .zip(&index.name_symbols)
             .map(|((&letters, &starts), &symbols)| (letters, starts, symbols));
         assert_eq!(kept.collect::<Vec<_>>(), fingerprints);
+        let mut fresh = index.clone();
+        fresh.add_letters();
+        assert_eq!(index.folds, fresh.folds);
     }
 
     /// What deciding whether a change needs a new list reads: each folder's children, and
@@ -1903,6 +1921,39 @@ mod tests {
             index.distinct_names(),
             settings.scan().unwrap().index.distinct_names()
         );
+    }
+
+    /// One résumé typed on a Mac, one saved by a browser as e and an accent, then a drive whose
+    /// name has an accent.
+    #[test]
+    fn a_name_an_update_adds_folds() {
+        let (_dir, root, settings, mut index) = at_the_line();
+        write(
+            &root,
+            &["a/R\u{e9}sum\u{e9}.pdf", "b/Re\u{301}sume\u{301}.pdf"],
+        );
+        assert!(!settings.update(&mut index, &[&root]).compacted);
+        let both = [
+            root.join("a/R\u{e9}sum\u{e9}.pdf"),
+            root.join("b/Re\u{301}sume\u{301}.pdf"),
+        ];
+        assert_eq!(search(&index, "resume"), both);
+        assert_current(&settings, &index, &root, "after adding them");
+
+        for i in 0..11 {
+            fs::remove_file(root.join(format!("f/{i}"))).unwrap();
+        }
+        assert!(settings.update(&mut index, &[root.join("f")]).compacted);
+        assert_eq!(search(&index, "resume"), both);
+        assert_current(&settings, &index, &root, "after compacting");
+
+        let (_v, outside) = temp_root();
+        let volume = outside.join("Caf\u{e9} Drive");
+        write(&volume, &["notes.txt"]);
+        settings.add_volume(&mut index, &volume).unwrap();
+        let drive = index.entry_name[*index.roots.last().unwrap() as usize];
+        assert!(index.match_text(drive).ends_with("Cafe Drive"));
+        assert_current(&settings, &index, &root, "with the drive");
     }
 
     /// Each list's length and room, but the runs of siblings, which every update builds anew.

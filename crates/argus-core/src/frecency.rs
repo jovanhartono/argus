@@ -1044,6 +1044,20 @@ mod tests {
         assert!(boosts_of(&list, &index, NOW).is_empty());
     }
 
+    /// A résumé a browser saved as e and an accent is looked up by the name on disk, not the
+    /// text search matches it by.
+    #[test]
+    fn an_accented_file_keeps_its_boost() {
+        let mut builder = IndexBuilder::new();
+        let root = builder.push("/home", NO_PARENT, true);
+        let resume = builder.push("Re\u{301}sume\u{301}.pdf", root, false);
+        builder.push("R\u{e9}sum\u{e9}.pdf", root, false);
+        let index = builder.finish();
+        let list = opened(&[("/home/Re\u{301}sume\u{301}.pdf", &[NOW])]);
+        let boosts = boosts_of(&list, &index, NOW);
+        assert_eq!(boosts, [(resume, 12)].into_iter().collect());
+    }
+
     #[test]
     fn boosts_match_a_path_by_path_lookup_on_made_up_names() {
         let index = crate::stand_in(20_000);

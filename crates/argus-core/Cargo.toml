@@ -11,6 +11,7 @@ crc32fast = "1.5.3"
 frizbee = "=0.13.0"
 hashbrown = "0.17.1"
 rayon = "1.12.0"
+unicode-normalization = "=0.1.26"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 libc = "0.2.191"

@@ -1,6 +1,7 @@
 //! Argus's search engine: the file-name index, the fuzzy matcher, ranking and frecency.
 
 mod apps;
+mod fold;
 mod frecency;
 mod ignore;
 mod index;
