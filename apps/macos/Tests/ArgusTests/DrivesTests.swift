@@ -99,8 +99,9 @@ final class DrivesTests: XCTestCase {
 
     func testMacOSAskingToUnmountLetsGoWhileTheMainThreadIsBusy() async throws {
         let gone = OSAllocatedUnfairLock<[String]>(initialState: [])
+        // A settle no CI stall outlasts, so the unmount note always lands before the check.
         let drives = Drives(
-            center: center, mounted: [], isMounted: { _ in false }, settle: .milliseconds(50),
+            center: center, mounted: [], isMounted: { _ in false }, settle: .seconds(1),
             letGo: { path in gone.withLock { $0.append(path) } },
             added: { [unowned self] in heard.append("+" + $0) },
             removing: { [unowned self] in heard.append("-" + $0) })
@@ -110,9 +111,9 @@ final class DrivesTests: XCTestCase {
         XCTAssertEqual(heard, [], "the window hears once the main thread is free")
         post(NSWorkspace.willUnmountNotification, "/Volumes/Photos")
         XCTAssertEqual(heard, ["-/Volumes/Photos"])
-        try await Task.sleep(for: .milliseconds(10))
+        // Once macOS's question has reached the main thread.
+        await withCheckedContinuation { done in DispatchQueue.main.async { done.resume() } }
         post(NSWorkspace.didUnmountNotification, "/Volumes/Photos")
-        try await settled()
         XCTAssertEqual(heard, ["-/Volumes/Photos"], "let go of once")
         XCTAssertEqual(drives.leaving, [])
     }

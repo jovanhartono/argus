@@ -2883,14 +2883,14 @@ final class SearchPanelTests: XCTestCase {
         try await until { window.rows.count == 2 }
         window.toggleDetails(nil)
         XCTAssertEqual(window.pane.row, window.rows[0])
-
         try await type("budget p", in: window)
         try await until { window.rows.map(\.name) == ["budget plan.md"] }
         XCTAssertEqual(window.table.selectedRow, 0)
         XCTAssertEqual(window.pane.row, window.rows[0])
         XCTAssertEqual(window.pane.name.stringValue, "budget plan.md")
         XCTAssertTrue(window.pane.summary.stringValue.hasSuffix("6 bytes"), window.pane.summary.stringValue)
-        XCTAssertEqual(window.pane.waiting, window.rows[0].url)
+        let plan = window.rows[0].url
+        try await until { window.pane.waiting == plan || window.pane.thumbnailed == plan }
     }
 
     func testAFileSavedWhileThePaneShowsGetsItsNewSize() async throws {
@@ -2904,6 +2904,7 @@ final class SearchPanelTests: XCTestCase {
         window.toggleDetails(nil)
         let picked = window.rows[0].url
         try await until { window.pane.thumbnailed == picked }
+        let thumbnail = window.pane.picture.image
 
         // The new file ranks below, so the saved one keeps row 0 in the new list.
         try Data("abcdef".utf8).write(to: url)
@@ -2912,7 +2913,10 @@ final class SearchPanelTests: XCTestCase {
         XCTAssertEqual(window.selected?.url, picked)
         XCTAssertEqual(window.table.selectedRow, 0)
         XCTAssertTrue(window.pane.summary.stringValue.hasSuffix("6 bytes"), window.pane.summary.stringValue)
-        XCTAssertEqual(window.pane.waiting, picked, "a new thumbnail for the new contents")
+        // A new thumbnail for the new contents, still being drawn or already in.
+        try await until {
+            window.pane.waiting == picked || (window.pane.thumbnailed == picked && window.pane.picture.image !== thumbnail)
+        }
     }
 
     func testAClickBelowTheRowsKeepsThePick() async throws {
