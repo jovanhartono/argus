@@ -18,15 +18,17 @@ restore() {
 trap restore EXIT
 ARGUS_SITE_FRAMES=$frames swift test --package-path apps/macos --filter Site
 
-# video <concat list> <width> <mp4>
+# video <concat list> <mp4>
+# Kept at the frames' full Retina size: a Mac shows the video at two pixels per point, so anything
+# smaller is stretched and the window's text goes soft.
 video() {
   local total=$(awk '$1 == "duration" { s += $2 } END { print s }' $1)
   ffmpeg -loglevel error -y -f concat -safe 0 -i $1 -t $total \
-    -vf "fps=30,scale=$2:-2:flags=lanczos,format=yuv420p" \
-    -c:v libx264 -preset veryslow -crf 22 -tune stillimage -movflags +faststart -an $3
+    -vf "fps=30,format=yuv420p" \
+    -c:v libx264 -preset veryslow -crf 18 -tune stillimage -movflags +faststart -an $2
 }
-video $frames/frames.txt 1280 site/argus.mp4
-video $frames/browse/frames.txt 1600 site/argus-browse.mp4
+video $frames/frames.txt site/argus.mp4
+video $frames/browse/frames.txt site/argus-browse.mp4
 # The typo found: "desing" with design.key picked. Atlas open in the details pane.
 # Lossless WebP is a quarter of the PNG's size for flat window pictures. Link previews get a PNG
 # at the 1200×630 they all crop to.

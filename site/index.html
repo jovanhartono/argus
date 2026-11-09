@@ -81,13 +81,13 @@
   .install button:hover { color: var(--accent); border-color: var(--accent); }
 
   figure { margin: 48px 0 0; }
-  /* Wider than the text so the window's own text stays readable. */
+  /* Wider than the text, and never wider than the window was drawn, so its text stays sharp. */
   figure video {
-    width: min(960px, calc(100vw - 32px)); height: auto; display: block;
+    width: min(var(--w), calc(100vw - 32px)); height: auto; display: block;
     margin-left: 50%; transform: translateX(-50%);
   }
   /* Below this, 100vw counts a visible scrollbar and the video would overflow. */
-  @media (max-width: 1000px) { figure video { width: 100%; margin-left: 0; transform: none; } }
+  @media (max-width: 1150px) { figure video { width: 100%; margin-left: 0; transform: none; } }
   figure img { max-width: 100%; height: auto; display: block; }
   h2 ~ figure { margin-top: 24px; }
   figcaption { color: var(--dim); margin-top: 8px; font-size: 12px; }
@@ -129,7 +129,7 @@
       <p class="dim">or <a href="https://github.com/jovanhartono/argus/releases/latest/download/Argus.dmg">download Argus.dmg</a> · macOS 13+ · Apple and Intel</p>
 
       <figure>
-        <video src="argus.mp4" poster="argus-poster.webp" width="1280" height="800" muted loop playsinline aria-label="The Argus search window: typing desing puts design.key in ~/Documents at the top, then ⌘T and kickoff find matching lines inside three files."></video>
+        <video src="argus.mp4" poster="argus-poster.webp" width="864" height="540" style="--w: 864px" muted loop playsinline aria-label="The Argus search window: typing desing puts design.key in ~/Documents at the top, then ⌘T and kickoff find matching lines inside three files."></video>
         <figcaption>"desing" finds design.key, typo and all. ⌘T looks inside files.</figcaption>
       </figure>
     </section>
@@ -153,7 +153,7 @@
       <p><span class="accent">⌘I</span> opens a details pane: where it lives, dates, what's inside, a preview of the file.</p>
       <p><span class="accent">Tab</span> narrows the search to the folder picked in the list.</p>
       <figure>
-        <video src="argus-browse.mp4" poster="argus-browse-poster.webp" width="1100" height="648" muted loop playsinline aria-label="Typing atlas finds the Atlas folder; ⌘I shows its details and contents; → steps into Atlas and then Designs; ← and Esc step back to Atlas; Tab searches inside Atlas, where typing road finds roadmap.txt with a preview of its text."></video>
+        <video src="argus-browse.mp4" poster="argus-browse-poster.webp" width="1100" height="648" style="--w: 1100px" muted loop playsinline aria-label="Typing atlas finds the Atlas folder; ⌘I shows its details and contents; → steps into Atlas and then Designs; ← and Esc step back to Atlas; Tab searches inside Atlas, where typing road finds roadmap.txt with a preview of its text."></video>
         <figcaption>"atlas", ⌘I for details, → into Designs, ← and Esc back out, Tab and "road" to search inside Atlas.</figcaption>
       </figure>
     </section>
