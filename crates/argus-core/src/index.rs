@@ -1,10 +1,12 @@
 //! The file-name index: every file and folder under its roots, kept as flat lists.
 
+use crate::fold::fold;
 use crate::name_starts::NameStarts;
 use crate::siblings::{NO_FOLDER, Siblings};
 use crate::walk::Kind;
 use hashbrown::{DefaultHashBuilder, HashTable};
 use rayon::prelude::*;
+use std::borrow::Cow;
 use std::hash::BuildHasher;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
@@ -31,6 +33,8 @@ pub struct Index {
     pub(crate) name_letters: Vec<u64>,
     pub(crate) name_digit_starts: Vec<u8>,
     pub(crate) name_symbols: Vec<u8>,
+    /// The matched text of each name marked `FOLDED`.
+    pub(crate) folds: Folds,
     pub(crate) entry_name: Vec<NameId>,
     /// Each entry's folder and depth. A root, and an entry an update removed, which search
     /// skips, have no folder.
@@ -242,6 +246,7 @@ impl Index {
             + self.folder_inodes.capacity() * size_of::<u32>()
             + self.passages.capacity() * size_of::<EntryId>()
             + self.roots.capacity() * size_of::<EntryId>()
+            + self.folds.heap_bytes()
     }
 
     pub(crate) fn name_len(&self, name: NameId) -> u32 {
@@ -254,6 +259,15 @@ impl Index {
         &self.names[self.name_starts.get(name)..self.name_starts.get(name + 1)]
     }
 
+    /// The text search matches the name by.
+    pub(crate) fn match_text(&self, name: NameId) -> &str {
+        if self.name_symbols[name as usize] & FOLDED == 0 {
+            self.name_text(name)
+        } else {
+            self.folds.get(name)
+        }
+    }
+
     /// The letters that start the name or a word in it.
     pub(crate) fn word_starts(&self, name: usize) -> u64 {
         word_starts_of(self.name_letters[name], self.name_digit_starts[name])
@@ -264,22 +278,135 @@ impl Index {
 pub(crate) const ALL_LETTERS: u64 = (1 << 36) - 1;
 /// Word starts held in a name's fingerprint, above its letters; the rest take a byte of their own.
 const STARTS_INSIDE: u32 = 64 - 36;
+/// Every bit a symbol can set in a fingerprint.
+pub(crate) const EVERY_SYMBOL: u8 = 0b1_1111;
+/// Set in a name's symbols when it is matched by its text in `Index::folds`.
+pub(crate) const FOLDED: u8 = 1 << 7;
+
+/// The folded text of the few names folding changes, by name number.
+#[cfg_attr(test, derive(Debug, PartialEq))]
+#[derive(Clone, Default)]
+pub(crate) struct Folds {
+    /// One bit per name with a text here, up to the last one. A library of French music reads a
+    /// text for most names on every keystroke, so finding one must cost no search of its own.
+    marked: Vec<u64>,
+    /// How many texts the names before each 64 of `marked` have.
+    before: Vec<u32>,
+    /// Where each text ends in `text`. Folding can make a name longer than `NameStarts` allows.
+    ends: Vec<u32>,
+    text: String,
+}
+
+impl Folds {
+    /// Empty, with room for every text `self` holds.
+    pub(crate) fn emptied(&self) -> Self {
+        Self {
+            marked: Vec::with_capacity(self.marked.len()),
+            before: Vec::with_capacity(self.before.len()),
+            ends: Vec::with_capacity(self.ends.len()),
+            text: String::with_capacity(self.text.len()),
+        }
+    }
+
+    /// Names come smallest first. Grows by a sixteenth, as the lists an update adds to do.
+    pub(crate) fn push(&mut self, name: NameId, folded: &str) {
+        let (block, bit) = (name as usize / 64, name % 64);
+        debug_assert!(self.marked.len() <= block + 1);
+        debug_assert!(
+            self.marked
+                .get(block)
+                .is_none_or(|&marked| marked >> bit == 0)
+        );
+        if block >= self.marked.len() {
+            let more = block + 1 - self.marked.len();
+            if self.marked.capacity() - self.marked.len() < more {
+                let more = more.max(self.marked.len() / 16);
+                self.marked.reserve_exact(more);
+                self.before.reserve_exact(more);
+            }
+            self.marked.resize(block + 1, 0);
+            self.before.resize(block + 1, self.ends.len() as u32);
+        }
+        self.marked[block] |= 1 << bit;
+        if self.ends.len() == self.ends.capacity() {
+            self.ends.reserve_exact((self.ends.len() / 16).max(1));
+        }
+        if self.text.capacity() - self.text.len() < folded.len() {
+            self.text
+                .reserve_exact(folded.len().max(self.text.len() / 16));
+        }
+        self.text.push_str(folded);
+        self.ends.push(self.text.len() as u32);
+    }
+
+    pub(crate) fn shrink_to_fit(&mut self) {
+        self.marked.shrink_to_fit();
+        self.before.shrink_to_fit();
+        self.ends.shrink_to_fit();
+        self.text.shrink_to_fit();
+    }
+
+    /// Whether a name in `names`, or one beside them, has a text here.
+    pub(crate) fn any_near(&self, names: Range<usize>) -> bool {
+        let texts_before = |block: usize| {
+            (self.before.get(block)).map_or(self.ends.len(), |&before| before as usize)
+        };
+        texts_before(names.start / 64) != texts_before(names.end.div_ceil(64))
+    }
+
+    pub(crate) fn get(&self, name: NameId) -> &str {
+        let (block, bit) = (name as usize / 64, name % 64);
+        let marked = self.marked[block];
+        debug_assert!(marked >> bit & 1 == 1, "a folded name has its text");
+        let at = self.before[block] as usize + (marked & ((1 << bit) - 1)).count_ones() as usize;
+        let start = at
+            .checked_sub(1)
+            .map_or(0, |before| self.ends[before] as usize);
+        &self.text[start..self.ends[at] as usize]
+    }
+
+    fn heap_bytes(&self) -> usize {
+        self.marked.capacity() * size_of::<u64>()
+            + self.before.capacity() * size_of::<u32>()
+            + self.ends.capacity() * size_of::<u32>()
+            + self.text.capacity()
+    }
+}
 
 /// A name's letters, with most of its word starts above them, the starts of the last eight
-/// digits, and its symbols. Ten bytes a name, so a million names cost 10 MB. The letter check
-/// only knows ASCII, so a name like "café" must always get through.
+/// digits, and its symbols, from the text it is matched by. Ten bytes a name, so a million
+/// names cost 10 MB. The letter check only knows ASCII, so a name like "会議" that stays beyond
+/// ASCII once folded must always get through.
 pub(crate) fn name_fingerprint(text: &str) -> (u64, u8, u8) {
-    let (letters, starts, symbols) = fingerprints(text);
-    let (letters, symbols) = if text.is_ascii() {
-        (letters, symbols)
+    folded_fingerprint(text).0
+}
+
+/// `name_fingerprint`, and the text the name is matched by, owned when folding changed it.
+pub(crate) fn folded_fingerprint(text: &str) -> ((u64, u8, u8), Cow<'_, str>) {
+    let (letters, starts, symbols, folded) = if text.is_ascii() {
+        let (letters, starts, symbols) = fingerprints(text);
+        (letters, starts, symbols, Cow::Borrowed(text))
     } else {
-        (ALL_LETTERS, u8::MAX)
+        let folded = fold(text);
+        let (letters, starts, symbols) = fingerprints(&folded);
+        let (letters, symbols) = if folded.is_ascii() {
+            (letters, symbols)
+        } else {
+            (ALL_LETTERS, EVERY_SYMBOL)
+        };
+        let flag = if matches!(folded, Cow::Owned(_)) {
+            FOLDED
+        } else {
+            0
+        };
+        (letters, starts, symbols | flag, folded)
     };
-    (
+    let fingerprint = (
         letters | starts << 36,
         (starts >> STARTS_INSIDE) as u8,
         symbols,
-    )
+    );
+    (fingerprint, folded)
 }
 
 /// The word starts `name_fingerprint` split in two, put back together.
@@ -420,6 +547,7 @@ impl IndexBuilder {
                 name_letters: Vec::new(),
                 name_digit_starts: Vec::new(),
                 name_symbols: Vec::new(),
+                folds: Folds::default(),
                 entry_name: Vec::new(),
                 siblings: Siblings::default(),
                 roots: Vec::new(),
@@ -555,6 +683,7 @@ impl Index {
             name_letters: Vec::new(),
             name_digit_starts: Vec::new(),
             name_symbols: Vec::new(),
+            folds: Folds::default(),
             entry_name,
             siblings,
             roots,
@@ -590,16 +719,33 @@ impl Index {
         let mut letters = vec![0; self.distinct_names()];
         let mut starts = vec![0; self.distinct_names()];
         let mut symbols = vec![0; self.distinct_names()];
-        letters
+        let folded: Vec<(NameId, String)> = letters
             .par_iter_mut()
             .zip(&mut starts)
             .zip(&mut symbols)
             .enumerate()
-            .for_each(|(name, ((letters, starts), symbols))| {
-                (*letters, *starts, *symbols) = name_fingerprint(self.name_text(name as NameId));
-            });
+            .filter_map(|(name, ((letters, starts), symbols))| {
+                let (fingerprint, folded) = folded_fingerprint(self.name_text(name as NameId));
+                (*letters, *starts, *symbols) = fingerprint;
+                match folded {
+                    Cow::Owned(text) => Some((name as NameId, text)),
+                    Cow::Borrowed(_) => None,
+                }
+            })
+            .collect();
         (self.name_letters, self.name_digit_starts) = (letters, starts);
         self.name_symbols = symbols;
+        let blocks = folded.last().map_or(0, |&(name, _)| name as usize / 64 + 1);
+        let mut folds = Folds {
+            marked: Vec::with_capacity(blocks),
+            before: Vec::with_capacity(blocks),
+            ends: Vec::with_capacity(folded.len()),
+            text: String::with_capacity(folded.iter().map(|(_, text)| text.len()).sum()),
+        };
+        for (name, text) in &folded {
+            folds.push(*name, text);
+        }
+        self.folds = folds;
     }
 }
 
@@ -843,13 +989,15 @@ mod tests {
         assert_eq!(letters("09"), 1 << 26 | 1 << 35);
         assert_eq!(letters(".-_ ~(+\t\u{7f}"), 0);
         assert_eq!(letters("é日本"), 0);
-        assert_eq!(name_fingerprint("café").0 & ALL_LETTERS, ALL_LETTERS);
+        assert_eq!(name_fingerprint("café").0 & ALL_LETTERS, letters("cafe"));
+        assert_eq!(name_fingerprint("日本").0 & ALL_LETTERS, ALL_LETTERS);
         assert_eq!(symbols("a.b"), 1);
         assert_eq!(symbols("-_ "), 0b1110);
         assert_eq!(symbols("~(+\t\u{7f}"), 1 << 4);
         assert_eq!(symbols("aZ09é日本"), 0);
         assert_eq!(name_fingerprint("a-b").2, 1 << 1);
-        assert_eq!(name_fingerprint("café").2, u8::MAX);
+        assert_eq!(name_fingerprint("café").2, FOLDED);
+        assert_eq!(name_fingerprint("日本").2, EVERY_SYMBOL);
     }
 
     #[test]
@@ -885,6 +1033,28 @@ mod tests {
     }
 
     #[test]
+    fn each_folded_name_finds_its_own_text() {
+        let names = [0, 1, 63, 64, 65, 127, 200, 1000];
+        let mut folds = Folds::default();
+        for name in names {
+            folds.push(name, &format!("t{name}"));
+        }
+        for name in names {
+            assert_eq!(folds.get(name), format!("t{name}"));
+        }
+        for (near, any) in [
+            (0..64, true),
+            (128..192, false),
+            (192..256, true),
+            (256..960, false),
+            (960..1024, true),
+            (1024..2048, false),
+        ] {
+            assert_eq!(folds.any_near(near.clone()), any, "{near:?}");
+        }
+    }
+
+    #[test]
     fn a_name_fingerprint_keeps_every_letter_and_word_start() {
         let chars: Vec<char> = ('\0'..='~').chain(['é', '日']).collect();
         let mut seed = 0x2545_F491_4F6C_DD1D_u64;
@@ -897,12 +1067,14 @@ mod tests {
                     chars[(seed % chars.len() as u64) as usize]
                 })
                 .collect();
-            let (letters, starts, symbols) = fingerprints(&name);
+            let folded = crate::fold::fold(&name);
+            let (letters, starts, symbols) = fingerprints(&folded);
             let (fingerprint, digit_starts, name_symbols) = name_fingerprint(&name);
-            let kept = if name.is_ascii() {
-                (letters, symbols)
+            let flag = if folded != name { FOLDED } else { 0 };
+            let kept = if folded.is_ascii() {
+                (letters, symbols | flag)
             } else {
-                (ALL_LETTERS, u8::MAX)
+                (ALL_LETTERS, EVERY_SYMBOL | flag)
             };
             assert_eq!((fingerprint & ALL_LETTERS, name_symbols), kept, "{name:?}");
             assert_eq!(

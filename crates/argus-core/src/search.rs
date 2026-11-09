@@ -1,12 +1,14 @@
 //! Search: the letter check, fuzzy matching per word, and dropping searches nobody wants any more.
 
 use crate::apps::{AppId, Apps};
+use crate::fold::fold;
 use crate::frecency::{Boosts, Frecency};
 use crate::index::{ALL_LETTERS, EntryId, Index, NameId, letter, letters, symbols};
 use crate::siblings::NO_FOLDER;
 use crate::within::Within;
 use frizbee::{CaseMatching, Config, Match, Matcher, Matching, Pattern, Scoring, SortStrategy};
 use rayon::prelude::*;
+use std::borrow::Cow;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -243,11 +245,14 @@ fn run(
     parsed.truncate(MAX_WORDS);
     let mut words = Vec::with_capacity(parsed.len());
     let (mut wanted, mut unwanted, mut typo_ready) = (0u8, 0u8, 0u8);
-    for (w, word) in parsed.into_iter().enumerate() {
+    for (w, mut word) in parsed.into_iter().enumerate() {
         if word.negated {
             unwanted |= 1 << w;
         } else {
             wanted |= 1 << w;
+        }
+        if let Cow::Owned(folded) = fold(&word.needle) {
+            word.needle = folded;
         }
         let word = positive(word);
         // Below four letters one typo matches almost anything, and `^`, `$` and `'` words
@@ -672,17 +677,17 @@ fn match_apps(
     }
     app_score.clear();
     app_score.resize(apps.len(), 0);
+    let texts = &apps.match_texts;
     let mut matched = 0u8;
     for (w, word) in words.iter().enumerate() {
         let word = word.clone().max_typos(Some(u16::from(typos >> w & 1)));
-        for found in Matcher::new(word, &config).match_list(&apps.names) {
+        for found in Matcher::new(word, &config).match_list(texts) {
             let n = found.index as usize;
             app_words[n] |= 1 << w;
             matched |= 1 << w;
             if wanted >> w & 1 == 1 {
-                let name = &apps.names[n];
                 let needle = &words[w].needle;
-                let (score, holds) = points(found, name, needle, 0, true, &config.scoring);
+                let (score, holds) = points(found, &texts[n], needle, 0, true, &config.scoring);
                 app_held[n] |= u8::from(holds) << w;
                 app_score[n] = app_score[n].saturating_add(score);
             }
@@ -843,7 +848,18 @@ fn match_names(
                     for batch in (first..end).step_by(MATCH_BATCH) {
                         ids.clear();
                         texts.clear();
-                        for n in batch..end.min(batch + MATCH_BATCH) {
+                        let batch_end = end.min(batch + MATCH_BATCH);
+                        // Most homes hold a handful of accented names, so most batches skip the
+                        // check: it cost 2% of every search.
+                        let folded = index.folds.any_near(batch..batch_end);
+                        let text_of = |n: usize| {
+                            if folded {
+                                index.match_text(n as NameId)
+                            } else {
+                                index.name_text(n as NameId)
+                            }
+                        };
+                        for n in batch..batch_end {
                             if only_possible && !is_marked(possible, n) {
                                 continue;
                             }
@@ -880,13 +896,13 @@ fn match_names(
                                 bits[n - first] |= 1 << w;
                                 matched |= 1 << w;
                                 if wanted >> w & 1 == 1 {
-                                    let text = || index.name_text(n as NameId);
+                                    let text = || text_of(n);
                                     let score = one.score(starts(), text, &config.scoring);
                                     scores[n - first] = scores[n - first].saturating_add(score);
                                 }
                                 continue;
                             }
-                            let text = index.name_text(n as NameId);
+                            let text = text_of(n);
                             ids.push(n - first);
                             texts.push(match text.strip_prefix('.') {
                                 Some(hidden) if !keep_dot => hidden,
@@ -1444,7 +1460,7 @@ fn keep_best(hits: &mut Vec<Hit>, limit: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::index::{IndexBuilder, NO_PARENT, word_starts};
+    use crate::index::{IndexBuilder, NO_PARENT, name_fingerprint, word_starts_of};
     use std::path::{Path, PathBuf};
 
     #[test]
@@ -1540,7 +1556,8 @@ mod tests {
     fn held_floor_never_hides_a_held_word() {
         let mut rng = Rng(0x5eed);
         let names = [
-            "a", "b", "3", "8", "A", "B", ".", "-", "_", " ", "/", "(", "é", "a", "3",
+            "a", "b", "3", "8", "A", "B", ".", "-", "_", " ", "/", "(", "é", "a", "3", "e\u{301}",
+            "É", "ß", "→",
         ];
         let lower = ["a", "b", "3", "8", ".", "_"];
         let config = matcher_config();
@@ -1559,7 +1576,9 @@ mod tests {
             let word = Pattern::parse_query(&typed).remove(0).max_typos(Some(0));
             assert_eq!(word.needle, needle);
             let floor = held_floor(&word, 0, &config.scoring);
-            let haystacks: Vec<String> = (0..40).map(|_| rng.name(&names, 30)).collect();
+            let haystacks: Vec<String> = (0..40)
+                .map(|_| fold(&rng.name(&names, 30)).into_owned())
+                .collect();
             for found in Matcher::new(word.clone(), &config).match_list(&haystacks) {
                 let name = &haystacks[found.index as usize];
                 if floor > 0 && !matches!(held_in(name, &needle, false), Held::No) {
@@ -1576,6 +1595,7 @@ mod tests {
         let mut rng = Rng(0x5a7b);
         let parts = [
             "a", "b", "3", "A", ".", "-", "_", " ", "~", "(", "é", "日", "a", ".", "-", "_",
+            "e\u{301}", "É", "ß", "→",
         ];
         let typed = ["a", "b", "3", "B", ".", "-", "_", "~", "("];
         let config = matcher_config();
@@ -1590,7 +1610,8 @@ mod tests {
             let keep_dot = word.needle.starts_with('.');
             let (needed, needed_symbols) = (letters(&word.needle), symbols(&word.needle));
             let names: Vec<String> = (0..40).map(|_| rng.name(&parts, 12)).collect();
-            let texts: Vec<&str> = names
+            let folded: Vec<Cow<str>> = names.iter().map(|name| fold(name)).collect();
+            let texts: Vec<&str> = folded
                 .iter()
                 .map(|name| match name.strip_prefix('.') {
                     Some(hidden) if !keep_dot => hidden,
@@ -1614,6 +1635,7 @@ mod tests {
         let mut rng = Rng(0xc0ffee);
         let names = [
             "a", "b", "c", "3", "A", "B", "C", ".", "-", "_", " ", "(", "~", "a", "c", "2",
+            "e\u{301}", "É", "ß", "→",
         ];
         let config = matcher_config();
         let mut checked = 0;
@@ -1621,7 +1643,8 @@ mod tests {
             let word = positive(Pattern::parse_query(typed).remove(0)).max_typos(Some(0));
             let one = OneLetter::new(&word, 0).unwrap();
             let haystacks: Vec<String> = (0..20_000).map(|_| rng.name(&names, 12)).collect();
-            let stripped: Vec<&str> = haystacks
+            let folded: Vec<Cow<str>> = haystacks.iter().map(|name| fold(name)).collect();
+            let stripped: Vec<&str> = folded
                 .iter()
                 .map(|name| name.strip_prefix('.').unwrap_or(name))
                 .collect();
@@ -1629,9 +1652,15 @@ mod tests {
             for found in Matcher::new(word.clone(), &config).match_list(&stripped) {
                 frizbee[found.index as usize] = Some(found.score);
             }
-            for (name, expected) in haystacks.iter().zip(frizbee) {
-                let ours = (letters(name) & one.bit != 0)
-                    .then(|| one.score(word_starts(name), || name, &config.scoring));
+            for ((name, text), expected) in haystacks.iter().zip(&folded).zip(frizbee) {
+                let (fingerprint, digit_starts, _) = name_fingerprint(name);
+                // A name beyond ASCII once folded goes to frizbee, as `match_names` sends it.
+                if fingerprint & ALL_LETTERS == ALL_LETTERS {
+                    continue;
+                }
+                let starts = word_starts_of(fingerprint, digit_starts);
+                let ours = (fingerprint & one.bit != 0)
+                    .then(|| one.score(starts, || text, &config.scoring));
                 assert_eq!(ours, expected, "{typed:?} in {name:?}");
                 checked += usize::from(ours.is_some());
             }
@@ -1644,14 +1673,19 @@ mod tests {
     #[test]
     fn one_letter_scores_and_word_starts_match_frizbee_for_every_pair() {
         let config = matcher_config();
-        let chars: Vec<char> = (' '..='~').chain(['é', '日']).collect();
+        let others = ["é", "日", "e\u{301}", "É", "ß", "→"];
+        let chars: Vec<String> = (' '..='~')
+            .map(String::from)
+            .chain(others.map(String::from))
+            .collect();
         let mut haystacks = Vec::new();
-        for &a in &chars {
-            for &b in &chars {
+        for a in &chars {
+            for b in &chars {
                 haystacks.extend([format!("{a}{b}"), format!(".{a}{b}"), format!("q{a}{b}")]);
             }
         }
-        let stripped: Vec<&str> = haystacks
+        let folded: Vec<Cow<str>> = haystacks.iter().map(|name| fold(name)).collect();
+        let stripped: Vec<&str> = folded
             .iter()
             .map(|name| name.strip_prefix('.').unwrap_or(name))
             .collect();
@@ -1663,14 +1697,15 @@ mod tests {
             for found in Matcher::new(word.clone(), &config).match_list(&stripped) {
                 frizbee[found.index as usize] = Some(found.score);
             }
-            for (name, expected) in haystacks.iter().zip(frizbee) {
-                let starts = word_starts(name);
+            for ((name, text), expected) in haystacks.iter().zip(&folded).zip(frizbee) {
+                let (fingerprint, digit_starts, _) = name_fingerprint(name);
+                let starts = word_starts_of(fingerprint, digit_starts);
                 if starts & one.bit == 0 {
                     assert!(expected <= Some(ceiling), "{typed:?} in {name:?}");
                 }
-                if name.is_ascii() {
-                    let ours = (letters(name) & one.bit != 0)
-                        .then(|| one.score(starts, || name, &config.scoring));
+                if text.is_ascii() {
+                    let ours = (fingerprint & one.bit != 0)
+                        .then(|| one.score(starts, || text, &config.scoring));
                     assert_eq!(ours, expected, "{typed:?} in {name:?}");
                 }
             }
@@ -1681,7 +1716,8 @@ mod tests {
     fn a_plain_name_never_scores_above_the_ceiling() {
         let mut rng = Rng(0xfeed);
         let names = [
-            "a", "b", "3", "8", "A", "B", ".", "-", "_", " ", "(", "é", "a", "3", "8",
+            "a", "b", "3", "8", "A", "B", ".", "-", "_", " ", "(", "é", "a", "3", "8", "e\u{301}",
+            "É", "ß", "→",
         ];
         let lower = ["a", "b", "3", "8"];
         let config = matcher_config();
@@ -1698,13 +1734,15 @@ mod tests {
             let ceiling = plain_ceiling(&word, &config.scoring).unwrap();
             let needed = letters(&typed);
             let haystacks: Vec<String> = (0..40).map(|_| rng.name(&names, 16)).collect();
-            let stripped: Vec<&str> = haystacks
+            let folded: Vec<Cow<str>> = haystacks.iter().map(|name| fold(name)).collect();
+            let stripped: Vec<&str> = folded
                 .iter()
                 .map(|name| name.strip_prefix('.').unwrap_or(name))
                 .collect();
             for found in Matcher::new(word.clone(), &config).match_list(&stripped) {
                 let name = &haystacks[found.index as usize];
-                if word_starts(name) & needed == 0 {
+                let (fingerprint, digit_starts, _) = name_fingerprint(name);
+                if word_starts_of(fingerprint, digit_starts) & needed == 0 {
                     checked += 1;
                     let held = held_in(stripped[found.index as usize], &typed, false);
                     assert!(found.score <= ceiling, "{typed:?} in {name:?}");
@@ -2274,13 +2312,13 @@ mod tests {
     fn a_word_scoring_exactly_the_floor_still_counts_as_held() {
         let mut builder = IndexBuilder::new();
         let root = builder.push("/home", NO_PARENT, true);
-        builder.push("é38.pdf", root, false);
+        builder.push("日38.pdf", root, false);
         builder.push("x38.pdf", root, false);
         builder.push("xdesingx.txt", root, false);
         builder.push("design.pdf", root, false);
         let index = builder.finish();
-        // Frizbee gives "38" no bonus after "é", yet it stands alone there.
-        assert_eq!(first(&index, "38"), "/home/é38.pdf");
+        // Frizbee gives "38" no bonus after "日", yet it stands alone there.
+        assert_eq!(first(&index, "38"), "/home/日38.pdf");
         // "desing" held letter for letter blocks the typo that would find design.pdf.
         assert_eq!(paths(&index, "desing"), ["/home/xdesingx.txt"]);
     }
@@ -3463,6 +3501,7 @@ mod tests {
             "Makefile",
             "notes.",
             "résumé.pdf",
+            "会議.pdf",
             "photo.JPG",
             "budget 2024.numbers",
             "Mr. Robot",
@@ -3585,6 +3624,7 @@ mod tests {
             ("leasedf", &["Lease Agreement.pdf"], &[]),
             ("mainfs", &["main.rs"], &[]),
             ("résuméodf", &["résumé.pdf"], &[]),
+            ("会議odf", &["会議.pdf"], &[]),
             // The extension's first two letters swapped is one typo too.
             ("reportdpf", &["report.pdf"], &[]),
             ("leasedpf", &["Lease Agreement.pdf"], &[]),
@@ -3878,7 +3918,7 @@ mod tests {
     fn the_extension_rule_never_drops_a_word_one_side_holds() {
         let mut rng = Rng(0xe47);
         let parts = [
-            "a", "b", "x", "A", "X", ".", "-", "_", " ", "é", "É", "日", "1",
+            "a", "b", "x", "A", "X", ".", "-", "_", " ", "é", "É", "日", "1", "e\u{301}", "ß", "→",
         ];
         let typed = ["a", "b", "x", "A", "X", "1", "é", "É"];
         let config = matcher_config();
@@ -3889,7 +3929,9 @@ mod tests {
             let word = Pattern::parse_query(&needle)
                 .remove(0)
                 .max_typos(Some(typos));
-            let names: Vec<String> = (0..40).map(|_| rng.name(&parts, 12)).collect();
+            let names: Vec<String> = (0..40)
+                .map(|_| fold(&rng.name(&parts, 12)).into_owned())
+                .collect();
             let mut matcher = Matcher::new(word.clone(), &config);
             let mut sides = Sides::new(&word, typos);
             let mut one_side = Matcher::new(word.clone(), &config);
@@ -3915,7 +3957,9 @@ mod tests {
     #[test]
     fn a_search_finds_exactly_the_names_the_extension_rule_keeps() {
         let mut rng = Rng(0x5eac);
-        let parts = ["a", "b", "c", "x", ".", ".", "-", "ab", "cx", "tsx"];
+        let parts = [
+            "a", "b", "c", "x", ".", ".", "-", "ab", "cx", "tsx", "e\u{301}", "É", "ß", "→",
+        ];
         let mut builder = IndexBuilder::new();
         let root = builder.push("/home", NO_PARENT, true);
         let mut names = Vec::new();
@@ -3932,10 +3976,11 @@ mod tests {
         let config = matcher_config();
         let never = &|| false;
         let mut checked = 0;
+        let folded: Vec<Cow<str>> = names.iter().map(|name| fold(name)).collect();
         for _ in 0..200 {
             let query = rng.text(&["a", "b", "c", "x", "t"], 3);
             let word = Pattern::parse_query(&query).remove(0);
-            let texts: Vec<&str> = names
+            let texts: Vec<&str> = folded
                 .iter()
                 .map(|name| name.strip_prefix('.').unwrap_or(name))
                 .collect();
@@ -3985,5 +4030,179 @@ mod tests {
             assert_eq!(ranked(index, &apps, "ma").len(), 2);
             assert!(ranked(index, &Apps::default(), "maps").is_empty());
         }
+    }
+
+    /// Best first, each path with its score.
+    fn scores(index: &Index, apps: &Apps, query: &str) -> Vec<(String, u32)> {
+        let searcher = Searcher::with_threads(2);
+        let hits = searcher.search(index, apps, query, searcher.ticket(), 10);
+        let path = |item| match item {
+            Item::Entry(entry) => index.path(entry),
+            Item::App(app) => apps.path(app),
+        };
+        (hits.unwrap().iter())
+            .map(|hit| {
+                (
+                    path(hit.item).to_string_lossy().replace('\\', "/"),
+                    hit.score,
+                )
+            })
+            .collect()
+    }
+
+    /// Each name in a folder of its own, all at the same depth.
+    fn apart(names: &[&str]) -> Index {
+        let mut builder = IndexBuilder::new();
+        let root = builder.push("/home", NO_PARENT, true);
+        for (i, name) in names.iter().enumerate() {
+            let folder = builder.push(&format!("f{i}"), root, true);
+            builder.push(name, folder, false);
+        }
+        builder.finish()
+    }
+
+    /// A résumé typed on a Mac and one a browser saved as e and an accent.
+    #[test]
+    fn a_name_matches_whichever_form_it_is_stored_in() {
+        let index = apart(&["R\u{e9}sum\u{e9}.pdf", "Re\u{301}sume\u{301}.pdf"]);
+        let searcher = Searcher::with_threads(2);
+        for query in ["r\u{e9}sum\u{e9}", "re\u{301}sume\u{301}", "resume"] {
+            let hits =
+                (searcher.search(&index, &Apps::default(), query, searcher.ticket(), 10)).unwrap();
+            assert_eq!(hits.len(), 2, "{query:?}");
+            let (a, b) = (hits[0], hits[1]);
+            assert_eq!(a.score, b.score, "{query:?}");
+        }
+    }
+
+    #[test]
+    fn a_plain_word_finds_an_accented_name() {
+        let index = apart(&[
+            "cr\u{e8}me br\u{fb}l\u{e9}e.txt",
+            "Stra\u{df}e.txt",
+            "\u{c6}r\u{f8} trip.md",
+            "na\u{ef}ve notes.md",
+            "naive notes.md",
+        ]);
+        let found = |query| scores(&index, &Apps::default(), query);
+        assert_eq!(
+            found("brulee")[0].0,
+            "/home/f0/cr\u{e8}me br\u{fb}l\u{e9}e.txt"
+        );
+        assert_eq!(found("strasse")[0].0, "/home/f1/Stra\u{df}e.txt");
+        assert_eq!(found("aero")[0].0, "/home/f2/\u{c6}r\u{f8} trip.md");
+        let naive = found("naive");
+        assert_eq!(naive.len(), 2);
+        assert_eq!(naive[0].1, naive[1].1);
+    }
+
+    /// Typed on a Mac, "côte" holds a map a browser saved as o and an accent letter for letter,
+    /// not a typo away, so it ranks as the plain word does on a plain name.
+    #[test]
+    fn an_accented_word_holds_a_decomposed_name_without_a_typo() {
+        let apps = applications(&["Print Center", "FaceTime"]);
+        for (query, name, plain_query, plain_name) in [
+            ("c\u{f4}te", "Co\u{302}te map.svg", "cote", "Cote map.svg"),
+            (
+                "caf\u{e9} terms",
+                "Cafe\u{301} Menu - Terms.docx",
+                "cafe terms",
+                "Cafe Menu - Terms.docx",
+            ),
+        ] {
+            let accented = scores(&apart(&[name]), &apps, query);
+            let plain = scores(&apart(&[plain_name]), &apps, plain_query);
+            assert_eq!(accented[0].0, format!("/home/f0/{name}"), "{query:?}");
+            assert_eq!(accented[0].1, plain[0].1, "{query:?}");
+        }
+    }
+
+    #[test]
+    fn case_still_counts_after_folding() {
+        let index = apart(&["\u{dc}ber Plan.txt", "\u{fc}ber lower.txt"]);
+        for query in ["\u{fc}ber", "uber"] {
+            let found = scores(&index, &Apps::default(), query);
+            assert_eq!(found.len(), 2, "{query:?}");
+            assert_eq!(found[0].1, found[1].1, "{query:?}");
+        }
+        for query in ["\u{dc}ber", "Uber"] {
+            assert_eq!(
+                paths(&index, query),
+                ["/home/f0/\u{dc}ber Plan.txt"],
+                "{query:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn excluding_an_accented_word_drops_both_forms() {
+        let index = apart(&[
+            "Caf\u{e9} Menu.docx",
+            "Cafe\u{301} Menu.docx",
+            "Plain Menu.docx",
+        ]);
+        assert_eq!(
+            paths(&index, "menu !caf\u{e9}"),
+            ["/home/f2/Plain Menu.docx"]
+        );
+    }
+
+    /// "été" typed on a Mac or pasted as e and an accent is three letters either way, too short
+    /// for a typo, so neither form finds ate.txt.
+    #[test]
+    fn a_short_accented_word_takes_no_typo_in_either_form() {
+        let index = apart(&["ate.txt", "notes.md"]);
+        assert_eq!(paths(&index, "\u{e9}t\u{e9}"), Vec::<String>::new());
+        assert_eq!(paths(&index, "e\u{301}te\u{301}"), Vec::<String>::new());
+    }
+
+    /// "el" finds Élan.txt as it finds Elan.txt, even when enough names start a word with "el"
+    /// that the search stops early.
+    #[test]
+    fn an_accented_first_letter_starts_the_name() {
+        let with = |name: &str| {
+            let mut builder = IndexBuilder::new();
+            let root = builder.push("/home", NO_PARENT, true);
+            builder.push(name, root, false);
+            for i in 0..20 {
+                builder.push(&format!("elixir{i}.txt"), root, false);
+            }
+            builder.finish()
+        };
+        let (accented, plain) = (with("\u{c9}lan.txt"), with("Elan.txt"));
+        let expected = scores(&plain, &Apps::default(), "el");
+        assert_eq!(expected[0].0, "/home/Elan.txt");
+        let found = scores(&accented, &Apps::default(), "el");
+        assert_eq!(found[0], ("/home/\u{c9}lan.txt".to_owned(), expected[0].1));
+        let (apps, none) = (Apps::default(), Boosts::default());
+        let (_, early_stops) = with_and_without_shortcuts(&accented, &apps, "el", 10, &none);
+        assert!(early_stops > 0);
+        for query in ["e", "l"] {
+            with_and_without_shortcuts(&accented, &apps, query, 10, &none);
+        }
+    }
+
+    #[test]
+    fn an_accent_inside_a_word_is_not_a_word_break() {
+        let index = apart(&[
+            "R\u{e9}sum\u{e9}.pdf",
+            "Re\u{301}sume\u{301}.pdf",
+            "Resume.pdf",
+        ]);
+        let found = scores(&index, &Apps::default(), "sum");
+        assert_eq!(found.len(), 3);
+        assert!(
+            found.iter().all(|&(_, score)| score == found[0].1),
+            "{found:?}"
+        );
+    }
+
+    #[test]
+    fn a_plain_word_finds_an_accented_app() {
+        let index = IndexBuilder::new().finish();
+        let accented = scores(&index, &applications(&["Caf\u{e9}"]), "cafe");
+        let plain = scores(&index, &applications(&["Cafe"]), "cafe");
+        assert_eq!(accented.len(), 1);
+        assert_eq!(accented[0].1, plain[0].1);
     }
 }

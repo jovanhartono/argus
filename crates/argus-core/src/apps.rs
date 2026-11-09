@@ -9,6 +9,8 @@ pub type AppId = u32;
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Apps {
     pub(crate) names: Vec<Box<str>>,
+    /// Each name as search matches it, folded once here rather than on every keystroke.
+    pub(crate) match_texts: Vec<Box<str>>,
     /// The folder each app sits in, by its place in `folders`.
     folder_of: Vec<u32>,
     folders: Vec<PathBuf>,
@@ -74,6 +76,7 @@ impl Apps {
         apps.drop_repeated_links(&links);
         apps.names.shrink_to_fit();
         apps.folder_of.shrink_to_fit();
+        apps.match_texts = fold_all(&apps.names);
         apps
     }
 
@@ -130,6 +133,12 @@ impl Apps {
     pub fn heap_bytes(&self) -> usize {
         self.names.capacity() * size_of::<Box<str>>()
             + self.names.iter().map(|name| name.len()).sum::<usize>()
+            + self.match_texts.capacity() * size_of::<Box<str>>()
+            + self
+                .match_texts
+                .iter()
+                .map(|text| text.len())
+                .sum::<usize>()
             + self.folder_of.capacity() * size_of::<u32>()
             + self.folders.capacity() * size_of::<PathBuf>()
             + self.folders.iter().map(PathBuf::capacity).sum::<usize>()
@@ -137,12 +146,21 @@ impl Apps {
 
     #[cfg(test)]
     pub(crate) fn from_names(folder: &Path, names: &[&str]) -> Self {
+        let names: Vec<Box<str>> = names.iter().map(|&name| name.into()).collect();
         Self {
-            names: names.iter().map(|&name| name.into()).collect(),
+            match_texts: fold_all(&names),
             folder_of: vec![0; names.len()],
+            names,
             folders: vec![folder.to_path_buf()],
         }
     }
+}
+
+fn fold_all(names: &[Box<str>]) -> Vec<Box<str>> {
+    names
+        .iter()
+        .map(|name| crate::fold::fold(name).into())
+        .collect()
 }
 
 fn top_folders(home: &Path) -> Vec<PathBuf> {
