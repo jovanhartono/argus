@@ -28,7 +28,10 @@ video() {
 video $frames/frames.txt 1280 site/argus.mp4
 video $frames/browse/frames.txt 1600 site/argus-browse.mp4
 # The typo found: "desing" with design.key picked. Atlas open in the details pane.
+# Lossless WebP is a quarter of the PNG's size for flat window pictures; the PNG stays for link previews.
 cp $frames/*-desing-6.png site/argus-poster.png
-cp $frames/browse/*-details.png site/argus-browse-poster.png
-[[ -f $frames/settings.png ]] && cp $frames/settings.png site/settings.png
-ls -lh site/*.mp4 site/*.png
+webp() { cwebp -quiet -lossless -z 9 $1 -o $2; }
+webp site/argus-poster.png site/argus-poster.webp
+webp $frames/browse/*-details.png site/argus-browse-poster.webp
+[[ -f $frames/settings.png ]] && webp $frames/settings.png site/settings.webp
+ls -lh site/*.mp4 site/*.png site/*.webp
