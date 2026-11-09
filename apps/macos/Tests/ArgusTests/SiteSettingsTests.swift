@@ -50,7 +50,7 @@ final class SiteSettingsTests: XCTestCase {
             ignoreList: root.appendingPathComponent(".config/argus/ignore"), quit: {},
             format: HealthFormat(locale: Locale(identifier: "en_US")),
             usableArea: { _ in NSRect(x: 0, y: 0, width: 1920, height: 1200) })
-        window.panel.appearance = NSAppearance(named: .darkAqua)
+        window.panel.appearance = NSAppearance(named: .aqua)
         window.show()
         defer { window.hide() }
 
@@ -62,8 +62,8 @@ final class SiteSettingsTests: XCTestCase {
         try shoot(window.panel)
     }
 
-    /// The whole window, title bar included, on the page's dark background with the rounded
-    /// corners and hairline edge an off-screen drawing leaves out.
+    /// The whole window, title bar included, on the page's light background with the rounded
+    /// corners, shadow and hairline edge an off-screen drawing leaves out.
     private func shoot(_ panel: NSPanel) throws {
         let frameView = try XCTUnwrap(panel.contentView?.superview)
         frameView.layoutSubtreeIfNeeded()
@@ -87,13 +87,22 @@ final class SiteSettingsTests: XCTestCase {
         NSGraphicsContext.saveGraphicsState()
         defer { NSGraphicsContext.restoreGraphicsState() }
         NSGraphicsContext.current = context
-        NSColor(srgbRed: 0x0d / 255, green: 0x0d / 255, blue: 0x0d / 255, alpha: 1).setFill()
+        NSColor(srgbRed: 0xfa / 255, green: 0xfa / 255, blue: 0xfa / 255, alpha: 1).setFill()
         NSRect(origin: .zero, size: canvas).fill()
 
         let frame = NSRect(origin: NSPoint(x: Self.margin, y: Self.margin), size: size)
         let outline = NSBezierPath(roundedRect: frame, xRadius: 12, yRadius: 12)
-        let dark = try XCTUnwrap(NSAppearance(named: .darkAqua))
-        dark.performAsCurrentDrawingAppearance {
+        let lightMode = try XCTUnwrap(NSAppearance(named: .aqua))
+        lightMode.performAsCurrentDrawingAppearance {
+            NSGraphicsContext.saveGraphicsState()
+            let shadow = NSShadow()
+            shadow.shadowColor = NSColor.black.withAlphaComponent(0.16)
+            shadow.shadowBlurRadius = 24
+            shadow.shadowOffset = NSSize(width: 0, height: -8)
+            shadow.set()
+            NSColor.windowBackgroundColor.setFill()
+            outline.fill()
+            NSGraphicsContext.restoreGraphicsState()
             NSGraphicsContext.saveGraphicsState()
             outline.addClip()
             NSColor.windowBackgroundColor.setFill()
@@ -105,7 +114,7 @@ final class SiteSettingsTests: XCTestCase {
             NSColor(srgbRed: 1, green: 0x5f / 255, blue: 0x57 / 255, alpha: 1).setFill()
             NSBezierPath(ovalIn: light).fill()
             NSGraphicsContext.restoreGraphicsState()
-            NSColor.white.withAlphaComponent(0.14).setStroke()
+            NSColor.black.withAlphaComponent(0.12).setStroke()
             let edge = NSBezierPath(roundedRect: frame.insetBy(dx: 0.25, dy: 0.25), xRadius: 12, yRadius: 12)
             edge.lineWidth = 0.5
             edge.stroke()

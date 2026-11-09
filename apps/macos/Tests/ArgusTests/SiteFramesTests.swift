@@ -139,7 +139,7 @@ final class SiteFramesTests: XCTestCase {
 
     private func opened() async throws -> SearchPanel {
         let window = SearchPanel(root: root.path, hasAccess: { true }, stage: stage, finder: { .none })
-        window.panel.appearance = NSAppearance(named: .darkAqua)
+        window.panel.appearance = NSAppearance(named: .aqua)
         try await until { window.indexed }
         return window
     }
@@ -266,8 +266,9 @@ final class SiteFramesTests: XCTestCase {
         XCTAssertTrue(done(), file: file, line: line)
     }
 
-    /// The window as it looks on a dark page: its own background, rounded corners, a hairline
-    /// edge, and a caret after the text, none of which an off-screen drawing of its views has.
+    /// The window as it looks on the site's light page: its own background, rounded corners, a
+    /// shadow, a hairline edge, and a caret after the text, none of which an off-screen drawing of
+    /// its views has.
     private func shoot(_ window: SearchPanel, _ name: String, _ seconds: Double) throws {
         let content = try XCTUnwrap(window.panel.contentView)
         content.layoutSubtreeIfNeeded()
@@ -280,15 +281,24 @@ final class SiteFramesTests: XCTestCase {
         NSGraphicsContext.saveGraphicsState()
         defer { NSGraphicsContext.restoreGraphicsState() }
         NSGraphicsContext.current = context
-        NSColor(srgbRed: 0x0d / 255, green: 0x0d / 255, blue: 0x0d / 255, alpha: 1).setFill()
+        NSColor(srgbRed: 0xfa / 255, green: 0xfa / 255, blue: 0xfa / 255, alpha: 1).setFill()
         NSRect(origin: .zero, size: canvas).fill()
 
         let frame = NSRect(
             x: left ?? ((canvas.width - size.width) / 2).rounded(), y: canvas.height - Self.top - size.height,
             width: size.width, height: size.height)
         let outline = NSBezierPath(roundedRect: frame, xRadius: 16, yRadius: 16)
-        let dark = try XCTUnwrap(NSAppearance(named: .darkAqua))
-        dark.performAsCurrentDrawingAppearance {
+        let light = try XCTUnwrap(NSAppearance(named: .aqua))
+        light.performAsCurrentDrawingAppearance {
+            NSGraphicsContext.saveGraphicsState()
+            let shadow = NSShadow()
+            shadow.shadowColor = NSColor.black.withAlphaComponent(0.16)
+            shadow.shadowBlurRadius = 24
+            shadow.shadowOffset = NSSize(width: 0, height: -8)
+            shadow.set()
+            NSColor.windowBackgroundColor.setFill()
+            outline.fill()
+            NSGraphicsContext.restoreGraphicsState()
             NSGraphicsContext.saveGraphicsState()
             outline.addClip()
             NSColor.windowBackgroundColor.setFill()
@@ -302,7 +312,7 @@ final class SiteFramesTests: XCTestCase {
             NSRect(x: frame.minX + field.minX + 2 + typed, y: frame.maxY - field.maxY + 3, width: 2, height: field.height - 6)
                 .fill()
             NSGraphicsContext.restoreGraphicsState()
-            NSColor.white.withAlphaComponent(0.14).setStroke()
+            NSColor.black.withAlphaComponent(0.12).setStroke()
             let edge = NSBezierPath(roundedRect: frame.insetBy(dx: 0.25, dy: 0.25), xRadius: 16, yRadius: 16)
             edge.lineWidth = 0.5
             edge.stroke()
