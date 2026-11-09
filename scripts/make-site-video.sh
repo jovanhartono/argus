@@ -8,8 +8,14 @@ cargo build --release -p argus-ffi
 frames=$(mktemp -d)
 # Sizes and dates as an English page reads them ("4.2 MB", not "4,2 MB"), whatever the Mac's
 # region; only the test runner's own setting, removed again on exit.
+locale=$(defaults read com.apple.dt.xctest.tool AppleLocale 2>/dev/null || true)
 defaults write com.apple.dt.xctest.tool AppleLocale en_US
-trap 'rm -rf $frames; defaults delete com.apple.dt.xctest.tool AppleLocale' EXIT
+restore() {
+  rm -rf $frames
+  if [[ -n $locale ]]; then defaults write com.apple.dt.xctest.tool AppleLocale $locale
+  else defaults delete com.apple.dt.xctest.tool AppleLocale; fi
+}
+trap restore EXIT
 ARGUS_SITE_FRAMES=$frames swift test --package-path apps/macos --filter Site
 
 # video <concat list> <width> <mp4>

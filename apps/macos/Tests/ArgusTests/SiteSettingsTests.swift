@@ -23,8 +23,10 @@ final class SiteSettingsTests: XCTestCase {
         stage = OffStage()
         out = URL(fileURLWithPath: folder, isDirectory: true)
         try FileManager.default.createDirectory(at: out, withIntermediateDirectories: true)
-        // The skipped-folders row writes its path from the home folder, so a made-up one stands in.
-        root = URL(fileURLWithPath: "/Users/Shared/argus-site-home-\(UUID().uuidString)", isDirectory: true)
+        // The skipped-folders row writes its path from the home folder, so a made-up one stands in:
+        // the same one SiteFramesTests uses, as the app reads the home folder once per run.
+        root = URL(fileURLWithPath: "/Users/Shared/argus-site-home", isDirectory: true)
+        try? FileManager.default.removeItem(at: root)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         setenv("CFFIXED_USER_HOME", root.path, 1)
     }
