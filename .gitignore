@@ -4,3 +4,5 @@
 /apps/macos/.build
 .swiftpm
 .DS_Store
+.vercel
+.env*
