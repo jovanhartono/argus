@@ -158,6 +158,8 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
     private(set) var detailsOn = false
     /// How far the pane pushed the window left to fit on the screen; closing it moves the box back.
     private var nudge: CGFloat = 0
+    /// The frame last handed to the animator, which the panel's own frame trails for 0.15 s.
+    private lazy var asked = panel.frame
 
     private(set) var hatch: Hatch?
     private let hasAccess: () -> Bool
@@ -645,6 +647,7 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
         let x = min(centred, visible.maxX - width)
         nudge = centred - x
         let frame = NSRect(x: x, y: top - height, width: width, height: height)
+        asked = frame
         // Going through the animator stops a resize still running from before the window hid.
         NSAnimationContext.runAnimationGroup { context in
             context.duration = 0
@@ -763,8 +766,11 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
         if detailing { pane.frame = NSRect(x: Metric.width, y: head + 1, width: 1 + Metric.pane, height: body) }
 
         let height = head + (body > 0 ? 1 + body : 0)
-        var frame = panel.frame
-        guard frame.height != height || frame.width != width else { return }
+        // ⌘T's lines can land as the window starts shrinking for "Searching inside files…", before
+        // it has moved; checked against the panel, they asked for "no change" and stayed hidden.
+        guard asked.height != height || asked.width != width else { return }
+        // At rest the panel is where it was dragged; mid-resize, where it is heading.
+        var frame = panel.frame.size == asked.size ? panel.frame : asked
         frame.origin.y += frame.height - height
         frame.size.height = height
         frame.size.width = width
@@ -775,6 +781,7 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
             nudge = frame.origin.x - x
             frame.origin.x = x
         }
+        asked = frame
         guard shown, !reduceMotion else {
             // Hidden mid-resize, as when ⌘T's lines go after the fade-out, the old resize would
             // land after this one; going through the animator stops it.
