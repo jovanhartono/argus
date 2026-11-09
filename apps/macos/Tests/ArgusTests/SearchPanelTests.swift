@@ -3362,6 +3362,24 @@ final class SearchPanelTests: XCTestCase {
         try await until { window.panel.frame.height == Metric.field + 1 + Metric.row + 2 * Metric.inset }
     }
 
+    /// ⌘T's lines arriving just as the window started shrinking to "Searching inside files…" left it
+    /// 105 pt tall with the lines cut off. ⌘I twice in one turn asks for two sizes the same way.
+    func testASizeAskedBeforeTheLastResizeMovesTheWindowIsTheOneItEndsAt() async throws {
+        try write("x", at: "notes/budget.txt")
+        let window = try await opened(access: true)
+        window.show()
+        defer { window.hide() }
+        try await type("budget", in: window)
+        try await until { window.rows.count == 1 }
+        try await settled(window)
+        let before = window.panel.frame
+
+        window.toggleDetails(nil)
+        window.toggleDetails(nil)
+        try await Task.sleep(for: .seconds(3 * Metric.resize))
+        XCTAssertEqual(window.panel.frame, before)
+    }
+
     func testCommandTWhileTheNamesAreOnTheirWayWaitsForThem() async throws {
         try write("the budget", at: "notes/plan.txt")
         let window = try await opened(access: true)
