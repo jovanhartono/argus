@@ -10,7 +10,7 @@ checksum = "683d7910e743518b0e34f1186f92494becacb047c7b6bf616c96772180fef923"
 
 [[package]]
 name = "argus-cli"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "argus-core",
  "argus-grep",
@@ -20,7 +20,7 @@ dependencies = [
 
 [[package]]
 name = "argus-core"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "crc32fast",
  "frizbee",
@@ -33,7 +33,7 @@ dependencies = [
 
 [[package]]
 name = "argus-ffi"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "argus-core",
  "argus-grep",
@@ -42,7 +42,7 @@ dependencies = [
 
 [[package]]
 name = "argus-grep"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "argus-core",
  "grep-matcher",
