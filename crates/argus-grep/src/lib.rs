@@ -232,9 +232,13 @@ impl Grep {
     }
 }
 
-/// Whether `text` can be looked for: not empty, and on one line. Other text finds nothing.
+/// Whether `text` can be looked for: on one line, and more than accents, which fold to
+/// nothing. Name search keeps a lone accent instead.
 pub fn can_search(text: &str) -> bool {
-    !text.is_empty() && !text.contains('\n')
+    !text.contains('\n')
+        && text
+            .chars()
+            .any(|letter| !literal::folds_to_nothing(letter))
 }
 
 fn searcher() -> Searcher {
@@ -499,13 +503,19 @@ fn letter_around(line: &[u8], at: usize) -> Option<Range<usize>> {
     let lead = (at.saturating_sub(3)..at)
         .rev()
         .find(|&i| !is_inside_letter(line[i]))?;
-    let len = match line[lead] {
-        0xC0..=0xDF => 2,
-        0xE0..=0xEF => 3,
-        0xF0..=0xF7 => 4,
-        _ => return None,
-    };
+    let len = letter_len(line[lead])?;
     (lead + len > at).then_some(lead..lead + len)
+}
+
+/// How many bytes the letter starting with `lead` takes, or `None` when it starts none.
+fn letter_len(lead: u8) -> Option<usize> {
+    match lead {
+        0..=0x7F => Some(1),
+        0xC0..=0xDF => Some(2),
+        0xE0..=0xEF => Some(3),
+        0xF0..=0xF7 => Some(4),
+        _ => None,
+    }
 }
 
 /// A UTF-8 byte that continues a letter rather than starting one.

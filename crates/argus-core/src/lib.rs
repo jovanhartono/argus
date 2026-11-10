@@ -18,6 +18,7 @@ mod walk;
 mod within;
 
 pub use apps::{AppId, Apps};
+pub use fold::fold_letter;
 pub use frecency::{Boosts, Frecency, FrecencyError, unix_now};
 pub use ignore::Ignore;
 pub use index::{EntryId, Index};
