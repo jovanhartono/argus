@@ -337,6 +337,13 @@ final class DetailsPane: NSView, NSTableViewDataSource, NSTableViewDelegate {
         inside && children.indices.contains(contents.selectedRow) ? children[contents.selectedRow].row : nil
     }
 
+    /// The picked item when → could step into it.
+    var pickedFolder: Row? {
+        guard inside, children.indices.contains(contents.selectedRow) else { return nil }
+        let child = children[contents.selectedRow]
+        return Self.lists(child.row, child.details) ? child.row : nil
+    }
+
     /// → on the picked result's folder, then on a folder picked in the list. The first level is
     /// the list already shown; each deeper one is read in the background as the first was.
     func stepIn(at pressed: TimeInterval) -> Bool {
