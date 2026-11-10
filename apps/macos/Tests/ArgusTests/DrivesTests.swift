@@ -289,8 +289,9 @@ final class DrivesTests: XCTestCase {
 
 /// Mounts a real disk image where Finder shows it, so only when asked for:
 /// ARGUS_DRIVE_IMAGE=~/tmp/argus-test/drive.dmg swift test --filter DriveImageTests
-/// The image holds trips/zanzibar-sunset-unique.jpg and is made writable, as macOS's own
-/// read-only images are left out.
+/// The image holds trips/zanzibar-sunset-unique.jpg and is made writable. Disk images are left
+/// out, but with ARGUS_DRIVE_IMAGE set the core judges them by their mount flags alone, so a
+/// writable one counts as a drive.
 @MainActor
 final class DriveImageTests: XCTestCase {
     func testADriveIsFoundWhileMountedAndLetGoOfOnEject() async throws {

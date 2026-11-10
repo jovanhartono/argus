@@ -2231,8 +2231,9 @@ pub unsafe extern "C" fn tl_window_shown(core: *const TlCore, shown: u32) -> u32
 /// remembered and read once `tl_grant_full_disk` is called, as macOS asks before an app reads
 /// an external drive. Returns 1 when that work was queued, else 0, as for a volume already
 /// added. `mark` is as for `tl_changed`. Safe to call from any thread, and given the path
-/// macOS mounted the volume at, it reads only the system's list of mounts and Disk
-/// Arbitration's note on the device, never the volume.
+/// macOS mounted the volume at, it reads only the system's list of mounts and, for one that
+/// could be a drive, asks Disk Arbitration about the device, never touching the volume: that
+/// call to a system service waits 0.1-0.4 ms, up to 2 ms the first time.
 ///
 /// # Safety
 /// `core` came from `tl_core_new` or `tl_core_new_stand_in`, and `path` points to `len` bytes.
