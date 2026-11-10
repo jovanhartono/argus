@@ -39,12 +39,13 @@ struct Mount<'a> {
     quarantined: bool,
     /// The same device as / or the startup disk's data volume.
     startup: bool,
+    /// Whether Disk Arbitration knows the device as an opened disk image, when it can say.
+    disk_image: Option<bool>,
 }
 
-/// Disk images open read-only as APFS or Mac OS Extended. A drive formatted for Windows that
-/// macOS can only read, like NTFS, stays in. A disk image opened for writing, or an .iso,
-/// looks like any drive and is indexed; a Mac drive locked read-only is taken for an image.
-/// Telling them apart for sure takes asking Disk Arbitration for the device's model.
+/// Disk Arbitration tells an opened disk image, .sparsebundle or .iso from a drive. When it
+/// can't say, a quarantined mount, or a read-only APFS or Mac OS Extended one, is taken for an
+/// image, as disk images open that way; a drive formatted for Windows, like NTFS, stays in.
 #[cfg_attr(
     not(any(target_os = "macos", test)),
     expect(dead_code, reason = "only a Mac lists its volumes so far")
@@ -58,7 +59,9 @@ fn judge(mount: &Mount<'_>) -> Result<(), Refusal> {
     let backup = mount.from.contains("com.apple.TimeMachine")
         || mount.from.contains("com.apple.backupd")
         || mount.at.iter().any(|name| name == ".timemachine");
-    let image = mount.quarantined || (mount.read_only && matches!(mount.kind, "apfs" | "hfs"));
+    let looks_like_image =
+        mount.quarantined || (mount.read_only && matches!(mount.kind, "apfs" | "hfs"));
+    let image = mount.disk_image.unwrap_or(looks_like_image);
     if mount.startup {
         Err(Refusal::StartupDisk)
     } else if backup {
@@ -77,8 +80,9 @@ fn judge(mount: &Mount<'_>) -> Result<(), Refusal> {
 }
 
 /// The real path of the volume mounted at `path`, when it belongs in the index. Reads only
-/// the system's list of mounts, never the volume itself, so a drive spinning up or a file
-/// server gone away never holds up the window's main thread. `path` is the mount point, as
+/// the system's list of mounts and what Disk Arbitration knows of the device, never the volume
+/// itself, so a drive spinning up or a file server gone away never holds up the window's main
+/// thread. Takes 0.1-0.4 ms, about 1 ms the first time. `path` is the mount point, as
 /// macOS reports mounts; any other path is resolved on disk first.
 #[cfg(target_os = "macos")]
 pub fn check_volume(path: &Path) -> Result<PathBuf, Refusal> {
@@ -96,7 +100,8 @@ pub fn check_volume(path: &Path) -> Result<PathBuf, Refusal> {
         .filter(|mount| mount.at == Path::new("/") || mount.at == Path::new("/System/Volumes/Data"))
         .map(|mount| mount.from.as_str())
         .collect();
-    judge(&mac::facts(mount, &startup)).map(|()| mount.at.clone())
+    let disk_image = mac::disk_image(&mount.from);
+    judge(&mac::facts(mount, &startup, disk_image)).map(|()| mount.at.clone())
 }
 
 /// Volumes are only indexed on a Mac so far.
@@ -131,7 +136,11 @@ mod mac {
     }
 
     /// `startup` holds the devices of / and the startup disk's data volume.
-    pub(super) fn facts<'a>(mount: &'a Mounted, startup: &[&str]) -> Mount<'a> {
+    pub(super) fn facts<'a>(
+        mount: &'a Mounted,
+        startup: &[&str],
+        disk_image: Option<bool>,
+    ) -> Mount<'a> {
         Mount {
             at: &mount.at,
             from: &mount.from,
@@ -141,6 +150,7 @@ mod mac {
             read_only: mount.flags & READ_ONLY != 0,
             quarantined: mount.flags & QUARANTINE != 0,
             startup: startup.contains(&mount.from.as_str()),
+            disk_image,
         }
     }
 
@@ -181,6 +191,92 @@ mod mac {
             })
             .collect()
     }
+
+    type CFTypeRef = *const std::ffi::c_void;
+    const UTF8: u32 = 0x0800_0100;
+
+    // SAFETY: the signatures match CoreFoundation's CFBase.h, CFString.h and CFDictionary.h,
+    // and DiskArbitration's DASession.h and DADisk.h.
+    #[link(name = "CoreFoundation", kind = "framework")]
+    unsafe extern "C" {
+        fn CFRelease(cf: CFTypeRef);
+        fn CFGetTypeID(cf: CFTypeRef) -> usize;
+        fn CFStringGetTypeID() -> usize;
+        fn CFStringGetCString(
+            string: CFTypeRef,
+            buffer: *mut libc::c_char,
+            size: isize,
+            encoding: u32,
+        ) -> u8;
+        fn CFDictionaryGetValue(dictionary: CFTypeRef, key: CFTypeRef) -> CFTypeRef;
+    }
+
+    #[link(name = "DiskArbitration", kind = "framework")]
+    unsafe extern "C" {
+        static kDADiskDescriptionDeviceModelKey: CFTypeRef;
+        static kDADiskDescriptionDeviceProtocolKey: CFTypeRef;
+        fn DASessionCreate(allocator: CFTypeRef) -> CFTypeRef;
+        fn DADiskCreateFromBSDName(
+            allocator: CFTypeRef,
+            session: CFTypeRef,
+            name: *const libc::c_char,
+        ) -> CFTypeRef;
+        fn DADiskCopyDescription(disk: CFTypeRef) -> CFTypeRef;
+    }
+
+    /// A CoreFoundation object this code created, released once.
+    struct Owned(CFTypeRef);
+
+    impl Owned {
+        fn new(made: CFTypeRef) -> Option<Self> {
+            (!made.is_null()).then_some(Self(made))
+        }
+    }
+
+    impl Drop for Owned {
+        fn drop(&mut self) {
+            // SAFETY: made by a Create or Copy call, so this code holds one reference to it.
+            unsafe { CFRelease(self.0) };
+        }
+    }
+
+    /// A short string from a disk's description; `None` for anything else.
+    ///
+    /// # Safety
+    /// `value` is null or a live CoreFoundation object.
+    unsafe fn short_text(value: CFTypeRef) -> Option<String> {
+        if value.is_null() || unsafe { CFGetTypeID(value) != CFStringGetTypeID() } {
+            return None;
+        }
+        let mut buffer = [0 as libc::c_char; 64];
+        let room = buffer.len() as isize;
+        // SAFETY: writes at most `room` bytes, ending in a nul, or fails.
+        let fits = unsafe { CFStringGetCString(value, buffer.as_mut_ptr(), room, UTF8) != 0 };
+        fits.then(|| String::from_utf8_lossy(&text(&buffer)).into_owned())
+    }
+
+    /// Whether Disk Arbitration knows the device `from`, like /dev/disk4s1, as an opened disk
+    /// image. `None` for a file server, or a device it can't tell about.
+    pub(super) fn disk_image(from: &str) -> Option<bool> {
+        let name = std::ffi::CString::new(from.strip_prefix("/dev/")?).ok()?;
+        let null = std::ptr::null();
+        // SAFETY: each call is given live objects, or null where DiskArbitration allows one,
+        // and returns null when it has nothing.
+        let session = Owned::new(unsafe { DASessionCreate(null) })?;
+        let disk = Owned::new(unsafe { DADiskCreateFromBSDName(null, session.0, name.as_ptr()) })?;
+        let description = Owned::new(unsafe { DADiskCopyDescription(disk.0) })?;
+        // SAFETY: the keys are DiskArbitration's own, and the dictionary keeps the value alive.
+        let says = |key| unsafe { short_text(CFDictionaryGetValue(description.0, key)) };
+        let model = says(unsafe { kDADiskDescriptionDeviceModelKey });
+        let protocol = says(unsafe { kDADiskDescriptionDeviceProtocolKey });
+        if model.is_none() && protocol.is_none() {
+            return None;
+        }
+        Some(
+            model.as_deref() == Some("Disk Image")
+                || protocol.as_deref() == Some("Virtual Interface"),
+        )
+    }
 }
 
 #[cfg(test)]
@@ -198,6 +294,7 @@ mod tests {
             read_only: false,
             quarantined: false,
             startup: false,
+            disk_image: None,
         }
     }
 
@@ -343,6 +440,67 @@ mod tests {
     }
 
     #[test]
+    fn disk_arbitration_tells_images_from_drives() {
+        fn image(mount: Mount<'_>) -> Mount<'_> {
+            Mount {
+                disk_image: Some(true),
+                ..mount
+            }
+        }
+        fn not_image(mount: Mount<'_>) -> Mount<'_> {
+            Mount {
+                disk_image: Some(false),
+                ..mount
+            }
+        }
+        let locked = Mount {
+            read_only: true,
+            ..drive("/Volumes/Locked")
+        };
+        let cases = [
+            // A Mac drive locked read-only.
+            (not_image(locked), Ok(())),
+            (
+                not_image(Mount {
+                    kind: "hfs",
+                    ..locked
+                }),
+                Ok(()),
+            ),
+            // A disk image you made and opened for writing, or a .sparsebundle.
+            (image(drive("/Volumes/T")), Err(Refusal::DiskImage)),
+            (
+                image(Mount {
+                    kind: "cd9660",
+                    read_only: true,
+                    ..drive("/Volumes/ISO")
+                }),
+                Err(Refusal::DiskImage),
+            ),
+            (
+                image(Mount {
+                    kind: "exfat",
+                    ..drive("/Volumes/EX")
+                }),
+                Err(Refusal::DiskImage),
+            ),
+            (image(locked), Err(Refusal::DiskImage)),
+            (not_image(drive("/Volumes/Photos")), Ok(())),
+            // Hidden still comes first.
+            (
+                image(Mount {
+                    browsable: false,
+                    ..drive("/Volumes/Recovery")
+                }),
+                Err(Refusal::Hidden),
+            ),
+        ];
+        for (mount, expected) in cases {
+            assert_eq!(judge(&mount), expected, "{mount:?}");
+        }
+    }
+
+    #[test]
     fn the_first_reason_wins() {
         let everything = Mount {
             startup: true,
@@ -417,9 +575,17 @@ mod tests {
             read_only: false,
             quarantined: false,
             startup: false,
+            disk_image: None,
         };
         let drive = mounted("/dev/disk4s1", mac::LOCAL);
-        assert_eq!(mac::facts(&drive, &startup), plain);
+        assert_eq!(mac::facts(&drive, &startup, None), plain);
+        assert_eq!(
+            mac::facts(&drive, &startup, Some(true)),
+            Mount {
+                disk_image: Some(true),
+                ..plain
+            }
+        );
         let cases = [
             (
                 mac::LOCAL | mac::READ_ONLY,
@@ -452,11 +618,11 @@ mod tests {
         ];
         for (flags, expected) in cases {
             let drive = mounted("/dev/disk4s1", flags);
-            assert_eq!(mac::facts(&drive, &startup), expected, "{flags:#x}");
+            assert_eq!(mac::facts(&drive, &startup, None), expected, "{flags:#x}");
         }
         for from in startup {
             let data = mounted(from, mac::LOCAL);
-            let facts = mac::facts(&data, &startup);
+            let facts = mac::facts(&data, &startup, None);
             assert_eq!(
                 facts,
                 Mount {
@@ -468,7 +634,7 @@ mod tests {
         }
         // A file server's name is never taken for the startup disk.
         let share = mounted("//ana@nas/share", 0);
-        assert!(!mac::facts(&share, &startup).startup);
+        assert!(!mac::facts(&share, &startup, None).startup);
     }
 
     #[test]
@@ -478,6 +644,20 @@ mod tests {
         std::fs::create_dir(dir.path().join("Backups.backupdb")).unwrap();
         assert!(holds_backups(dir.path()));
         assert!(!holds_backups(&dir.path().join("gone")));
+    }
+
+    /// For checking by hand with a drive or disk image attached:
+    /// `cargo test -p argus-core judge_what_is_mounted -- --ignored --nocapture`.
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "prints how each volume mounted right now is judged"]
+    fn judge_what_is_mounted() {
+        for entry in std::fs::read_dir("/Volumes").unwrap() {
+            let path = entry.unwrap().path();
+            let start = std::time::Instant::now();
+            let judged = check_volume(&path);
+            println!("{path:?}: {judged:?} in {:?}", start.elapsed());
+        }
     }
 
     #[cfg(target_os = "macos")]
