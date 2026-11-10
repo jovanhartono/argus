@@ -20,16 +20,43 @@ pub fn query(text: &str) -> Option<String> {
         if !query.is_empty() {
             query.push_str(" && ");
         }
-        query.push_str("kMDItemTextContent == \"");
-        for letter in word.chars() {
-            if matches!(letter, '\\' | '"' | '*' | '?') {
-                query.push('\\');
+        match spelled_out(word) {
+            Some(other) => {
+                query.push('(');
+                starts_a_word(&mut query, word);
+                query.push_str(" || ");
+                starts_a_word(&mut query, &other);
+                query.push(')');
             }
-            query.push(letter);
+            None => starts_a_word(&mut query, word),
         }
-        query.push_str("*\"cdw");
     }
     (!query.is_empty()).then_some(query)
+}
+
+fn starts_a_word(query: &mut String, word: &str) {
+    query.push_str("kMDItemTextContent == \"");
+    for letter in word.chars() {
+        if matches!(letter, '\\' | '"' | '*' | '?') {
+            query.push('\\');
+        }
+        query.push(letter);
+    }
+    query.push_str("*\"cdw");
+}
+
+/// The word with æ for ae: Spotlight finds "encyclopaedia" for "encyclopædia" typed, not the
+/// other way round. ø for o and þ for th would add a clause to most English words, so they wait.
+fn spelled_out(word: &str) -> Option<String> {
+    let mut other = String::with_capacity(word.len() + 1);
+    let mut letters = word.chars().peekable();
+    while let Some(letter) = letters.next() {
+        match letter {
+            'a' | 'A' if letters.next_if(|l| matches!(l, 'e' | 'E')).is_some() => other.push('æ'),
+            _ => other.push(letter),
+        }
+    }
+    (other != word).then_some(other)
 }
 
 /// `query` narrowed to the files changed in the last week.
@@ -342,6 +369,33 @@ mod tests {
         );
     }
 
+    /// Spotlight finds Straße for "strasse" but not encyclopædia for "encyclopaedia", so only
+    /// that one is asked both ways (mdfind, 11 Nov 2026).
+    #[test]
+    fn letters_spotlight_spells_one_way_are_asked_both_ways() {
+        assert_eq!(
+            query("encyclopaedia").as_deref(),
+            Some(concat!(
+                r#"(kMDItemTextContent == "encyclopaedia*"cdw || "#,
+                r#"kMDItemTextContent == "encyclopædia*"cdw)"#
+            ))
+        );
+        for asked in [
+            "Straße",
+            "strasse",
+            "encyclopædia",
+            "thorn",
+            "søster",
+            "cœur",
+            "Łódź",
+        ] {
+            assert_eq!(
+                query(asked),
+                Some(format!(r#"kMDItemTextContent == "{asked}*"cdw"#))
+            );
+        }
+    }
+
     #[test]
     fn spotlights_own_marks_are_escaped() {
         assert_eq!(
@@ -367,9 +421,10 @@ mod tests {
     #[test]
     fn the_recent_ask_keeps_every_word() {
         assert_eq!(
-            recent(&query("refund diskon").unwrap()),
+            recent(&query("refund aerial").unwrap()),
             concat!(
-                r#"(kMDItemTextContent == "refund*"cdw && kMDItemTextContent == "diskon*"cdw)"#,
+                r#"(kMDItemTextContent == "refund*"cdw && "#,
+                r#"(kMDItemTextContent == "aerial*"cdw || kMDItemTextContent == "ærial*"cdw))"#,
                 " && kMDItemFSContentChangeDate >= $time.today(-7)"
             )
         );
