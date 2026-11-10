@@ -2636,6 +2636,56 @@ final class SearchPanelTests: XCTestCase {
         XCTAssertEqual(stage.copied, [realRoot.appendingPathComponent("archive/empty").path])
     }
 
+    func testTabInsideThePaneSearchesThePickedFolderNotTheResult() async throws {
+        try writeArchive()
+        let app = root.appendingPathComponent("archive/Tool.app")
+        try FileManager.default.createDirectory(at: app, withIntermediateDirectories: true)
+        try FileManager.default.setAttributes(
+            [.modificationDate: Date(timeIntervalSince1970: 1_600_000_000)], ofItemAtPath: app.path)
+        let window = try await opened(access: true)
+        window.show()
+        defer { window.hide() }
+        try await type("archive", in: window)
+        try await until { window.rows.map(\.name) == ["archive"] }
+        window.toggleDetails(nil)
+        try await until { window.pane.children.map(\.row.name) == ["natural_images", "data", "Tool.app"] }
+        XCTAssertTrue(right(window))
+        try await until { window.picked?.name == "natural_images" }
+
+        XCTAssertTrue(tab(window))
+        XCTAssertEqual(window.scopes.map(\.name), ["archive", "natural_images"])
+        XCTAssertFalse(window.pane.inside)
+        XCTAssertEqual(window.chipText.stringValue, "archive › natural_images")
+        try await type("jpg", in: window)
+        try await until { Set(window.rows.map(\.name)) == ["cat.jpg", "dog.jpg"] }
+        try await type("", in: window)
+        XCTAssertTrue(backspace(window))
+        XCTAssertEqual(window.scopes.map(\.name), ["archive"], "⌫ climbs back up the folders → went through")
+
+        XCTAssertTrue(backspace(window))
+        try await type("archive", in: window)
+        try await until { window.rows.map(\.name) == ["archive"] }
+        XCTAssertTrue(right(window))
+        try await until { window.picked?.name == "natural_images" }
+        XCTAssertTrue(right(window))
+        try await until { window.picked?.name == "cat.jpg" }
+        XCTAssertTrue(tab(window), "on a file, Tab searches the folder the pane shows")
+        XCTAssertEqual(window.scopes.map(\.name), ["archive", "natural_images"])
+
+        try await type("", in: window)
+        XCTAssertTrue(backspace(window))
+        XCTAssertTrue(backspace(window))
+        try await type("archive", in: window)
+        try await until { window.rows.map(\.name) == ["archive"] }
+        XCTAssertTrue(right(window))
+        try await until { window.pane.inside }
+        down(window)
+        down(window)
+        XCTAssertEqual(window.picked?.name, "Tool.app")
+        XCTAssertTrue(tab(window), "→ doesn't step into an app, so Tab searches the folder shown")
+        XCTAssertEqual(window.scopes.map(\.name), ["archive"])
+    }
+
     func testEscAndLeftWithThePaneHiddenBehindAMessageActAsWithoutIt() async throws {
         try writeArchive()
         let window = try await opened(access: true)

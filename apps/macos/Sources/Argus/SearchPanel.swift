@@ -885,9 +885,18 @@ final class SearchPanel: NSObject, NSWindowDelegate, NSTextFieldDelegate, NSTabl
     }
 
     /// Pressed a moment after typing, Tab waits for the results for what you typed, as Return
-    /// does; if they start with a file, it still reaches Open System Settings.
+    /// does; if they start with a file, it still reaches Open System Settings. Inside the ⌘I
+    /// pane it searches the folder picked there, else the one the pane shows.
     private func tabIntoFolder() -> Bool {
         guard indexed, !composing, !field.stringValue.isEmpty else { return false }
+        if inPane {
+            // ⌫ then climbs back up the same folders → went through.
+            var levels = pane.trail
+            if let folder = pane.pickedFolder { levels.append(folder) }
+            scopes += levels.dropLast()
+            enter(levels[levels.count - 1])
+            return true
+        }
         if newest == answered && selected?.isFolder != true { return false }
         onceAnswered { [weak self] in
             guard let self else { return }
