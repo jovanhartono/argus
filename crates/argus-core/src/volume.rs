@@ -613,7 +613,8 @@ mod tests {
             .iter()
             .find(|mount| mount.at == Path::new("/"))
             .unwrap();
-        assert_eq!(mac::disk_image(&root.from), Some(false), "{}", root.from);
+        // A virtual Mac, like a CI runner, gives its startup disk no model at all.
+        assert_ne!(mac::disk_image(&root.from), Some(true), "{}", root.from);
         assert_eq!(mac::disk_image("//ana@nas/share"), None);
         assert_eq!(mac::disk_image("/dev/disk999s9"), None);
     }
