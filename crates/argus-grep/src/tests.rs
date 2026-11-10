@@ -166,6 +166,48 @@ fn lower_case_finds_any_case_and_upper_case_only_itself() {
     assert_eq!(texts("οδός"), ["8:ΟΔΌΣ"]);
 }
 
+/// As in names, "cafe" and "café" find each other however the file stores the é, and the bold
+/// range covers the letters as stored.
+#[test]
+fn accents_count_on_neither_side() {
+    let folder = folder(&[
+        ("composed.txt", "Le café est fermé\n".as_bytes()),
+        (
+            "decomposed.txt",
+            "Le cafe\u{301} est ferme\u{301}\n".as_bytes(),
+        ),
+        ("plain.txt", b"cafe hours\n"),
+    ]);
+    let index = index(&folder);
+    let search = Grep::with_threads(2);
+    for text in ["cafe", "café", "cafe\u{301}", "CAFÉ"] {
+        let bold = Mutex::new(Vec::new());
+        search
+            .search(&index, text, search.ticket(), 10, |file| {
+                for found in file {
+                    let name = found.path.file_name().unwrap().to_string_lossy();
+                    let shown = format!("{name}:{}", &found.text[found.matched.clone()]);
+                    bold.lock().unwrap().push(shown);
+                }
+            })
+            .unwrap();
+        let mut bold = bold.into_inner().unwrap();
+        bold.sort();
+        let expected = if text == "CAFÉ" {
+            vec![]
+        } else {
+            vec![
+                "composed.txt:café".to_owned(),
+                "decomposed.txt:cafe\u{301}".to_owned(),
+                "plain.txt:cafe".to_owned(),
+            ]
+        };
+        assert_eq!(bold, expected, "{text:?}");
+    }
+    assert_eq!(grep(&folder, "Ferme").0, Vec::<String>::new());
+    assert_eq!(grep(&folder, "ferme").0.len(), 2);
+}
+
 #[test]
 fn text_is_matched_letter_for_letter_never_as_a_pattern() {
     let folder = folder(&[("a.txt", b"a.b\naxb\nf(x)\n[x]*\n")]);
@@ -730,8 +772,9 @@ fn work_installed_runs_its_jobs_on_the_search_threads() {
 
 #[test]
 fn only_one_line_of_text_can_be_searched() {
-    assert!(can_search("milk") && can_search(" "));
+    assert!(can_search("milk") && can_search(" ") && can_search("e\u{301}"));
     assert!(!can_search("") && !can_search("one\ntwo") && !can_search("\n"));
+    assert!(!can_search("\u{301}") && !can_search("\u{301}\u{308}"));
 }
 
 #[test]
@@ -820,8 +863,7 @@ fn lossy_len_counts_like_from_utf8_lossy() {
 }
 
 /// A fixed-seed xorshift, so a failing case comes back on every run.
-fn random_below() -> impl FnMut(usize) -> usize {
-    let mut seed = 0x2545_f491_4f6c_dd1d_u64;
+pub(crate) fn random_below(mut seed: u64) -> impl FnMut(usize) -> usize {
     move |below| {
         seed ^= seed << 13;
         seed ^= seed >> 7;
@@ -835,7 +877,7 @@ fn random_below() -> impl FnMut(usize) -> usize {
 #[test]
 fn any_cut_keeps_whole_letters_and_the_match() {
     let letters = ["a", " ", "é", "€", "𝄞", "\u{fffd}"];
-    let mut random = random_below();
+    let mut random = random_below(0x2545_f491_4f6c_dd1d);
     for _ in 0..2000 {
         let mut line = String::new();
         for _ in 0..random(600) {
@@ -857,7 +899,7 @@ fn any_cut_keeps_whole_letters_and_the_match() {
 #[test]
 fn any_cut_of_broken_bytes_still_shows_the_match() {
     let pieces: [&[u8]; 5] = [b"a", b"\x80", b"\xff", "é".as_bytes(), b"\xe2\x82"];
-    let mut random = random_below();
+    let mut random = random_below(0x2545_f491_4f6c_dd1d);
     for _ in 0..2000 {
         let mut line = Vec::new();
         for _ in 0..random(800) {
@@ -874,30 +916,7 @@ fn any_cut_of_broken_bytes_still_shows_the_match() {
 
 /// Whether a line holds the text, the slow and obvious way.
 fn plainly_holds(line: &[u8], text: &str) -> bool {
-    let has_case = |letter: char| letter.is_lowercase() || letter.is_uppercase();
-    if text.chars().any(char::is_uppercase) || !text.chars().any(has_case) {
-        return line
-            .windows(text.len())
-            .any(|window| window == text.as_bytes());
-    }
-    let fold = |letter| if letter == 'ς' { 'σ' } else { letter };
-    let wanted: Vec<char> = text.to_lowercase().chars().map(fold).collect();
-    let letters: Vec<Option<char>> = String::from_utf8_lossy(line)
-        .chars()
-        .map(|letter| {
-            let mut lower = letter.to_lowercase();
-            match (lower.next(), lower.next()) {
-                (Some(lower), None) if letter.is_ascii() || !lower.is_ascii() => Some(fold(lower)),
-                _ => None,
-            }
-        })
-        .collect();
-    letters.windows(wanted.len()).any(|window| {
-        window
-            .iter()
-            .zip(&wanted)
-            .all(|(&got, &want)| got == Some(want))
-    })
+    literal::plain_find(text, &String::from_utf8_lossy(line), 0).is_some()
 }
 
 /// Random small folders and random text: the search finds exactly the lines a plain
@@ -905,10 +924,10 @@ fn plainly_holds(line: &[u8], text: &str) -> bool {
 #[test]
 fn any_search_agrees_with_a_plain_line_by_line_check() {
     let pieces = [
-        "a", "A", "é", "É", "ß", "ẞ", "σ", "ς", "Σ", "k", "\u{212a}", " ", "\t", "\r", "\r\n",
-        "\n", "\n", "\u{ff}", "\u{80}",
+        "a", "A", "é", "É", "ß", "ẞ", "σ", "ς", "Σ", "k", "\u{212a}", "e\u{301}", "\u{301}", " ",
+        "\t", "\r", "\r\n", "\n", "\n", "\u{ff}", "\u{80}",
     ];
-    let mut random = random_below();
+    let mut random = random_below(0x2545_f491_4f6c_dd1d);
     for _ in 0..300 {
         let files: Vec<(String, Vec<u8>)> = (0..=random(3))
             .map(|i| {
@@ -924,7 +943,11 @@ fn any_search_agrees_with_a_plain_line_by_line_check() {
                 (format!("{i}.txt"), bytes)
             })
             .collect();
-        let text: String = (0..=random(3)).map(|_| pieces[random(11)]).collect();
+        let text: String = (0..=random(3)).map(|_| pieces[random(13)]).collect();
+        // Accents alone find nothing and open no file.
+        if text.chars().all(|letter| letter == '\u{301}') {
+            continue;
+        }
         let named: Vec<(&str, &[u8])> = files.iter().map(|(n, b)| (n.as_str(), &b[..])).collect();
         let folder = folder(&named);
         let mut expected: Vec<String> = files
