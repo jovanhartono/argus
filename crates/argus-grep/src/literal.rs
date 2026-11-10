@@ -20,6 +20,10 @@ pub(crate) struct Literal {
     /// The anchor the next block of lines starts with, as files read together are mostly in
     /// one language: an index into `anchors`, then into `fresh`.
     chosen: AtomicUsize,
+    /// The anchor guessed from the text alone, which files like English ones go back to.
+    guess: usize,
+    /// The anchor last learned on lines that crowd the guess, which files like those go back to.
+    learned: AtomicUsize,
     /// Needles blocks chose afresh from their own bytes, and how many slots are taken.
     fresh: [OnceLock<Anchor>; RENEWALS],
     renewals: AtomicUsize,
@@ -59,6 +63,9 @@ const MOST_PASSES: usize = 8;
 /// How far a search reads before checking that its needles are rare in the line.
 const SAMPLE: usize = 4096;
 
+/// How far a search on the guess reads before trying the anchor last learned.
+const COMPARE: usize = 1024;
+
 /// How many times a search chooses needles afresh, each about as slow as reading a file.
 const RENEWALS: usize = 8;
 
@@ -70,6 +77,39 @@ const CROWD: usize = 10_000 / 128;
 /// is read whole and folded, about four times as slow.
 fn stop(byte: u8) -> usize {
     if byte.is_ascii() { 1 } else { 4 }
+}
+
+/// Whether stopping as much as `stops` in `read` bytes makes lines crowded.
+fn crowded(stops: usize, read: usize) -> bool {
+    stops * 10_000 > read * CROWD
+}
+
+/// How many times `needles` show up in `sample`, up to `most`.
+fn occurrences(needles: &[u8], sample: &[u8], most: usize) -> usize {
+    let mut found = 0;
+    for three in needles.chunks(3) {
+        for _ in Places::new(three, sample) {
+            found += 1;
+            if found >= most {
+                return most;
+            }
+        }
+    }
+    found
+}
+
+/// Where the line holding the byte before `at` starts. A match is never over two lines, so
+/// one a search read up to `at` without finding starts there or later.
+fn line_start(haystack: &[u8], at: usize) -> usize {
+    memchr::memrchr(b'\n', &haystack[..at]).map_or(0, |end| end + 1)
+}
+
+/// Where a search stopped before a match.
+enum Stop {
+    /// Its needles stop it too often, by how far it read.
+    Crowded(usize),
+    /// The other anchor kept is cheaper in the lines read, and how far it read.
+    Other(usize, usize),
 }
 
 impl Anchor {
@@ -97,7 +137,29 @@ impl Anchor {
     /// over the line as much as `pass` of them.
     fn cost(&self, count: impl Fn(u8) -> usize, pass: usize) -> usize {
         let found: usize = self.needles.iter().map(|&needle| count(needle)).sum();
-        found + pass * self.needles.len().div_ceil(3)
+        found + pass * self.passes()
+    }
+
+    /// The needles that are ASCII spellings, which sort first.
+    fn ascii(&self) -> &[u8] {
+        &self.needles[..self.needles.partition_point(u8::is_ascii)]
+    }
+
+    /// How many passes over a line the needles take, three to a pass.
+    fn passes(&self) -> usize {
+        self.needles.len().div_ceil(3)
+    }
+
+    /// The needles `search` looks for in its first pass, and the others, all beyond ASCII:
+    /// up to three, or more with the ASCII spellings first, the way most text writes them.
+    fn split(&self) -> (&[u8], &[u8]) {
+        let (needles, ascii) = (&self.needles, self.ascii().len());
+        let first = if needles.len() <= 3 || ascii == 0 {
+            needles.len().min(3)
+        } else {
+            ascii.min(3)
+        };
+        needles.split_at(first)
     }
 
     /// Whether a needle found at `at` can be part of a spelling: a byte inside a letter only
@@ -192,6 +254,8 @@ impl Literal {
                 folded.push(letter);
             }
         }
+        // A search that changes anchor goes on from a line start, as no match runs over two.
+        debug_assert!(!folded.contains('\n'));
         let any_case = folded.chars().any(has_case) && !folded.chars().any(char::is_uppercase);
         let text: String = if any_case {
             folded.to_lowercase().chars().map(sigma).collect()
@@ -244,6 +308,8 @@ impl Literal {
             ways,
             anchors,
             chosen: AtomicUsize::new(0),
+            guess: 0,
+            learned: AtomicUsize::new(0),
             fresh: [const { OnceLock::new() }; RENEWALS],
             renewals: AtomicUsize::new(0),
             attempts: AtomicUsize::new(0),
@@ -251,7 +317,9 @@ impl Literal {
             text,
             any_case,
         };
-        *literal.chosen.get_mut() = literal.cheapest(guess, PASS);
+        literal.guess = literal.cheapest(guess, PASS);
+        *literal.chosen.get_mut() = literal.guess;
+        *literal.learned.get_mut() = literal.guess;
         Some(literal)
     }
 
@@ -268,15 +336,25 @@ impl Literal {
             .expect("the first letter anchors")
     }
 
-    /// The first match. When the anchor shows up all over the first lines read, as E1 does
-    /// in Vietnamese for a guess, the bytes last read choose another, which starts over.
+    /// The first match. An anchor that is crowded or costs more than the other kept gives way
+    /// to another, which goes on from the line it stopped in.
     fn find_in(&self, haystack: &[u8]) -> Option<Range<usize>> {
-        let chosen = self.chosen.load(Ordering::Acquire);
-        let start = self.anchor(chosen);
-        let read = match self.search(start, haystack, 0, true) {
-            Ok(found) => return found,
-            Err(read) => read,
+        let (mut chosen, mut from, mut compare) = (self.chosen.load(Ordering::Acquire), 0, true);
+        let read = loop {
+            match self.search(chosen, haystack, from, compare, true) {
+                Ok(found) => return found,
+                Err(Stop::Crowded(read)) => break read,
+                Err(Stop::Other(other, read)) => {
+                    self.chosen.store(other, Ordering::Release);
+                    // All read without a match: the other anchor is for the next lines.
+                    if read == haystack.len() {
+                        return None;
+                    }
+                    (chosen, from, compare) = (other, line_start(haystack, read), false);
+                }
+            }
         };
+        let start = self.anchor(chosen);
         let sample = &haystack[read - SAMPLE / 2..read];
         let mut counts = [0; 256];
         sample
@@ -285,7 +363,15 @@ impl Literal {
         let count = |byte: u8| counts[usize::from(byte)];
         let pass = sample.len() / 250;
         let mut next = self.cheapest(count, pass);
-        let mut learned = &self.anchors[next];
+        // Needles chosen afresh before too, so lines like the ones they came from don't renew.
+        for (slot, fresh) in self.fresh.iter().enumerate() {
+            if let Some(fresh) = fresh.get()
+                && fresh.cost(count, pass) < self.anchor(next).cost(count, pass)
+            {
+                next = self.anchors.len() + slot;
+            }
+        }
+        let mut learned = self.anchor(next);
         if start.cost(count, pass) <= learned.cost(count, pass) {
             (next, learned) = (chosen, start);
         }
@@ -308,39 +394,39 @@ impl Literal {
                 }
             }
         }
+        // Lines that crowd only the guess, like English or Czech ones, keep the anchor learned.
+        if next >= self.anchors.len() || chosen == self.learned.load(Ordering::Acquire) {
+            self.learned.store(next, Ordering::Release);
+        }
         self.chosen.store(next, Ordering::Release);
         let from = if std::ptr::eq(learned, start) {
             read
         } else {
-            0
+            line_start(haystack, read)
         };
-        self.search(learned, haystack, from, false)
+        if read == haystack.len() {
+            return None;
+        }
+        self.search(next, haystack, from, false, false)
             .unwrap_or_else(|_| unreachable!("searches to the end"))
     }
 
-    /// The first match from `from`, read in stretches that double, as the next match is often
-    /// a line away. `Err` with how far it read when `crowded` and needles stop it too often.
+    /// The first match from `from`, read in doubling stretches. Stops short when `compare`
+    /// finds the other anchor cheaper, or `crowd` finds its needles too many.
     fn search(
         &self,
-        anchor: &Anchor,
+        chosen: usize,
         haystack: &[u8],
         mut from: usize,
-        crowded: bool,
-    ) -> Result<Option<Range<usize>>, usize> {
-        // Up to three needles in one pass. More: ASCII spellings first, the way most text
-        // writes them, and the others only up to the first match found by those.
-        let needles = &anchor.needles;
-        let ascii = needles
-            .iter()
-            .take_while(|needle| needle.is_ascii())
-            .count();
-        let first = if needles.len() <= 3 || ascii == 0 {
-            needles.len().min(3)
-        } else {
-            ascii.min(3)
-        };
-        let (first, others) = needles.split_at(first);
-        let (mut size, mut tried) = (64, 0);
+        compare: bool,
+        crowd: bool,
+    ) -> Result<Option<Range<usize>>, Stop> {
+        let anchor = self.anchor(chosen);
+        // The others only up to the first match found by the first.
+        let (first, others) = anchor.split();
+        let (start, mut size, mut tried) = (from, 64, 0);
+        // `cheaper` weighs `tried` against the lines from the top.
+        debug_assert!(!compare || start == 0);
         while from < haystack.len() {
             let to = haystack.len().min(from + size);
             let window = &haystack[from..to];
@@ -364,12 +450,59 @@ impl Literal {
             if let Some((_, found)) = earlier.or(first) {
                 return Ok(Some(found));
             }
-            if crowded && to >= SAMPLE && tried * 10_000 > to * CROWD {
-                return Err(to);
+            if crowd && to >= start + SAMPLE && crowded(tried, to - start) {
+                return Err(Stop::Crowded(to));
+            }
+            // A crowded guess gives way early, as in a Vietnamese file after English ones; a
+            // learned anchor only after 8 KB, so a few English lines don't fool it.
+            let point = if chosen == self.guess {
+                COMPARE
+            } else {
+                SAMPLE
+            };
+            if compare
+                && from < point
+                && to >= point
+                && let Some(other) = self.cheaper(chosen, &haystack[..to], tried)
+            {
+                return Err(Stop::Other(other, to));
             }
             (from, size) = (to, size * 2);
         }
         Ok(None)
+    }
+
+    /// The learned anchor where `tried` shows the guess crowded, else the guess, if it costs
+    /// less than `chosen` in the lines `read`, as `Anchor::cost` weighs them.
+    fn cheaper(&self, chosen: usize, read: &[u8], tried: usize) -> Option<usize> {
+        let other = if chosen == self.guess {
+            let learned = self.learned.load(Ordering::Acquire);
+            if learned == chosen || !crowded(tried, read.len()) {
+                return None;
+            }
+            learned
+        } else {
+            // With the same ASCII needles both cost the same in plain text, and lines that
+            // crowd only one are left to the crowded recheck.
+            if self.anchor(chosen).ascii() == self.anchor(self.guess).ascii() {
+                return None;
+            }
+            self.guess
+        };
+        let (chosen, other_anchor) = (self.anchor(chosen), self.anchor(other));
+        let pass = read.len() / 250;
+        let (passes, other_passes) = (pass * chosen.passes(), pass * other_anchor.passes());
+        // `tried` is at least what `chosen` found, so counting a crowded other stops early, and
+        // `chosen` is counted only when the other may cost less.
+        let most = (tried + passes).saturating_sub(other_passes);
+        if most == 0 {
+            return None;
+        }
+        let found = occurrences(&other_anchor.needles, read, most);
+        // The other costs less once `chosen` has found this many.
+        let beaten = (found + other_passes + 1).saturating_sub(passes);
+        (found < most && (beaten == 0 || occurrences(&chosen.needles, read, beaten) >= beaten))
+            .then_some(other)
     }
 
     /// The match whose anchor holds the needle found at `at`, if there is one. A later anchor
@@ -1046,14 +1179,129 @@ mod tests {
         ] {
             let literal = Literal::new(text).unwrap();
             let haystack = format!("{}{tail}", filler.repeat(SAMPLE));
-            let guess = literal.anchor(literal.chosen.load(Ordering::Relaxed));
-            let guess = literal.search(guess, haystack.as_bytes(), 0, true);
+            let guess = literal.search(literal.guess, haystack.as_bytes(), 0, false, true);
             assert!(guess.is_err(), "{text:?}");
             let found = literal.find(haystack.as_bytes()).unwrap();
             let found = found.map(|m| (m.start(), m.end()));
             assert!(found.is_some(), "{text:?}");
             assert_eq!(found, plain_find(text, &haystack, 0), "{text:?}");
         }
+    }
+
+    /// An anchor learned on crowded lines is left for English files and taken back for lines
+    /// like its own, and lines that crowd only the guess don't replace it.
+    #[test]
+    fn a_learned_anchor_is_kept_only_where_it_suits() {
+        let literal = Literal::new("zebra").unwrap();
+        let english = "a quick brown fox jumps over the old dog, then naps in the warm sun all day \
+            long until the night comes and the moon is high up in the sky. ";
+        let crowded = format!("{} ZEBRA", "ž".repeat(SAMPLE));
+        let headed = format!("{}{crowded}", english.repeat(18));
+        let stretch = format!("{}{}{crowded}", "ž".repeat(3000), english.repeat(15));
+        let plain = format!("{}Zebra", english.repeat(75));
+        let chosen = || literal.chosen.load(Ordering::Relaxed);
+        let find = |haystack: &str| {
+            let found = literal.find(haystack.as_bytes()).unwrap();
+            assert_eq!(
+                found.map(|m| (m.start(), m.end())),
+                plain_find("zebra", haystack, 0)
+            );
+        };
+        find(&crowded);
+        let learned = chosen();
+        assert_ne!(learned, literal.guess);
+        find(&headed);
+        assert_eq!(chosen(), learned);
+        find(&stretch);
+        assert_eq!(chosen(), learned);
+        find(&english.repeat(36));
+        assert_eq!(chosen(), literal.guess);
+        find(&crowded);
+        assert_eq!(chosen(), learned);
+        find(&plain);
+        assert_eq!(chosen(), literal.guess);
+        find(&crowded);
+        assert_eq!(chosen(), learned);
+        // Left where the learned letter of a match is just past what the learned anchor read:
+        // the guess goes back to the start of the line.
+        let mut ends = (1..).map(|k| 64 * ((1 << k) - 1));
+        let stop = ends.find(|&end| end >= SAMPLE).unwrap();
+        let before = literal.ways[literal.anchor(learned).way].before;
+        assert!(before > 0);
+        for at in stop - before..stop {
+            let mut straddle = english.replace(". ", ".\n").repeat(60);
+            straddle.truncate(at);
+            straddle.push_str("zebra");
+            find(&straddle);
+            assert_eq!(chosen(), literal.guess);
+            find(&crowded);
+            assert_eq!(chosen(), learned);
+        }
+        // Crowding the guess, and the learned letter even more, as a Czech file after Vietnamese
+        // ones: a third anchor, and the learned one kept for lines like its own.
+        let spellings = &literal.ways[literal.anchor(learned).way].spellings;
+        let letter = spellings.iter().find(|letter| letter.is_ascii()).unwrap();
+        find(&plain);
+        find(&format!(
+            "{} ZEBRA",
+            format!("ž{letter}{letter}").repeat(SAMPLE)
+        ));
+        assert!(![literal.guess, learned].contains(&chosen()));
+        assert_eq!(literal.learned.load(Ordering::Relaxed), learned);
+        // Crowding the learned anchor once taken: it gives way.
+        find(&plain);
+        find(&format!("{} ZEBRA", format!("ž{letter}").repeat(SAMPLE)));
+        assert!(![literal.guess, learned].contains(&chosen()));
+        assert_eq!(literal.learned.load(Ordering::Relaxed), chosen());
+    }
+
+    /// A crowded block that moves to a letter earlier in the text goes back to the start of
+    /// the line, where that letter of a match running past the crowded lines is.
+    #[test]
+    fn a_crowded_block_goes_on_from_the_line_it_stopped_in() {
+        let literal = Literal::new("abz").unwrap();
+        let mut ends = (1..).map(|k| 64 * ((1 << k) - 1));
+        let stop = ends.find(|&end| end >= SAMPLE).unwrap();
+        let mut haystack = "zz zz zz zz\n".repeat(stop);
+        haystack.truncate(stop - 3);
+        haystack.push_str("\nabz zz\n");
+        let guess = literal.search(literal.guess, haystack.as_bytes(), 0, false, true);
+        assert!(matches!(guess, Err(Stop::Crowded(read)) if read == stop));
+        let found = literal.find(haystack.as_bytes()).unwrap();
+        assert_eq!(
+            found.map(|m| (m.start(), m.end())),
+            Some((stop - 2, stop + 1))
+        );
+        assert_ne!(literal.chosen.load(Ordering::Relaxed), literal.guess);
+    }
+
+    /// The guess is taken back only when it costs less than the learned anchor, not as much.
+    #[test]
+    fn a_learned_anchor_gives_way_only_to_a_cheaper_guess() {
+        let literal = Literal::new("zebra").unwrap();
+        let (guess, anchors) = (literal.guess, &literal.anchors);
+        let chosen = (0..anchors.len())
+            .find(|&a| {
+                !anchors[a].ascii().is_empty() && anchors[a].ascii() != anchors[guess].ascii()
+            })
+            .unwrap();
+        let (mine, other) = (anchors[chosen].ascii()[0], anchors[guess].ascii()[0]);
+        let read = |mine_found: usize, other_found: usize| {
+            let mut read = vec![b'.'; 2500];
+            (0..mine_found).for_each(|at| read[10 * at] = mine);
+            (0..other_found).for_each(|at| read[1250 + 10 * at] = other);
+            read
+        };
+        let pass = 2500 / 250;
+        let (passes, other_passes) = (
+            pass * anchors[chosen].passes(),
+            pass * anchors[guess].passes(),
+        );
+        let other_found = passes;
+        let tie = other_found + other_passes - passes;
+        let cheaper = |found| literal.cheaper(chosen, &read(found, other_found), found + 100);
+        assert_eq!(cheaper(tie), None);
+        assert_eq!(cheaper(tie + 1), Some(guess));
     }
 
     /// The h of "the" is also looked for as the þ that holds it after the t, and the e of
