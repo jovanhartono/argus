@@ -33,8 +33,8 @@ struct Ways {
     before: usize,
     /// Accents and all, sorted.
     spellings: Vec<char>,
-    /// Letters that hold it after the letters just before it in the text, like the þ that
-    /// holds the h of "the", and how many bytes of the text they hold before it.
+    /// Letters that hold it, like the þ of "the" or the ß of "se", with how many letters of
+    /// their fold come before it.
     inside: Vec<(char, usize)>,
 }
 
@@ -208,10 +208,13 @@ impl Literal {
         let ways: Vec<Ways> = (text.char_indices())
             .map(|(before, letter)| {
                 let start = later.partition_point(|(part, ..)| *part < letter);
+                let typed = &text[..before];
                 let mut inside: Vec<(char, usize)> = (later[start..].iter())
                     .take_while(|(part, ..)| *part == letter)
-                    .filter(|(_, earlier, _)| text[..before].ends_with(earlier.as_str()))
-                    .map(|(_, earlier, holder)| (*holder, earlier.len()))
+                    .filter(|(_, earlier, _)| {
+                        typed.ends_with(earlier.as_str()) || earlier.ends_with(typed)
+                    })
+                    .map(|(_, earlier, holder)| (*holder, earlier.chars().count()))
                     .collect();
                 inside.sort_unstable();
                 inside.dedup();
@@ -415,9 +418,10 @@ impl Literal {
     #[inline(never)]
     fn match_letter_at(&self, anchor: &Anchor, haystack: &[u8], at: usize) -> Option<Range<usize>> {
         let ways = &self.ways[anchor.way];
-        let matched = |letter: usize, held: usize| {
-            let start = self.start_before(haystack, letter, &self.text[..ways.before - held])?;
-            Some(start..self.folded_end(haystack, start)?)
+        let matched = |letter: usize, parts: usize| {
+            let typed = &self.text[..ways.before];
+            let (start, skip) = self.start_before(haystack, letter, parts, typed)?;
+            Some(start..self.folded_end(haystack, start, skip)?)
         };
         if haystack[at].is_ascii() {
             return matched(at, 0);
@@ -432,71 +436,100 @@ impl Literal {
             .inside
             .iter()
             .filter(|&&(holder, _)| holder == spelling);
-        (here.into_iter().chain(inside.map(|&(_, held)| held)))
-            .filter_map(|held| matched(letter, held))
+        (here.into_iter().chain(inside.map(|&(_, parts)| parts)))
+            .filter_map(|parts| matched(letter, parts))
             .min_by_key(|found| found.start)
     }
 
-    /// Where a match starts whose letters before `at` fold to `typed`, the text before the
-    /// anchor. They are compared on the way back, so a line that differs stops at once.
-    fn start_before(&self, haystack: &[u8], mut at: usize, mut typed: &str) -> Option<usize> {
-        let width = |letter: char| {
-            if self.any_case {
-                letter.to_lowercase().count()
-            } else {
-                1
-            }
+    /// Where a match starts, and how much of its first letter's fold it leaves out (the ß of
+    /// "se"); compared on the way back, so a line that differs stops at once.
+    fn start_before(
+        &self,
+        haystack: &[u8],
+        mut at: usize,
+        mut parts: usize,
+        mut typed: &str,
+    ) -> Option<(usize, usize)> {
+        let (mut letter, mut folded) = match parts {
+            0 => ('\0', false),
+            _ => (letter_at(haystack, at)?.0, true),
         };
-        while !typed.is_empty() {
-            let (letter, len) = letter_before(haystack, at)?;
-            at -= len;
-            let mut parts = 0;
-            let folded = folds(letter, |part| parts += width(part));
+        loop {
+            // An accent stored apart from its letter folds to nothing; the walk goes on past it.
+            if parts > 0 {
+                let Some((start, _)) = typed.char_indices().rev().nth(parts - 1) else {
+                    let skip = parts - typed.chars().count();
+                    self.eat_folded(letter, skip, &mut typed.chars())?;
+                    return Some((at, skip));
+                };
+                let mut wanted = typed[start..].chars();
+                if folded {
+                    self.eat_folded(letter, 0, &mut wanted)?;
+                } else if !self.eat(letter, &mut wanted) {
+                    return None;
+                }
+                typed = &typed[..start];
+            }
+            if typed.is_empty() {
+                return Some((at, 0));
+            }
+            let (before, len) = letter_before(haystack, at)?;
+            (letter, at, parts) = (before, at - len, 0);
+            let mut count = |part: char| {
+                parts += if self.any_case {
+                    part.to_lowercase().count()
+                } else {
+                    1
+                }
+            };
+            folded = folds(letter, &mut count);
             if !folded {
-                parts = width(letter);
+                count(letter);
             }
-            // An accent stored apart from its letter folds to nothing.
-            if parts == 0 {
-                continue;
-            }
-            let (start, _) = typed.char_indices().rev().nth(parts - 1)?;
-            let mut wanted = typed[start..].chars();
-            let mut same = true;
-            if folded {
-                folds(letter, |part| same &= self.eat(part, &mut wanted));
-            } else {
-                same = self.eat(letter, &mut wanted);
-            }
-            if !same {
-                return None;
-            }
-            typed = &typed[..start];
         }
-        Some(at)
     }
 
-    /// Where the text ends when it starts at `start`, each letter there folded, with the
-    /// accents stored after its last letter. A match starts and ends on whole letters.
-    fn folded_end(&self, haystack: &[u8], start: usize) -> Option<usize> {
+    /// Where the text ends, accents after its last letter included; a match covers whole
+    /// letters, even one it holds only part of, like the ß of "stras".
+    fn folded_end(&self, haystack: &[u8], start: usize, mut skip: usize) -> Option<usize> {
         let mut wanted = self.text.chars();
         let mut at = start;
         while !wanted.as_str().is_empty() {
             let (letter, len) = letter_at(haystack, at)?;
             let typed = wanted.clone();
-            if !self.eat(letter, &mut wanted) {
+            if skip > 0 || !self.eat(letter, &mut wanted) {
                 wanted = typed;
-                let (mut same, mut any) = (true, false);
-                let folds = folds(letter, |part| {
-                    any = true;
-                    same &= self.eat(part, &mut wanted);
-                });
-                if !folds || !same || (at == start && !any) {
+                let took = self.eat_folded(letter, skip, &mut wanted)?;
+                if at == start && took == 0 {
                     return None;
                 }
+                skip = 0;
             }
             at += len;
         }
         Some(accents_after(haystack, at))
+    }
+
+    /// Takes the letters `letter` folds to, after the first `skip`, off the front of `wanted`
+    /// until it runs out: `None` when it doesn't fold or one differs, else how many it took.
+    fn eat_folded(&self, letter: char, mut skip: usize, wanted: &mut Chars<'_>) -> Option<usize> {
+        let (mut same, mut took) = (true, 0);
+        let mut each = |part: char| {
+            let mut one = |part: char| {
+                if skip > 0 {
+                    skip -= 1;
+                } else if same && !wanted.as_str().is_empty() {
+                    same = wanted.next() == Some(part);
+                    took += 1;
+                }
+            };
+            if self.any_case {
+                part.to_lowercase().for_each(|lower| one(sigma(lower)));
+            } else {
+                one(part);
+            }
+        };
+        (folds(letter, &mut each) && same).then_some(took)
     }
 
     /// Takes `letter` off the front of `wanted`, if it is there.
@@ -802,8 +835,8 @@ pub(crate) fn folds_to_nothing(letter: char) -> bool {
     folds(letter, |_| any = true) && !any
 }
 
-/// The first match at or after `at`, the slow and obvious way: the text and each letter of
-/// the line folded on its own, and lower-cased when the text has no capital.
+/// The first match at or after `at`, the slow and obvious way: each letter folded, the text
+/// looked for in them strung together, as names are, covering any letter it touches.
 #[cfg(test)]
 pub(crate) fn plain_find(text: &str, haystack: &str, at: usize) -> Option<(usize, usize)> {
     let fold = |letter: char| {
@@ -829,19 +862,21 @@ pub(crate) fn plain_find(text: &str, haystack: &str, at: usize) -> Option<(usize
         .map(|(start, letter)| (start, case(fold(letter))))
         .collect();
     let start_of = |i: usize| letters.get(i).map_or(haystack.len(), |l| l.0);
-    (0..letters.len())
-        .filter(|&i| letters[i].0 >= at && !letters[i].1.is_empty())
-        .find_map(|i| {
-            let mut got: Vec<char> = Vec::new();
-            let mut end = i;
-            while got.len() < wanted.len() && end < letters.len() {
-                got.extend(&letters[end].1);
-                end += 1;
-            }
+    // Each letter of the folded line, and which letter of the line it comes from.
+    let folded: Vec<(usize, char)> = (letters.iter().enumerate())
+        .flat_map(|(i, (_, parts))| parts.iter().map(move |&part| (i, part)))
+        .collect();
+    (0..folded.len())
+        .filter(|&from| letters[folded[from].0].0 >= at)
+        .find_map(|from| {
+            let got = folded.get(from..from + wanted.len())?;
+            let (first, last) = (got.first()?.0, got.last()?.0);
+            let mut end = last + 1;
             while end < letters.len() && letters[end].1.is_empty() {
                 end += 1;
             }
-            (got == wanted).then(|| (start_of(i), start_of(end)))
+            (got.iter().map(|&(_, part)| part).eq(wanted.iter().copied()))
+                .then(|| (start_of(first), start_of(end)))
         })
 }
 
@@ -1033,7 +1068,7 @@ mod tests {
         assert!(inside("mae", 2).contains(&('æ', 1)));
         assert!(inside("mae", 2).contains(&('Ǽ', 1)));
         assert_eq!(inside("es", 1), []);
-        assert_eq!(inside("ss", 0), []);
+        assert!(inside("ss", 0).contains(&('ß', 1)));
         assert!(inside("ss", 1).contains(&('ß', 1)));
         assert_eq!(find("the", "x þe"), Some((2, 5)));
         assert_eq!(find("the", "x tþe"), Some((3, 6)));
@@ -1041,6 +1076,27 @@ mod tests {
         assert_eq!(find("mae", "MÆ"), Some((0, 3)));
         assert_eq!(find("ss", "ß"), Some((0, 2)));
         assert_eq!(find("sss", "sß"), Some((0, 3)));
+    }
+
+    /// As in names, a match can end or start partway through a letter spelled as several,
+    /// and covers that whole letter, so no keystroke of "strasse" loses the Straße line.
+    #[test]
+    fn a_match_can_hold_part_of_a_spelled_letter() {
+        let ends = [5, 6, 7, 8, 10, 10, 11];
+        for (typed, end) in (1..=7).map(|len| &"strasse"[..len]).zip(ends) {
+            assert_eq!(find(typed, "Die Straße"), Some((4, end)), "{typed:?}");
+        }
+        assert_eq!(find("se", "Straße"), Some((4, 7)));
+        assert_eq!(find("e", "ße"), Some((2, 3)));
+        assert_eq!(find("encyclopa", "Encyclopædia"), Some((0, 10)));
+        assert_eq!(find("ediA", "æDIA"), None);
+        assert_eq!(find("edia", "ENCYCLOPÆDIA"), Some((8, 13)));
+        assert_eq!(find("h", "þ"), Some((0, 2)));
+        assert_eq!(find("hor", "Þorn"), Some((0, 4)));
+        assert_eq!(find("sa", "ßa ssa"), Some((0, 3)));
+        assert_eq!(find("ss", "ßs"), Some((0, 2)));
+        assert_eq!(find("sß", "ßs"), Some((0, 3)));
+        assert_eq!(find("es", "æs"), Some((0, 3)));
     }
 
     /// No letter takes more passes than a search keeps track of, whichever bytes are rare.
@@ -1179,7 +1235,7 @@ mod tests {
     #[test]
     fn any_case_agrees_with_a_plain_search() {
         let mut random = crate::tests::random_below(0x9e37_79b9_7f4a_7c15);
-        let alphabets: [&[&str]; 6] = [
+        let alphabets: [&[&str]; 8] = [
             &[
                 "s", "S", "ß", "ẞ", "π", "Π", "a", "e", "æ", "Æ", "\u{301}", "α", "ά", "ᾶ", " ",
             ],
@@ -1198,6 +1254,15 @@ mod tests {
             &[
                 "\u{304b}", "\u{304c}", "\u{3099}", "\u{1112}", "\u{1161}", "\u{d55c}", "a",
                 "\u{301}", " ",
+            ],
+            // Letters spelled as several, which a match can start or end inside.
+            &[
+                "s", "S", "ß", "ẞ", "t", "T", "h", "þ", "Þ", "a", "e", "æ", "Æ", "o", "œ", "ø",
+                "\u{301}", " ",
+            ],
+            // Letters that fold to three.
+            &[
+                "\u{fb2c}", "\u{fb2d}", "\u{5e9}", "\u{5bc}", "\u{5c1}", "\u{5c2}", "a", " ",
             ],
         ];
         for alphabet in alphabets {
