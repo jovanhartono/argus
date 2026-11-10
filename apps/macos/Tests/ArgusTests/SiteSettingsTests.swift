@@ -12,7 +12,6 @@ final class SiteSettingsTests: XCTestCase {
     private var stage: OffStage!
 
     private static let margin: CGFloat = 40
-    private static let scale = 2
 
     override func setUp() async throws {
         _ = NSApplication.shared
@@ -23,17 +22,11 @@ final class SiteSettingsTests: XCTestCase {
         stage = OffStage()
         out = URL(fileURLWithPath: folder, isDirectory: true)
         try FileManager.default.createDirectory(at: out, withIntermediateDirectories: true)
-        // The skipped-folders row writes its path from the home folder, so a made-up one stands in:
-        // the same one SiteFramesTests uses, as the app reads the home folder once per run.
-        root = URL(fileURLWithPath: "/Users/Shared/argus-site-home", isDirectory: true)
-        try? FileManager.default.removeItem(at: root)
-        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
-        setenv("CFFIXED_USER_HOME", root.path, 1)
+        root = try SitePage.makeHome()
     }
 
     override func tearDown() async throws {
-        unsetenv("CFFIXED_USER_HOME")
-        if let root { try? FileManager.default.removeItem(at: root) }
+        SitePage.leaveHome()
         XCTAssertEqual(NSApp.windows.filter(\.isVisible), [], "a test put a window on the screen")
         XCTAssertFalse(NSApp.isActive, "a test made the test runner the active app")
     }
@@ -62,8 +55,7 @@ final class SiteSettingsTests: XCTestCase {
         try shoot(window.panel)
     }
 
-    /// The whole window, title bar included, on the page's light background with the rounded
-    /// corners, shadow and hairline edge an off-screen drawing leaves out.
+    /// The whole window, title bar included, on the site's page.
     private func shoot(_ panel: NSPanel) throws {
         let frameView = try XCTUnwrap(panel.contentView?.superview)
         frameView.layoutSubtreeIfNeeded()
@@ -78,63 +70,23 @@ final class SiteSettingsTests: XCTestCase {
         let close = try XCTUnwrap(panel.standardWindowButton(.closeButton))
         let closeAt = close.convert(close.bounds, to: nil)
         let size = frameView.bounds.size
-        let views = try bitmap(size)
+        let views = try SitePage.bitmap(size)
         frameView.cacheDisplay(in: frameView.bounds, to: views)
 
         let canvas = NSSize(width: size.width + 2 * Self.margin, height: size.height + 2 * Self.margin)
-        let page = try bitmap(canvas)
-        let context = try XCTUnwrap(NSGraphicsContext(bitmapImageRep: page))
-        NSGraphicsContext.saveGraphicsState()
-        defer { NSGraphicsContext.restoreGraphicsState() }
-        NSGraphicsContext.current = context
-        NSColor(srgbRed: 0xfa / 255, green: 0xfa / 255, blue: 0xfa / 255, alpha: 1).setFill()
-        NSRect(origin: .zero, size: canvas).fill()
-
         let frame = NSRect(origin: NSPoint(x: Self.margin, y: Self.margin), size: size)
-        let outline = NSBezierPath(roundedRect: frame, xRadius: 12, yRadius: 12)
-        let lightMode = try XCTUnwrap(NSAppearance(named: .aqua))
-        lightMode.performAsCurrentDrawingAppearance {
-            NSGraphicsContext.saveGraphicsState()
-            let shadow = NSShadow()
-            shadow.shadowColor = NSColor.black.withAlphaComponent(0.16)
-            shadow.shadowBlurRadius = 24
-            shadow.shadowOffset = NSSize(width: 0, height: -8)
-            shadow.set()
-            NSColor.windowBackgroundColor.setFill()
-            outline.fill()
-            NSGraphicsContext.restoreGraphicsState()
-            NSGraphicsContext.saveGraphicsState()
-            outline.addClip()
-            NSColor.windowBackgroundColor.setFill()
-            frame.fill()
-            views.draw(in: frame, from: .zero, operation: .sourceOver, fraction: 1, respectFlipped: true, hints: nil)
+        let page = try SitePage.window(views, at: frame, on: canvas, corner: 12) {
             let side: CGFloat = 14
             let light = NSRect(
                 x: frame.minX + closeAt.midX - side / 2, y: frame.minY + closeAt.midY - side / 2, width: side, height: side)
             NSColor(srgbRed: 1, green: 0x5f / 255, blue: 0x57 / 255, alpha: 1).setFill()
             NSBezierPath(ovalIn: light).fill()
-            NSGraphicsContext.restoreGraphicsState()
-            NSColor.black.withAlphaComponent(0.12).setStroke()
-            let edge = NSBezierPath(roundedRect: frame.insetBy(dx: 0.25, dy: 0.25), xRadius: 12, yRadius: 12)
-            edge.lineWidth = 0.5
-            edge.stroke()
         }
-        context.flushGraphics()
         try XCTUnwrap(page.representation(using: .png, properties: [:]))
             .write(to: out.appendingPathComponent("settings.png"))
     }
 
     private func labels(in view: NSView) -> [NSTextField] {
         view.subviews.flatMap { sub in (sub as? NSTextField).map { [$0] } ?? labels(in: sub) }
-    }
-
-    private func bitmap(_ size: NSSize) throws -> NSBitmapImageRep {
-        let rep = try XCTUnwrap(
-            NSBitmapImageRep(
-                bitmapDataPlanes: nil, pixelsWide: Int(size.width) * Self.scale, pixelsHigh: Int(size.height) * Self.scale,
-                bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false, colorSpaceName: .deviceRGB,
-                bytesPerRow: 0, bitsPerPixel: 0))
-        rep.size = size
-        return rep
     }
 }

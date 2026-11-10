@@ -17,7 +17,6 @@ final class SiteFramesTests: XCTestCase {
     private var left: CGFloat?
 
     private static let top: CGFloat = 40
-    private static let scale = 2
     /// Three frames at 30 fps.
     private static let letter = 0.1
 
@@ -30,19 +29,11 @@ final class SiteFramesTests: XCTestCase {
         stage = OffStage()
         out = URL(fileURLWithPath: folder, isDirectory: true)
         try FileManager.default.createDirectory(at: out, withIntermediateDirectories: true)
-        // The rows write folders from the home folder, "~/Documents/Work", so a made-up one stands
-        // in. Not under /private/var, where Foundation drops the /private and the list doesn't, nor
-        // in the real home folder, where ⌘T reads only the files Spotlight has already seen. The
-        // same one for every test: the app reads the home folder once.
-        root = URL(fileURLWithPath: "/Users/Shared/argus-site-home", isDirectory: true)
-        try? FileManager.default.removeItem(at: root)
-        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
-        setenv("CFFIXED_USER_HOME", root.path, 1)
+        root = try SitePage.makeHome()
     }
 
     override func tearDown() async throws {
-        unsetenv("CFFIXED_USER_HOME")
-        if let root { try? FileManager.default.removeItem(at: root) }
+        SitePage.leaveHome()
         XCTAssertEqual(NSApp.windows.filter(\.isVisible), [], "a test put a window on the screen")
         XCTAssertFalse(NSApp.isActive, "a test made the test runner the active app")
     }
@@ -266,44 +257,18 @@ final class SiteFramesTests: XCTestCase {
         XCTAssertTrue(done(), file: file, line: line)
     }
 
-    /// The window as it looks on the site's light page: its own background, rounded corners, a
-    /// shadow, a hairline edge, and a caret after the text, none of which an off-screen drawing of
-    /// its views has.
+    /// The window on the site's page, with a caret after the text.
     private func shoot(_ window: SearchPanel, _ name: String, _ seconds: Double) throws {
         let content = try XCTUnwrap(window.panel.contentView)
         content.layoutSubtreeIfNeeded()
         let size = content.bounds.size
-        let views = try bitmap(size)
+        let views = try SitePage.bitmap(size)
         content.cacheDisplay(in: content.bounds, to: views)
-
-        let page = try bitmap(canvas)
-        let context = try XCTUnwrap(NSGraphicsContext(bitmapImageRep: page))
-        NSGraphicsContext.saveGraphicsState()
-        defer { NSGraphicsContext.restoreGraphicsState() }
-        NSGraphicsContext.current = context
-        NSColor(srgbRed: 0xfa / 255, green: 0xfa / 255, blue: 0xfa / 255, alpha: 1).setFill()
-        NSRect(origin: .zero, size: canvas).fill()
 
         let frame = NSRect(
             x: left ?? ((canvas.width - size.width) / 2).rounded(), y: canvas.height - Self.top - size.height,
             width: size.width, height: size.height)
-        let outline = NSBezierPath(roundedRect: frame, xRadius: 16, yRadius: 16)
-        let light = try XCTUnwrap(NSAppearance(named: .aqua))
-        light.performAsCurrentDrawingAppearance {
-            NSGraphicsContext.saveGraphicsState()
-            let shadow = NSShadow()
-            shadow.shadowColor = NSColor.black.withAlphaComponent(0.16)
-            shadow.shadowBlurRadius = 24
-            shadow.shadowOffset = NSSize(width: 0, height: -8)
-            shadow.set()
-            NSColor.windowBackgroundColor.setFill()
-            outline.fill()
-            NSGraphicsContext.restoreGraphicsState()
-            NSGraphicsContext.saveGraphicsState()
-            outline.addClip()
-            NSColor.windowBackgroundColor.setFill()
-            frame.fill()
-            views.draw(in: frame, from: .zero, operation: .sourceOver, fraction: 1, respectFlipped: true, hints: nil)
+        let page = try SitePage.window(views, at: frame, on: canvas, corner: 16) {
             let typed = NSAttributedString(
                 string: window.field.stringValue, attributes: [.font: window.field.font as Any]
             ).size().width
@@ -311,27 +276,11 @@ final class SiteFramesTests: XCTestCase {
             NSColor.controlAccentColor.setFill()
             NSRect(x: frame.minX + field.minX + 2 + typed, y: frame.maxY - field.maxY + 3, width: 2, height: field.height - 6)
                 .fill()
-            NSGraphicsContext.restoreGraphicsState()
-            NSColor.black.withAlphaComponent(0.12).setStroke()
-            let edge = NSBezierPath(roundedRect: frame.insetBy(dx: 0.25, dy: 0.25), xRadius: 16, yRadius: 16)
-            edge.lineWidth = 0.5
-            edge.stroke()
         }
-        context.flushGraphics()
 
         let file = String(format: "%03d-%@.png", shots.count, name)
         try XCTUnwrap(page.representation(using: .png, properties: [:])).write(to: out.appendingPathComponent(file))
         shots.append((file, seconds))
-    }
-
-    private func bitmap(_ size: NSSize) throws -> NSBitmapImageRep {
-        let rep = try XCTUnwrap(
-            NSBitmapImageRep(
-                bitmapDataPlanes: nil, pixelsWide: Int(size.width) * Self.scale, pixelsHigh: Int(size.height) * Self.scale,
-                bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false, colorSpaceName: .deviceRGB,
-                bytesPerRow: 0, bitsPerPixel: 0))
-        rep.size = size
-        return rep
     }
 
     /// ffmpeg's concat list. ffmpeg drops the last file's hold unless it is named again, and then
