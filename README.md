@@ -128,7 +128,17 @@ cargo run --release -p argus-cli                         # lists every command
 
 Bug reports and ideas are welcome in [issues](https://github.com/jovanhartono/argus/issues). For a bug, include your macOS version, your Mac's chip and the steps that lead to it.
 
-Pull requests are welcome too. For anything bigger than a small fix, open an issue first so we can agree on the approach. Before you open a pull request, make sure these pass:
+Pull requests are welcome too. For anything bigger than a small fix, open an issue first so we can agree on the approach.
+
+- Fork the repo and branch from `main`. Keep each pull request to one change.
+- Title it in [Conventional Commits](https://www.conventionalcommits.org) style, with a scope when it touches one area, such as `fix(grep): …` or `docs(site): …`. Pull requests are squash-merged, so the title becomes the commit on `main`.
+- In the description, say what changed and why, how you checked it, and which issue it closes (`Closes #123`).
+- Changes to ranking should come with a test that fails without the change. Changes on a hot path, like indexing or matching, should include before and after timings.
+- Changes to the C functions in `crates/argus-ffi` must update `crates/argus-ffi/include/argus.h` to match and bump `TL_ABI_VERSION` on both sides.
+- CI doesn't check `site/`. Serve it locally, look at it in a browser at full and phone width, and say what you saw.
+- The Vercel check fails on pull requests from forks until a maintainer approves it. You can ignore it.
+
+Before you open a pull request, make sure these pass:
 
 ```sh
 cargo fmt --all --check
@@ -136,8 +146,6 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 swift test --package-path apps/macos   # if you changed the Mac app
 ```
-
-Changes to ranking should come with a test that fails without the change. Changes on a hot path, like indexing or matching, should include before and after timings.
 
 ## Licence
 
